@@ -1,0 +1,109 @@
+name: core build (v2 engine spike)
+
+# Builds core/ (the native baresip/libre engine + ctrl_json) on the v2
+# branch. Scoped separately from build.yml (the v1 Electron app's
+# workflow, which only watches `main`) via branch + path filters, so
+# neither workflow fires on the other's changes.
+on:
+  push:
+    branches: [v2]
+    paths:
+      - 'core/**'
+      - '.github/workflows/core-build.yml'
+  pull_request:
+    branches: [v2]
+    paths:
+      - 'core/**'
+      - '.github/workflows/core-build.yml'
+
+jobs:
+  macos:
+    name: macOS (supported)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install toolchain
+        run: brew install cmake openssl
+
+      - name: Apply local re patch
+        run: git apply --directory=core/deps/re core/patches/0001-re-configurable-sip-ws-path.patch
+
+      - name: Configure + build libre
+        run: |
+          cmake -S core/deps/re -B core/deps/re/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DOPENSSL_ROOT_DIR="$(brew --prefix openssl)"
+          cmake --build core/deps/re/build -j"$(sysctl -n hw.ncpu)"
+
+      - name: Configure + build baresip + ctrl_json
+        run: |
+          cmake -S core/deps/baresip -B core/deps/baresip/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DOPENSSL_ROOT_DIR="$(brew --prefix openssl)" \
+            -DMODULES="account;g711;auconv;auresamp;ausine;aufile;ice;dtls_srtp;menu" \
+            -DAPP_MODULES="ctrl_json" \
+            -DAPP_MODULES_DIR="${{ github.workspace }}/core/modules"
+          cmake --build core/deps/baresip/build -j"$(sysctl -n hw.ncpu)"
+
+      - name: Sanity - binary + ctrl_json module exist
+        run: |
+          test -x core/deps/baresip/build/baresip
+          test -e core/deps/baresip/build/ctrl_json.so
+          core/deps/baresip/build/baresip -h
+
+  windows:
+    name: Windows (experimental, allowed to fail)
+    runs-on: windows-latest
+    # See core/BUILD.md "Windows CI" - not validated locally before this
+    # branch was pushed. ctrl_json.c uses POSIX unistd.h/read()/
+    # STDIN_FILENO, which MSVC does not ship - that piece is expected to
+    # need a Windows-specific stdin path (ReadFile/_read) before this
+    # job can go green. re/baresip themselves do support Windows
+    # upstream, so a partial pass (re + baresip build, ctrl_json fails)
+    # is a plausible, informative outcome, not just an all-or-nothing one.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install OpenSSL (Chocolatey, preinstalled on windows-latest)
+        run: choco install openssl -y --no-progress
+
+      - name: Apply local re patch
+        shell: bash
+        run: git apply --directory=core/deps/re core/patches/0001-re-configurable-sip-ws-path.patch
+
+      - name: Configure + build libre
+        shell: bash
+        run: |
+          set -o pipefail
+          cmake -S core/deps/re -B core/deps/re/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            2>&1 | tee re-configure.log
+          cmake --build core/deps/re/build --config Release 2>&1 | tee -a re-configure.log
+
+      - name: Configure + build baresip + ctrl_json
+        shell: bash
+        run: |
+          set -o pipefail
+          cmake -S core/deps/baresip -B core/deps/baresip/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DMODULES="account;g711;auconv;auresamp;menu" \
+            -DAPP_MODULES="ctrl_json" \
+            -DAPP_MODULES_DIR="${{ github.workspace }}/core/modules" \
+            2>&1 | tee baresip-configure.log
+          cmake --build core/deps/baresip/build --config Release 2>&1 | tee -a baresip-configure.log
+
+      - name: Upload build logs (pass or fail)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-core-build-logs
+          path: |
+            re-configure.log
+            baresip-configure.log
+          if-no-files-found: warn
