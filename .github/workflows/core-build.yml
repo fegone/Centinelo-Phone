@@ -78,9 +78,9 @@ jobs:
   windows:
     name: Windows (experimental)
     runs-on: windows-latest
-    # See core/BUILD.md "Windows CI". Stays on until a run is confirmed green,
-    # per that doc's note (do not flip without first seeing a green run).
-    continue-on-error: true
+    # Gating (no longer continue-on-error): a green Windows run was confirmed on
+    # run 29459035249 (5be8dbf, OpenSSL discovery fix). See core/BUILD.md
+    # "Windows CI" for the path-detection rationale.
     steps:
       - uses: actions/checkout@v4
         with:
