@@ -187,8 +187,9 @@ Enabled URI's:
 ```
 Asterisk's `res_http_websocket` mounts at `/ws`, not `/`. TLS itself is
 fine (raw `openssl s_client` completes the handshake and shows a normal,
-if self-signed, cert from `Neola Internal CA` — see "TODO: cert pinning"
-below); the 404 is purely an HTTP-routing mismatch, and it is not
+if self-signed, cert from `Neola Internal CA` — see "TLS leaf-certificate
+pinning (CENT_TLS_PIN)" below, implemented in F1); the 404 is purely an
+HTTP-routing mismatch, and it is not
 something `sip_verify_server`/account params can route around, since the
 request path isn't exposed through the account/config surface at all in
 this baresip version.
