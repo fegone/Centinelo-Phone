@@ -11,12 +11,15 @@ Everything under `core/` is new. The v1 Electron app at the repo root
 independently; this directory does not depend on it and nothing here is
 wired into its build.
 
-**Status: F1 complete** — full call control (dial/answer/hangup/hold/
-resume/mute/DTMF/blind+attended transfer), BLF presence, RTCP quality
-stats, runtime register/unregister, TLS cert pinning, and a
-Windows-portable stdin path, all e2e-verified against the real test PBX.
-See `PROTOCOL.md` (v1, the wire protocol) and `E2E-F1.md` (the
-verification evidence).
+**Status: F1 complete, v1.1 protocol hardening complete** — full call
+control (dial/answer/hangup/hold/resume/mute/DTMF/blind+attended
+transfer), BLF presence, RTCP quality stats (v1.1: + codec/transport),
+runtime register/unregister, TLS cert pinning, a Windows-portable stdin
+path, per-command request/response correlation (`id`/`result`), audio
+device enumeration/selection (`devices`/`set_device`), and pure-NDJSON
+stdout, all e2e-verified against the real test PBX. See `PROTOCOL.md`
+(v1.1, the wire protocol) and `E2E-F1.md` (the verification evidence,
+F1 + v1.1's "F3 regression").
 
 ## Layout
 
@@ -24,8 +27,8 @@ verification evidence).
 core/
 ├── README.md          this file
 ├── BUILD.md            exact, from-clean-clone build steps + findings
-├── PROTOCOL.md          the v1 JSON control protocol (implemented + planned)
-├── E2E-F1.md            F1 end-to-end verification evidence (real PBX)
+├── PROTOCOL.md          the v1.1 JSON control protocol (implemented + planned)
+├── E2E-F1.md            F1 + v1.1 "F3 regression" end-to-end evidence (real PBX)
 ├── run-spike.sh          launches baresip with a generated scratch config
 ├── deps/
 │   ├── re/               git submodule, github.com/baresip/re, pinned v4.9.0
@@ -36,11 +39,23 @@ core/
 │   │                      submodule checkout - see BUILD.md "Findings" for
 │   │                      why it's needed (Asterisk's SIP-over-WSS listener
 │   │                      isn't mounted at "/", which stock re hardcodes)
-│   └── 0002-re-tls-fingerprint-pin.patch
-│                          adds CENT_TLS_PIN (optional leaf-cert SHA256
-│                          pin, independent of chain-of-trust verification)
-│                          to deps/re's http client - see BUILD.md "TLS
-│                          leaf-certificate pinning"
+│   ├── 0002-re-tls-fingerprint-pin.patch
+│   │                      adds CENT_TLS_PIN (optional leaf-cert SHA256
+│   │                      pin, independent of chain-of-trust verification)
+│   │                      to deps/re's http client - see BUILD.md "TLS
+│   │                      leaf-certificate pinning"
+│   ├── 0003-baresip-json-stdout-purity.patch
+│   │                      v1.1: CENT_JSON_STDOUT gate (main.c) + stderr
+│   │                      fallback for disabled stdout logging (log.c) +
+│   │                      SIP-trace-to-stderr (uag.c) - see BUILD.md
+│   │                      "lg.enable_stdout defaults to true" for the
+│   │                      full pure-JSON-stdout story
+│   └── 0004-re-json-stdout-purity.patch
+│                          v1.1: the other half of the same fix - a
+│                          handful of unconditional re_printf()s in
+│                          deps/re's SIP-over-WS transport code
+│                          (transp.c), found by actually running the F3
+│                          e2e regression after 0003 - see BUILD.md
 └── modules/
     └── ctrl_json/          our out-of-tree baresip "application" module:
         ├── ctrl_json.c        newline-delimited JSON commands on stdin,

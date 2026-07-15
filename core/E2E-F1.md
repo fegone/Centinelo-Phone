@@ -1,11 +1,14 @@
-# core/ — F1 end-to-end verification
+# core/ — F1 end-to-end verification (+ F3 regression, v1.1)
 
 Real evidence, gathered by actually running the built engine against the
 live test PBX (FreePBX 17 / Asterisk 22, `100.119.230.80`, Tailscale-only,
 ext 1100 / secret from `~/Library/Application Support/Centinelo
 Phone/settings.json`, never printed/committed). PBX-side verification was
 SSH + read-only `asterisk -rx "... show ..."` commands only — no PBX
-configuration was changed at any point in this work.
+configuration was changed at any point in this work. Scenarios (a)-(d) +
+"Additional verification"/"Memory safety" are the original F1 (v1)
+evidence; "F3 regression" further down is the v1.1 protocol-hardening
+follow-up (`core/PROTOCOL.md` "Changes from v1") against this same PBX.
 
 Methodology: a small Python harness (not checked in — scratch tooling)
 spoke the NDJSON protocol over `run-spike.sh`'s stdin/stdout, with a
@@ -261,6 +264,139 @@ against the same live PBX:
   practical way to gain confidence without it. See `BUILD.md` "Memory
   safety" for the full note.
 
+## F3 regression (v1.1 protocol hardening)
+
+Re-verification against the same live test PBX after the v1.1 changes
+(`core/PROTOCOL.md` "Changes from v1": `id` request/response correlation,
+`devices`/`set_device`, `quality_stats` codec/transport enrichment, pure
+JSON stdout) — both to confirm every v1 scenario above still passes
+byte-for-byte unchanged, *and* to gather fresh evidence for what's new.
+Same methodology as (a)-(d) above: a small Python harness (not checked
+in — scratch tooling), OS pipes for stdin/stdout (a real `subprocess`,
+not the harness's own shell — `run-spike.sh`'s `fd_listen(STDIN_FILENO,
+...)` needs a genuinely pollable fd, which a sandboxed shell's own stdin
+redirection doesn't always provide; a subprocess pipe always is), a
+background thread parsing `{`-prefixed lines into a queue, `wait_for()`
+with a hard timeout, PBX-side snapshots via read-only `asterisk -rx`
+before/during/after.
+
+### (e) register → dial \*43 with `id` → `result` + call events → `quality_stats` (enriched) → `devices` → `set_device` → hangup with `id`
+
+**PASS.**
+
+```
+-> {"cmd": "dial", "uri": "sip:*43@100.119.230.80", "id": "d1"}
+<- {"event":"reg_state","account":"sip:1100@100.119.230.80:8089","state":"registered","transport":"wss"}
+<- {"event":"result","id":"d1","ok":true}
+<- {"event":"call_state","state":"established","peer":"sip:*43@100.119.230.80;transport=wss","id":"8832d603f43c4fd3","call_id":"8832d603f43c4fd3"}
+```
+
+1. `register` (startup, wss) → `reg_state registered` — unchanged from
+   scenario (a).
+2. `{"cmd":"dial","uri":"sip:*43@100.119.230.80","id":"d1"}` → both a
+   correlated `result` (`id:"d1"`, `ok:true`) **and** the normal
+   `call_state established` arrived (order between the two is not
+   guaranteed by the protocol and wasn't fixed run to run — the harness
+   collects both before proceeding). `id`/`result` is additive: nothing
+   about the existing `call_state` event changed.
+3. After the same ~20s ICE settle window as scenario (a):
+   `{"cmd":"quality_stats","call_id":"...","id":"q1"}` →
+   ```
+   {"event":"stats","call_id":"...","rtt_us":0,"tx_packets":672,"tx_lost":0,
+    "tx_jitter_us":2125,"rx_packets":671,"rx_lost":0,"rx_jitter_us":0,
+    "codec":"PCMU","transport":"wss"}
+   {"event":"result","id":"q1","ok":true,"rtt_us":0,"tx_packets":672,"tx_lost":0,
+    "tx_jitter_us":2125,"rx_packets":671,"rx_lost":0,"rx_jitter_us":0,
+    "codec":"PCMU","transport":"wss"}
+   ```
+   Both the standalone `stats` event *and* the `id`-correlated `result`
+   carry the new `codec`/`transport` fields (`"PCMU"`/`"wss"` — matches
+   the account's `audio_codecs=pcmu,pcma` and the wss registration) —
+   confirms both the enrichment itself and the "command-specific fields
+   merge onto `result`" design for `quality_stats`. `rtt_us:0` again
+   (see scenario (d) — expected, not a regression).
+4. `{"cmd":"devices","id":"dv1"}` →
+   ```
+   {"event":"devices","input":[{"name":"ausine,440","active":true},
+    {"name":"aufile","active":false}],
+    "output":[{"name":"aufile,/.../centinelo-spike.ZBQWss/rx.wav","active":true}]}
+   {"event":"result","id":"dv1","ok":true,"input":[...],"output":[...]}
+   ```
+   (identical `input`/`output` arrays on both — confirmed). One real
+   finding here: `input` lists *two* entries — `ausine,440` (the
+   configured/active source) *and* `aufile` (`aufile` registers both an
+   `ausrc` *and* an `auplay` driver, see `modules/aufile/aufile.c`, so it
+   legitimately appears in `input` too, `active:false` since the account
+   isn't sourcing from it) — correct behavior for this build's module
+   set, not a bug; worth knowing before assuming `input.length` maps
+   1:1 to "physical microphones" once a real device backend is added.
+5. `{"cmd":"set_device","kind":"input","name":"ausine,440","id":"sd1"}`
+   (the exact `name` string read back from step 4's own `devices`
+   event — round-trip, as designed) → `{"event":"result","id":"sd1","ok":true}`.
+   Applied to the *already-active* driver (idempotent stop+restart of
+   the same `ausrc`), on a live, established call — no error, no
+   observable disruption to the running call (confirmed by the
+   subsequent hangup completing normally, next step).
+6. `{"cmd":"hangup","call_id":"...","id":"h1"}` → `result id:"h1" ok:true`
+   **and** `call_state closed` — same additive relationship as step 2.
+
+### (f) PBX-side corroboration + `-s` stdout purity
+
+**PASS.** A second, focused run (register → dial \*43 → hangup, quick,
+`CENT_BARESIP_ARGS="-s"`) with `asterisk -rx "core show channels
+concise"` snapshots around the call, independent of the harness's own
+self-reported events:
+
+```
+PBX channels BEFORE:        []
+PBX channels DURING call:   ['PJSIP/1100-0000087b!from-internal!*43!7!Up!BackGround!demo-echotest,,,app-echo-test-echo!1100!!!3!3!!1784157785.3767']
+PBX channels AFTER hangup:  []
+```
+
+A real PBX channel exists exactly while the engine reports the call
+`established`, running the expected `demo-echotest` application (safe
+target, matches scenario (a)/(b)'s own `*43` usage), and is gone again
+right after `hangup` — independent confirmation the JSON events reflect
+real call state, not just internally-consistent self-reporting.
+
+### (g) stdout purity — the actual acceptance test
+
+**PASS, both scenarios (e) and (f).** Every stdout line captured by the
+harness (everything the child process ever wrote to its stdout, not
+just the ones that happened to parse as JSON) was checked with the
+Python equivalent of `grep -cv '^{'`:
+
+| Run | Total stdout lines | Non-JSON lines |
+|---|---|---|
+| (e) — full scenario, no `-s` | 12 | **0** |
+| (f) — quick scenario, `CENT_BARESIP_ARGS="-s"` | 7 | **0** |
+
+`-s` was confirmed to actually be *doing* something in run (f) — not
+just silently absent — by grepping the run's stderr for SIP
+INVITE/REGISTER occurrences: **31 matches**, i.e. the SIP trace machinery
+genuinely fired repeatedly during this run and still produced zero
+stdout leakage; this isn't "it passed because it was never exercised."
+
+Getting to `0`/`0` took two rounds, both against this same real PBX, and
+that gap between them is itself a real finding (see below): the first
+round (`core/patches/0003-*` only — the baresip-side banner/log/
+SIP-trace fix) brought a scenario-(e)-shaped run down from the v1
+baseline to **3** non-JSON lines (`"websock: connecting to
+'wss://100.119.230.80:8089/ws'"`, `"<...> WSS websock established to
+100.119.230.80:8089"`, `"--> send"`) — all from unconditional
+`re_printf()`s in `core/deps/re`'s own SIP-over-WS transport code
+(`src/sip/transp.c`), a different submodule than 0003 touched, only
+found by actually capturing and grepping a live run's stdout, not by
+inspection. `core/patches/0004-*` fixed those (plus two adjacent error-
+path `re_printf()`s in the same functions), and the second round of
+scenario (e) is where the `0`/`12` numbers above came from. See
+`core/BUILD.md` "Findings" for the full per-line breakdown, including
+several *other* `re_printf()` call sites found during the same audit
+that were deliberately left unpatched (dormant/unreachable for this
+engine's actual usage — dead code, debug-gated-off, wrong protocol/no
+module loaded, or a WS-server-only accept path this outbound-only client
+never reaches).
+
 ## Summary of findings (for future F-phases)
 
 1. ICE needs real settle time here (~15-20s) before relying on live RTP
@@ -286,3 +422,26 @@ against the same live PBX:
    (same extension, two simultaneous registrations, `max_contacts: 2`)
    is a safe (nothing rings in the clinic) way to get a genuine bridge
    for transfer testing without dialing a real extension.
+6. **(F3)** A stdout-purity fix needs its acceptance test to actually
+   *run*, not just be reasoned about: the first-pass baresip-only patch
+   looked complete by inspection (every `info()`/`warning()`/`debug()`
+   call site traced back to one gate) but missed a second submodule
+   (`re`) entirely — its own unconditional `re_printf()`s in the SIP-
+   over-WS transport code don't go through baresip's logging system at
+   all. `grep -cv '^{'` against a real captured run is what actually
+   caught it; a code-reading-only review of "every `info()`/`warning()`
+   call site" would not have.
+7. **(F3)** `aufile` registers as *both* an `ausrc` and an `auplay`
+   driver (see `modules/aufile/aufile.c`), so it legitimately appears in
+   `devices`' `"input"` array too (as `active:false`, alongside the
+   real active source) even though nothing in this engine's config ever
+   sources audio from it — correct, not a bug, but worth knowing before
+   assuming a `devices` array's length maps 1:1 to physical
+   microphones/speakers.
+8. **(F3)** `audio_set_source()`/`audio_set_player()` (`src/audio.c`)
+   are genuine live hot-swap APIs — confirmed both by reading their
+   implementation (stop the running `ausrc_st`/`auplay_st`, allocate a
+   fresh one against the same `struct audio`, no re-INVITE) and by
+   exercising `set_device` against an already-established call in a
+   real e2e run with no disruption to that call (it continued normally
+   through to a clean `hangup` afterward).

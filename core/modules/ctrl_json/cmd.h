@@ -43,13 +43,29 @@ enum cent_cmd_type {
 	CENT_CMD_QUALITY_STATS,
 	CENT_CMD_BLF_SUBSCRIBE,
 	CENT_CMD_BLF_UNSUBSCRIBE,
+	CENT_CMD_DEVICES,
+	CENT_CMD_SET_DEVICE,
 };
 
 enum {
 	CENT_URI_SIZE  = 512,   /**< dial / blind_transfer / attended_transfer uri */
-	CENT_ID_SIZE   = 128,   /**< call_id */
+	CENT_ID_SIZE   = 128,   /**< call_id, and (v1.1) the request/response
+				  *  correlation "id" - same size, same kind
+				  *  of opaque caller-supplied token, no
+				  *  reason for the two to differ. */
 	CENT_DTMF_SIZE = 64,    /**< dtmf digit string */
 	CENT_EXT_SIZE  = 32,    /**< blf ext */
+	CENT_DEVICE_KIND_SIZE = 16,    /**< set_device "kind": "input"/"output" */
+	CENT_DEVICE_NAME_SIZE = 192,   /**< set_device "name": see PROTOCOL.md
+					 *   "devices" - big enough for the
+					 *   composite "<module>,<device>"
+					 *   shape that command's own "name"
+					 *   fields use (config_audio's
+					 *   src_mod/play_mod are 16 bytes,
+					 *   src_dev/play_dev are 128, see
+					 *   baresip.h struct config_audio -
+					 *   16 + 1 + 128 with room to
+					 *   spare). */
 };
 
 /**
@@ -69,6 +85,28 @@ struct cent_cmd {
 	char digits[CENT_DTMF_SIZE];
 	char ext[CENT_EXT_SIZE];
 	bool mute_on;
+
+	/** v1.1 request/response correlation (see PROTOCOL.md) - unlike
+	 * every other field above, valid regardless of .type: decoded
+	 * unconditionally before the 'cmd' field itself is even inspected,
+	 * so it's populated even for a CENT_CMD_NONE/CENT_CMD_UNKNOWN
+	 * decode (a malformed or unrecognised command can still be
+	 * correlated back to whoever sent it - see
+	 * ctrl_json.c process_line()). */
+	char id[CENT_ID_SIZE];
+	bool have_id;
+
+	char device_kind[CENT_DEVICE_KIND_SIZE]; /**< set_device: "input" or
+						    *  "output", already
+						    *  validated by
+						    *  cent_cmd_decode(). */
+	char device_name[CENT_DEVICE_NAME_SIZE]; /**< set_device: target
+						    *  device name - opaque
+						    *  here, see PROTOCOL.md
+						    *  "devices"/"set_device"
+						    *  for the "<module>[,
+						    *  <device>]" shape
+						    *  ctrl_json.c parses. */
 };
 
 /**

@@ -47,6 +47,22 @@ static void optional_call_id(const struct odict *od, struct cent_cmd *out)
 }
 
 
+/* Optional "id" - v1.1 request/response correlation (see PROTOCOL.md).
+ * Unlike call_id (only meaningful on call-scoped commands), id applies to
+ * every command, so this is called unconditionally, before 'cmd' itself
+ * is even inspected - see cent_cmd_decode() below - not from inside each
+ * per-command branch the way optional_call_id() is. */
+static void optional_id(const struct odict *od, struct cent_cmd *out)
+{
+	const char *v = odict_string(od, "id");
+
+	if (v && v[0]) {
+		str_ncpy(out->id, v, sizeof(out->id));
+		out->have_id = true;
+	}
+}
+
+
 enum cent_cmd_type cent_cmd_decode(struct cent_cmd *out,
 				    const struct odict *od,
 				    const char **errmsg)
@@ -62,6 +78,11 @@ enum cent_cmd_type cent_cmd_decode(struct cent_cmd *out,
 		return CENT_CMD_NONE;
 
 	memset(out, 0, sizeof(*out));
+
+	/* Unconditional, before 'cmd' is even looked at - see
+	 * optional_id()'s comment: every command MAY carry an id, including
+	 * ones that go on to decode as CENT_CMD_NONE/CENT_CMD_UNKNOWN. */
+	optional_id(od, out);
 
 	cmd = odict_string(od, "cmd");
 	if (!cmd || !cmd[0]) {
@@ -154,6 +175,27 @@ enum cent_cmd_type cent_cmd_decode(struct cent_cmd *out,
 				  "blf_unsubscribe", errmsg))
 			return CENT_CMD_NONE;
 		out->type = CENT_CMD_BLF_UNSUBSCRIBE;
+	}
+	else if (!str_casecmp(cmd, "devices")) {
+		out->type = CENT_CMD_DEVICES;
+	}
+	else if (!str_casecmp(cmd, "set_device")) {
+		const char *kind = odict_string(od, "kind");
+
+		if (!kind || (str_casecmp(kind, "input") &&
+			      str_casecmp(kind, "output"))) {
+			*errmsg = "set_device: 'kind' must be \"input\" or"
+				  " \"output\"";
+			return CENT_CMD_NONE;
+		}
+		str_ncpy(out->device_kind, kind, sizeof(out->device_kind));
+
+		if (!require_str(od, "name", out->device_name,
+				  sizeof(out->device_name), "set_device",
+				  errmsg))
+			return CENT_CMD_NONE;
+
+		out->type = CENT_CMD_SET_DEVICE;
 	}
 	else {
 		out->type = CENT_CMD_UNKNOWN;

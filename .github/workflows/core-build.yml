@@ -32,6 +32,11 @@ jobs:
         run: |
           git apply --directory=core/deps/re core/patches/0001-re-configurable-sip-ws-path.patch
           git apply --directory=core/deps/re core/patches/0002-re-tls-fingerprint-pin.patch
+          git apply --directory=core/deps/re core/patches/0004-re-json-stdout-purity.patch
+
+      - name: Apply local baresip patches
+        run: |
+          git apply --directory=core/deps/baresip core/patches/0003-baresip-json-stdout-purity.patch
 
       - name: Configure + build libre
         run: |
@@ -103,6 +108,12 @@ jobs:
         run: |
           git apply --directory=core/deps/re core/patches/0001-re-configurable-sip-ws-path.patch
           git apply --directory=core/deps/re core/patches/0002-re-tls-fingerprint-pin.patch
+          git apply --directory=core/deps/re core/patches/0004-re-json-stdout-purity.patch
+
+      - name: Apply local baresip patches
+        shell: bash
+        run: |
+          git apply --directory=core/deps/baresip core/patches/0003-baresip-json-stdout-purity.patch
 
       - name: Configure + build libre
         shell: bash

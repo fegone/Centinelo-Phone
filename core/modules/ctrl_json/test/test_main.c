@@ -245,6 +245,127 @@ static void test_cmd_unknown_and_malformed(void)
 }
 
 
+/*
+ * v1.1: request/response correlation ("id" - see PROTOCOL.md "result").
+ * id is decoded unconditionally, before 'cmd' is even inspected (see
+ * cmd.c cent_cmd_decode()/optional_id()), so - unlike call_id, which
+ * only matters on call-scoped commands - it must survive every decode
+ * outcome: a normal command, a command with no id at all, and even the
+ * two "failed to fully decode" outcomes (CENT_CMD_NONE/CENT_CMD_UNKNOWN)
+ * - the whole point being that a caller can correlate a rejected/
+ * unrecognised command back to itself too, not just a successful one.
+ */
+static void test_cmd_id_correlation(void)
+{
+	struct cent_cmd cmd;
+	const char *err = NULL;
+
+	CHECK(CENT_CMD_ANSWER ==
+	      decode("{\"cmd\":\"answer\",\"id\":\"req-1\"}", &cmd, &err),
+	      "answer+id: type");
+	CHECK(cmd.have_id, "answer+id: have_id true");
+	CHECK_STREQ(cmd.id, "req-1", "answer+id: id value");
+
+	CHECK(CENT_CMD_ANSWER == decode("{\"cmd\":\"answer\"}", &cmd, &err),
+	      "answer without id: type");
+	CHECK(!cmd.have_id, "answer without id: have_id false");
+
+	CHECK(CENT_CMD_HOLD ==
+	      decode("{\"cmd\":\"hold\",\"call_id\":\"c1\",\"id\":\"req-2\"}",
+		     &cmd, &err), "hold+call_id+id: type");
+	CHECK(cmd.have_call_id, "hold+call_id+id: have_call_id true");
+	CHECK_STREQ(cmd.call_id, "c1", "hold+call_id+id: call_id value");
+	CHECK(cmd.have_id, "hold+call_id+id: have_id true");
+	CHECK_STREQ(cmd.id, "req-2", "hold+call_id+id: id value - id and"
+		    " call_id are independent fields, not aliases");
+
+	/* id survives even a hard decode error (missing 'cmd') ... */
+	CHECK(CENT_CMD_NONE ==
+	      decode("{\"id\":\"req-3\"}", &cmd, &err),
+	      "id with missing 'cmd' field -> CENT_CMD_NONE");
+	CHECK(cmd.have_id, "missing 'cmd' but id present -> have_id true");
+	CHECK_STREQ(cmd.id, "req-3", "missing 'cmd' but id present -> id"
+		    " value still decoded");
+	CHECK(err != NULL, "missing 'cmd' field -> errmsg still set");
+
+	/* ... and an unrecognised cmd value. */
+	CHECK(CENT_CMD_UNKNOWN ==
+	      decode("{\"cmd\":\"levitate\",\"id\":\"req-4\"}", &cmd, &err),
+	      "unknown cmd + id -> CENT_CMD_UNKNOWN");
+	CHECK(cmd.have_id, "unknown cmd + id -> have_id true");
+	CHECK_STREQ(cmd.id, "req-4", "unknown cmd + id -> id value");
+
+	/* a required-field failure (dial with no uri) also keeps id. */
+	CHECK(CENT_CMD_NONE ==
+	      decode("{\"cmd\":\"dial\",\"id\":\"req-5\"}", &cmd, &err),
+	      "dial missing uri + id -> CENT_CMD_NONE");
+	CHECK(cmd.have_id, "dial missing uri + id -> have_id true");
+	CHECK_STREQ(cmd.id, "req-5", "dial missing uri + id -> id value");
+}
+
+
+/*
+ * v1.1: "devices" (no fields) and "set_device" (see PROTOCOL.md
+ * "devices"/"set_device"). cmd.c's job here is purely mechanical field
+ * extraction + 'kind' validation - the actual module/device name
+ * splitting (the "<module>[,<device>]" convention) happens in
+ * ctrl_json.c's cmd_set_device(), out of reach of this standalone test
+ * binary (see this file's own top-of-file comment) - so device_name is
+ * checked here only as the opaque string cent_cmd_decode() is supposed
+ * to copy verbatim, same as every other free-form string field (uri,
+ * digits, ext, ...).
+ */
+static void test_cmd_devices_and_set_device(void)
+{
+	struct cent_cmd cmd;
+	const char *err = NULL;
+
+	CHECK(CENT_CMD_DEVICES == decode("{\"cmd\":\"devices\"}", &cmd, &err),
+	      "devices: type");
+
+	CHECK(CENT_CMD_SET_DEVICE ==
+	      decode("{\"cmd\":\"set_device\",\"kind\":\"input\","
+		     "\"name\":\"ausine,440\"}", &cmd, &err),
+	      "set_device input: type");
+	CHECK_STREQ(cmd.device_kind, "input", "set_device input: kind value");
+	CHECK_STREQ(cmd.device_name, "ausine,440",
+		    "set_device input: name value verbatim (module,device)");
+
+	CHECK(CENT_CMD_SET_DEVICE ==
+	      decode("{\"cmd\":\"set_device\",\"kind\":\"output\","
+		     "\"name\":\"aufile\"}", &cmd, &err),
+	      "set_device output: type");
+	CHECK_STREQ(cmd.device_kind, "output",
+		    "set_device output: kind value");
+	CHECK_STREQ(cmd.device_name, "aufile",
+		    "set_device output: name value verbatim (no comma)");
+
+	/* case-insensitive kind, matching cmd's own case-insensitivity */
+	CHECK(CENT_CMD_SET_DEVICE ==
+	      decode("{\"cmd\":\"set_device\",\"kind\":\"INPUT\","
+		     "\"name\":\"x\"}", &cmd, &err),
+	      "set_device: kind is case-insensitive");
+
+	CHECK(CENT_CMD_NONE ==
+	      decode("{\"cmd\":\"set_device\",\"kind\":\"sideways\","
+		     "\"name\":\"x\"}", &cmd, &err),
+	      "set_device: invalid kind -> CENT_CMD_NONE");
+	CHECK(err != NULL && strstr(err, "kind") != NULL,
+	      "set_device: invalid kind -> errmsg mentions 'kind'");
+
+	CHECK(CENT_CMD_NONE ==
+	      decode("{\"cmd\":\"set_device\",\"name\":\"x\"}", &cmd, &err),
+	      "set_device: missing kind -> CENT_CMD_NONE");
+
+	CHECK(CENT_CMD_NONE ==
+	      decode("{\"cmd\":\"set_device\",\"kind\":\"input\"}",
+		     &cmd, &err),
+	      "set_device: missing name -> CENT_CMD_NONE");
+	CHECK(err != NULL && strstr(err, "name") != NULL,
+	      "set_device: missing name -> errmsg mentions 'name'");
+}
+
+
 static void test_dialog_info_idle(void)
 {
 	static const char idle[] =
@@ -413,6 +534,8 @@ int main(void)
 	test_cmd_transfer();
 	test_cmd_quality_stats_and_blf();
 	test_cmd_unknown_and_malformed();
+	test_cmd_id_correlation();
+	test_cmd_devices_and_set_device();
 
 	test_dialog_info_idle();
 	test_dialog_info_ringing();

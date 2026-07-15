@@ -42,23 +42,39 @@
 #                        CENT_WS_PATH) - consumed by the re patch in
 #                        core/patches/0002-*, see BUILD.md "TLS
 #                        leaf-certificate pinning".
+#   CENT_JSON_STDOUT     Any non-empty value (default here: "1" - this
+#                        script always sets it unless the caller already
+#                        exported it, even empty, before invoking this
+#                        script). Reserves stdout exclusively for
+#                        ctrl_json's own NDJSON from the first byte the
+#                        process writes - no banner, no module-load log
+#                        lines, no SIP trace (even with -s), all of that
+#                        goes to stderr instead. Consumed by the baresip
+#                        patch in
+#                        core/patches/0003-baresip-json-stdout-purity.patch
+#                        - see BUILD.md "Findings" / PROTOCOL.md "Framing".
+#                        Export it as empty (CENT_JSON_STDOUT= ./run-spike.sh)
+#                        to get the old, noisier v1 stdout behavior back
+#                        (e.g. for interactive by-hand debugging of a
+#                        fresh baresip build without ctrl_json's own
+#                        `{`-prefix filtering).
 #   CENT_BARESIP_ARGS    extra args appended to the baresip invocation
 #                        unquoted/word-split on purpose, e.g.
 #                        CENT_BARESIP_ARGS="-t 30" to auto-quit after 30s
-#                        (-s adds SIP trace - see PROTOCOL.md "Framing"
-#                        for where that output actually lands)
+#                        (-s adds SIP trace - with CENT_JSON_STDOUT on
+#                        (the default), it lands on stderr like everything
+#                        else non-JSON - see PROTOCOL.md "Framing")
 #
 # I/O once running:
 #   stdin  - newline-delimited JSON commands (see PROTOCOL.md), on
 #            Windows read by a dedicated thread (see PROTOCOL.md
 #            "Framing / stdin"), otherwise identical either platform
-#   stdout - newline-delimited JSON events (see PROTOCOL.md), interleaved
-#            with non-JSON noise (baresip's startup banner, some
-#            module-load log lines, and - only if CENT_BARESIP_ARGS
-#            includes -s - raw SIP trace) - see PROTOCOL.md "Framing" for
-#            the full why, and filter for lines starting with '{' if you
-#            need a strictly-JSON stream.
-#   stderr - baresip's own human-readable debug/info/warning log.
+#   stdout - newline-delimited JSON events ONLY (see PROTOCOL.md
+#            "Framing") - pure NDJSON with CENT_JSON_STDOUT on (the
+#            default here): no banner, no module-load log lines, no SIP
+#            trace, nothing but ctrl_json's own `{`-prefixed lines.
+#   stderr - baresip's own human-readable debug/info/warning log (now
+#            including everything CENT_JSON_STDOUT diverted off stdout).
 #
 # Example:
 #   CENT_EXT=1100 CENT_HOST=100.119.230.80 CENT_TRANSPORT=wss \
@@ -77,6 +93,11 @@ BARESIP_BIN="$BUILD_DIR/baresip"
 CENT_TRANSPORT="${CENT_TRANSPORT:-wss}"
 CENT_VERIFY_SERVER="${CENT_VERIFY_SERVER:-no}"
 export CENT_WS_PATH="${CENT_WS_PATH:-/ws}"
+# `-` (not `:-`): an explicitly-empty CENT_JSON_STDOUT= from the caller's
+# own environment is preserved as empty (opts back out to noisier v1
+# stdout behavior - see header comment above), only a fully *unset* var
+# gets this script's own "1" default.
+export CENT_JSON_STDOUT="${CENT_JSON_STDOUT-1}"
 
 if [ ! -x "$BARESIP_BIN" ]; then
 	echo "error: $BARESIP_BIN not found - build it first, see core/BUILD.md" >&2

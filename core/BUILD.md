@@ -37,6 +37,8 @@ directory, i.e. it expects exactly the `core/deps/re` next to
 ```bash
 git apply --directory=core/deps/re core/patches/0001-re-configurable-sip-ws-path.patch
 git apply --directory=core/deps/re core/patches/0002-re-tls-fingerprint-pin.patch
+git apply --directory=core/deps/baresip core/patches/0003-baresip-json-stdout-purity.patch
+git apply --directory=core/deps/re core/patches/0004-re-json-stdout-purity.patch
 ```
 
 These are the **only** local modifications to either submodule. They are
@@ -46,8 +48,15 @@ stay at their exact pinned upstream tag in git (`git -C core/deps/re
 status` is clean after a fresh `submodule update`), so `git submodule
 update` always gives you real, verifiable upstream source, and each fix
 is a visible, reviewable diff. See "Findings" below for *why* patch 0001
-exists (the WSS e2e test does not pass without it) and "TLS verification"
-below for patch 0002 (`CENT_TLS_PIN` cert pinning).
+exists (the WSS e2e test does not pass without it), "TLS verification"
+below for patch 0002 (`CENT_TLS_PIN` cert pinning), and "`lg.enable_stdout`
+defaults to `true`" below for patches 0003/0004 (pure-JSON-stdout, v1.1 —
+0003 is the baresip-side fix: `main.c`'s new `CENT_JSON_STDOUT` gate +
+`log.c`'s stderr fallback + `uag.c`'s SIP-trace redirect; 0004 is a
+second, smaller re-side fix for a handful of unconditional
+`re_printf()`s in `core/deps/re/src/sip/transp.c`'s WS-client connect/
+send/close paths, found only by actually running the F3 e2e regression
+against the real PBX after 0003 — see `core/E2E-F1.md` "F3 regression").
 
 ## 4. Build re, then baresip
 
@@ -227,17 +236,89 @@ also sets `outbound="sip:<host>:<port>;transport=<transport>"` (see
 under test. Confirmed fixed: dialing the bare `*43@100.119.230.80` after
 this reached `established` on both wss and udp.
 
-### `lg.enable_stdout` defaults to `true`
+### `lg.enable_stdout` defaults to `true` (v1) → pure JSON stdout (v1.1)
 
+**v1 status (superseded by the v1.1 fix below, kept for history):**
 stdout is the JSON channel (see `PROTOCOL.md`), but baresip's own
 human-readable logger (`src/log.c`) defaults `enable_stdout=true` and is
 only ever turned off by `-d`/daemon mode in `main.c` — which isn't usable
 here (daemonizing forks/detaches, severing the stdio pipe `ctrl_json`
 depends on). `ctrl_json`'s `ctrl_init()` calls `log_enable_stdout(false)`
-(a public baresip API) as its first action. This helps, but does not
-fully clean the stream — see `PROTOCOL.md` "Framing" for what's left and
-why, and how a consumer should handle it (filter for lines starting with
-`{`).
+(a public baresip API) as its first action. This helped, but did not
+fully clean the stream: `ctrl_json` is always the *last* module loaded
+(see "Module selection" above), so every earlier module's own
+info()/debug() startup line, the banner (`main.c`, printed before any
+module loads at all), and (with `-s`) raw SIP trace (`uag.c`, `re_printf()`
+straight to stdout, bypassing `log.c` entirely) all still leaked onto
+stdout ahead of/around `ctrl_json`'s own JSON — see the v1 `PROTOCOL.md`
+"Framing" section (superseded, see current version) for the exact
+"filter for lines starting with `{`" workaround this forced on every
+consumer.
+
+**v1.1 fix (patches 0003/0004, see "Apply the local patches" above):**
+stdout is now *pure* NDJSON end to end, confirmed empirically (not just
+by inspection) — `grep -cv '^{'` on stdout captured from a real,
+full-length e2e run (register → dial → 20s ICE settle → quality_stats →
+devices → set_device → hangup → quit) against the live test PBX returns
+`0`, both with and without `-s` (SIP trace) — see `core/E2E-F1.md` "F3
+regression" for the exact commands and captured output. Three
+independent sources of stdout noise, three independent fixes, all in the
+one pair of patches:
+
+1. **The banner + all module-load logging** (`core/patches/0003-*`,
+   `main.c`+`log.c`): `main.c` now checks a new env var,
+   `CENT_JSON_STDOUT` (any non-empty value — `run-spike.sh` sets it by
+   default, see that script's own header comment for how to opt back
+   out), *before* printing the banner or doing anything else — when set,
+   the banner goes to stderr instead, and `log_enable_stdout(false)`
+   runs immediately after `libre_init()`, before `conf_configure()`/
+   `conf_modules()` gets a chance to load a single module and log a line
+   the old (stdout) way. This alone would have made every
+   info()/warning()/debug() call in the *entire remaining process
+   lifetime* go completely silent rather than just off-stdout — traced
+   to `log.c`'s `vlog()` having no branch at all for `!enable_stdout`
+   (nothing in this build's minimal module set, no `cons`/`syslog`, ever
+   calls `log_register_handler()` to give it somewhere else to go) — so
+   `log.c` is *also* patched: `!lg.enable_stdout` now routes to stderr
+   (same color/formatting logic, different stream) instead of dropping
+   the message. `ctrl_json.c`'s own `log_enable_stdout(false)` call (its
+   only effect under v1) is unchanged and still runs, now typically a
+   harmless no-op given `main.c` already flipped the switch — see that
+   call site's own comment in `ctrl_json.c`.
+2. **SIP trace with `-s`** (`core/patches/0003-*`, `uag.c`):
+   `sip_trace_handler()`'s `re_printf(...)` (stdout, unconditional,
+   bypasses `log.c` entirely — confirmed by reading
+   `core/deps/re/src/fmt/print.c`'s `re_vprintf()` while investigating
+   this) is now `re_fprintf(stderr, ...)`. Unconditional, not gated
+   behind `CENT_JSON_STDOUT` — SIP trace was never a valid NDJSON stream
+   on stdout to begin with, so there's no compatibility case to
+   preserve, unlike the banner.
+3. **The WS-client connect/send/close lines**
+   (`core/patches/0004-re-json-stdout-purity.patch`,
+   `core/deps/re/src/sip/transp.c`): found only by actually *running*
+   the F3 e2e regression after 0003 — `grep -cv '^{'` on that first
+   post-0003 run wasn't `0` yet. Three unconditional `re_printf()`s
+   (`"websock: connecting to '...'"`, `"--> send"`,
+   `"<...> ... websock established to ..."`) plus two more on adjacent
+   error paths (`"websock_connect: %m"`, `"sip: websock connection
+   closed (%m)"`) all fire during this engine's normal SIP-over-WSS
+   *client* traffic (registration, every SIP message send, connection
+   teardown) — all five now `re_fprintf(stderr, ...)`. A broader audit
+   of every remaining `re_printf(` call site in `core/deps/re/src/`
+   turned up several more (STUN/SIP message dump utilities with no
+   automatic caller anywhere in the tree; H264 NAL parsing, unreachable
+   with no video module loaded; two ICE/trice debug printers already
+   gated behind `icem->conf.debug`/`.trace`, off by default; a PCP
+   option-parsing note and a rare macOS-only TCP-ICE `EADDRINUSE` retry
+   message, both real but narrow/network-topology-dependent edge cases
+   this engine's actual test runs never hit; and the WS-*server* accept
+   handler in the same `transp.c`, unreachable since this engine only
+   ever makes outbound WS connections, never listens for inbound ones)
+   — all confirmed dormant for this engine's actual usage (by reading
+   each call site's guard/caller graph, not just grep) and deliberately
+   left unpatched rather than growing patch scope for code this build
+   never executes. See `core/patches/0004-*`'s own comments for the
+   exact per-line rationale on the five that *were* patched.
 
 ### TLS verification
 
@@ -318,14 +399,18 @@ support `detect_leaks` (LeakSanitizer isn't available on Darwin) —
 platform" rather than silently ignoring it; leak checking on macOS is
 done separately, see "Memory safety" below.
 
-63 checks across both files as of this version, including one fixture
-that's the *real* dialog-info+xml body captured from the test PBX (see
-`core/E2E-F1.md` scenario c) — not just synthetic ones. Two real bugs
-were caught by these tests before any e2e run: the dialog-info parser
-originally conflated "well-formed idle" with "unparseable garbage" (both
-returned `idle`; fixed to require a `<dialog-info` root element before
-concluding idle, garbage now correctly falls into the `offline`/"can't
-tell" bucket), and a use-after-free in the `CENT_CMD_UNKNOWN` error path
+96 checks across both files as of this version (63 pre-v1.1 + 33 new:
+`id` correlation surviving every decode outcome including
+CENT_CMD_NONE/CENT_CMD_UNKNOWN, and `devices`/`set_device` decoding
+including the "kind" validation and both required/missing-field error
+paths), including one fixture that's the *real* dialog-info+xml body
+captured from the test PBX (see `core/E2E-F1.md` scenario c) — not just
+synthetic ones. Two real bugs were caught by these tests before any e2e
+run: the dialog-info parser originally conflated "well-formed idle" with
+"unparseable garbage" (both returned `idle`; fixed to require a
+`<dialog-info` root element before concluding idle, garbage now
+correctly falls into the `offline`/"can't tell" bucket), and a
+use-after-free in the `CENT_CMD_UNKNOWN` error path
 (read the just-freed decoded JSON object to build the error message —
 fixed by capturing the `cmd` string before freeing).
 
@@ -357,7 +442,7 @@ to get confidence without that.
 and `windows-latest`. The Windows job is marked
 `continue-on-error: true` (allowed to fail) and its build log is uploaded
 as an artifact either way — see that workflow file for the exact commands
-(same submodule + both patches + CMake sequence as above).
+(same submodule + all four patches + CMake sequence as above).
 
 **F1 status**: `ctrl_json.c`'s stdin path — the specific, previously-
 flagged Windows blocker (`unistd.h`/`read()`/`STDIN_FILENO`, POSIX-only)
@@ -418,7 +503,10 @@ _WIN32` as its only real caller and correcting the stale "shared"
 comment. Neither of these would show up in the macOS job at all — worth
 re-running this check after any future change to `ctrl_json.c`'s
 `_WIN32` block, not just relying on the Windows CI job's own (slower,
-`continue-on-error`) feedback loop.
+`continue-on-error`) feedback loop. Re-run for v1.1 (this version added
+no new code inside the `_WIN32` block itself, but a fair amount to the
+shared, always-compiled parts of the file that block also sits in - same
+command, clean, 0 warnings/errors).
 
 There's also a real, deliberate memory-safety design point in that
 `_WIN32` code worth flagging for review: the reader thread is never

@@ -1,0 +1,59 @@
+diff --git a/src/sip/transp.c b/src/sip/transp.c
+index b6fbda4..d257d0d 100644
+--- a/src/sip/transp.c
++++ b/src/sip/transp.c
+@@ -913,7 +913,18 @@ static void websock_estab_handler(void *arg)
+ 	struct le *le;
+ 	int err;
+ 
+-	re_printf("<%p> %s websock established to %J\n",
++	/* Centinelo Phone v2 F1.1 patch (core/patches/): re_printf() prints
++	 * to stdout unconditionally, bypassing baresip's own
++	 * log.c/lg.enable_stdout entirely (see core/deps/re/src/fmt/print.c
++	 * re_vprintf() -> re_vfprintf(stdout, ...)) - this engine's only
++	 * USE_TLS/websock traffic is the SIP-over-WSS upgrade to the
++	 * configured PBX host (see core/run-spike.sh), a code path this
++	 * engine, as a WS *client*, genuinely reaches on every registration
++	 * - confirmed leaking onto stdout in a real run against the test
++	 * PBX before this patch (core/E2E-F1.md "F3 regression"). stderr
++	 * instead, unconditional - matches the same rationale as the
++	 * sip_trace_handler() fix in src/uag.c (same patch). */
++	re_fprintf(stderr, "<%p> %s websock established to %J\n",
+ 		  conn, sip_transp_name(conn->tp), &conn->paddr);
+ 
+ 	conn->established = true;
+@@ -936,7 +947,7 @@ static void websock_estab_handler(void *arg)
+ 			   conn,
+ 			   &conn->paddr, qent->mb);
+ 
+-		re_printf("--> send\n");
++		re_fprintf(stderr, "--> send\n");
+ 
+ 		err = websock_send(conn->websock_conn, WEBSOCK_BIN,
+ 				   "%b",
+@@ -1001,7 +1012,7 @@ static void websock_close_handler(int err, void *arg)
+ {
+ 	struct sip_conn *conn = arg;
+ 
+-	re_printf("sip: websock connection closed (%m)\n", err);
++	re_fprintf(stderr, "sip: websock connection closed (%m)\n", err);
+ 	conn_close(conn, err ? err : ECONNRESET);
+ 	mem_deref(conn);
+ }
+@@ -1105,14 +1116,14 @@ static int ws_conn_send(struct sip_connqent **qentp, struct sip *sip,
+ #endif
+ 	}
+ 
+-	re_printf("websock: connecting to '%s'\n", ws_uri);
++	re_fprintf(stderr, "websock: connecting to '%s'\n", ws_uri);
+ 	err = websock_connect(&conn->websock_conn, sip->websock,
+ 			      transp->http_cli, ws_uri, 15000,
+ 			      websock_estab_handler, websock_recv_handler,
+ 			      websock_close_handler, conn,
+ 			      "Sec-WebSocket-Protocol: sip\r\n");
+ 	if (err) {
+-		re_printf("websock_connect: %m\n", err);
++		re_fprintf(stderr, "websock_connect: %m\n", err);
+ 		goto out;
+ 	}
+ 

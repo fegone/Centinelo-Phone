@@ -41,7 +41,23 @@
  * across the whole protocol. See PROTOCOL.md's changelog for this
  * decision spelled out for protocol consumers.
  *
- * See core/PROTOCOL.md for the wire protocol (v1).
+ * v1.1 adds (see PROTOCOL.md's own changelog for the full list):
+ * per-command request/response correlation via an optional "id" field
+ * (see cmd.have_id, emit_result(), and process_line()'s
+ * g_error_seq-based ok/fail tracking - no existing handler's signature
+ * changed to support this); a "devices"/"set_device" pair for audio
+ * device enumeration/selection; codec/transport enrichment on
+ * quality_stats' "stats" event; and stdout is now *pure* NDJSON end to
+ * end - the baresip banner, module-load log lines, and (with -s) SIP
+ * trace, all previously leaking onto stdout ahead of/around this file's
+ * own JSON (see the old "Framing" section this replaced), now land on
+ * stderr instead, via a small baresip patch (core/patches/0003-*, see
+ * BUILD.md) rather than anything in this file - ctrl_json.c's own
+ * log_enable_stdout(false) call in ctrl_init() below still runs, but is
+ * now typically a no-op by the time it's reached (see that call site's
+ * own comment).
+ *
+ * See core/PROTOCOL.md for the wire protocol (v1.1).
  *
  * Copyright (C) 2026 Neola Dental / Centinelo Phone
  */
@@ -178,9 +194,32 @@ static void emit_ready(void)
 }
 
 
+/*
+ * v1.1 request/response correlation (see PROTOCOL.md "result"): every
+ * emit_error()/emit_errorf() call - i.e. every place in this file that
+ * already, under v1, signals "this command failed" - also records its
+ * message here and bumps g_error_seq. process_line() snapshots
+ * g_error_seq immediately before dispatching a command and compares it
+ * again immediately after: if it moved, some emit_error() fired *during
+ * that command's own synchronous dispatch*, so the command failed - see
+ * process_line() for why this is a safe, race-free way to learn a
+ * handler's outcome without changing any handler's own signature/return
+ * type (every cmd_* / do_* function below is completely unmodified by
+ * v1.1; this is the only new plumbing request/response correlation
+ * needed). g_last_error is then the exact same text an "error" event
+ * would show (or already did, if have_id is also false) - single
+ * source of truth, no duplicated message-building.
+ */
+static char g_last_error[256];
+static uint32_t g_error_seq;
+
+
 static void emit_error(const char *message)
 {
 	struct odict *od = NULL;
+
+	str_ncpy(g_last_error, message ? message : "", sizeof(g_last_error));
+	++g_error_seq;
 
 	if (odict_alloc(&od, 4))
 		return;
@@ -214,12 +253,13 @@ static const char *transp_name(enum sip_transp tp)
 {
 	switch (tp) {
 
-	case SIP_TRANSP_UDP: return "udp";
-	case SIP_TRANSP_TCP: return "tcp";
-	case SIP_TRANSP_TLS: return "tls";
-	case SIP_TRANSP_WS:  return "ws";
-	case SIP_TRANSP_WSS: return "wss";
-	default:             return "udp";
+	case SIP_TRANSP_UDP:  return "udp";
+	case SIP_TRANSP_TCP:  return "tcp";
+	case SIP_TRANSP_TLS:  return "tls";
+	case SIP_TRANSP_WS:   return "ws";
+	case SIP_TRANSP_WSS:  return "wss";
+	case SIP_TRANSP_NONE: return "none";
+	default:              return "udp";
 	}
 }
 
@@ -316,6 +356,59 @@ static void emit_call_state(struct call *call, const char *state)
 }
 
 
+/*
+ * v1.1 enrichment (see PROTOCOL.md "stats"): adds "codec" (the TX/
+ * encoder side - see audio_codec()'s `tx` param; for every flow this
+ * repo exercises the rx side negotiates the same codec, SDP offer/
+ * answer being symmetric, so one field covers "the" codec in practice)
+ * and "transport" (call_transp() - the *call's own* actual SIP
+ * transport, the same per-call accessor baresip itself uses
+ * internally, not a guess derived from the account - reuses
+ * transp_name(), already used by reg_state, for the same udp/tcp/tls/
+ * ws/wss vocabulary). Both are omitted entirely (not emitted as an
+ * empty string) when not yet known - e.g. "codec" before SDP
+ * negotiation completes - so a consumer can tell "not known yet" apart
+ * from a real value, matching this file's existing convention for
+ * optional fields (see emit_reg_state()'s "reason").
+ *
+ * rtt_us (rs->rtt, unchanged v1 field/name and unchanged RTCP source)
+ * is frequently 0 in practice against a real PBX - see
+ * core/E2E-F1.md scenario (d): RTCP round-trip-time needs a full SR/
+ * RR/DLSR round trip to populate, which this engine's test PBX
+ * empirically never completed in any capture in that document, even
+ * though tx/rx packet/loss/jitter (also RTCP-sourced, same
+ * struct rtcp_stats) were consistently non-zero and independently
+ * PBX-confirmed in the same window. A 0 rtt_us is not, by itself,
+ * evidence this field is broken - see also the RTCP-cadence caveat
+ * below (also unchanged from v1: querying faster than the PBX's own
+ * RTCP interval - ~10-20s, measured empirically - returns identical
+ * numbers, not fresh ones, for every field this function emits).
+ */
+static void fill_stats_fields(struct odict *od, struct call *call,
+			       const struct rtcp_stats *rs)
+{
+	const struct aucodec *ac = audio_codec(call_audio(call), true);
+
+	(void)odict_entry_add(od, "rtt_us", ODICT_INT, (int64_t)rs->rtt);
+	(void)odict_entry_add(od, "tx_packets", ODICT_INT,
+			       (int64_t)rs->tx.sent);
+	(void)odict_entry_add(od, "tx_lost", ODICT_INT, (int64_t)rs->tx.lost);
+	(void)odict_entry_add(od, "tx_jitter_us", ODICT_INT,
+			       (int64_t)rs->tx.jit);
+	(void)odict_entry_add(od, "rx_packets", ODICT_INT,
+			       (int64_t)rs->rx.sent);
+	(void)odict_entry_add(od, "rx_lost", ODICT_INT, (int64_t)rs->rx.lost);
+	(void)odict_entry_add(od, "rx_jitter_us", ODICT_INT,
+			       (int64_t)rs->rx.jit);
+
+	if (ac)
+		(void)odict_entry_add(od, "codec", ODICT_STRING, ac->name);
+
+	(void)odict_entry_add(od, "transport", ODICT_STRING,
+			       transp_name(call_transp(call)));
+}
+
+
 static void emit_stats(struct call *call)
 {
 	const struct rtcp_stats *rs;
@@ -337,17 +430,7 @@ static void emit_stats(struct call *call)
 
 	(void)odict_entry_add(od, "event", ODICT_STRING, "stats");
 	(void)odict_entry_add(od, "call_id", ODICT_STRING, call_id(call));
-	(void)odict_entry_add(od, "rtt_us", ODICT_INT, (int64_t)rs->rtt);
-	(void)odict_entry_add(od, "tx_packets", ODICT_INT,
-			       (int64_t)rs->tx.sent);
-	(void)odict_entry_add(od, "tx_lost", ODICT_INT, (int64_t)rs->tx.lost);
-	(void)odict_entry_add(od, "tx_jitter_us", ODICT_INT,
-			       (int64_t)rs->tx.jit);
-	(void)odict_entry_add(od, "rx_packets", ODICT_INT,
-			       (int64_t)rs->rx.sent);
-	(void)odict_entry_add(od, "rx_lost", ODICT_INT, (int64_t)rs->rx.lost);
-	(void)odict_entry_add(od, "rx_jitter_us", ODICT_INT,
-			       (int64_t)rs->rx.jit);
+	fill_stats_fields(od, call, rs);
 
 	emit(od);
 	mem_deref(od);
@@ -392,6 +475,138 @@ static void emit_attended_transfer_started(struct call *source,
 
 
 /* ------------------------------------------------------------------- */
+/* Devices (v1.1 - see PROTOCOL.md "devices"/"set_device")             */
+
+/*
+ * Appends one array entry per real device in `driver_devs` (a
+ * struct ausrc/struct auplay's own dev_list - see baresip.h struct
+ * ausrc/struct auplay) to `arr`, named "<driver_name>,<device name>" -
+ * the same "module,device" shape baresip's own audio_source/
+ * audio_player config-file syntax uses (see run-spike.sh's generated
+ * config), so a client can round-trip a "devices" event's "name"
+ * straight into "set_device"'s own "name" field unmodified (see
+ * cmd_set_device() below, which splits on the first comma the same way
+ * this builds it).
+ *
+ * If `driver_devs` is empty - true for every driver in this spike's
+ * actual minimal module set (BUILD.md "Module selection": ausine/
+ * aufile, no coreaudio/alsa/wasapi/... - confirmed by reading both
+ * modules' source, neither ever calls mediadev_add()) - falls back to
+ * reporting the driver itself as the one selectable pseudo-device for
+ * its direction, so "devices" is never an empty, useless array in this
+ * build. A future real device-backend module plugs in with no change
+ * here: its dev_list stops being empty and this naturally starts
+ * emitting one real entry per device instead of the one driver-level
+ * fallback entry.
+ */
+static void devices_add_driver(struct odict *arr, const char *driver_name,
+				const struct list *driver_devs,
+				const char *cfg_mod, const char *cfg_dev)
+{
+	struct le *le;
+	bool any = false;
+
+	for (le = list_head(driver_devs); le; le = le->next) {
+		const struct mediadev *dev = le->data;
+		struct odict *entry = NULL;
+		char name[CENT_DEVICE_NAME_SIZE];
+		bool active;
+
+		if (odict_alloc(&entry, 4))
+			continue;
+
+		(void)re_snprintf(name, sizeof(name), "%s,%s", driver_name,
+				   dev->name);
+		active = !str_casecmp(driver_name, cfg_mod) &&
+			 !str_casecmp(dev->name, cfg_dev);
+
+		(void)odict_entry_add(entry, "name", ODICT_STRING, name);
+		(void)odict_entry_add(entry, "active", ODICT_BOOL, active);
+		(void)odict_entry_add(arr, "device", ODICT_OBJECT, entry);
+		mem_deref(entry);
+		any = true;
+	}
+
+	if (!any) {
+		struct odict *entry = NULL;
+		char name[CENT_DEVICE_NAME_SIZE];
+
+		if (odict_alloc(&entry, 4))
+			return;
+
+		if (str_isset(cfg_dev) && !str_casecmp(driver_name, cfg_mod))
+			(void)re_snprintf(name, sizeof(name), "%s,%s",
+					   driver_name, cfg_dev);
+		else
+			str_ncpy(name, driver_name, sizeof(name));
+
+		(void)odict_entry_add(entry, "name", ODICT_STRING, name);
+		(void)odict_entry_add(entry, "active", ODICT_BOOL,
+				       !str_casecmp(driver_name, cfg_mod));
+		(void)odict_entry_add(arr, "device", ODICT_OBJECT, entry);
+		mem_deref(entry);
+	}
+}
+
+
+/* Shared by emit_devices() (the standalone "devices" event) and
+ * emit_result()'s CENT_CMD_DEVICES enrichment (see PROTOCOL.md
+ * "result") - adds "input"/"output" ODICT_ARRAY entries directly onto
+ * whatever odict is passed in, so both call sites walk the driver
+ * lists exactly once each, same code, same output shape. */
+static void fill_devices_fields(struct odict *od)
+{
+	struct config *cfg = conf_config();
+	struct odict *input = NULL;
+	struct odict *output = NULL;
+	struct le *le;
+
+	if (!cfg)
+		return;
+
+	if (odict_alloc(&input, 8) || odict_alloc(&output, 8)) {
+		mem_deref(input);
+		mem_deref(output);
+		return;
+	}
+
+	for (le = list_head(baresip_ausrcl()); le; le = le->next) {
+		const struct ausrc *as = le->data;
+
+		devices_add_driver(input, as->name, &as->dev_list,
+				    cfg->audio.src_mod, cfg->audio.src_dev);
+	}
+
+	for (le = list_head(baresip_auplayl()); le; le = le->next) {
+		const struct auplay *ap = le->data;
+
+		devices_add_driver(output, ap->name, &ap->dev_list,
+				    cfg->audio.play_mod, cfg->audio.play_dev);
+	}
+
+	(void)odict_entry_add(od, "input", ODICT_ARRAY, input);
+	(void)odict_entry_add(od, "output", ODICT_ARRAY, output);
+	mem_deref(input);
+	mem_deref(output);
+}
+
+
+static void emit_devices(void)
+{
+	struct odict *od = NULL;
+
+	if (odict_alloc(&od, 4))
+		return;
+
+	(void)odict_entry_add(od, "event", ODICT_STRING, "devices");
+	fill_devices_fields(od);
+
+	emit(od);
+	mem_deref(od);
+}
+
+
+/* ------------------------------------------------------------------- */
 /* Call/UA resolution helpers                                          */
 
 /* The one UA this engine registers (see run-spike.sh: one CENT_EXT
@@ -417,6 +632,64 @@ static struct call *resolve_call(bool have_call_id, const char *call_id)
 		return uag_call_find(call_id);
 
 	return ua_call(primary_ua());
+}
+
+
+/*
+ * v1.1 request/response correlation (see PROTOCOL.md "result"). Only
+ * ever called from process_line(), and only when the input command
+ * carried an "id" - see cmd.have_id. `ok` reflects whether this
+ * command's own *synchronous* dispatch succeeded - i.e. whether
+ * emit_error()/emit_errorf() fired during it (see g_error_seq) - not
+ * the eventual outcome of anything asynchronous: a blind_transfer that
+ * gets "result ok:true" can still later fail far-end, exactly like v1's
+ * existing BEVENT_CALL_TRANSFER_FAILED -> error-event convention for
+ * that same command (see event_handler()); "ok:true" here means
+ * "accepted and dispatched without a synchronous validation/API
+ * failure", not a guarantee about what happens next - watch the normal
+ * call_state/reg_state/stats/blf/... events for that, same as always.
+ *
+ * `type`/`cmd` decide the two cases that also get "command-specific
+ * fields" merged onto a successful result: quality_stats and devices
+ * are both "query" commands whose entire purpose is the data they
+ * return, so an "ok:true" with no data would be nearly useless without
+ * a second stats/devices event to correlate by hand - every other
+ * command is a pure action, where ok/error is the complete story (a
+ * consumer that wants more detail already has call_id/ext/etc from its
+ * own request to correlate against the normal broadcast events).
+ */
+static void emit_result(const struct cent_cmd *cmd, enum cent_cmd_type type,
+			 bool ok, const char *error)
+{
+	struct odict *od = NULL;
+
+	if (odict_alloc(&od, 16))
+		return;
+
+	(void)odict_entry_add(od, "event", ODICT_STRING, "result");
+	(void)odict_entry_add(od, "id", ODICT_STRING, cmd->id);
+	(void)odict_entry_add(od, "ok", ODICT_BOOL, ok);
+
+	if (!ok) {
+		(void)odict_entry_add(od, "error", ODICT_STRING,
+				       error ? error : "");
+	}
+	else if (type == CENT_CMD_QUALITY_STATS) {
+		struct call *call = resolve_call(cmd->have_call_id,
+						  cmd->call_id);
+		const struct rtcp_stats *rs = call ?
+			stream_rtcp_stats(audio_strm(call_audio(call))) :
+			NULL;
+
+		if (rs)
+			fill_stats_fields(od, call, rs);
+	}
+	else if (type == CENT_CMD_DEVICES) {
+		fill_devices_fields(od);
+	}
+
+	emit(od);
+	mem_deref(od);
 }
 
 
@@ -903,6 +1176,106 @@ static void cmd_blind_transfer(const struct cent_cmd *cmd)
 }
 
 
+/*
+ * v1.1 "set_device" (see PROTOCOL.md "devices"/"set_device"). Splits
+ * cmd->device_name back into module/device the same way
+ * devices_add_driver() built it (see that function's header comment) -
+ * a bare name with no comma is treated as a module with no specific
+ * device string (dev "" -> NULL below), matching how this spike's own
+ * ausine/aufile drivers are reported today (see
+ * devices_add_driver()'s "no real per-device enumeration" fallback).
+ *
+ * Two effects, both real, not just one-or-the-other:
+ *
+ *  1. Persists the choice into conf_config()->audio.{src,play}_{mod,dev}
+ *     - the exact same fields run-spike.sh's generated config seeds at
+ *     process start (see BUILD.md) - so it becomes the default for any
+ *     call started *after* this command, same as "at next call" in the
+ *     task this version implements.
+ *
+ *  2. ALSO applied live, immediately, to whatever call is active right
+ *     now (if any) via audio_set_source()/audio_set_player()
+ *     (src/audio.c) - investigated briefly while building this: both
+ *     are real hot-swap APIs, confirmed by reading their implementation
+ *     - they mem_deref() the running ausrc_st/auplay_st and
+ *     ausrc_alloc()/aurecv_start_player() a fresh one against the SAME
+ *     struct audio, no re-INVITE, no call restart. So "live if baresip
+ *     supports hot-swap" - it does, and this uses it.
+ *
+ * Scope note: like every other no-call_id command in this file (see
+ * resolve_call()), "the current call" means ua_call(primary_ua()) - a
+ * second, concurrent call (the attended-transfer consultation leg) is
+ * deliberately NOT touched here; a future multi-call-aware version
+ * would need this command to grow its own optional call_id, same as
+ * the rest already have.
+ */
+static void cmd_set_device(const struct cent_cmd *cmd)
+{
+	struct config *cfg = conf_config();
+	char mod[CENT_DEVICE_KIND_SIZE + CENT_DEVICE_NAME_SIZE] = "";
+	char dev[CENT_DEVICE_NAME_SIZE] = "";
+	const char *comma;
+	struct call *call;
+	bool is_input;
+	int err;
+
+	if (!cfg) {
+		emit_error("set_device: no config");
+		return;
+	}
+
+	is_input = !str_casecmp(cmd->device_kind, "input");
+
+	comma = strchr(cmd->device_name, ',');
+	if (comma) {
+		size_t modlen = (size_t)(comma - cmd->device_name);
+
+		if (modlen >= sizeof(mod)) {
+			emit_error("set_device: module name too long");
+			return;
+		}
+		memcpy(mod, cmd->device_name, modlen);
+		mod[modlen] = '\0';
+		str_ncpy(dev, comma + 1, sizeof(dev));
+	}
+	else {
+		str_ncpy(mod, cmd->device_name, sizeof(mod));
+	}
+
+	if (is_input) {
+		str_ncpy(cfg->audio.src_mod, mod, sizeof(cfg->audio.src_mod));
+		str_ncpy(cfg->audio.src_dev, dev, sizeof(cfg->audio.src_dev));
+	}
+	else {
+		str_ncpy(cfg->audio.play_mod, mod,
+			 sizeof(cfg->audio.play_mod));
+		str_ncpy(cfg->audio.play_dev, dev,
+			 sizeof(cfg->audio.play_dev));
+	}
+
+	call = ua_call(primary_ua());
+	if (!call) {
+		/* Persisted default above still applies to the next call -
+		 * nothing live to update right now is not itself an error
+		 * (a client can already tell from "devices"' own "active"
+		 * flag whether anything is live). */
+		return;
+	}
+
+	if (is_input)
+		err = audio_set_source(call_audio(call), mod,
+					str_isset(dev) ? dev : NULL);
+	else
+		err = audio_set_player(call_audio(call), mod,
+					str_isset(dev) ? dev : NULL);
+
+	if (err)
+		emit_errorf("set_device: saved as the default for future"
+			    " calls, but live swap on the current call"
+			    " failed (%m)", err);
+}
+
+
 /* ------------------------------------------------------------------- */
 /* Command dispatch                                                     */
 
@@ -915,6 +1288,14 @@ static void cmd_blind_transfer(const struct cent_cmd *cmd)
  * dial/answer/quit still go through cmd_process_long() - see this file's
  * top-of-file comment for why those three (and not the rest) stay on
  * that path.
+ *
+ * v1.1: if the decoded command carried an "id" (cmd.have_id), a
+ * correlated "result" event is emitted after dispatch - see
+ * emit_result()'s own header comment for the full contract. This wraps
+ * the *entire* switch below (every existing case, completely
+ * unmodified) rather than touching each handler individually: ok is
+ * derived from whether g_error_seq moved during dispatch (see
+ * emit_error()), so no handler needed a signature change for this.
  */
 static void process_line(const char *line, size_t len)
 {
@@ -923,6 +1304,7 @@ static void process_line(const char *line, size_t len)
 	enum cent_cmd_type type;
 	const char *errmsg = NULL;
 	char cmd_name[64] = "";
+	uint32_t error_seq_before;
 
 	if (json_decode_odict(&od, 8, line, len, 8)) {
 		emit_error("invalid JSON command line");
@@ -939,6 +1321,8 @@ static void process_line(const char *line, size_t len)
 
 	type = cent_cmd_decode(&cmd, od, &errmsg);
 	mem_deref(od);
+
+	error_seq_before = g_error_seq;
 
 	switch (type) {
 
@@ -1042,9 +1426,23 @@ static void process_line(const char *line, size_t len)
 		blf_unsubscribe(cmd.ext);
 		break;
 
+	case CENT_CMD_DEVICES:
+		emit_devices();
+		break;
+
+	case CENT_CMD_SET_DEVICE:
+		cmd_set_device(&cmd);
+		break;
+
 	default:
 		emit_error("internal error: unhandled command type");
 		break;
+	}
+
+	if (cmd.have_id) {
+		bool ok = (g_error_seq == error_seq_before);
+
+		emit_result(&cmd, type, ok, ok ? NULL : g_last_error);
 	}
 }
 
@@ -1428,13 +1826,39 @@ static int ctrl_init(void)
 	int err;
 
 	/*
-	 * stdout is the JSON event channel - baresip's own human-readable
-	 * logger defaults lg.enable_stdout=true (see src/log.c) and is only
-	 * ever turned off by main.c in daemon (-d) mode, which we don't use
-	 * (daemonizing would fork/detach and sever the very stdio pipe this
-	 * module depends on). Claim stdout exclusively for JSON here instead.
-	 * debug()/re_dbg output is unaffected - libre always sends that to
-	 * stderr, never stdout.
+	 * stdout is the JSON event channel. Under v1, this call was the
+	 * *only* thing that ever turned off baresip's own human-readable
+	 * stdout logger (lg.enable_stdout, default true - see src/log.c),
+	 * and only from here on: ctrl_json is always the last module
+	 * loaded (see BUILD.md "Module selection"), so every earlier
+	 * module's own info()/debug() line during startup - account
+	 * population, codec registration, network interface enumeration,
+	 * ... - had already gone to stdout by the time this line ran.
+	 *
+	 * v1.1 (core/patches/0003-*, see BUILD.md/PROTOCOL.md) fixes this
+	 * at the source instead: main.c now flips
+	 * log_enable_stdout(false) immediately, before any config/module
+	 * loading, whenever CENT_JSON_STDOUT is set in the environment
+	 * (run-spike.sh always sets it) - and log.c now routes
+	 * !enable_stdout output to *stderr* rather than dropping it
+	 * silently (the v1 code path had no third option: stdout or
+	 * nowhere - every info()/warning()/debug() call in this file
+	 * itself, e.g. the warning() calls in blf_notify_handler() below,
+	 * would otherwise have gone completely dark for the rest of the
+	 * process the moment this line ran, not just quieted on stdout -
+	 * confirmed by reading log.c's vlog() while investigating this).
+	 *
+	 * This call therefore stays, but is now typically a harmless no-op
+	 * by the time it's reached (already false): it's still the *only*
+	 * thing enforcing stdout purity when CENT_JSON_STDOUT is unset
+	 * (e.g. someone builds this exact baresip tree standalone, outside
+	 * run-spike.sh) - dropping it would silently regress that case
+	 * back to v1's original module-load-noise-on-stdout behavior.
+	 * debug()/DEBUG_* (re_dbg.h) output is unaffected either way -
+	 * libre always sends that to stderr, never stdout, independent of
+	 * this flag - see BUILD.md "Findings" for the SIP-trace log
+	 * exception to that (also fixed by the same 0003 patch, in
+	 * src/uag.c, not here).
 	 */
 	log_enable_stdout(false);
 
