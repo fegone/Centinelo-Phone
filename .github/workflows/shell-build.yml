@@ -1,0 +1,90 @@
+name: shell build (v2 desktop shell)
+
+# Builds shell/ (the Tauri v2 desktop app) on the v2-shell branch. Scoped
+# separately from build.yml (v1 Electron, watches `main`) and
+# core-build.yml (the native engine, watches `v2`) via branch + path
+# filters, so none of the three workflows fire on the others' changes.
+#
+# This job builds the shell app itself (Rust backend + static frontend) -
+# it does NOT build core/, since shell/'s sidecar binary path is resolved
+# at runtime (see src-tauri/src/sidecar.rs resolve_core_binary), not a
+# compile-time dependency. core/ has its own CI in core-build.yml.
+
+on:
+  push:
+    branches: [v2-shell]
+    paths:
+      - 'shell/**'
+      - '.github/workflows/shell-build.yml'
+  pull_request:
+    branches: [v2, v2-shell]
+    paths:
+      - 'shell/**'
+      - '.github/workflows/shell-build.yml'
+
+jobs:
+  macos:
+    name: macOS (supported)
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: shell
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install JS dependencies (Tauri CLI + API)
+        run: npm ci
+
+      - name: Rust toolchain
+        run: rustup show
+
+      - name: cargo check (fast compile-time sanity)
+        working-directory: shell/src-tauri
+        run: cargo check --all-targets
+
+      - name: cargo clippy
+        working-directory: shell/src-tauri
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build the Tauri app (.app bundle, unsigned)
+        # --bundles app (not the default "all"): DMG creation shells out to
+        # Finder/AppleScript to lay out the installer window, which is
+        # unnecessary flakiness for a routine build-verification job - a
+        # release workflow can build the full DMG separately.
+        run: npx tauri build --bundles app
+
+  windows:
+    name: Windows (experimental, allowed to fail)
+    runs-on: windows-latest
+    # Not validated locally before this branch was pushed (no Windows
+    # machine available this session) - same caveat as core-build.yml's
+    # own Windows job. The Rust backend cfg-gates every unix-only bit
+    # (file permissions, SIGKILL vs taskkill) so it *should* build, but
+    # that's unverified here.
+    continue-on-error: true
+    defaults:
+      run:
+        working-directory: shell
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install JS dependencies (Tauri CLI + API)
+        run: npm ci
+
+      - name: cargo check (fast compile-time sanity)
+        working-directory: shell/src-tauri
+        run: cargo check --all-targets
+
+      - name: Build the Tauri app (NSIS installer, unsigned)
+        # "app" is a macOS-only bundle type; nsis is Windows' equivalent
+        # default. Unverified on real Windows this session - this whole
+        # job is continue-on-error for exactly that reason.
+        run: npx tauri build --bundles nsis
