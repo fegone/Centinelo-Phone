@@ -54,7 +54,13 @@ jobs:
         run: |
           test -x core/deps/baresip/build/baresip
           test -e core/deps/baresip/build/ctrl_json.so
-          core/deps/baresip/build/baresip -h
+          # `baresip -h` deliberately exits non-zero (254 - -h's own
+          # usage() path, unrelated to any change in this repo, verified
+          # pre-existing: the very first CI run for this workflow, before
+          # any of core/'s F1 work, hit the exact same thing) - so check
+          # its actual output instead of trusting the exit code for this
+          # sanity check.
+          core/deps/baresip/build/baresip -h 2>&1 | grep -q "Usage: baresip"
 
       - name: Configure + build + run ctrl_json unit tests (ASan)
         # Standalone project (core/modules/ctrl_json/test/), not part of
@@ -75,9 +81,12 @@ jobs:
     # See core/BUILD.md "Windows CI". F1 replaced ctrl_json.c's stdin
     # path with a _WIN32-gated thread+fgets+mqueue implementation (no
     # more unistd.h/STDIN_FILENO/read() on that platform - see
-    # ctrl_json.c's "stdin - Windows" section) specifically so this job
-    # can compile; unverified on real Windows hardware (none available
-    # to run this from) until this actual CI run's result is checked -
+    # ctrl_json.c's "stdin - Windows" section), but as of this version
+    # this job still fails *earlier* than that, in baresip's own CMake
+    # find_package(re) step (unrelated pre-existing issue, out of this
+    # version's scope - see core/BUILD.md "Windows CI" for the exact
+    # error) - so ctrl_json.c's own Windows portability remains
+    # syntax-checked locally only, not CI/MSVC-verified either way.
     # continue-on-error stays on until a run is confirmed green, per
     # core/BUILD.md.
     continue-on-error: true

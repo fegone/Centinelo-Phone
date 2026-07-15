@@ -363,11 +363,35 @@ flagged Windows blocker (`unistd.h`/`read()`/`STDIN_FILENO`, POSIX-only)
 — now has a `_WIN32`-gated implementation (reader thread + `fgets()` +
 `re_mqueue.h`, see `core/PROTOCOL.md` "Framing / stdin" for the full
 design and rationale). No Windows machine was available to run this
-engine on real Windows hardware, so this is **compile-verified via CI
-only, not run-verified**; `continue-on-error` stays `true` until an
-actual green `windows-latest` run is confirmed (check the Actions run
-for this push before flipping it — do not flip it on the strength of
-local reasoning alone).
+engine on real Windows hardware.
+
+**Actual `windows-latest` CI result for this version (run checked, not
+assumed): still red, but for a different, earlier, unrelated reason.**
+`re` builds successfully; baresip's own configure step then fails before
+reaching `ctrl_json` at all:
+
+```
+CMake Error at .../FindPackageHandleStandardArgs.cmake:290 (message):
+  Could NOT find RE (missing: RE_LIBRARY)
+Call Stack (most recent call first):
+  cmake/FindRE.cmake:25 (find_package_handle_standard_args)
+  CMakeLists.txt:39 (find_package)
+```
+
+This is baresip's own top-level `CMakeLists.txt` failing to locate the
+`re` library it just built, on Windows specifically (likely an MSVC
+`.lib` naming/layout mismatch against what `cmake/FindRE.cmake` expects
+— not investigated further, out of scope: this is a pre-existing
+re/baresip CMake-on-Windows packaging question, unrelated to
+`ctrl_json.c`'s own portability, and touching baresip's/`re`'s own
+`FindRE.cmake`/CMake config generation is outside this version's actual
+scope, which was `ctrl_json.c`'s stdin path specifically). Net effect:
+`ctrl_json.c`'s own Windows-portability work in this version is
+**unreached by this CI run either way** — neither confirmed nor
+contradicted by it, only syntax-checked locally (see below).
+`continue-on-error` correctly stays `true`; do not flip it without first
+resolving the `RE_LIBRARY` discovery issue (a separate task) and then
+seeing an actual green run.
 
 Before pushing, the `_WIN32` branch was also sanity-checked locally with
 a forced-macro syntax-only compile (no real MSVC available, but this

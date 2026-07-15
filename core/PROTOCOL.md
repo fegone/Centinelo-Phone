@@ -80,9 +80,13 @@ themselves, per point 3 above).
   into the exact same `process_line()`/command-dispatch code — see
   `ctrl_json.c`'s "stdin - Windows" section for the full rationale,
   including why the reader thread is deliberately never `thrd_join()`'d.
-  **Compiles on `windows-latest` CI as of this version** (see
-  `.github/workflows/core-build.yml`); not run-verified on real Windows
-  hardware — see core/BUILD.md "Windows CI".
+  **Not yet reached by `windows-latest` CI as of this version** — an
+  earlier, unrelated step (baresip's own CMake `find_package(re)`
+  discovery on Windows) fails first; this file's own code is only
+  syntax-checked locally (`clang -fsyntax-only -D_WIN32`), not compiled
+  by MSVC or run on real Windows hardware — see core/BUILD.md "Windows
+  CI" for the exact CI error and why fixing it is out of this version's
+  scope.
 
 ## Commands (stdin)
 
