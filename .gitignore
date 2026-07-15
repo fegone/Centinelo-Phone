@@ -8,3 +8,15 @@ settings.local.json
 *.pem
 *.key
 *.crt
+
+# core/ (v2 native engine spike) - build output and scratch runs, never
+# secrets: run-spike.sh reads CENT_SECRET from the environment and only
+# ever writes it into a generated accounts file under a scratch dir.
+core/deps/re/build/
+core/deps/baresip/build/
+core/deps/*/build/
+core/**/*.o
+core/**/*.so
+core/**/*.dylib
+centinelo-spike.*/
+*.baresip-scratch/

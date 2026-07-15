@@ -1,0 +1,6 @@
+[submodule "core/deps/re"]
+	path = core/deps/re
+	url = https://github.com/baresip/re.git
+[submodule "core/deps/baresip"]
+	path = core/deps/baresip
+	url = https://github.com/baresip/baresip.git
