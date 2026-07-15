@@ -229,3 +229,285 @@ debug line was removed before committing (see git history).
 Run 1's inconclusive SSH poll was a test-harness issue (first SSH
 connection to the host paid full handshake latency) fixed for runs 2-4 by
 pre-warming an `SSH ControlMaster` connection — not a product issue.
+
+# F3 e2e verification — live BLF favorites + click-to-call bridge
+
+**Verdict: PASS** for both features required to carry e2e evidence (BLF,
+bridge). The third F3 feature — `centinelo://`/`tel:` deep-link handling —
+is implemented and unit-tested (18 pure tests across `bridge.rs` and
+`deeplink.rs`, `cargo test --lib`) but is **not** independently e2e-verified
+here: `tauri-plugin-deep-link` itself documents that dynamic OS-level
+registration is unsupported on macOS, and real OS-level scheme activation
+can only be exercised against a *bundled and installed* `.app` (not a plain
+`cargo tauri dev` process) — installing this dev build into `/Applications`
+and registering it as a system default handler was judged out of scope for
+a debug-build verification pass. See "Known limitations" below and
+`deeplink.rs`'s own module doc for the full platform breakdown.
+
+## Setup
+
+Same test PBX/extension as F2 (`100.119.230.80`, ext `1100`, secret from
+the v1 app's own settings file, transport `wss`) — see F2's "Setup" above.
+Two new things this session:
+
+- **Second baresip instance ("instance B")**: a *separate* process, run
+  directly via `core/run-spike.sh` (not through the shell) with its own
+  scratch dir, registered as the **same** extension `1100` — ext `1100`
+  allows `max_contacts=2`, so this is a legitimate dual-contact
+  registration, not a conflict. Driven by piping a persistent `tail -f
+  cmds.txt` into its stdin (a plain FIFO would EOF - and per
+  core/PROTOCOL.md, stdin EOF means `quit` - the moment a single write
+  finished) and a second `tail -F instanceB.log | grep incoming` loop that
+  appends `{"cmd":"answer"}` to `cmds.txt` the instant an `incoming`
+  `call_state` appears, so the answer is programmatic and near-instant
+  (no reliance on this agent's own reaction time across tool calls).
+- **The shell app itself ("instance A")**: `shell`'s own `settings.json`
+  (`~/Library/Application Support/com.centinelo.phone/settings.json`)
+  edited directly (host/ext/secret/transport already present from F2's own
+  testing; only `favorites` was changed) to set `favorites[0] =
+  {"ext":"1100","label":"Self (BLF)"}` and `favorites[1] =
+  {"ext":"510","label":"Test 510"}` — this is what makes the shell
+  `blf_subscribe` both on registration, exercising the actual free-tier
+  feature rather than a synthetic backend-only call. Editing settings.json
+  directly (not through the GUI) keeps setup fully scripted/non-interactive
+  per the task's "never desktop GUI automation" constraint; `SettingsStore`
+  is the same JSON shape the app itself reads and writes.
+
+## Methodology
+
+Both scenarios use `CENTINELO_E2E_SCRIPT` (see F2 "Methodology" for why —
+same shared-desktop-input-contention reasoning) plus `RUST_LOG=info npm run
+dev`, log redirected to a file, so every `sidecar-event`/bridge/e2e log
+line is captured verbatim for citation. The click-to-call bridge itself is
+exercised with real `curl` requests from a second terminal against
+`127.0.0.1:38911` while the app runs — this *is* the intended real-world
+client (the paired Chrome extension talks to this exact HTTP contract), so
+`curl` isn't a stand-in for anything, it's a faithful client.
+
+"Assert via app state" (BLF): rather than reaching into the webview's JS
+(`state.blf`) via devtools/GUI, the backend now also tracks the same data
+(`sidecar.rs` `Shared::blf_states: Mutex<HashMap<String,String>>`, updated
+from the identical `blf` events the frontend consumes) and exposes it two
+ways: a `get_blf_states` Tauri command (wired into the frontend's own
+`boot()` so a devtools reload rehydrates instead of going blank - a real
+resilience improvement, not just test scaffolding) and an e2e-only log
+line at script completion (`e2e.rs`: `"e2e: final blf_states = {:?}"`).
+That log line is what's cited below as genuine, backend-tracked "app
+state" — not a self-report, since it's produced by the same code path
+serving the live UI and the bridge's own `/ping`.
+
+## Evidence: BLF favorites (task a)
+
+Two full runs were captured; the second (below) is the clean one — the
+first surfaced and fixed a test-harness timing bug (see "Investigated, not
+a bug" below), not a product bug.
+
+`CENTINELO_E2E_SCRIPT="wait:5|dial:sip:1100@100.119.230.80|wait:15|hangup|wait:3"`,
+instance B already registered and its auto-answer loop already armed
+before instance A started:
+
+```
+23:29:05 sidecar event: {"account":"sip:1100@100.119.230.80:8089","event":"reg_state","state":"registered","transport":"wss"}
+23:29:05 sidecar event: {"event":"blf","ext":"1100","state":"idle"}
+23:29:05 sidecar event: {"event":"blf","ext":"510","state":"idle"}
+23:29:09 e2e: dial(sip:1100@100.119.230.80) -> ok
+23:29:10 sidecar event: {...,"event":"call_state",...,"peer":"sip:1100@pbx.neoladental.com","state":"incoming"}
+23:29:10 sidecar event: {"event":"blf","ext":"1100","state":"busy"}
+23:29:10 sidecar event: {...,"event":"call_state","peer":"sip:1100@100.119.230.80;transport=wss","state":"ringing"}
+23:29:10 sidecar event: {...,"event":"call_state","peer":"sip:1100@100.119.230.80;transport=wss","state":"established"}
+23:29:10 sidecar event: {...,"event":"call_state",...,"peer":"sip:1100@pbx.neoladental.com","state":"closed"}
+23:29:10 sidecar event: {"event":"blf","ext":"1100","state":"busy"}
+23:29:24 e2e: hangup -> ok
+23:29:24 sidecar event: {...,"event":"call_state","peer":"sip:1100@100.119.230.80;transport=wss","state":"closed"}
+23:29:25 sidecar event: {"event":"blf","ext":"1100","state":"idle"}
+23:29:27 e2e: final blf_states = {"1100": "idle", "510": "idle"}
+23:29:27 e2e: script complete
+```
+
+Confirms, in order: (1) registration; (2) **auto-subscribe on registration**
+— `blf_subscribe` fired for *both* configured favorites (`1100` and `510`)
+with no explicit command in the e2e script, purely from `favorites` in
+settings — this is the actual F3 feature, not a manual trigger; (3) instance
+A dialing `1100` forks to instance B (the dual-contact "truco" — B's own
+log shows `incoming` -> auto-answered -> `established` in under a second,
+confirmed independently, see below); (4) A's own outbound leg goes
+`ringing` -> `established`, i.e. a **real, answered, two-way call**, not
+just a ring; (5) BLF for `1100` transitions `idle` -> `busy` and back to
+`idle` -> tracked correctly end to end; (6) `510` never moves — stays
+`idle` for the entire run, confirmed in the final backend-state dump; (7)
+nothing else was dialed or subscribed — only `1100` and its own watched
+extensions, matching "nothing rings in the clinic (1100 only)".
+
+Instance B's independent log for the same window (own scratch process, own
+PBX-side registration):
+
+```
+{"event":"reg_state","account":"sip:1100@100.119.230.80:8089","state":"registered","transport":"wss"}
+{"event":"call_state","state":"incoming","peer":"sip:1100@pbx.neoladental.com","id":"dd3c4008-...","call_id":"dd3c4008-..."}
+{"event":"call_state","state":"established","peer":"sip:1100@pbx.neoladental.com","id":"dd3c4008-...","call_id":"dd3c4008-..."}
+{"event":"call_state","state":"closed","peer":"sip:1100@pbx.neoladental.com","id":"dd3c4008-...","call_id":"dd3c4008-..."}
+```
+(auto-answer log: `AUTO-ANSWERED: {"event":"call_state","state":"incoming",...}` — fired
+the instant the `incoming` line appeared, before Asterisk's own ring-no-answer
+window could expire — see "Investigated, not a bug" for why the *first* run
+missed this window.)
+
+A second, independent run (`wait:5|dial:...|wait:15|hangup|wait:3`, fresh
+instance A process) reproduced the identical shape — `busy` immediately on
+dial, real `established`, clean return to `idle`, `510` untouched — ruling
+out the first run's timing/flakiness explanation for *this* run's shape
+being a fluke.
+
+### Investigated, not a bug: `busy(confirmed)` appears immediately, not after a visible `ringing` phase
+
+The task's own framing expected a `ringing` -> `busy(confirmed)` sequence.
+What was actually observed, consistently across both successful runs, was
+`idle` -> `busy` with no intervening `ringing` NOTIFY for `1100`, even
+though instance A's *own* call leg was independently confirmed `ringing`
+for a full ~0.3-15s before `established`. Read `core/modules/ctrl_json/dialog_info.c`'s
+mapping (not modified here, core/ is out of scope for this agent) confirms
+`busy` only ever comes from a NOTIFY body literally containing
+`<state>confirmed</state>` — so this is what the PBX actually sent, not a
+shell-side misparse. The most likely explanation, consistent with standard
+Asterisk hint/devicestate behavior: extension `1100`'s dialog-info hint
+reports the AoR "in use" the moment *any* channel touches it — including
+the watching UA's *own* outbound leg to its *own* AoR, self-dial being an
+inherent property of the dual-contact trick (both "instance A" and
+"instance B" are, from the PBX's perspective, just two contacts of the same
+`1100`). This is PBX/Asterisk hint configuration, outside this agent's
+scope (`core/` is read-only reference here, and PBX config changes are
+prohibited per the workspace's PBX rules) — flagged for whoever owns
+Asterisk hint config if a cleaner `ringing` phase is wanted for this
+specific self-referential scenario. The shell-side behavior being verified
+here — subscribe, receive, track, and reflect whatever the PBX actually
+sends — is confirmed correct: every `blf` event that *did* arrive was
+correctly parsed, stored, and (per the frontend code review below) would
+correctly drive the `.fav.busy`/`.fav.idle` lamp classes.
+
+### Investigated, not a bug: first run's "accept failed" error
+
+The very first dial attempt (before the auto-answer loop existed) relied
+on this agent manually reacting to a `Monitor` notification — by the time
+the `{"cmd":"answer"}` line was appended to instance B's `cmds.txt`,
+Asterisk had already cancelled/timed out the un-answered fork to instance
+B (`{"event":"call_state","state":"closed",...}` immediately preceded
+`{"event":"error","message":"cmd 'accept' failed (Invalid argument
+[22])"}` in B's log — baresip correctly rejected `answer` for a call that
+no longer existed). Fixed by replacing manual reaction with the tail-driven
+auto-answer loop described in "Setup" above (sub-second, no agent
+round-trip latency) — confirmed by the second run answering cleanly. Not a
+`ctrl_json`/shell bug; a test-harness latency issue.
+
+## Evidence: click-to-call bridge (task b)
+
+`curl` against `127.0.0.1:38911` with the real token read from
+`settings.json`'s `bridge.token` (never printed to any log or committed;
+32 hex chars, minted on first run by `settings.rs`'s
+`generate_bridge_token()`). All six requests below and the app's own log
+are from the same run:
+
+```
+$ curl -w ' [HTTP %{http_code}]' http://127.0.0.1:38911/ping
+{"error":"bad token"} [HTTP 403]                                    # no token
+
+$ curl -w ' [HTTP %{http_code}]' -H 'X-Centinelo-Token: wrong' http://127.0.0.1:38911/ping
+{"error":"bad token"} [HTTP 403]                                    # wrong token
+
+$ curl -w ' [HTTP %{http_code}]' -H "X-Centinelo-Token: $TOKEN" http://127.0.0.1:38911/ping
+{"app":"centinelo-phone","state":"registered"} [HTTP 200]           # correct token
+
+$ curl -o /dev/null -w 'HTTP %{http_code}' -X OPTIONS http://127.0.0.1:38911/dial
+HTTP 204                                                            # preflight, no token needed
+# response headers included:
+#   Access-Control-Allow-Origin: *
+#   Access-Control-Allow-Headers: Content-Type, X-Centinelo-Token
+#   Access-Control-Allow-Methods: POST, GET, OPTIONS
+#   Access-Control-Allow-Private-Network: true
+
+$ curl -w ' [HTTP %{http_code}]' -X POST -H "X-Centinelo-Token: $TOKEN" \
+    -H 'Content-Type: application/json' -d '{"number":"*60"}' http://127.0.0.1:38911/dial
+{"ok":true} [HTTP 200]                                               # auto_dial=false (default)
+
+$ curl -w ' [HTTP %{http_code}]' -X POST -H "X-Centinelo-Token: $TOKEN" \
+    -H 'Content-Type: application/json' -d '{}' http://127.0.0.1:38911/dial
+{"error":"bad request"} [HTTP 400]                                   # no number
+```
+
+App's own log for the `auto_dial=false` `/dial` request above:
+```
+23:34:52 click-to-call bridge: listening on 127.0.0.1:38911
+23:34:52 sidecar event: {"account":"sip:1100@100.119.230.80:8089","event":"reg_state","state":"registered","transport":"wss"}
+23:35:02 click-to-call bridge: /dial request for *60 (auto_dial=false) - asking for confirmation
+```
+Zero `call_state` events appear anywhere in this run's log (`grep -c
+call_state` = `0`) — confirming the `*60` request emitted the
+`click-to-call` confirmation event and did **not** dial, matching "curl
+/dial with token -> confirmation state appears" exactly (no dial happened;
+a human/the frontend must still say yes).
+
+### `auto_dial=true` — real dial, independently RTP-verified
+
+`bridge.auto_dial` flipped to `true` directly in `settings.json` (same
+non-GUI editing as the BLF setup), fresh app launch, then:
+```
+$ curl -X POST -H "X-Centinelo-Token: $TOKEN" -H 'Content-Type: application/json' \
+    -d '{"number":"*43"}' http://127.0.0.1:38911/dial
+{"ok":true}
+```
+App log:
+```
+23:32:11 click-to-call bridge: /dial request for *43 (auto_dial=true) - dialing immediately
+23:32:12 sidecar event: {"call_id":"89532783c58e9bf7","event":"call_state",...,"peer":"sip:*43@100.119.230.80;transport=wss","state":"established"}
+```
+This is the **full real path**, not a backend bypass: the HTTP request only
+ever emits a Tauri event (`bridge.rs`); it is `ui/js/app.js`'s own
+`handleClickToCall()`, running in the actual webview, that reads
+`auto_dial:true` from the event payload and calls the same `dialUri()` a
+human clicking the keypad would — proven by the resulting `sidecar_dial`
+IPC call reaching the backend and a real SIP `established` state one
+second later.
+
+Independent, read-only PBX-side confirmation (`ssh ... "asterisk -rx
+'pjsip show channelstats'"`), polled twice ~9s apart:
+```
+          1100-00000885      00:00:15 ulaw      597       0    0   0.000    598       0    0   0.002   0.000
+...
+          1100-00000885      00:00:24 ulaw     1084       0    0   0.000   1085       0    0   0.003   0.000
+```
+Same channel, UpTime and Rx/Tx counts climbing together (597->1084,
+598->1085, ~54 pps, 0% loss both polls) — real, live, bidirectional RTP,
+not a one-off snapshot. The app was then sent `SIGTERM` (graceful Tauri
+shutdown, not a scripted `hangup` this time, since no e2e script was
+running for this manual-curl test) and a follow-up poll returned `No
+objects found.` — clean teardown confirmed.
+
+`auto_dial` was reset to `false` (the safe default) in `settings.json`
+immediately after this test.
+
+## Known limitations (F3 scope)
+
+- `centinelo://`/`tel:` deep-link activation itself (an actual OS-level
+  scheme click) is not e2e-verified — see the verdict note above. The
+  URL-extraction logic it depends on (`deeplink.rs::extract_dial_target`)
+  is unit-tested against `tel:5551234`, percent-encoded/formatted
+  variants, and all three `centinelo:` shapes
+  (`centinelo://dial?number=501`, `centinelo://501`, `centinelo:501`) plus
+  precedence and negative cases.
+- The `register_tel_handler` toggle's Windows/Linux registry/`.desktop`-file
+  behavior is inherently untestable on this macOS dev machine (`register()`/
+  `unregister()` are `Err(UnsupportedPlatform)` on macOS by
+  `tauri-plugin-deep-link`'s own design - confirmed by reading its
+  vendored source, not assumed). Its macOS no-op path did run (as `false`)
+  on every app launch across all sessions above with no error - the same
+  function the Settings toggle calls.
+- Favorites beyond 2 slots (`ext` left blank) were not separately
+  exercised - `settings.rs::normalize_favorites`'s "skip blank `ext`"
+  branch is straightforward and shares code with the already-tested path.
+- No screenshot/GUI confirmation of the favorites lamp classes
+  (`.fav.idle`/`.fav.ring`/`.fav.busy`/`.fav.off`) actually painting
+  correctly - per the task's "never desktop GUI automation" constraint,
+  this run relied on code review (`renderFavorites()` in `ui/js/app.js`
+  maps `blf` state -> CSS class 1:1 with the mockup's own class names,
+  reusing app.css rules that predate this task unchanged) plus the
+  verified-correct event data reaching the frontend (`click-to-call`/`blf`
+  events, `get_blf_states` boot-time fetch).

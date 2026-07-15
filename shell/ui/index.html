@@ -171,6 +171,12 @@
         </div>
       </div>
 
+      <h2>Favorites</h2>
+      <div class="settings-card" id="favorites-card">
+        <p class="hint" style="margin:0 0 10px">Up to 4 extensions with live status on the main window. Calling one always asks for confirmation first.</p>
+        <div id="favorites-fields"></div>
+      </div>
+
       <h2>How calls travel</h2>
       <div class="transports" role="radiogroup" aria-label="Transport" id="transport-choice">
         <button class="tcard" role="radio" data-transport="auto">
@@ -185,6 +191,37 @@
           <span class="row1"><span class="radio" aria-hidden="true"></span><b>Secure web</b><span class="mono">WSS</span></span>
           <p>Calls travel inside an encrypted web connection — best across the internet and strict firewalls.</p>
         </button>
+      </div>
+
+      <h2>Click-to-call</h2>
+      <div class="settings-card">
+        <p class="hint" style="margin:0 0 10px">Dial numbers you click on the web with the Centinelo browser extension. Runs on this computer only.</p>
+        <div class="field">
+          <label for="bridge-address">Bridge address</label>
+          <input id="bridge-address" type="text" readonly style="font-family:var(--font-mono)">
+        </div>
+        <div class="field">
+          <label for="bridge-token">Pairing token</label>
+          <div class="btnrow" style="margin-top:0">
+            <input id="bridge-token" type="text" readonly style="font-family:var(--font-mono);flex:1">
+            <button class="ghost" id="btn-copy-token">Copy</button>
+          </div>
+          <span class="hint" id="copy-token-status"></span>
+        </div>
+        <div class="field">
+          <label>Dial automatically</label>
+          <div class="themerow" role="radiogroup" aria-label="Dial automatically" id="auto-dial-row">
+            <button data-bool-choice="false" class="on">Off</button><button data-bool-choice="true">On</button>
+          </div>
+          <span class="hint">When off, every click-to-call and centinelo:// or tel: link asks "Call this number?" first.</span>
+        </div>
+        <div class="field">
+          <label>Answer tel: links</label>
+          <div class="themerow" role="radiogroup" aria-label="Answer tel: links" id="tel-handler-row">
+            <button data-bool-choice="false" class="on">Off</button><button data-bool-choice="true">On</button>
+          </div>
+          <span class="hint">Lets Centinelo offer to dial tel: links from other apps.</span>
+        </div>
       </div>
 
       <h2>Advanced</h2>
@@ -251,6 +288,28 @@
       <span class="status" id="save-status"></span>
       <button class="ghost" id="btn-cancel-settings">Cancel</button>
       <button class="primary" id="btn-save-settings">Save</button>
+    </div>
+  </div>
+
+  <!-- ================= dial confirmation (favorites + click-to-call + centinelo/tel deep links) =================
+       Shares the admin-lock overlay's visual language (icon + heading +
+       description + buttons) - see shell/README.md "Design fidelity notes"
+       for the project's precedent of new components in the same language
+       where the mockups don't cover a state. Sits above everything
+       (dial-confirm-overlay raises the shared .lock-overlay's z-index),
+       since a dial request can arrive at any time. -->
+  <div class="lock-overlay dial-confirm-overlay" id="dial-confirm-overlay" hidden>
+    <div class="lock-card">
+      <div class="lockhead">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6.8 10.6a13.8 13.8 0 0 0 6.6 6.6l2-2c.33-.33.8-.44 1.24-.3 1 .33 2.03.5 3.06.5.7 0 1.3.57 1.3 1.28v2.58c0 .7-.6 1.28-1.3 1.28C11 20.5 3.5 13 3.5 4.3c0-.7.58-1.3 1.28-1.3h2.58c.71 0 1.28.6 1.28 1.3 0 1.03.17 2.06.5 3.06.14.44.03.9-.3 1.24l-2.04 2z"/></svg>
+        <b>Call this number?</b>
+      </div>
+      <p id="dial-confirm-source">From your browser.</p>
+      <div class="plate" id="dial-confirm-number" style="font-size:15px;color:var(--text-1);letter-spacing:.04em">—</div>
+      <div class="btnrow">
+        <button class="primary" id="btn-dial-confirm-call">Call</button>
+        <button class="ghost" id="btn-dial-confirm-cancel">Not now</button>
+      </div>
     </div>
   </div>
 

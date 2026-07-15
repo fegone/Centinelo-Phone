@@ -55,6 +55,13 @@ pub fn maybe_run_e2e_script(app: &AppHandle) {
                 log::warn!("e2e: unknown step '{step}'");
             }
         }
+        // Genuine backend-tracked "app state" (sidecar.rs `Shared::blf_states`,
+        // fed by real `blf` events - the same data the frontend's own
+        // `state.blf` derives from), logged as part of the evidence trail so
+        // BLF verification doesn't need any GUI/devtools introspection - see
+        // shell/E2E.md "F3".
+        let sidecar: tauri::State<SidecarHandle> = app.state();
+        log::info!("e2e: final blf_states = {:?}", sidecar.blf_states());
         log::info!("e2e: script complete");
     });
 }

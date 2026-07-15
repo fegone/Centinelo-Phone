@@ -147,6 +147,34 @@ pub fn get_favorites(settings: State<Arc<SettingsStore>>) -> Vec<FavoriteSlot> {
     settings.snapshot().favorites
 }
 
+/// Last-known BLF state per watched extension (see sidecar.rs
+/// `Shared::blf_states`) - fetched at `boot()` so a devtools reload
+/// mid-session repaints the favorites grid immediately instead of waiting
+/// for the next NOTIFY (BLF re-notifies on change, not on a timer).
+#[tauri::command(rename_all = "snake_case")]
+pub fn get_blf_states(sidecar: State<SidecarHandle>) -> std::collections::HashMap<String, String> {
+    sidecar.blf_states()
+}
+
+/// Admin-gated, like account/transport/core-path - favorites in a real
+/// clinic dial real people's extensions (see shell task spec). Restarts the
+/// sidecar so the new list takes effect immediately: a fresh process
+/// re-registers and re-issues `blf_subscribe` for the saved extensions
+/// (see sidecar.rs's stdout reader) rather than needing separate
+/// subscribe/unsubscribe diffing against the previous list.
+#[tauri::command(rename_all = "snake_case")]
+pub fn save_favorites(
+    settings: State<Arc<SettingsStore>>,
+    admin: State<AdminSession>,
+    sidecar: State<SidecarHandle>,
+    favorites: Vec<FavoriteSlot>,
+) -> Result<Vec<FavoriteSlot>, String> {
+    require_unlocked(&admin)?;
+    settings.update_favorites(favorites).map_err(|e| e.to_string())?;
+    sidecar.restart_now();
+    Ok(settings.snapshot().favorites)
+}
+
 // ---- theme ------------------------------------------------------------
 
 #[tauri::command(rename_all = "snake_case")]
@@ -244,4 +272,49 @@ pub fn add_recent(
         missed: input.missed,
     };
     settings::add_recent(settings.recents_path(), entry).map_err(|e| e.to_string())
+}
+
+// ---- click-to-call bridge + deep links ------------------------------------
+// Not admin-gated (unlike account/favorites): these are behavioral toggles,
+// not credentials - the bridge's actual security boundary is the token
+// itself (settings.bridge.token, never round-tripped except here, where the
+// operator explicitly needs to read/copy it to pair the browser extension -
+// same as v1's settings.js, which put `clickToCallToken` straight into a
+// visible field).
+
+#[derive(Serialize)]
+pub struct BridgeSettingsView {
+    pub token: String,
+    pub port: u16,
+    pub auto_dial: bool,
+    pub register_tel_handler: bool,
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn get_bridge_settings(settings: State<Arc<SettingsStore>>) -> BridgeSettingsView {
+    let bridge = settings.snapshot().bridge;
+    BridgeSettingsView {
+        token: bridge.token,
+        port: crate::bridge::BRIDGE_PORT,
+        auto_dial: bridge.auto_dial,
+        register_tel_handler: bridge.register_tel_handler,
+    }
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn set_auto_dial(settings: State<Arc<SettingsStore>>, auto_dial: bool) -> Result<(), String> {
+    settings.update_bridge_auto_dial(auto_dial).map_err(|e| e.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn set_register_tel_handler(
+    app: tauri::AppHandle,
+    settings: State<Arc<SettingsStore>>,
+    enabled: bool,
+) -> Result<(), String> {
+    settings
+        .update_bridge_register_tel(enabled)
+        .map_err(|e| e.to_string())?;
+    crate::deeplink::apply_tel_registration(&app, enabled);
+    Ok(())
 }
