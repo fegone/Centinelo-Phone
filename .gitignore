@@ -15,6 +15,7 @@ settings.local.json
 core/deps/re/build/
 core/deps/baresip/build/
 core/deps/*/build/
+core/modules/ctrl_json/test/build/
 core/**/*.o
 core/**/*.so
 core/**/*.dylib
