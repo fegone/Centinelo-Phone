@@ -6,12 +6,12 @@ name: core build (v2 engine spike)
 # neither workflow fires on the other's changes.
 on:
   push:
-    branches: [v2]
+    branches: [v2, v2-winci]
     paths:
       - 'core/**'
       - '.github/workflows/core-build.yml'
   pull_request:
-    branches: [v2]
+    branches: [v2, v2-winci]
     paths:
       - 'core/**'
       - '.github/workflows/core-build.yml'
@@ -76,20 +76,17 @@ jobs:
           ctest --test-dir core/modules/ctrl_json/test/build --output-on-failure
 
   windows:
-    name: Windows (experimental, allowed to fail)
+    name: Windows (experimental)
     runs-on: windows-latest
-    # See core/BUILD.md "Windows CI". F1 replaced ctrl_json.c's stdin
-    # path with a _WIN32-gated thread+fgets+mqueue implementation (no
-    # more unistd.h/STDIN_FILENO/read() on that platform - see
-    # ctrl_json.c's "stdin - Windows" section), but as of this version
-    # this job still fails *earlier* than that, in baresip's own CMake
-    # find_package(re) step (unrelated pre-existing issue, out of this
-    # version's scope - see core/BUILD.md "Windows CI" for the exact
-    # error) - so ctrl_json.c's own Windows portability remains
-    # syntax-checked locally only, not CI/MSVC-verified either way.
-    # continue-on-error stays on until a run is confirmed green, per
-    # core/BUILD.md.
+    # See core/BUILD.md "Windows CI". Stays on until a run is confirmed green,
+    # per that doc's note (do not flip without first seeing a green run).
     continue-on-error: true
+    env:
+      # Chocolatey's `openssl` package installs here on windows-latest; passed
+      # to both the libre and baresip CMake configs so find_package(OpenSSL)
+      # resolves the same headers/libs in both (baresip's configure pulls in
+      # core/deps/re/cmake/re-config.cmake, which re-runs find_package(OpenSSL)).
+      OPENSSL_ROOT_DIR: C:\Program Files\OpenSSL-Win64
     steps:
       - uses: actions/checkout@v4
         with:
@@ -104,26 +101,66 @@ jobs:
           git apply --directory=core/deps/re core/patches/0001-re-configurable-sip-ws-path.patch
           git apply --directory=core/deps/re core/patches/0002-re-tls-fingerprint-pin.patch
 
-      - name: Configure + build libre
+      - name: Configure + build + install libre
+        # Build re STATIC-only (baresip is itself STATIC on Windows - see its
+        # `option(STATIC ... ON)` for WIN32) and `cmake --install` it. The
+        # install flattens MSVC's multi-config `Release/` subdir that
+        # baresip's cmake/FindRE.cmake never searches: FindRE.cmake's
+        # find_library HINTS are only ../re, ../re/build, ../re/build/Debug,
+        # but the .lib actually lands in ../re/build/Release - hence the raw
+        # build-tree lookup failed with "Could NOT find RE (missing:
+        # RE_LIBRARY)". The installed archive is handed to baresip explicitly
+        # via -DRE_LIBRARY in the next step.
         shell: bash
         run: |
           set -o pipefail
+          RE_INSTALL="$(pwd -W)/re-install-prefix"
           cmake -S core/deps/re -B core/deps/re/build \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$RE_INSTALL" \
+            -DLIBRE_BUILD_SHARED=OFF \
+            -DLIBRE_BUILD_STATIC=ON \
+            -DOPENSSL_ROOT_DIR="$OPENSSL_ROOT_DIR" \
             2>&1 | tee re-configure.log
           cmake --build core/deps/re/build --config Release 2>&1 | tee -a re-configure.log
+          cmake --install core/deps/re/build --config Release 2>&1 | tee -a re-configure.log
 
       - name: Configure + build baresip + ctrl_json
+        # -DRE_LIBRARY / -DRE_INCLUDE_DIR satisfy baresip's MODULE-mode
+        # find_package(RE) (cmake/FindRE.cmake) directly, instead of relying
+        # on its (Windows-broken) build-tree HINTS. RE_INCLUDE_DIR points at
+        # the re *source* tree, where re.h lives (same ../re/include the macOS
+        # job resolves via FindRE.cmake); RE_LIBRARY at the just-installed
+        # static archive re-static.lib (OUTPUT_NAME re-static on MSVC).
         shell: bash
         run: |
           set -o pipefail
+          RE_INSTALL="$(pwd -W)/re-install-prefix"
           cmake -S core/deps/baresip -B core/deps/baresip/build \
             -DCMAKE_BUILD_TYPE=Release \
+            -DRE_LIBRARY="$RE_INSTALL/lib/re-static.lib" \
+            -DRE_INCLUDE_DIR="$(pwd -W)/core/deps/re/include" \
+            -DOPENSSL_ROOT_DIR="$OPENSSL_ROOT_DIR" \
             -DMODULES="account;g711;auconv;auresamp;menu" \
             -DAPP_MODULES="ctrl_json" \
-            -DAPP_MODULES_DIR="${{ github.workspace }}/core/modules" \
+            -DAPP_MODULES_DIR="$(pwd -W)/core/modules" \
             2>&1 | tee baresip-configure.log
           cmake --build core/deps/baresip/build --config Release 2>&1 | tee -a baresip-configure.log
+
+      - name: Sanity - baresip + ctrl_json built
+        # STATIC build (Windows default): there is no ctrl_json.dll - the
+        # module is compiled into the static baresip lib via the generated
+        # src/static.c exports table (a green *link* therefore implies
+        # ctrl_json compiled - static.c references exports_ctrl_json). We
+        # only confirm the artifacts exist; baresip.exe is not run, as the
+        # static build still links OpenSSL's import libs and would need the
+        # OpenSSL DLLs on PATH at runtime.
+        shell: bash
+        run: |
+          RE_INSTALL="$(pwd -W)/re-install-prefix"
+          test -x core/deps/baresip/build/Release/baresip.exe
+          test -f "$RE_INSTALL/lib/re-static.lib"
+          echo "OK: re + baresip(+ctrl_json) built on Windows"
 
       - name: Upload build logs (pass or fail)
         if: always()
