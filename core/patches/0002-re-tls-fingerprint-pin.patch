@@ -1,0 +1,117 @@
+diff --git a/src/http/client.c b/src/http/client.c
+index a7ad1c9..484e295 100644
+--- a/src/http/client.c
++++ b/src/http/client.c
+@@ -5,6 +5,7 @@
+  */
+ 
+ #include <string.h>
++#include <stdlib.h>
+ #include <re_types.h>
+ #include <re_mem.h>
+ #include <re_mbuf.h>
+@@ -438,6 +439,86 @@ static void send_req_handler(void *arg)
+ }
+ 
+ 
++#ifdef USE_TLS
++/*
++ * Centinelo Phone v2 F1 patch (core/patches/): optional TLS leaf-
++ * certificate fingerprint pin, independent of (checked in *addition* to)
++ * whatever chain-of-trust verification tls_set_verify_server() already
++ * configured for this connection - see conn_connect() above, which calls
++ * it unconditionally for every secure request. That matters because it
++ * means this still protects a connection even when the account/config
++ * left server verification off entirely (tls_disable_verify_server(),
++ * baresip's default for this spike's self-signed/internal-CA PBX cert -
++ * see core/BUILD.md "TLS verification"): tls_set_verify_server() no-ops
++ * completely (does not even call SSL_set_verify()) when
++ * tls->verify_server is false, so today nothing at all checks the peer
++ * cert for that case without this.
++ *
++ * Format matches the v1 Electron app's settings.pinnedCertSha256: sha256
++ * of the leaf cert's DER bytes, hex, non-hex separators (':', ' ', ...)
++ * tolerated and skipped - see src/main/main.js pemToDerSha256()/
++ * pinMatches() in this repo. tls_peer_fingerprint() (re_tls.h) computes
++ * the exact same thing on the C/OpenSSL side (X509_digest() over the
++ * DER encoding), confirmed by reading both implementations while writing
++ * this patch.
++ *
++ * Scope: CENT_TLS_PIN is one global env var, checked for *every* secure
++ * connection this http_client makes - fine for this engine's actual
++ * usage (its only USE_TLS http_client traffic is the one SIP-over-WSS
++ * upgrade to the configured PBX host, see core/run-spike.sh), but not
++ * host-keyed - a future multi-account version would need a real
++ * per-host pin store instead of one flat env var. Documented in
++ * core/BUILD.md, not silently assumed.
++ */
++static bool cent_tls_pin_mismatch(const struct tls_conn *sc, const char *pin)
++{
++	uint8_t want[32], got[32];
++	size_t n = 0;
++
++	while (*pin && n < sizeof(want)) {
++		int hi = *pin, lo;
++
++		if (hi >= '0' && hi <= '9') hi -= '0';
++		else if (hi >= 'a' && hi <= 'f') hi -= ('a' - 10);
++		else if (hi >= 'A' && hi <= 'F') hi -= ('A' - 10);
++		else { ++pin; continue; }   /* skip separators, e.g. ':' */
++		++pin;
++
++		lo = *pin;
++		if (lo >= '0' && lo <= '9') lo -= '0';
++		else if (lo >= 'a' && lo <= 'f') lo -= ('a' - 10);
++		else if (lo >= 'A' && lo <= 'F') lo -= ('A' - 10);
++		else break;                  /* malformed: odd trailing nibble */
++		++pin;
++
++		want[n++] = (uint8_t)((hi << 4) | lo);
++	}
++
++	if (n != sizeof(want)) {
++		DEBUG_WARNING("CENT_TLS_PIN: malformed pin value"
++			      " (need 64 hex chars, decoded %zu bytes)\n", n);
++		return true;   /* fail closed */
++	}
++
++	if (tls_peer_fingerprint(sc, TLS_FINGERPRINT_SHA256, got,
++				  sizeof(got))) {
++		DEBUG_WARNING("CENT_TLS_PIN: could not read the peer"
++			      " certificate fingerprint\n");
++		return true;   /* fail closed */
++	}
++
++	if (0 != memcmp(want, got, sizeof(want))) {
++		DEBUG_WARNING("CENT_TLS_PIN: peer certificate fingerprint"
++			      " does not match the pinned value - rejecting"
++			      " this connection\n");
++		return true;
++	}
++
++	return false;
++}
++#endif
++
++
+ static void estab_handler(void *arg)
+ {
+ 	struct conn *conn = arg;
+@@ -446,6 +527,17 @@ static void estab_handler(void *arg)
+ 	if (!req || !req->cli)
+ 		return;
+ 
++#ifdef USE_TLS
++	if (conn->sc) {
++		const char *pin = getenv("CENT_TLS_PIN");
++
++		if (pin && pin[0] && cent_tls_pin_mismatch(conn->sc, pin)) {
++			try_next(conn, EAUTH);
++			return;
++		}
++	}
++#endif
++
+ 	err = send_req_buf(conn);
+ 	if (err) {
+ 		try_next(conn, err);

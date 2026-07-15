@@ -22,24 +22,42 @@
 #                        mktemp one (it will be created if missing)
 #   CENT_VERIFY_SERVER   yes|no (default: no). The PBX WSS endpoint used
 #                        for this spike serves a self-signed/internal-CA
-#                        cert - see BUILD.md "TODO: cert pinning".
+#                        cert - see BUILD.md "TLS leaf-certificate
+#                        pinning" for CENT_TLS_PIN, below, which adds an
+#                        independent check on top of this.
 #   CENT_WS_PATH         HTTP path for the ws/wss upgrade request
 #                        (default: /ws, matching Asterisk's default
 #                        `res_http_websocket` mount point). Consumed by
 #                        the re patch in core/patches/ - see BUILD.md
 #                        "Findings" for why this exists: stock re/baresip
 #                        hardcode "/", which 404s against Asterisk.
+#   CENT_TLS_PIN         sha256 hex (colons/spaces tolerated) of the
+#                        expected WSS server leaf cert, DER bytes -
+#                        matching the v1 Electron app's
+#                        settings.pinnedCertSha256 entries. Optional;
+#                        unset = pre-F1 behavior (no pin check, only
+#                        whatever CENT_VERIFY_SERVER configures). Passed
+#                        straight through to the child baresip process's
+#                        environment (no default computed here, unlike
+#                        CENT_WS_PATH) - consumed by the re patch in
+#                        core/patches/0002-*, see BUILD.md "TLS
+#                        leaf-certificate pinning".
 #   CENT_BARESIP_ARGS    extra args appended to the baresip invocation
 #                        unquoted/word-split on purpose, e.g.
 #                        CENT_BARESIP_ARGS="-t 30" to auto-quit after 30s
+#                        (-s adds SIP trace - see PROTOCOL.md "Framing"
+#                        for where that output actually lands)
 #
 # I/O once running:
-#   stdin  - newline-delimited JSON commands (see PROTOCOL.md)
-#   stdout - newline-delimited JSON events (see PROTOCOL.md), *preceded by
-#            one plain-text baresip startup banner line* printed by
-#            baresip's main() before any module (incl. ctrl_json) loads -
-#            see PROTOCOL.md "Framing" for why, and filter for lines
-#            starting with '{' if you need a strictly-JSON stream.
+#   stdin  - newline-delimited JSON commands (see PROTOCOL.md), on
+#            Windows read by a dedicated thread (see PROTOCOL.md
+#            "Framing / stdin"), otherwise identical either platform
+#   stdout - newline-delimited JSON events (see PROTOCOL.md), interleaved
+#            with non-JSON noise (baresip's startup banner, some
+#            module-load log lines, and - only if CENT_BARESIP_ARGS
+#            includes -s - raw SIP trace) - see PROTOCOL.md "Framing" for
+#            the full why, and filter for lines starting with '{' if you
+#            need a strictly-JSON stream.
 #   stderr - baresip's own human-readable debug/info/warning log.
 #
 # Example:
