@@ -32,20 +32,22 @@ supported pairing — confirmed by baresip's own `CMakeLists.txt`, which
 directory, i.e. it expects exactly the `core/deps/re` next to
 `core/deps/baresip` layout used here).
 
-## 3. Apply the local patch
+## 3. Apply the local patches
 
 ```bash
 git apply --directory=core/deps/re core/patches/0001-re-configurable-sip-ws-path.patch
+git apply --directory=core/deps/re core/patches/0002-re-tls-fingerprint-pin.patch
 ```
 
-This is the **only** local modification to either submodule. It is kept
-as a patch file, applied on top of a clean pinned checkout, rather than as
-a dirty submodule commit — `core/deps/re` and `core/deps/baresip` stay at
-their exact pinned upstream tag in git (`git -C core/deps/re status` is
-clean after a fresh `submodule update`), so `git submodule update` always
-gives you real, verifiable upstream source, and the fix is a visible,
-reviewable diff. See "Findings" below for *why* this patch exists — it is
-not cosmetic, the WSS e2e test in step 6a does not pass without it.
+These are the **only** local modifications to either submodule. They are
+kept as patch files, applied on top of a clean pinned checkout, rather
+than as dirty submodule commits — `core/deps/re` and `core/deps/baresip`
+stay at their exact pinned upstream tag in git (`git -C core/deps/re
+status` is clean after a fresh `submodule update`), so `git submodule
+update` always gives you real, verifiable upstream source, and each fix
+is a visible, reviewable diff. See "Findings" below for *why* patch 0001
+exists (the WSS e2e test does not pass without it) and "TLS verification"
+below for patch 0002 (`CENT_TLS_PIN` cert pinning).
 
 ## 4. Build re, then baresip
 
@@ -246,12 +248,107 @@ listener, which serves a self-signed cert issued by an internal CA
 WSS TLS context (`uag.wss_tls`), independent of the plain-TLS-transport
 context.
 
-**TODO (cert pinning, not done in this spike)**: the v1 Electron app's
-settings already carry a `pinnedCertSha256` for this exact cert; a real F2
-implementation should pin that hash in the engine too (baresip's TLS
-layer supports `tls_add_cafile_path`, so pinning the CA rather than
-disabling verification entirely is realistic) instead of running with
-verification off indefinitely.
+### TLS leaf-certificate pinning (`CENT_TLS_PIN`)
+
+Implemented in F1 (`core/patches/0002-re-tls-fingerprint-pin.patch`,
+`core/deps/re/src/http/client.c`). Optional env var, checked right after
+the TLS handshake completes (`estab_handler()` in that file — confirmed
+by reading `core/deps/re/src/tls/openssl/tls_tcp.c` while implementing
+this: that handler only fires *after* `SSL_state(tc->ssl) == SSL_ST_OK`,
+i.e. handshake done, cert chain check already run):
+
+```bash
+CENT_TLS_PIN="$(python3 -c "import json;print(json.load(open('$HOME/Library/Application Support/Centinelo Phone/settings.json'))['pinnedCertSha256'][0])")" \
+CENT_EXT=1100 CENT_HOST=100.119.230.80 CENT_TRANSPORT=wss \
+CENT_SECRET="..." ./core/run-spike.sh
+```
+
+- Format matches the v1 Electron app's `settings.pinnedCertSha256`
+  entries: SHA256 of the leaf cert's DER bytes, hex, non-hex separators
+  (`:`, spaces, ...) tolerated and stripped. `tls_peer_fingerprint()`
+  (`re_tls.h`) computes the same digest baresip-side (`X509_digest()`
+  over the DER encoding) that `pemToDerSha256()` in `src/main/main.js`
+  computes on the Electron side — confirmed by reading both while
+  implementing this, not assumed.
+- **Independent of, and checked in addition to,** whatever
+  `sip_verify_server`/`tls_set_verify_server()` chain-of-trust
+  verification is otherwise configured — including when that's fully
+  disabled (`sip_verify_server no`, this spike's default for the
+  self-signed/internal-CA cert): `tls_set_verify_server()` no-ops
+  completely (doesn't even call `SSL_set_verify()`) when
+  `tls->verify_server` is false, so today *nothing else* checks the peer
+  cert for that case without `CENT_TLS_PIN`.
+- Unset (default): no-op, identical to pre-F1 behavior.
+- Mismatch: the connection is rejected before any SIP traffic is sent
+  over it (`try_next(conn, EAUTH)` in the patch) — surfaces as a normal
+  `reg_state` `"failed"` event with `reason` containing `"Authentication
+  error"`, not a crash or a hang. Verified live against the test PBX
+  with both a correct pin (registers normally) and a deliberately wrong
+  one (fails cleanly) — see `core/E2E-F1.md`.
+- Scope: one flat env var, checked for every secure connection this
+  engine's `http_client` makes — not host-keyed, not a list (unlike v1's
+  array-of-pins). Sufficient for this engine's actual one-PBX-host usage;
+  see `core/PROTOCOL.md` "Planned" for what a multi-host version would
+  need.
+
+## Unit tests (`cmd.c` / `dialog_info.c`)
+
+`core/modules/ctrl_json/test/` is a **standalone** CMake project (own
+`project()`, not part of baresip's own build tree — see that directory's
+`CMakeLists.txt` for why), covering the two pieces of `ctrl_json` that
+are pure/parseable without a running engine: JSON-command decoding
+(`cmd.c`) and dialog-info+xml parsing for BLF (`dialog_info.c`). Requires
+`core/deps/re` already built (step 4a above — links that exact
+`libre.a`, patches included, so what's tested matches what ships).
+
+```bash
+cmake -S core/modules/ctrl_json/test -B core/modules/ctrl_json/test/build \
+  -DCMAKE_BUILD_TYPE=Debug \
+  -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)"
+cmake --build core/modules/ctrl_json/test/build
+ctest --test-dir core/modules/ctrl_json/test/build --output-on-failure
+```
+
+With AddressSanitizer (`-DCENT_ASAN=ON`, same commands otherwise — this
+is what `.github/workflows/core-build.yml`'s macOS job runs): clean, 0
+findings, as of this version. Note: macOS's ASan build does **not**
+support `detect_leaks` (LeakSanitizer isn't available on Darwin) —
+`ASAN_OPTIONS=detect_leaks=1` will abort with "not supported on this
+platform" rather than silently ignoring it; leak checking on macOS is
+done separately, see "Memory safety" below.
+
+63 checks across both files as of this version, including one fixture
+that's the *real* dialog-info+xml body captured from the test PBX (see
+`core/E2E-F1.md` scenario c) — not just synthetic ones. Two real bugs
+were caught by these tests before any e2e run: the dialog-info parser
+originally conflated "well-formed idle" with "unparseable garbage" (both
+returned `idle`; fixed to require a `<dialog-info` root element before
+concluding idle, garbage now correctly falls into the `offline`/"can't
+tell" bucket), and a use-after-free in the `CENT_CMD_UNKNOWN` error path
+(read the just-freed decoded JSON object to build the error message —
+fixed by capturing the `cmd` string before freeing).
+
+## Memory safety
+
+No ASan run for the *full* engine (re+baresip+ctrl_json all built
+`-fsanitize=address` would be a much larger rebuild for marginal extra
+coverage beyond the unit tests above, which already ASan-cover every
+line ctrl_json.c added that's reachable without a live SIP stack).
+Instead, the live engine process was checked with macOS's `leaks` tool
+during real e2e runs against the test PBX, exercising every new command
+(including repeating the full set — blf subscribe/unsubscribe,
+register/unregister, hold/mute/dtmf, and the malformed/unknown-cmd error
+paths — 8 times over in one process lifetime to distinguish a possible
+per-call leak from a one-time allocation): consistently **1 leak, 1024
+bytes, identical after 1 rep and after 8 reps** — i.e. a fixed-size,
+one-time allocation (almost certainly re/baresip core init or OpenSSL's
+own static state, given it doesn't scale with repeated command
+traffic), not something introduced by this version's new code paths.
+`leaks` itself flags the process as "not debuggable" (this binary isn't
+signed with a `get-task-allow` entitlement), which limits it to
+read-only introspection and blocks a full allocation-site stack trace
+for that one block — the repeat-count comparison was the practical way
+to get confidence without that.
 
 ## Windows CI
 
@@ -259,22 +356,66 @@ verification off indefinitely.
 and `windows-latest`. The Windows job is marked
 `continue-on-error: true` (allowed to fail) and its build log is uploaded
 as an artifact either way — see that workflow file for the exact commands
-(same submodule + patch + CMake sequence as above, with
-`-DSTATIC=ON` since baresip's own `CMakeLists.txt` defaults `STATIC` to
-`ON` on `WIN32`, and MSVC-appropriate generator flags). This spike did not
-have a Windows machine to validate the job locally before pushing; its
-actual pass/fail state on `windows-latest` is unverified as of this
-commit — that is the literal, explicit ask in task step 8 ("Windows may
-legitimately fail at this stage"). Known likely Windows risk points, for
-whoever picks this up: `getopt`/POSIX bits `re`/`baresip` conditionally
-compile around (both project support Windows upstream, so this is a
-tooling/generator question more than a source-portability one),
-`unistd.h`/`read()`/`STDIN_FILENO` in `ctrl_json.c` (POSIX-only — a real
-Windows build of `ctrl_json` needs a `ReadFile`/`_read` + fd_listen (or
-equivalent) path; **not implemented in this v0** — flagged as a
-Windows-specific follow-up, not covered by the `CENT_WS_PATH` patch or
-anything else in this spike), and whether `EXPORT_SYM`
+(same submodule + both patches + CMake sequence as above).
+
+**F1 status**: `ctrl_json.c`'s stdin path — the specific, previously-
+flagged Windows blocker (`unistd.h`/`read()`/`STDIN_FILENO`, POSIX-only)
+— now has a `_WIN32`-gated implementation (reader thread + `fgets()` +
+`re_mqueue.h`, see `core/PROTOCOL.md` "Framing / stdin" for the full
+design and rationale). No Windows machine was available to run this
+engine on real Windows hardware, so this is **compile-verified via CI
+only, not run-verified**; `continue-on-error` stays `true` until an
+actual green `windows-latest` run is confirmed (check the Actions run
+for this push before flipping it — do not flip it on the strength of
+local reasoning alone).
+
+Before pushing, the `_WIN32` branch was also sanity-checked locally with
+a forced-macro syntax-only compile (no real MSVC available, but this
+still parses the exact same C source with clang, catching real mistakes
+in code that otherwise never gets compiled at all on a non-Windows dev
+machine):
+
+```bash
+clang -fsyntax-only -D_WIN32 -Wall -Wextra \
+  -I core/deps/re/include -I core/deps/baresip/include \
+  core/modules/ctrl_json/ctrl_json.c
+```
+
+This caught two real bugs before they ever reached CI: a missing
+`#include <stdlib.h>` (the `_WIN32` path's `malloc`/`free` calls were
+implicitly declared, undetectable on the POSIX build since that path
+never compiles `_WIN32`'s code at all), and `process_inbuf()` — written
+as "shared" between both stdin paths — turned out to be POSIX-only in
+practice (`fgets()` on the Windows side already delivers whole lines, so
+it never calls the shared buffer-splitting helper), flagged as an
+unused-function warning; fixed by scoping it under the same `#ifndef
+_WIN32` as its only real caller and correcting the stale "shared"
+comment. Neither of these would show up in the macOS job at all — worth
+re-running this check after any future change to `ctrl_json.c`'s
+`_WIN32` block, not just relying on the Windows CI job's own (slower,
+`continue-on-error`) feedback loop.
+
+There's also a real, deliberate memory-safety design point in that
+`_WIN32` code worth flagging for review: the reader thread is never
+`thrd_join()`'d (risk of blocking shutdown indefinitely if it's still
+parked in `fgets()`), so it must never touch anything the main thread
+might free first. It's built to take its own `mem_ref()`'d reference to
+just the `mqueue` object (not the whole `ctrl_st`) precisely so a
+concurrent teardown on the main thread can never race it into a
+use-after-free — see the block comment above `stdin_thread_main()` in
+`ctrl_json.c` for the full reasoning; this shape only exists because an
+earlier draft got this wrong (thread held a raw, unrefcounted `ctrl_st*`)
+and the syntax-check pass above doesn't catch use-after-free bugs, only
+compile errors — this one was caught by re-reading the code, not
+tooling.
+
+Two risk points flagged in the previous version
+of this doc remain genuinely open (unrelated to the stdin fix, not
+addressed this version, still real per-item risk):
+`getopt`/POSIX bits `re`/`baresip` conditionally compile around (both
+projects support Windows upstream, so this is a tooling/generator
+question more than a source-portability one), and whether `EXPORT_SYM`
 (`__declspec(dllexport)`, see `core/deps/re/include/re_mod.h`) is
 sufficient by itself for `ctrl_json.dll`'s `exports` symbol to be
-discoverable via baresip's Windows module loader (`core/deps/baresip/src/mod/...`)
-without also needing a `.def` file — unverified here.
+discoverable via baresip's Windows module loader
+(`core/deps/baresip/src/mod/...`) without also needing a `.def` file.

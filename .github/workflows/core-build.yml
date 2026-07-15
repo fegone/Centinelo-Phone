@@ -28,8 +28,10 @@ jobs:
       - name: Install toolchain
         run: brew install cmake openssl
 
-      - name: Apply local re patch
-        run: git apply --directory=core/deps/re core/patches/0001-re-configurable-sip-ws-path.patch
+      - name: Apply local re patches
+        run: |
+          git apply --directory=core/deps/re core/patches/0001-re-configurable-sip-ws-path.patch
+          git apply --directory=core/deps/re core/patches/0002-re-tls-fingerprint-pin.patch
 
       - name: Configure + build libre
         run: |
@@ -54,16 +56,30 @@ jobs:
           test -e core/deps/baresip/build/ctrl_json.so
           core/deps/baresip/build/baresip -h
 
+      - name: Configure + build + run ctrl_json unit tests (ASan)
+        # Standalone project (core/modules/ctrl_json/test/), not part of
+        # baresip's own CMake tree - see that dir's CMakeLists.txt for
+        # why. Links the just-built core/deps/re/build/libre.a, so this
+        # step must run after "Configure + build libre" above.
+        run: |
+          cmake -S core/modules/ctrl_json/test -B core/modules/ctrl_json/test/build \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DOPENSSL_ROOT_DIR="$(brew --prefix openssl)" \
+            -DCENT_ASAN=ON
+          cmake --build core/modules/ctrl_json/test/build
+          ctest --test-dir core/modules/ctrl_json/test/build --output-on-failure
+
   windows:
     name: Windows (experimental, allowed to fail)
     runs-on: windows-latest
-    # See core/BUILD.md "Windows CI" - not validated locally before this
-    # branch was pushed. ctrl_json.c uses POSIX unistd.h/read()/
-    # STDIN_FILENO, which MSVC does not ship - that piece is expected to
-    # need a Windows-specific stdin path (ReadFile/_read) before this
-    # job can go green. re/baresip themselves do support Windows
-    # upstream, so a partial pass (re + baresip build, ctrl_json fails)
-    # is a plausible, informative outcome, not just an all-or-nothing one.
+    # See core/BUILD.md "Windows CI". F1 replaced ctrl_json.c's stdin
+    # path with a _WIN32-gated thread+fgets+mqueue implementation (no
+    # more unistd.h/STDIN_FILENO/read() on that platform - see
+    # ctrl_json.c's "stdin - Windows" section) specifically so this job
+    # can compile; unverified on real Windows hardware (none available
+    # to run this from) until this actual CI run's result is checked -
+    # continue-on-error stays on until a run is confirmed green, per
+    # core/BUILD.md.
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
@@ -73,9 +89,11 @@ jobs:
       - name: Install OpenSSL (Chocolatey, preinstalled on windows-latest)
         run: choco install openssl -y --no-progress
 
-      - name: Apply local re patch
+      - name: Apply local re patches
         shell: bash
-        run: git apply --directory=core/deps/re core/patches/0001-re-configurable-sip-ws-path.patch
+        run: |
+          git apply --directory=core/deps/re core/patches/0001-re-configurable-sip-ws-path.patch
+          git apply --directory=core/deps/re core/patches/0002-re-tls-fingerprint-pin.patch
 
       - name: Configure + build libre
         shell: bash
