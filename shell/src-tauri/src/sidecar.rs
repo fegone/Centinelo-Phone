@@ -1,0 +1,597 @@
+//! Sidecar process supervisor: spawns `core/`'s baresip+ctrl_json binary,
+//! speaks its newline-delimited-JSON protocol (see core/PROTOCOL.md) over
+//! stdio, forwards events to the frontend as Tauri events, and restarts the
+//! process with exponential backoff (capped at 5 tries) if it dies
+//! unexpectedly.
+//!
+//! Config generation (the `accounts`/`config` scratch files) mirrors
+//! `core/run-spike.sh` exactly - see that script's comments for *why* each
+//! line is there (module order, `outbound=`, `mediaenc=dtls_srtp`, etc).
+//! The one deliberate difference: `run-spike.sh` is a human-facing dev
+//! tool that reads CENT_* env vars; here the equivalent values come from
+//! `SettingsStore` (the account the operator configured in Settings), and
+//! the SIP secret is written *only* into that ephemeral, mode-0600,
+//! delete-on-stop scratch `accounts` file - the same sanctioned exception
+//! `run-spike.sh` itself documents - never anywhere else.
+
+use crate::settings::{AccountSettings, SettingsStore, TransportPriority};
+use serde::Serialize;
+use serde_json::Value;
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tauri::{AppHandle, Emitter};
+
+pub const MAX_ATTEMPTS: u32 = 5;
+const POLL_TICK: Duration = Duration::from_millis(120);
+const STOP_GRACE: Duration = Duration::from_secs(3);
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum StatusPayload {
+    /// No account configured yet, or explicitly stopped and never restarted.
+    Idle,
+    Starting,
+    Running,
+    Restarting {
+        attempt: u32,
+        max_attempts: u32,
+        delay_secs: u64,
+    },
+    Stopped,
+    Failed {
+        message: String,
+    },
+}
+
+const EVENT_STATUS: &str = "sidecar-status";
+const EVENT_LINE: &str = "sidecar-event";
+
+enum ControlSignal {
+    None,
+    Stop,
+    RestartNow,
+}
+
+struct Shared {
+    app: AppHandle,
+    settings: Arc<SettingsStore>,
+    stdin: Mutex<Option<std::process::ChildStdin>>,
+    control: Mutex<ControlSignal>,
+    thread_alive: Mutex<bool>,
+    attempts: AtomicU32,
+    exited_flag: AtomicBool,
+    current_pid: Mutex<Option<u32>>,
+    /// Set once per "session" (from start()/restart() to the next explicit
+    /// restart) so the wss->udp auto fallback only fires once, not in a loop.
+    auto_fallback_used: AtomicBool,
+    pending_transport_override: Mutex<Option<&'static str>>,
+    last_status: Mutex<StatusPayload>,
+}
+
+#[derive(Clone)]
+pub struct SidecarHandle(Arc<Shared>);
+
+impl SidecarHandle {
+    pub fn new(app: AppHandle, settings: Arc<SettingsStore>) -> Self {
+        Self(Arc::new(Shared {
+            app,
+            settings,
+            stdin: Mutex::new(None),
+            control: Mutex::new(ControlSignal::None),
+            thread_alive: Mutex::new(false),
+            attempts: AtomicU32::new(0),
+            exited_flag: AtomicBool::new(true),
+            current_pid: Mutex::new(None),
+            auto_fallback_used: AtomicBool::new(false),
+            pending_transport_override: Mutex::new(None),
+            last_status: Mutex::new(StatusPayload::Idle),
+        }))
+    }
+
+    /// Last known status, for the frontend's initial paint (before its event
+    /// listener would otherwise catch the next transition).
+    pub fn status(&self) -> StatusPayload {
+        self.0.last_status.lock().expect("poisoned").clone()
+    }
+
+    /// Start supervision if it isn't already running. No-op if a supervisor
+    /// thread is already alive (use `restart_now` to force a respawn).
+    pub fn start(&self) {
+        let mut alive = self.0.thread_alive.lock().expect("poisoned");
+        if *alive {
+            return;
+        }
+        *alive = true;
+        drop(alive);
+
+        self.0.auto_fallback_used.store(false, Ordering::SeqCst);
+        *self.0.pending_transport_override.lock().expect("poisoned") = None;
+        self.0.attempts.store(0, Ordering::SeqCst);
+        *self.0.control.lock().expect("poisoned") = ControlSignal::None;
+
+        let shared = self.0.clone();
+        std::thread::spawn(move || supervisor_loop(shared));
+    }
+
+    /// Force an immediate respawn: used after saving new account settings,
+    /// the UI's manual "retry" action, and internally by the wss->udp auto
+    /// fallback. Does not count against the crash-backoff budget.
+    pub fn restart_now(&self) {
+        *self.0.control.lock().expect("poisoned") = ControlSignal::RestartNow;
+        self.close_stdin();
+        if *self.0.thread_alive.lock().expect("poisoned") {
+            self.arm_force_kill_watchdog();
+        } else {
+            // Supervisor thread already exited (terminal Failed/Stopped) -
+            // nothing to interrupt, just start a fresh one.
+            self.start();
+        }
+    }
+
+    /// Graceful shutdown - used when the whole app is exiting. Closing
+    /// stdin is enough in the common case: ctrl_json treats stdin EOF as an
+    /// implicit `quit` (core/PROTOCOL.md), so the child exits on its own
+    /// and the supervisor thread sees `stop_requested` and does not
+    /// respawn. The watchdog force-kills after a grace period if the child
+    /// doesn't cooperate (e.g. truly hung).
+    pub fn stop(&self) {
+        *self.0.control.lock().expect("poisoned") = ControlSignal::Stop;
+        self.close_stdin();
+        self.arm_force_kill_watchdog();
+    }
+
+    fn close_stdin(&self) {
+        // Dropping the ChildStdin closes the write end of the pipe.
+        let _ = self.0.stdin.lock().expect("poisoned").take();
+    }
+
+    fn arm_force_kill_watchdog(&self) {
+        self.0.exited_flag.store(false, Ordering::SeqCst);
+        let shared = self.0.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(STOP_GRACE);
+            if !shared.exited_flag.load(Ordering::SeqCst) {
+                if let Some(pid) = *shared.current_pid.lock().expect("poisoned") {
+                    log::warn!("sidecar: pid {pid} did not exit within {STOP_GRACE:?}, force-killing");
+                    force_kill(pid);
+                }
+            }
+        });
+    }
+
+    /// Send a command line to the running sidecar's stdin. Returns Err if
+    /// the sidecar isn't currently running.
+    pub fn send_cmd(&self, value: Value) -> Result<(), String> {
+        let mut guard = self.0.stdin.lock().expect("poisoned");
+        match guard.as_mut() {
+            Some(stdin) => {
+                let mut line = serde_json::to_string(&value).map_err(|e| e.to_string())?;
+                line.push('\n');
+                stdin.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
+                stdin.flush().map_err(|e| e.to_string())
+            }
+            None => Err("Not connected to the phone system yet.".to_string()),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn force_kill(pid: u32) {
+    let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+}
+#[cfg(windows)]
+fn force_kill(pid: u32) {
+    let _ = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/F"])
+        .status();
+}
+
+fn supervisor_loop(shared: Arc<Shared>) {
+    loop {
+        // --- resolve config for this attempt -------------------------------
+        let account = shared.settings.snapshot().account;
+        if !account.is_configured() {
+            shared.emit_status_from_thread(StatusPayload::Idle);
+            *shared.thread_alive.lock().expect("poisoned") = false;
+            return;
+        }
+
+        let transport = choose_transport(&account, &shared);
+        let plan = match SpawnPlan::build(&shared.settings, &account, transport) {
+            Ok(p) => p,
+            Err(e) => {
+                let attempt = shared.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                if !wait_out_backoff_or_stop(&shared, attempt) {
+                    return; // stop requested during backoff
+                }
+                shared.emit_status_from_thread(StatusPayload::Failed {
+                    message: e.clone(),
+                });
+                if attempt >= MAX_ATTEMPTS {
+                    *shared.thread_alive.lock().expect("poisoned") = false;
+                    return;
+                }
+                continue;
+            }
+        };
+
+        shared.emit_status_from_thread(StatusPayload::Starting);
+
+        let mut child = match Command::new(&plan.binary)
+            .arg("-f")
+            .arg(&plan.scratch_dir)
+            .env("CENT_WS_PATH", &plan.ws_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&plan.scratch_dir);
+                let attempt = shared.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                shared.emit_status_from_thread(StatusPayload::Failed {
+                    message: format!("Couldn't start the core engine ({e}). Check the binary path in Settings > Advanced."),
+                });
+                if attempt >= MAX_ATTEMPTS || !wait_out_backoff_or_stop(&shared, attempt) {
+                    *shared.thread_alive.lock().expect("poisoned") = false;
+                    return;
+                }
+                continue;
+            }
+        };
+
+        *shared.current_pid.lock().expect("poisoned") = child.id().into();
+        shared.exited_flag.store(false, Ordering::SeqCst);
+
+        let stdin = child.stdin.take();
+        *shared.stdin.lock().expect("poisoned") = stdin;
+        let stdout = child.stdout.take().expect("piped");
+        let stderr = child.stderr.take().expect("piped");
+
+        let recent_stderr = Arc::new(Mutex::new(Vec::<String>::new()));
+        spawn_stderr_drain(stderr, recent_stderr.clone());
+        spawn_stdout_reader(shared.clone(), stdout, transport, account.transport_priority);
+
+        // Blocking wait - unblocks on natural exit/crash, or promptly after
+        // stop()/restart_now() close stdin (ctrl_json quits on stdin EOF).
+        let exit = wait_child(&mut child);
+        shared.exited_flag.store(true, Ordering::SeqCst);
+        *shared.stdin.lock().expect("poisoned") = None;
+        *shared.current_pid.lock().expect("poisoned") = None;
+        let _ = std::fs::remove_dir_all(&plan.scratch_dir);
+
+        let signal = std::mem::replace(&mut *shared.control.lock().expect("poisoned"), ControlSignal::None);
+        match signal {
+            ControlSignal::Stop => {
+                shared.emit_status_from_thread(StatusPayload::Stopped);
+                *shared.thread_alive.lock().expect("poisoned") = false;
+                return;
+            }
+            ControlSignal::RestartNow => {
+                // Intentional respawn (settings change / manual retry /
+                // auto transport fallback) - not a crash, no backoff.
+                continue;
+            }
+            ControlSignal::None => {
+                // Unexpected exit.
+                let attempt = shared.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                let tail = recent_stderr
+                    .lock()
+                    .map(|v| v.join(" | "))
+                    .unwrap_or_default();
+                let exit_desc = exit
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "unknown".into());
+                log::warn!("sidecar exited unexpectedly ({exit_desc}); attempt {attempt}/{MAX_ATTEMPTS}; stderr tail: {tail}");
+                if attempt >= MAX_ATTEMPTS {
+                    shared.emit_status_from_thread(StatusPayload::Failed {
+                        message: format!(
+                            "The core engine crashed {MAX_ATTEMPTS} times in a row and Centinelo stopped retrying. Last exit: {exit_desc}."
+                        ),
+                    });
+                    *shared.thread_alive.lock().expect("poisoned") = false;
+                    return;
+                }
+                if !wait_out_backoff_or_stop(&shared, attempt) {
+                    return;
+                }
+                continue;
+            }
+        }
+    }
+}
+
+impl Shared {
+    fn emit_status_from_thread(self: &Arc<Self>, payload: StatusPayload) {
+        *self.last_status.lock().expect("poisoned") = payload.clone();
+        let _ = self.app.emit(EVENT_STATUS, payload);
+    }
+}
+
+/// Sleeps in small increments up to the exponential backoff delay for
+/// `attempt` (1s, 2s, 4s, 8s, 16s), checking every tick whether a manual
+/// stop/restart came in so a human doesn't have to wait out a long delay.
+/// Returns false if a Stop was observed (caller should terminate).
+fn wait_out_backoff_or_stop(shared: &Arc<Shared>, attempt: u32) -> bool {
+    let delay_secs: u64 = 1 << (attempt.saturating_sub(1)).min(4); // 1,2,4,8,16
+    shared.emit_status_from_thread(StatusPayload::Restarting {
+        attempt,
+        max_attempts: MAX_ATTEMPTS,
+        delay_secs,
+    });
+    let ticks = (Duration::from_secs(delay_secs).as_millis() / POLL_TICK.as_millis()).max(1);
+    for _ in 0..ticks {
+        std::thread::sleep(POLL_TICK);
+        match &*shared.control.lock().expect("poisoned") {
+            ControlSignal::Stop => return false,
+            ControlSignal::RestartNow => return true, // stop waiting, respawn now
+            ControlSignal::None => {}
+        }
+    }
+    true
+}
+
+fn wait_child(child: &mut Child) -> Option<std::process::ExitStatus> {
+    child.wait().ok()
+}
+
+fn choose_transport(account: &AccountSettings, shared: &Arc<Shared>) -> &'static str {
+    if let Some(t) = *shared.pending_transport_override.lock().expect("poisoned") {
+        return t;
+    }
+    match account.transport_priority {
+        TransportPriority::Wss => "wss",
+        TransportPriority::Classic => "udp",
+        TransportPriority::Auto => "wss",
+    }
+}
+
+fn spawn_stderr_drain(stderr: std::process::ChildStderr, sink: Arc<Mutex<Vec<String>>>) {
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for line in reader.lines().map_while(Result::ok) {
+            log::debug!("core: {line}");
+            if let Ok(mut buf) = sink.lock() {
+                buf.push(line);
+                if buf.len() > 20 {
+                    buf.remove(0);
+                }
+            }
+        }
+    });
+}
+
+fn spawn_stdout_reader(
+    shared: Arc<Shared>,
+    stdout: std::process::ChildStdout,
+    transport_this_attempt: &'static str,
+    priority: TransportPriority,
+) {
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        let mut registered_once = false;
+        for line in reader.lines().map_while(Result::ok) {
+            let trimmed = line.trim_start();
+            if !trimmed.starts_with('{') {
+                continue; // baresip's own human-readable log noise, see PROTOCOL.md "Framing"
+            }
+            let value: Value = match serde_json::from_str(trimmed) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            // Evidence trail: every ctrl_json event line, verbatim, at INFO
+            // so `shell/E2E.md` can cite real captured output (see PROTOCOL.md
+            // "v0 events" - this mirrors how core/BUILD.md's own testing
+            // narrative captured stdout with `grep '^{'`).
+            log::info!("sidecar event: {value}");
+            let event_name = value.get("event").and_then(Value::as_str).unwrap_or("");
+
+            if event_name == "ready" {
+                shared.attempts.store(0, Ordering::SeqCst);
+                shared.emit_status_from_thread(StatusPayload::Running);
+            } else if event_name == "reg_state" {
+                let state = value.get("state").and_then(Value::as_str).unwrap_or("");
+                if state == "registered" {
+                    registered_once = true;
+                } else if state == "failed"
+                    && !registered_once
+                    && priority == TransportPriority::Auto
+                    && transport_this_attempt == "wss"
+                    && !shared.auto_fallback_used.swap(true, Ordering::SeqCst)
+                {
+                    log::info!("sidecar: wss registration failed, falling back to classic udp (auto transport)");
+                    *shared.pending_transport_override.lock().expect("poisoned") = Some("udp");
+                    *shared.control.lock().expect("poisoned") = ControlSignal::RestartNow;
+                    // Close stdin from here too, in case the owning thread's
+                    // wait() is what's blocking (same trick as restart_now()).
+                    let _ = shared.stdin.lock().expect("poisoned").take();
+                }
+            }
+
+            let _ = shared.app.emit(EVENT_LINE, value);
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Spawn plan / scratch config generation (Rust port of core/run-spike.sh)
+// ---------------------------------------------------------------------------
+
+struct SpawnPlan {
+    binary: PathBuf,
+    scratch_dir: PathBuf,
+    ws_path: String,
+}
+
+impl SpawnPlan {
+    fn build(
+        settings: &Arc<SettingsStore>,
+        account: &AccountSettings,
+        transport: &str,
+    ) -> Result<Self, String> {
+        let binary = resolve_core_binary(settings)?;
+        let module_path = binary
+            .parent()
+            .ok_or_else(|| "Core binary path has no parent directory".to_string())?
+            .to_path_buf();
+
+        let scratch_dir = std::env::temp_dir().join(format!(
+            "centinelo-shell.{}.{}",
+            std::process::id(),
+            nanos_suffix()
+        ));
+        std::fs::create_dir_all(&scratch_dir).map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&scratch_dir, std::fs::Permissions::from_mode(0o700));
+        }
+
+        let port = default_port_for(transport);
+        let ws_path = "/ws".to_string();
+
+        write_accounts_file(&scratch_dir, account, transport, port)?;
+        write_config_file(&scratch_dir, &module_path, transport)?;
+
+        Ok(Self {
+            binary,
+            scratch_dir,
+            ws_path,
+        })
+    }
+}
+
+fn default_port_for(transport: &str) -> u16 {
+    match transport {
+        "wss" => 8089,
+        "tls" => 5061,
+        _ => 5060, // tcp | udp
+    }
+}
+
+fn nanos_suffix() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+}
+
+fn write_accounts_file(
+    scratch_dir: &Path,
+    account: &AccountSettings,
+    transport: &str,
+    port: u16,
+) -> Result<(), String> {
+    // Mirrors run-spike.sh's ACCOUNT_URI/ACCOUNT_PARAMS exactly - see that
+    // script for why each param is required (webrtc=yes on the endpoint
+    // forces dtls_srtp/ice regardless of signaling transport; `outbound=`
+    // pins the route so a bare `dial sip:ext@host` reuses the registered
+    // transport instead of re-resolving to the wss/tls well-known port).
+    let host = &account.host;
+    let ext = &account.ext;
+    let secret = &account.secret;
+    let uri = format!("<sip:{ext}@{host}:{port};transport={transport}>");
+    let params = format!(
+        ";auth_pass={secret};mediaenc=dtls_srtp;medianat=ice;rtcp_mux=yes;audio_codecs=pcmu,pcma;regint=120;outbound=\"sip:{host}:{port};transport={transport}\""
+    );
+    let contents = format!("{uri}{params}\n");
+    write_private_file(&scratch_dir.join("accounts"), contents.as_bytes())
+}
+
+fn write_config_file(scratch_dir: &Path, module_path: &Path, transport: &str) -> Result<(), String> {
+    let _ = transport; // media requirements are unconditional, see run-spike.sh
+    let module_path_str = module_path.display();
+    let scratch_str = scratch_dir.display();
+    let contents = format!(
+        "# Generated by Centinelo Phone shell - do not edit by hand, do not commit.\n\n\
+module_path\t\t{module_path_str}\n\n\
+module\t\t\tg711.so\n\
+module\t\t\tauconv.so\n\
+module\t\t\tauresamp.so\n\
+module\t\t\tausine.so\n\
+module\t\t\taufile.so\n\
+module\t\t\tice.so\n\
+module\t\t\tdtls_srtp.so\n\
+module\t\t\tmenu.so\n\
+module\t\t\taccount.so\n\
+module_app\t\tctrl_json.so\n\n\
+sip_verify_server\tno\n\n\
+audio_source\t\tausine,440\n\
+audio_player\t\taufile,{scratch_str}/rx.wav\n\
+audio_alert\t\taufile,{scratch_str}/rx.wav\n\n\
+rtp_timeout\t\t0\n"
+    );
+    std::fs::write(scratch_dir.join("config"), contents).map_err(|e| e.to_string())
+}
+
+#[cfg(unix)]
+fn write_private_file(path: &Path, contents: &[u8]) -> Result<(), String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| e.to_string())?;
+    f.write_all(contents).map_err(|e| e.to_string())
+}
+#[cfg(not(unix))]
+fn write_private_file(path: &Path, contents: &[u8]) -> Result<(), String> {
+    std::fs::write(path, contents).map_err(|e| e.to_string())
+}
+
+/// Resolves the core binary: explicit setting override first, then
+/// `CENTINELO_CORE_BIN` env var, then a walk-up search from the current
+/// working directory and the running executable's directory for
+/// `core/deps/baresip/build/baresip` - matches this repo's dev layout
+/// (`shell/` next to `core/`) without hardcoding an absolute path.
+pub fn resolve_core_binary(settings: &Arc<SettingsStore>) -> Result<PathBuf, String> {
+    if let Some(p) = settings.snapshot().core_binary_path {
+        let pb = PathBuf::from(&p);
+        return if pb.is_file() {
+            Ok(pb)
+        } else {
+            Err(format!("Configured core binary path does not exist: {p}"))
+        };
+    }
+    if let Some(p) = default_core_binary_path() {
+        return Ok(p);
+    }
+    Err("Core engine binary not found. Build core/ per core/BUILD.md, or set its path in Settings > Advanced.".to_string())
+}
+
+pub fn default_core_binary_path() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("CENTINELO_CORE_BIN") {
+        let pb = PathBuf::from(&p);
+        if pb.is_file() {
+            return Some(pb);
+        }
+    }
+    let bin_name = if cfg!(windows) { "baresip.exe" } else { "baresip" };
+    let roots = [
+        std::env::current_dir().ok(),
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|p| p.to_path_buf())),
+    ];
+    for root in roots.into_iter().flatten() {
+        let mut dir = root.as_path();
+        for _ in 0..10 {
+            let candidate = dir.join("core/deps/baresip/build").join(bin_name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+            match dir.parent() {
+                Some(p) => dir = p,
+                None => break,
+            }
+        }
+    }
+    None
+}

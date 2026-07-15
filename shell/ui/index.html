@@ -1,0 +1,260 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:">
+<title>Centinelo Phone</title>
+<link rel="stylesheet" href="css/tokens.css">
+<link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+<div class="app" id="app">
+
+  <!-- ================= titlebar ================= -->
+  <div class="titlebar" data-tauri-drag-region>
+    <div class="brand" aria-label="Centinelo — watching, line healthy">
+      <svg width="17" height="17" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <path d="M19.4 6.8A9 9 0 1 0 21 12" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/>
+        <circle class="dot" id="watchlamp-dot" cx="12" cy="12" r="3.1" fill="var(--amber-fill)"/>
+      </svg>
+      <b>Centinelo</b>
+    </div>
+    <span class="state" id="titlebar-state">Starting…</span>
+    <div class="winbtns">
+      <button class="wbtn" id="btn-settings" aria-label="Settings">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M4 7h10M18 7h2M4 12h4M12 12h8M4 17h13"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="19" cy="17" r="2"/></svg>
+      </button>
+      <button class="wbtn" id="btn-minimize" aria-label="Minimize"><svg width="10" height="10" viewBox="0 0 10 10"><path d="M1 5h8" stroke="currentColor" stroke-width="1.2"/></svg></button>
+      <button class="wbtn close" id="btn-close" aria-label="Close"><svg width="10" height="10" viewBox="0 0 10 10"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7" stroke="currentColor" stroke-width="1.2"/></svg></button>
+    </div>
+  </div>
+
+  <!-- ================= main (idle / dial) ================= -->
+  <div class="body" id="screen-main">
+
+    <div id="banner-slot"></div>
+
+    <!-- shown only when no SIP account has been configured yet -->
+    <div class="setup-prompt" id="setup-prompt" hidden>
+      <b>Connect your phone system</b>
+      <p>Add your extension in Settings to register with your phone system and start making calls.</p>
+      <button class="primary" id="setup-open-settings">Open Settings</button>
+    </div>
+
+    <div id="configured-area" hidden>
+      <section class="me" aria-label="Your account">
+        <span class="medal" id="me-medal">--</span>
+        <div class="who">
+          <b id="me-name">—</b>
+          <span class="plate" id="me-plate">EXT — </span>
+        </div>
+        <span class="pill" id="reg-pill" title="Registration status">
+          <span class="dot" aria-hidden="true"></span><span id="reg-pill-transport">—</span><em id="reg-pill-detail"></em>
+        </span>
+      </section>
+
+      <div class="display" aria-label="Number to dial">
+        <span class="num" id="dial-num"></span><span class="caret" aria-hidden="true"></span>
+        <button class="back" id="btn-backspace" aria-label="Delete last digit">
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M8.5 5h10A1.5 1.5 0 0 1 20 6.5v11a1.5 1.5 0 0 1-1.5 1.5h-10L3 12l5.5-7z"/><path d="M11.5 9.5l5 5M16.5 9.5l-5 5"/></svg>
+        </button>
+      </div>
+
+      <div class="pad" role="group" aria-label="Dial pad" id="dialpad">
+        <button class="key" data-digit="1"><b>1</b><span>&nbsp;</span></button>
+        <button class="key" data-digit="2"><b>2</b><span>ABC</span></button>
+        <button class="key" data-digit="3"><b>3</b><span>DEF</span></button>
+        <button class="key" data-digit="4"><b>4</b><span>GHI</span></button>
+        <button class="key" data-digit="5"><b>5</b><span>JKL</span></button>
+        <button class="key" data-digit="6"><b>6</b><span>MNO</span></button>
+        <button class="key" data-digit="7"><b>7</b><span>PQRS</span></button>
+        <button class="key" data-digit="8"><b>8</b><span>TUV</span></button>
+        <button class="key" data-digit="9"><b>9</b><span>WXYZ</span></button>
+        <button class="key" data-digit="*"><b>*</b><span>&nbsp;</span></button>
+        <button class="key" data-digit="0"><b>0</b><span>+</span></button>
+        <button class="key" data-digit="#"><b>#</b><span>&nbsp;</span></button>
+      </div>
+
+      <div class="callrow">
+        <button class="callbtn" id="btn-call" aria-label="Call">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6.8 10.6a13.8 13.8 0 0 0 6.6 6.6l2-2c.33-.33.8-.44 1.24-.3 1 .33 2.03.5 3.06.5.7 0 1.3.57 1.3 1.28v2.58c0 .7-.6 1.28-1.3 1.28C11 20.5 3.5 13 3.5 4.3c0-.7.58-1.3 1.28-1.3h2.58c.71 0 1.28.6 1.28 1.3 0 1.03.17 2.06.5 3.06.14.44.03.9-.3 1.24l-2.04 2z"/></svg>
+        </button>
+      </div>
+
+      <div class="sect">
+        <h2>Favorites</h2>
+      </div>
+      <div class="favs" role="group" aria-label="Favorites" id="favorites-grid"></div>
+
+      <div class="sect"><h2>Recent</h2></div>
+      <div class="recents" aria-label="Recent calls" id="recents-list"></div>
+    </div>
+
+    <!-- ================= call overlay: incoming / ringing-out / established ================= -->
+    <div class="call-overlay" id="call-overlay" hidden>
+      <div class="caller">
+        <span class="medal" id="call-medal">--<span class="lamp" id="call-lamp" aria-hidden="true"></span></span>
+        <div class="who">
+          <b id="call-peer-name">—</b>
+          <span class="num" id="call-peer-uri"></span>
+          <span class="via" id="call-via"></span>
+        </div>
+      </div>
+
+      <div class="timerblock">
+        <div class="ringing-label" id="ringing-label" hidden><span class="rdot" aria-hidden="true"></span><span id="ringing-label-text">Ringing…</span></div>
+        <div class="timer" id="call-timer" aria-live="polite" hidden>00:00</div>
+      </div>
+
+      <div class="foot">
+        <div class="secure">
+          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>
+          Encrypted call
+        </div>
+        <div class="call-actions" id="call-actions-incoming" hidden>
+          <button class="declinebtn" id="btn-decline">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><g transform="rotate(135 12 12)"><path d="M6.8 10.6a13.8 13.8 0 0 0 6.6 6.6l2-2c.33-.33.8-.44 1.24-.3 1 .33 2.03.5 3.06.5.7 0 1.3.57 1.3 1.28v2.58c0 .7-.6 1.28-1.3 1.28C11 20.5 3.5 13 3.5 4.3c0-.7.58-1.3 1.28-1.3h2.58c.71 0 1.28.6 1.28 1.3 0 1.03.17 2.06.5 3.06.14.44.03.9-.3 1.24l-2.04 2z"/></g></svg>
+            Decline
+          </button>
+          <button class="answerbtn" id="btn-answer">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6.8 10.6a13.8 13.8 0 0 0 6.6 6.6l2-2c.33-.33.8-.44 1.24-.3 1 .33 2.03.5 3.06.5.7 0 1.3.57 1.3 1.28v2.58c0 .7-.6 1.28-1.3 1.28C11 20.5 3.5 13 3.5 4.3c0-.7.58-1.3 1.28-1.3h2.58c.71 0 1.28.6 1.28 1.3 0 1.03.17 2.06.5 3.06.14.44.03.9-.3 1.24l-2.04 2z"/></svg>
+            Answer
+          </button>
+        </div>
+        <button class="endbtn" id="btn-hangup" hidden>
+          <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><g transform="rotate(135 12 12)"><path d="M6.8 10.6a13.8 13.8 0 0 0 6.6 6.6l2-2c.33-.33.8-.44 1.24-.3 1 .33 2.03.5 3.06.5.7 0 1.3.57 1.3 1.28v2.58c0 .7-.6 1.28-1.3 1.28C11 20.5 3.5 13 3.5 4.3c0-.7.58-1.3 1.28-1.3h2.58c.71 0 1.28.6 1.28 1.3 0 1.03.17 2.06.5 3.06.14.44.03.9-.3 1.24l-2.04 2z"/></g></svg>
+          End call
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ================= settings ================= -->
+  <div class="settings-screen" id="screen-settings" hidden>
+    <div class="settings-header" data-tauri-drag-region>
+      <button class="back" id="settings-back" aria-label="Back">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 6l-6 6 6 6"/></svg>
+      </button>
+      <h1>Settings</h1>
+    </div>
+
+    <div class="settings-body" id="settings-body">
+
+      <h2>General</h2>
+      <div class="settings-card">
+        <div class="field">
+          <label for="in-display-name">Display name</label>
+          <input id="in-display-name" type="text" placeholder="Front desk" autocomplete="off" style="font-family:var(--font-ui)">
+        </div>
+        <div class="themerow" role="group" aria-label="Theme" id="theme-row">
+          <button data-theme-choice="auto" class="on">Auto</button>
+          <button data-theme-choice="light">Light</button>
+          <button data-theme-choice="dark">Dark</button>
+        </div>
+      </div>
+
+      <h2>Phone system</h2>
+      <div class="settings-card">
+        <div class="field">
+          <label for="in-host">Server host</label>
+          <input id="in-host" type="text" placeholder="pbx.example.com" autocomplete="off">
+        </div>
+        <div class="field">
+          <label for="in-ext">Extension</label>
+          <input id="in-ext" type="text" placeholder="1100" autocomplete="off">
+        </div>
+        <div class="field">
+          <label for="in-secret">Password</label>
+          <input id="in-secret" type="password" placeholder="Unchanged" autocomplete="off">
+          <span class="hint" id="secret-hint"></span>
+        </div>
+      </div>
+
+      <h2>How calls travel</h2>
+      <div class="transports" role="radiogroup" aria-label="Transport" id="transport-choice">
+        <button class="tcard" role="radio" data-transport="auto">
+          <span class="row1"><span class="radio" aria-hidden="true"></span><b>Auto</b><span class="mono">WSS→UDP</span></span>
+          <p>Centinelo tries the secure route first and falls back automatically if it can't register.</p>
+        </button>
+        <button class="tcard" role="radio" data-transport="classic">
+          <span class="row1"><span class="radio" aria-hidden="true"></span><b>Classic SIP</b><span class="mono">UDP</span></span>
+          <p>The traditional route — best when your phone system is on the same network.</p>
+        </button>
+        <button class="tcard" role="radio" data-transport="wss">
+          <span class="row1"><span class="radio" aria-hidden="true"></span><b>Secure web</b><span class="mono">WSS</span></span>
+          <p>Calls travel inside an encrypted web connection — best across the internet and strict firewalls.</p>
+        </button>
+      </div>
+
+      <h2>Advanced</h2>
+      <div class="settings-card">
+        <div class="field">
+          <label for="in-core-path">Core engine path</label>
+          <input id="in-core-path" type="text" placeholder="Auto-detected">
+          <span class="hint">Leave blank to auto-detect the locally built engine.</span>
+        </div>
+        <div class="btnrow">
+          <button class="ghost" id="btn-restart-engine">Restart engine</button>
+        </div>
+      </div>
+
+      <h2>Admin password</h2>
+      <div class="settings-card">
+        <p class="hint" id="admin-password-hint" style="margin:0 0 8px">Protects account, transport and advanced settings from casual changes at the front desk.</p>
+        <div class="field">
+          <label for="in-admin-new">New admin password</label>
+          <input id="in-admin-new" type="password" placeholder="At least 8 characters" autocomplete="off">
+        </div>
+        <div class="btnrow">
+          <button class="ghost" id="btn-set-admin-password">Set password</button>
+          <span class="hint" id="admin-password-status"></span>
+        </div>
+      </div>
+
+      <h2>About</h2>
+      <div class="settings-card">
+        <p class="hint" style="margin:0">Centinelo Phone 2.0 — shell build. Runs on this computer; nothing phones home.</p>
+      </div>
+
+      <!-- admin-lock gate: first-run "set a password" OR "unlock to edit" -->
+      <div class="lock-overlay" id="lock-overlay" hidden>
+        <div class="lock-card" id="lock-card-unlock" hidden>
+          <div class="lockhead">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>
+            <b>Settings are locked</b>
+          </div>
+          <p>Enter the admin password to edit account, transport and advanced settings.</p>
+          <input id="unlock-password" type="password" placeholder="Admin password" autocomplete="current-password">
+          <div class="err" id="unlock-error"></div>
+          <div class="btnrow">
+            <button class="primary" id="btn-unlock">Unlock</button>
+            <button class="ghost" id="btn-cancel-unlock">Not now</button>
+          </div>
+        </div>
+        <div class="lock-card" id="lock-card-firstrun" hidden>
+          <div class="lockhead">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>
+            <b>Set an admin password</b>
+          </div>
+          <p>This protects your phone system settings. You'll only be asked once per app launch.</p>
+          <input id="firstrun-password" type="password" placeholder="At least 8 characters" autocomplete="off">
+          <div class="err" id="firstrun-error"></div>
+          <div class="btnrow">
+            <button class="primary" id="btn-firstrun-set">Set password &amp; continue</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="save-bar">
+      <span class="status" id="save-status"></span>
+      <button class="ghost" id="btn-cancel-settings">Cancel</button>
+      <button class="primary" id="btn-save-settings">Save</button>
+    </div>
+  </div>
+
+</div>
+<script type="module" src="js/app.js"></script>
+</body>
+</html>

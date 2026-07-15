@@ -1,0 +1,244 @@
+/* == Centinelo Phone shell — app chrome & views =========================
+   Component rules ported from centinelo-premium-design/design/mockups/
+   (main.html, in-call.html, settings.html, onboarding.html) — class names
+   below match those mockups 1:1 where the surface is the same (titlebar,
+   identity card, dial pad, favorites, recents). New classes (call-overlay,
+   settings-*, lock-overlay, setup-prompt) adapt the wider desktop-settings
+   and in-call+transcript plates to this app's single 380px-wide window,
+   noted inline. See shell/README.md "Design fidelity notes".
+   ======================================================================= */
+
+/* [hidden] must win over any class that sets `display` at equal specificity
+   (author stylesheet beats the UA default [hidden]{display:none} on a tie) -
+   several views below (.call-overlay, .settings-screen, .lock-card, ...) set
+   display:flex on the same element these get toggled on. */
+[hidden] { display: none !important; }
+
+html, body { margin: 0; height: 100%; overflow: hidden; }
+body {
+  font-family: var(--font-ui);
+  color: var(--text-1);
+  background: var(--bg-0);
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+}
+button { font: inherit; color: inherit; background: none; border: 0; cursor: pointer; padding: 0; }
+button:focus-visible, input:focus-visible { outline: 2px solid var(--amber-fill); outline-offset: 2px; border-radius: 6px; }
+input { font: inherit; color: inherit; }
+::selection { background: var(--amber-glow); }
+
+.app { display: flex; flex-direction: column; height: 100vh; position: relative; }
+
+/* == titlebar ============================================================ */
+.titlebar {
+  height: 38px; flex: none; display: flex; align-items: center;
+  padding: 0 8px 0 14px; position: relative; -webkit-app-region: drag;
+}
+/* macOS keeps native traffic lights (titleBarStyle Overlay); inset our
+   content so it doesn't collide with them (~78px, per DIRECTION.md §5).
+   Only minimize/close are redundant with the native traffic lights -
+   Settings has no native equivalent and must stay reachable. */
+html[data-os="mac"] .titlebar { padding-left: 78px; }
+html[data-os="mac"] .titlebar #btn-minimize,
+html[data-os="mac"] .titlebar #btn-close { display: none; }
+
+.brand { display: flex; align-items: center; gap: 7px; }
+.brand svg { display: block; }
+.brand .dot { animation: breathe 4s var(--ease) infinite; }
+.brand .dot.unhealthy { animation: none; filter: none; opacity: .45; }
+@keyframes breathe { 0%,100% { filter: drop-shadow(0 0 1px var(--amber-glow)); } 50% { filter: drop-shadow(0 0 5px var(--amber-fill)); } }
+.brand b { font: 600 12.5px/1 var(--font-ui); letter-spacing: .01em; }
+.titlebar .state {
+  position: absolute; left: 50%; transform: translateX(-50%);
+  font: 400 11px/1 var(--font-ui); color: var(--text-3);
+  max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.winbtns { margin-left: auto; display: flex; gap: 2px; -webkit-app-region: no-drag; }
+.wbtn { width: 30px; height: 26px; display: grid; place-items: center; border-radius: 7px; color: var(--text-3); -webkit-app-region: no-drag; }
+.wbtn:hover { background: var(--bg-3); color: var(--text-1); }
+.wbtn.close:hover { background: var(--st-busy); color: #fff; }
+
+/* == body / idle surface ================================================= */
+.body { flex: 1; display: flex; flex-direction: column; padding: 4px 12px 12px; min-height: 0; position: relative; }
+
+.me { display: flex; align-items: center; gap: 10px; background: var(--bg-1); border: 1px solid var(--border-1); border-radius: var(--r-2); box-shadow: var(--edge), var(--shadow-1); padding: 9px 10px; flex: none; }
+.medal { width: 34px; height: 34px; border-radius: 50%; background: var(--bg-3); border: 1px solid var(--border-2); display: grid; place-items: center; font: 600 11.5px/1 var(--font-ui); color: var(--text-2); flex: none; }
+.me .who { min-width: 0; }
+.me .who b { display: block; font: 600 13px/1.2 var(--font-ui); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.plate { font: 600 9.5px/1 var(--font-mono); letter-spacing: .12em; color: var(--text-3); text-transform: uppercase; }
+.me .who .plate { margin-top: 4px; display: block; }
+.pill { margin-left: auto; flex: none; display: flex; align-items: center; gap: 6px; background: var(--bg-2); border: 1px solid var(--border-1); border-radius: var(--r-pill); padding: 5px 9px; font: 600 10px/1 var(--font-mono); letter-spacing: .08em; cursor: default; }
+.pill .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--st-off); }
+.pill.reg-registered .dot { background: var(--st-idle); }
+.pill.reg-registering .dot { background: var(--st-ring); animation: ringPulseDot 1.2s var(--ease) infinite; }
+.pill.reg-failed .dot { background: var(--st-busy); }
+.pill em { font-style: normal; color: var(--text-3); font-weight: 500; }
+@keyframes ringPulseDot { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+
+.setup-prompt { flex: none; display: flex; flex-direction: column; gap: 8px; background: var(--bg-1); border: 1px solid var(--border-1); border-radius: var(--r-2); box-shadow: var(--edge), var(--shadow-1); padding: 14px; text-align: left; }
+.setup-prompt b { font: 650 13.5px/1.3 var(--font-ui); }
+.setup-prompt p { margin: 0; font: 400 11.5px/1.5 var(--font-ui); color: var(--text-2); }
+.setup-prompt .primary { align-self: flex-start; margin-top: 2px; }
+
+/* == dial display ========================================================= */
+.display { flex: none; display: flex; align-items: center; gap: 8px; padding: 12px 4px 8px; border-bottom: 1px solid var(--border-1); margin: 2px 2px 8px; min-height: 30px; }
+.display .num { font: 500 25px/1 var(--font-mono); letter-spacing: .02em; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.display .num:empty::before { content: "Dial a number"; color: var(--text-3); font: 400 15px/1 var(--font-ui); }
+.caret { display: inline-block; width: 2px; height: 24px; background: var(--amber-fill); vertical-align: -3px; margin-left: 2px; animation: blink 1.1s steps(2,start) infinite; }
+@keyframes blink { 50% { opacity: 0; } }
+.display .back { margin-left: auto; flex: none; width: 34px; height: 30px; display: grid; place-items: center; border-radius: 8px; color: var(--text-3); }
+.display .back:hover { background: var(--bg-3); color: var(--text-1); }
+
+/* == keypad ================================================================ */
+.pad { flex: none; display: grid; grid-template-columns: repeat(3,1fr); gap: 6px; padding: 0 2px; }
+.key { height: 44px; border-radius: 12px; background: var(--bg-1); border: 1px solid var(--border-1); box-shadow: var(--edge), var(--shadow-1); display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; transition: background var(--t-fast) var(--ease), transform var(--t-fast) var(--ease); }
+.key:hover { background: var(--bg-3); }
+.key:active { transform: translateY(1px); box-shadow: var(--shadow-1); }
+.key b { font: 500 18px/1 var(--font-ui); }
+.key span { font: 600 8px/1 var(--font-mono); letter-spacing: .22em; color: var(--text-3); height: 8px; }
+.callrow { flex: none; display: grid; place-items: center; padding: 8px 0 4px; }
+.callbtn { width: 54px; height: 54px; border-radius: 50%; background: var(--st-idle-fill); color: var(--on-idle); display: grid; place-items: center; box-shadow: var(--edge), var(--shadow-2); transition: transform var(--t-fast) var(--ease), filter var(--t-fast); }
+.callbtn:hover { filter: brightness(1.06); }
+.callbtn:active { transform: scale(.96); }
+.callbtn:disabled { opacity: .4; filter: none; cursor: default; }
+
+/* == section headers / favorites / recents ================================ */
+.sect { flex: none; display: flex; align-items: baseline; gap: 8px; margin: 6px 2px 6px; }
+.sect h2 { margin: 0; font: 700 10px/1 var(--font-mono); letter-spacing: .16em; color: var(--text-3); text-transform: uppercase; }
+.sect .link { margin-left: auto; display: flex; align-items: center; gap: 5px; font: 600 11px/1 var(--font-ui); color: var(--amber); }
+.sect .link:hover { text-decoration: underline; text-underline-offset: 3px; }
+.protag { font: 700 8.5px/1 var(--font-mono); letter-spacing: .14em; color: var(--amber); border: 1px solid color-mix(in srgb, var(--amber-fill) 55%, transparent); border-radius: 5px; padding: 2.5px 4px 2px; background: var(--amber-soft); }
+
+.favs { flex: none; display: grid; grid-template-columns: 1fr 1fr; gap: 6px; padding: 0 2px; }
+.fav { position: relative; text-align: left; background: var(--bg-1); border: 1px solid var(--border-1); border-radius: var(--r-2); box-shadow: var(--edge), var(--shadow-1); padding: 8px 10px 8px 16px; overflow: hidden; }
+.fav::before { content: ""; position: absolute; left: 5px; top: 8px; bottom: 8px; width: 3px; border-radius: 2px; background: var(--st, var(--st-off)); }
+.fav:hover:not(:disabled) { background: var(--bg-3); }
+.fav:disabled { cursor: default; }
+.fav b { display: block; font: 600 12px/1.25 var(--font-ui); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.fav .sub { display: flex; justify-content: space-between; align-items: baseline; margin-top: 4px; gap: 6px; }
+.fav .st { font: 600 9.5px/1 var(--font-ui); letter-spacing: .02em; color: var(--st-off); }
+.fav.idle { --st: var(--st-idle); } .fav.idle .st { color: var(--st-idle); }
+.fav.busy { --st: var(--st-busy); } .fav.busy .st { color: var(--st-busy); }
+.fav.dnd { --st: var(--st-dnd); } .fav.dnd .st { color: var(--st-dnd); }
+.fav.off { --st: var(--st-off); }
+.fav.ring { --st: var(--st-ring); border-color: color-mix(in srgb, var(--amber-fill) 55%, var(--border-1)); box-shadow: var(--edge), 0 0 0 3px var(--amber-glow); }
+.fav.ring .st { color: var(--amber); }
+.fav.ring::after { content: ""; position: absolute; right: 10px; top: 10px; width: 7px; height: 7px; border-radius: 50%; background: var(--amber-fill); animation: ringPulse 1.2s var(--ease) infinite; }
+@keyframes ringPulse { 0% { box-shadow: 0 0 0 0 var(--amber-glow); } 70% { box-shadow: 0 0 0 8px transparent; } 100% { box-shadow: 0 0 0 0 transparent; } }
+
+.recents { flex: 1; min-height: 0; position: relative; overflow: auto; padding: 0 2px; }
+.recents::after { content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 24px; background: linear-gradient(transparent, var(--bg-0)); pointer-events: none; }
+.recents .empty { padding: 16px 6px; font: 400 12px/1.5 var(--font-ui); color: var(--text-3); }
+.row { width: 100%; display: flex; align-items: center; gap: 10px; padding: 7px 6px; border-radius: 9px; text-align: left; }
+.row:hover { background: var(--bg-3); }
+.row .ic { width: 26px; height: 26px; border-radius: 8px; background: var(--bg-2); border: 1px solid var(--border-1); display: grid; place-items: center; color: var(--text-3); flex: none; }
+.row .ic.missed { color: var(--st-busy); }
+.row .who { min-width: 0; flex: 1; }
+.row .who b { display: block; font: 600 12.5px/1.25 var(--font-ui); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.row .who b.mono { font-family: var(--font-mono); font-size: 12px; }
+.row .who i { font: 400 10.5px/1 var(--font-ui); font-style: normal; color: var(--text-3); }
+.row .meta { flex: none; text-align: right; font: 500 10.5px/1.5 var(--font-mono); color: var(--text-3); font-variant-numeric: tabular-nums; }
+.row .meta .miss { color: var(--st-busy); font-weight: 700; }
+
+/* == call overlay (incoming / ringing-out / established) ==================
+   Adapted from mockups/in-call.html's "call column" - same identity+timer+
+   secure-line+end-call language, compacted to this window's 380px body
+   (no cols/transcript panel/controls-grid/chips/context - those are Pro/F3
+   surfaces the v0 sidecar protocol doesn't support yet). See README. */
+.call-overlay {
+  position: absolute; inset: 0; z-index: 20;
+  background: var(--bg-0);
+  display: flex; flex-direction: column; padding: 18px 16px 16px;
+  animation: fadeSlide var(--t-slow) var(--ease) both;
+}
+@keyframes fadeSlide { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+.call-overlay .caller { display: flex; align-items: center; gap: 12px; flex: none; margin-top: 8px; }
+.call-overlay .medal { width: 52px; height: 52px; font: 600 16px/1 var(--font-ui); position: relative; }
+.call-overlay .medal .lamp { position: absolute; right: -1px; bottom: -1px; width: 12px; height: 12px; border-radius: 50%; background: var(--st-off); border: 2px solid var(--bg-0); }
+.call-overlay .medal .lamp.live { background: var(--st-idle); }
+.call-overlay .who b { display: block; font: 650 17px/1.2 var(--font-ui); letter-spacing: -.01em; }
+.call-overlay .who .num { display: block; margin-top: 3px; font: 500 12.5px/1 var(--font-mono); color: var(--text-2); letter-spacing: .02em; }
+.call-overlay .who .via { display: block; margin-top: 4px; font: 400 11px/1 var(--font-ui); color: var(--text-3); }
+.call-overlay .timerblock { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; }
+.call-overlay .timer { font: 600 42px/1 var(--font-mono); font-variant-numeric: tabular-nums; letter-spacing: -.01em; }
+.call-overlay .ringing-label { font: 600 13px/1 var(--font-ui); color: var(--amber); display: flex; align-items: center; gap: 8px; }
+.call-overlay .ringing-label .rdot { width: 8px; height: 8px; border-radius: 50%; background: var(--amber-fill); animation: ringPulse 1.2s var(--ease) infinite; }
+.call-overlay .foot { flex: none; }
+.secure { display: flex; align-items: center; justify-content: center; gap: 6px; font: 600 9.5px/1 var(--font-mono); letter-spacing: .12em; color: var(--text-3); text-transform: uppercase; padding: 10px 0; }
+.secure svg { color: var(--st-idle); }
+.call-actions { display: flex; gap: 10px; }
+.endbtn, .answerbtn, .declinebtn { flex: 1; height: 50px; border-radius: 12px; display: flex; align-items: center; justify-content: center; gap: 9px; font: 600 14px/1 var(--font-ui); box-shadow: var(--edge), var(--shadow-1); transition: filter var(--t-fast); }
+.endbtn:hover, .answerbtn:hover, .declinebtn:hover { filter: brightness(1.07); }
+.endbtn { width: 100%; background: var(--st-busy); color: var(--on-busy); }
+.answerbtn { background: var(--st-idle-fill); color: var(--on-idle); }
+.declinebtn { background: var(--st-busy); color: var(--on-busy); }
+
+/* == settings (compact single-column adaptation of mockups/settings.html +
+   mockups/onboarding.html's field/transport-card language - see README
+   "Design fidelity notes" for why this isn't the literal 940x640 2-pane
+   plate: this shell's real surface is the 380px main window.) =========== */
+.settings-screen { position: absolute; inset: 0; z-index: 30; background: var(--bg-0); display: flex; flex-direction: column; animation: fadeSlide var(--t-med) var(--ease) both; }
+.settings-header { flex: none; height: 38px; display: flex; align-items: center; gap: 8px; padding: 0 10px; border-bottom: 1px solid var(--border-1); -webkit-app-region: drag; }
+html[data-os="mac"] .settings-header { padding-left: 78px; }
+.settings-header .back { -webkit-app-region: no-drag; width: 28px; height: 28px; display: grid; place-items: center; border-radius: 7px; color: var(--text-2); }
+.settings-header .back:hover { background: var(--bg-3); color: var(--text-1); }
+.settings-header h1 { margin: 0; font: 650 13.5px/1 var(--font-ui); letter-spacing: -.01em; }
+.settings-body { flex: 1; overflow: auto; padding: 14px 16px 90px; position: relative; }
+.settings-body h2 { margin: 18px 0 4px; font: 700 10px/1 var(--font-mono); letter-spacing: .16em; color: var(--text-3); text-transform: uppercase; }
+.settings-body h2:first-child { margin-top: 2px; }
+.settings-card { background: var(--bg-1); border: 1px solid var(--border-1); border-radius: var(--r-2); box-shadow: var(--edge), var(--shadow-1); padding: 12px; }
+
+.field { display: flex; flex-direction: column; gap: 5px; margin-bottom: 10px; }
+.field label { font: 600 10.5px/1 var(--font-ui); color: var(--text-2); }
+.field input, .field select { height: 36px; padding: 0 10px; background: var(--bg-2); border: 1px solid var(--border-1); border-radius: var(--r-2); color: var(--text-1); font: 400 12.5px/1 var(--font-mono); }
+.field input::placeholder { color: var(--text-3); font-family: var(--font-ui); }
+.field input:focus-visible { outline: none; border-color: var(--amber-fill); }
+.field .hint { font: 400 10.5px/1.4 var(--font-ui); color: var(--text-3); }
+
+.transports { display: flex; flex-direction: column; gap: 6px; }
+.tcard { position: relative; text-align: left; width: 100%; background: var(--bg-1); border: 1px solid var(--border-1); border-radius: var(--r-2); box-shadow: var(--edge), var(--shadow-1); padding: 9px 10px; display: flex; flex-direction: column; gap: 3px; transition: background var(--t-fast) var(--ease); }
+.tcard:hover { background: var(--bg-3); }
+.tcard .row1 { display: flex; align-items: center; gap: 7px; }
+.tcard .radio { width: 14px; height: 14px; border-radius: 50%; border: 1.6px solid var(--border-2); flex: none; display: grid; place-items: center; }
+.tcard.sel { background: var(--amber-soft); border-color: color-mix(in srgb, var(--amber-fill) 60%, var(--border-1)); }
+.tcard.sel .radio { border-color: var(--amber-fill); }
+.tcard.sel .radio::after { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--amber-fill); }
+.tcard b { font: 600 12.5px/1.2 var(--font-ui); }
+.tcard .mono { margin-left: auto; font: 700 8.5px/1 var(--font-mono); letter-spacing: .1em; color: var(--text-3); border: 1px solid var(--border-2); border-radius: 4px; padding: 2.5px 4px 2px; text-transform: uppercase; }
+.tcard.sel .mono { color: var(--amber); border-color: color-mix(in srgb, var(--amber-fill) 55%, transparent); }
+.tcard p { margin: 0; font: 400 10.5px/1.45 var(--font-ui); color: var(--text-2); padding-left: 21px; }
+
+.btnrow { display: flex; gap: 8px; align-items: center; margin-top: 4px; }
+.primary { height: 36px; padding: 0 16px; border-radius: var(--r-2); background: var(--amber-fill); color: var(--on-amber); font: 650 12.5px/1 var(--font-ui); box-shadow: var(--edge), var(--shadow-1); transition: filter var(--t-fast); }
+.primary:hover { filter: brightness(1.05); }
+.primary:disabled { opacity: .5; cursor: default; filter: none; }
+.ghost { height: 36px; padding: 0 14px; border-radius: var(--r-2); border: 1px solid var(--border-1); background: var(--bg-1); font: 500 12px/1 var(--font-ui); color: var(--text-2); }
+.ghost:hover { background: var(--bg-3); color: var(--text-1); }
+.danger-ghost { color: var(--st-busy); }
+
+.themerow { display: flex; gap: 2px; padding: 3px; background: var(--bg-2); border: 1px solid var(--border-1); border-radius: var(--r-pill); width: max-content; }
+.themerow button { font: 500 11px/1 var(--font-ui); padding: 6px 12px; border-radius: var(--r-pill); color: var(--text-2); }
+.themerow button.on { background: var(--bg-1); color: var(--text-1); box-shadow: var(--shadow-1); }
+
+.save-bar { position: absolute; left: 0; right: 0; bottom: 0; padding: 10px 16px; background: light-dark(rgba(245,244,239,.92), rgba(12,17,14,.92)); border-top: 1px solid var(--border-1); display: flex; align-items: center; gap: 10px; backdrop-filter: blur(6px); }
+.save-bar .status { font: 400 11px/1.4 var(--font-ui); color: var(--text-3); flex: 1; min-width: 0; }
+.save-bar .status.ok { color: var(--st-idle); }
+.save-bar .status.err { color: var(--st-busy); }
+
+/* admin lock overlay */
+.lock-overlay { position: absolute; inset: 0; z-index: 5; background: light-dark(rgba(245,244,239,.86), rgba(7,10,8,.82)); backdrop-filter: blur(3px); display: flex; align-items: center; justify-content: center; padding: 24px; }
+.lock-card { width: 100%; max-width: 300px; background: var(--bg-1); border: 1px solid var(--border-1); border-radius: 12px; box-shadow: var(--edge), var(--shadow-2); padding: 16px; display: flex; flex-direction: column; gap: 10px; }
+.lock-card .lockhead { display: flex; align-items: center; gap: 8px; }
+.lock-card .lockhead svg { color: var(--amber); flex: none; }
+.lock-card .lockhead b { font: 650 13.5px/1.3 var(--font-ui); }
+.lock-card p { margin: 0; font: 400 11.5px/1.5 var(--font-ui); color: var(--text-2); }
+.lock-card .err { color: var(--st-busy); font: 500 11px/1.4 var(--font-ui); min-height: 14px; }
+
+/* == misc: banners, live region, sidecar status whisper ==================== */
+.banner { position: absolute; top: 6px; left: 8px; right: 8px; z-index: 40; padding: 8px 11px; border-radius: 9px; font: 500 11.5px/1.4 var(--font-ui); box-shadow: var(--shadow-2); animation: fadeSlide var(--t-fast) var(--ease) both; }
+.banner.err { background: var(--st-busy); color: var(--on-busy); }
+.banner.info { background: var(--bg-1); color: var(--text-1); border: 1px solid var(--border-1); }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; }
+
+.sidecar-whisper { flex: none; display: flex; align-items: center; gap: 6px; padding: 6px 8px; margin: 0 2px 6px; font: 500 10px/1.4 var(--font-mono); color: var(--text-3); letter-spacing: .03em; }
+.sidecar-whisper .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--st-busy); flex: none; }
