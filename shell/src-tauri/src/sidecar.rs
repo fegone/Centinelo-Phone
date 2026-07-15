@@ -17,6 +17,7 @@
 use crate::settings::{AccountSettings, SettingsStore, TransportPriority};
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -56,6 +57,24 @@ enum ControlSignal {
     RestartNow,
 }
 
+/// Coarse "what's happening on the line right now" - tracked here (not just
+/// left to the frontend) so the click-to-call bridge's `/ping` (bridge.rs)
+/// can report an honest state without duplicating protocol parsing. Mirrors
+/// the vocabulary v1's `currentCallState` used (src/main/main.js), minus
+/// `held` - F2/F3's shell UI has no hold control wired to the v1 protocol's
+/// `hold` command yet (see shell/README.md "Known limitations"), so that
+/// state can't actually be reached here and isn't fabricated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CallPhase {
+    None,
+    /// `call_state:"incoming"` - someone is calling us.
+    Incoming,
+    /// `call_state:"ringing"` with no prior `incoming` for this process - an
+    /// outbound call we placed is ringing out.
+    Calling,
+    InCall,
+}
+
 struct Shared {
     app: AppHandle,
     settings: Arc<SettingsStore>,
@@ -70,6 +89,19 @@ struct Shared {
     auto_fallback_used: AtomicBool,
     pending_transport_override: Mutex<Option<&'static str>>,
     last_status: Mutex<StatusPayload>,
+    /// True from a `reg_state:"registered"` event until the next
+    /// `"failed"`/`"unregistered"` transition or process exit. Read by
+    /// `ping_state()` (bridge.rs `/ping`) and used to gate the one-time BLF
+    /// auto-subscribe below.
+    registered: AtomicBool,
+    call_phase: Mutex<CallPhase>,
+    /// Last-known state per watched extension (ext -> "idle"|"ringing"|
+    /// "busy"|"offline"), from `blf` events - the same data the frontend's
+    /// own `state.blf` derives from, kept here too so (a) a devtools
+    /// reload doesn't lose it (`commands::get_blf_states`, fetched at
+    /// `boot()`) and (b) it's real, backend-tracked "app state" a scripted
+    /// e2e driver can read without any GUI - see e2e.rs.
+    blf_states: Mutex<HashMap<String, String>>,
 }
 
 #[derive(Clone)]
@@ -89,13 +121,45 @@ impl SidecarHandle {
             auto_fallback_used: AtomicBool::new(false),
             pending_transport_override: Mutex::new(None),
             last_status: Mutex::new(StatusPayload::Idle),
+            registered: AtomicBool::new(false),
+            call_phase: Mutex::new(CallPhase::None),
+            blf_states: Mutex::new(HashMap::new()),
         }))
+    }
+
+    /// Snapshot of every extension's last-known BLF state (see `Shared::blf_states`).
+    pub fn blf_states(&self) -> HashMap<String, String> {
+        self.0.blf_states.lock().expect("poisoned").clone()
     }
 
     /// Last known status, for the frontend's initial paint (before its event
     /// listener would otherwise catch the next transition).
     pub fn status(&self) -> StatusPayload {
         self.0.last_status.lock().expect("poisoned").clone()
+    }
+
+    /// Coarse call/registration state for the click-to-call bridge's
+    /// `/ping` (bridge.rs) - see `CallPhase`'s doc comment for the
+    /// vocabulary and why `held` is deliberately absent.
+    pub fn ping_state(&self) -> &'static str {
+        match self.status() {
+            StatusPayload::Idle | StatusPayload::Stopped | StatusPayload::Failed { .. } => {
+                "disconnected"
+            }
+            StatusPayload::Starting | StatusPayload::Restarting { .. } => "connecting",
+            StatusPayload::Running => {
+                if !self.0.registered.load(Ordering::SeqCst) {
+                    "connecting"
+                } else {
+                    match *self.0.call_phase.lock().expect("poisoned") {
+                        CallPhase::None => "registered",
+                        CallPhase::Incoming => "ringing",
+                        CallPhase::Calling => "calling",
+                        CallPhase::InCall => "in-call",
+                    }
+                }
+            }
+        }
     }
 
     /// Start supervision if it isn't already running. No-op if a supervisor
@@ -166,16 +230,26 @@ impl SidecarHandle {
     /// Send a command line to the running sidecar's stdin. Returns Err if
     /// the sidecar isn't currently running.
     pub fn send_cmd(&self, value: Value) -> Result<(), String> {
-        let mut guard = self.0.stdin.lock().expect("poisoned");
-        match guard.as_mut() {
-            Some(stdin) => {
-                let mut line = serde_json::to_string(&value).map_err(|e| e.to_string())?;
-                line.push('\n');
-                stdin.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
-                stdin.flush().map_err(|e| e.to_string())
-            }
-            None => Err("Not connected to the phone system yet.".to_string()),
+        send_cmd_raw(&self.0, value)
+    }
+}
+
+/// Writes one `ctrl_json` command line (core/PROTOCOL.md framing: one JSON
+/// object, `\n`-terminated) to the sidecar's stdin. Free function (not a
+/// `SidecarHandle` method) so the stdout-reader thread - which only ever
+/// holds the inner `Arc<Shared>`, not a `SidecarHandle` - can also issue
+/// commands (used for the BLF auto-subscribe below) without constructing a
+/// throwaway wrapper.
+fn send_cmd_raw(shared: &Shared, value: Value) -> Result<(), String> {
+    let mut guard = shared.stdin.lock().expect("poisoned");
+    match guard.as_mut() {
+        Some(stdin) => {
+            let mut line = serde_json::to_string(&value).map_err(|e| e.to_string())?;
+            line.push('\n');
+            stdin.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
+            stdin.flush().map_err(|e| e.to_string())
         }
+        None => Err("Not connected to the phone system yet.".to_string()),
     }
 }
 
@@ -263,6 +337,12 @@ fn supervisor_loop(shared: Arc<Shared>) {
         shared.exited_flag.store(true, Ordering::SeqCst);
         *shared.stdin.lock().expect("poisoned") = None;
         *shared.current_pid.lock().expect("poisoned") = None;
+        // The engine (and every subscription/call it held) is gone with the
+        // process - a stale "registered"/"in-call" ping_state() would be a
+        // straightforward lie to the click-to-call bridge.
+        shared.registered.store(false, Ordering::SeqCst);
+        *shared.call_phase.lock().expect("poisoned") = CallPhase::None;
+        shared.blf_states.lock().expect("poisoned").clear();
         let _ = std::fs::remove_dir_all(&plan.scratch_dir);
 
         let signal = std::mem::replace(&mut *shared.control.lock().expect("poisoned"), ControlSignal::None);
@@ -375,6 +455,14 @@ fn spawn_stdout_reader(
     std::thread::spawn(move || {
         let reader = BufReader::new(stdout);
         let mut registered_once = false;
+        // Guards the BLF auto-subscribe below to exactly once per process:
+        // `blf_subscribe` errors ("already subscribed") on a repeat call,
+        // and `regint=120` periodic re-REGISTER (or a transient reg blip)
+        // can legitimately fire more than one `"registered"` reg_state
+        // within a single process's lifetime - see core/PROTOCOL.md
+        // `blf_subscribe`. Resets naturally on every respawn since this is
+        // a fresh local in a freshly-spawned thread per attempt.
+        let mut favorites_subscribed = false;
         for line in reader.lines().map_while(Result::ok) {
             let trimmed = line.trim_start();
             if !trimmed.starts_with('{') {
@@ -398,18 +486,71 @@ fn spawn_stdout_reader(
                 let state = value.get("state").and_then(Value::as_str).unwrap_or("");
                 if state == "registered" {
                     registered_once = true;
-                } else if state == "failed"
-                    && !registered_once
-                    && priority == TransportPriority::Auto
-                    && transport_this_attempt == "wss"
-                    && !shared.auto_fallback_used.swap(true, Ordering::SeqCst)
-                {
-                    log::info!("sidecar: wss registration failed, falling back to classic udp (auto transport)");
-                    *shared.pending_transport_override.lock().expect("poisoned") = Some("udp");
-                    *shared.control.lock().expect("poisoned") = ControlSignal::RestartNow;
-                    // Close stdin from here too, in case the owning thread's
-                    // wait() is what's blocking (same trick as restart_now()).
-                    let _ = shared.stdin.lock().expect("poisoned").take();
+                    shared.registered.store(true, Ordering::SeqCst);
+                    if !favorites_subscribed {
+                        favorites_subscribed = true;
+                        let favorites = shared.settings.snapshot().favorites;
+                        for fav in favorites {
+                            let ext = fav.ext.trim();
+                            if ext.is_empty() {
+                                continue; // unconfigured slot - nothing to watch
+                            }
+                            if let Err(e) = send_cmd_raw(
+                                &shared,
+                                serde_json::json!({"cmd": "blf_subscribe", "ext": ext}),
+                            ) {
+                                log::warn!("sidecar: blf_subscribe({ext}) failed: {e}");
+                            }
+                        }
+                    }
+                } else {
+                    if state == "failed" || state == "unregistered" {
+                        shared.registered.store(false, Ordering::SeqCst);
+                    }
+                    if state == "failed"
+                        && !registered_once
+                        && priority == TransportPriority::Auto
+                        && transport_this_attempt == "wss"
+                        && !shared.auto_fallback_used.swap(true, Ordering::SeqCst)
+                    {
+                        log::info!("sidecar: wss registration failed, falling back to classic udp (auto transport)");
+                        *shared.pending_transport_override.lock().expect("poisoned") = Some("udp");
+                        *shared.control.lock().expect("poisoned") = ControlSignal::RestartNow;
+                        // Close stdin from here too, in case the owning thread's
+                        // wait() is what's blocking (same trick as restart_now()).
+                        let _ = shared.stdin.lock().expect("poisoned").take();
+                    }
+                }
+            } else if event_name == "call_state" {
+                // Coarse phase for ping_state() only - the frontend gets the
+                // full event (with call_id/peer/...) via the emit() below
+                // regardless and does its own richer state machine.
+                let call_state = value.get("state").and_then(Value::as_str).unwrap_or("");
+                let mut phase = shared.call_phase.lock().expect("poisoned");
+                match call_state {
+                    "incoming" => *phase = CallPhase::Incoming,
+                    "ringing" => {
+                        if *phase != CallPhase::Incoming {
+                            *phase = CallPhase::Calling;
+                        }
+                    }
+                    "established" => *phase = CallPhase::InCall,
+                    "closed" => *phase = CallPhase::None,
+                    // hold/resumed/muted/unmuted: attributes of an
+                    // established call, not a lifecycle change - see
+                    // core/PROTOCOL.md "Events".
+                    _ => {}
+                }
+            } else if event_name == "blf" {
+                if let (Some(ext), Some(blf_state)) = (
+                    value.get("ext").and_then(Value::as_str),
+                    value.get("state").and_then(Value::as_str),
+                ) {
+                    shared
+                        .blf_states
+                        .lock()
+                        .expect("poisoned")
+                        .insert(ext.to_string(), blf_state.to_string());
                 }
             }
 

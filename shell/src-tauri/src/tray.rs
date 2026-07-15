@@ -8,7 +8,10 @@ use tauri::{App, AppHandle, Manager};
 
 const TRAY_ICON_BYTES: &[u8] = include_bytes!("../icons/tray-icon@2x.png");
 
-fn show_and_focus(app: &AppHandle) {
+/// Also used by bridge.rs and deeplink.rs - any external dial trigger
+/// (click-to-call, centinelo:// or tel: link) surfaces the app the same way
+/// v1's `showMainWindow()` did (src/main/main.js).
+pub(crate) fn show_and_focus(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.unminimize();

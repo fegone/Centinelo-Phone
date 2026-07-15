@@ -1,4 +1,4 @@
-# Centinelo Phone 2.0 — desktop shell (F2)
+# Centinelo Phone 2.0 — desktop shell (F2/F3)
 
 Tauri v2 desktop app that wraps the `core/` baresip+`ctrl_json` sidecar (see
 `../core/PROTOCOL.md` and `../core/BUILD.md`) in a native window built to the
@@ -10,11 +10,13 @@ framework.
 shell/
   src-tauri/     Rust backend (Tauri app)
     src/
-      lib.rs       app wiring: state, commands, tray, lifecycle
+      lib.rs       app wiring: state, commands, tray, lifecycle, plugins
       sidecar.rs   sidecar process supervisor (spawn/pipe/restart/backoff)
       settings.rs  settings.json persistence + argon2 admin-password hashing
       commands.rs  #[tauri::command]s exposed to the frontend
       tray.rs      system tray (Show/Quit, close-to-tray)
+      bridge.rs    click-to-call localhost HTTP bridge (F3)
+      deeplink.rs  centinelo:// / tel: deep-link handling (F3)
       e2e.rs       debug-only scripted e2e driver (see "e2e verification")
   ui/            static frontend, served directly as `frontendDist`
     index.html     single-page app: main window + settings + call overlay
@@ -216,16 +218,66 @@ app, and independent PBX-side RTP packet-count confirmation
 (`asterisk -rx "pjsip show channelstats"`, read-only) for four separate
 real calls to the `*43` echo test extension over WSS.
 
-## Known limitations (F2 scope)
+## F3 additions: live BLF favorites, click-to-call bridge, deep links
 
-- No `hold`/`mute`/`transfer`/`dtmf` — not in the v0 `ctrl_json` protocol.
-- BLF favorites are static (dial-only), no live presence — F3.
+- **Live BLF favorites** — `favorites` (still 4 free-tier slots, `ext` +
+  `label`) is now admin-gated like the account fields (`commands::
+  save_favorites`, restarts the sidecar so a fresh process re-registers and
+  re-subscribes to the new list). On every `reg_state:"registered"`,
+  `sidecar.rs`'s stdout reader issues `blf_subscribe` once per configured
+  extension (guarded against `regint`-driven re-REGISTERs re-firing it
+  within the same process — `ctrl_json` errors on a duplicate subscribe).
+  Incoming `blf` events update `ui/js/app.js`'s `state.blf` map, which
+  `renderFavorites()` maps straight onto the mockup's own lamp classes —
+  `idle`->`.fav.idle`, `ringing`->`.fav.ring` (ringing owns the one amber
+  glow, per `DIRECTION.md`'s "one glow rule"), `busy`->`.fav.busy`,
+  `offline`/unconfigured->`.fav.off` — no new CSS, `app.css` already had
+  all four from F2's static placeholder tiles. Clicking a favorite always
+  shows the "Call this number?" confirmation (shared with the bridge/deep
+  links below) before dialing — favorites are real coworkers' extensions,
+  not a number a keypad-happy click should silently ring. The backend also
+  tracks the same per-extension state (`sidecar.rs` `Shared::blf_states`,
+  exposed as `get_blf_states`) so a devtools reload repaints instead of
+  going blank until the next NOTIFY.
+- **Click-to-call bridge** (`bridge.rs`) — ported from v1's Electron bridge
+  (`src/main/main.js`) onto a `tiny_http` listener on the same
+  `127.0.0.1:38911`, same `X-Centinelo-Token` header, same `GET /ping` +
+  `POST /dial` (JSON body `{"number":...}`) contract, same CORS headers
+  including `Access-Control-Allow-Private-Network` — the v1 Chrome
+  extension in `extension/` works against it unchanged. `token`/`number`
+  are *also* accepted as query params purely for `curl`-based verification
+  convenience; the extension itself never uses that path. One deliberate
+  behavior change from v1: a dial request no longer dials silently — it
+  raises the same "Call this number?" confirmation as favorites, unless
+  `settings.bridge.auto_dial` is on (default off).
+- **`centinelo://`/`tel:` deep links** (`deeplink.rs`, `tauri-plugin-deep-link`
+  + `tauri-plugin-single-instance`) — `centinelo` is always claimed (this
+  app's own scheme); `tel` is opt-in (`settings.bridge.register_tel_handler`,
+  off by default), matching v1's own `registerTelHandler` setting. Both
+  feed the exact same "click-to-call" event/confirmation flow as the
+  bridge. Platform note, confirmed by reading the plugin's vendored source
+  rather than assumed: dynamic `register()`/`unregister()` only work on
+  Windows/Linux — macOS has no runtime API for this, so a *built and
+  installed* Centinelo is always Info.plist-capable of `tel:` once
+  installed, and the in-app toggle there instead gates whether an incoming
+  `tel:` link is acted on at all.
+
+## Known limitations (F2/F3 scope)
+
+- No `hold`/`mute`/`transfer`/`dtmf` — not wired to the shell UI yet, even
+  though `core/`'s v1 protocol now supports them (see `core/PROTOCOL.md`).
 - No cert pinning (`sip_verify_server no`) — matches `core/BUILD.md`'s own
   documented TODO; the v1 app's `pinnedCertSha256` setting isn't ported.
 - No console (receptionist grid), transcript, recording, or licensing UI —
   those are Pro/later-phase surfaces per `DIRECTION.md`.
 - Windows: untested this session (no Windows machine available - same
   caveat as `core/BUILD.md`'s own Windows CI note). `shell-build.yml`'s
-  Windows job is `continue-on-error: true` for the same reason.
+  Windows job is `continue-on-error: true` for the same reason. The new
+  `register_tel_handler` toggle's actual Windows-registry/Linux-`.desktop`
+  behavior is therefore unverified on real hardware — see `shell/E2E.md`
+  "F3 ... Known limitations".
+- `centinelo://`/`tel:` activation itself (an OS-level scheme click, as
+  opposed to the URL-parsing logic behind it, which is unit-tested) isn't
+  e2e-verified this session — see `shell/E2E.md` "F3" for why.
 - Recents/favorites/settings have no import from the v1 Electron app; this
   is a fresh v2 app with its own app-data directory and schema.

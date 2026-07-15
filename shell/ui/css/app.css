@@ -189,6 +189,9 @@ html[data-os="mac"] .settings-header { padding-left: 78px; }
 .settings-card { background: var(--bg-1); border: 1px solid var(--border-1); border-radius: var(--r-2); box-shadow: var(--edge), var(--shadow-1); padding: 12px; }
 
 .field { display: flex; flex-direction: column; gap: 5px; margin-bottom: 10px; }
+/* one favorite's label+extension pair (settings "Favorites" card) */
+.field-row { display: flex; gap: 8px; }
+.field-row .field { flex: 1; }
 .field label { font: 600 10.5px/1 var(--font-ui); color: var(--text-2); }
 .field input, .field select { height: 36px; padding: 0 10px; background: var(--bg-2); border: 1px solid var(--border-1); border-radius: var(--r-2); color: var(--text-1); font: 400 12.5px/1 var(--font-mono); }
 .field input::placeholder { color: var(--text-3); font-family: var(--font-ui); }
@@ -227,6 +230,12 @@ html[data-os="mac"] .settings-header { padding-left: 78px; }
 
 /* admin lock overlay */
 .lock-overlay { position: absolute; inset: 0; z-index: 5; background: light-dark(rgba(245,244,239,.86), rgba(7,10,8,.82)); backdrop-filter: blur(3px); display: flex; align-items: center; justify-content: center; padding: 24px; }
+/* dial confirmation reuses .lock-overlay/.lock-card (see index.html) but
+   lives at the top of #app, not inside .settings-screen, and must sit
+   above both .call-overlay (20) and .settings-screen (30) - it can arrive
+   during either. */
+.dial-confirm-overlay { z-index: 50; }
+.dial-confirm-overlay .plate { text-align: center; margin: 2px 0 4px; }
 .lock-card { width: 100%; max-width: 300px; background: var(--bg-1); border: 1px solid var(--border-1); border-radius: 12px; box-shadow: var(--edge), var(--shadow-2); padding: 16px; display: flex; flex-direction: column; gap: 10px; }
 .lock-card .lockhead { display: flex; align-items: center; gap: 8px; }
 .lock-card .lockhead svg { color: var(--amber); flex: none; }

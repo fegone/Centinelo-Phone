@@ -1,4 +1,6 @@
+mod bridge;
 mod commands;
+mod deeplink;
 #[cfg(debug_assertions)]
 mod e2e;
 mod settings;
@@ -13,6 +15,19 @@ use tauri::Manager;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // Single-instance MUST be registered before the deep-link plugin
+        // (per tauri-plugin-deep-link's own docs) - with its "deep-link"
+        // feature enabled (Cargo.toml), it forwards a second launch's argv
+        // into the deep-link plugin automatically (Windows/Linux
+        // centinelo:// or tel: activation while already running), and this
+        // callback additionally surfaces the window on ANY second-launch
+        // attempt, matching v1's `app.on('second-instance', ...)`
+        // (src/main/main.js).
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            log::info!("second instance launched with args: {argv:?}");
+            tray::show_and_focus(app);
+        }))
+        .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_log::Builder::default().build())
         .setup(|app| {
             let app_data_dir = app.path().app_data_dir()?;
@@ -25,6 +40,9 @@ pub fn run() {
             if settings.snapshot().account.is_configured() {
                 sidecar.start();
             }
+
+            bridge::start(app.handle().clone(), settings.clone(), sidecar.clone());
+            deeplink::setup(app, settings.clone());
 
             tray::setup(app)?;
 
@@ -55,6 +73,8 @@ pub fn run() {
             commands::get_core_binary_path,
             commands::set_core_binary_path,
             commands::get_favorites,
+            commands::save_favorites,
+            commands::get_blf_states,
             commands::get_theme,
             commands::set_theme,
             commands::admin_status,
@@ -63,6 +83,9 @@ pub fn run() {
             commands::admin_lock,
             commands::get_recents,
             commands::add_recent,
+            commands::get_bridge_settings,
+            commands::set_auto_dial,
+            commands::set_register_tel_handler,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

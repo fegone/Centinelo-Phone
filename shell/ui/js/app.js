@@ -18,6 +18,8 @@ const state = {
   dial: "",
   account: null, // AccountSettingsView from the backend
   favorites: [],
+  blf: {}, // ext (string) -> "idle"|"ringing"|"busy"|"offline", from sidecar "blf" events
+  bridge: null, // BridgeSettingsView from the backend (click-to-call + deep links)
   regState: "unregistered", // unregistered|registering|registered|failed
   transport: null,
   sidecarStatus: { status: "idle" },
@@ -26,6 +28,7 @@ const state = {
   adminUnlocked: false,
   theme: "auto",
   callTimerHandle: null,
+  pendingDialNumber: null, // set while #dial-confirm-overlay is showing
 };
 
 const $ = (id) => document.getElementById(id);
@@ -189,19 +192,35 @@ function renderDial() {
   $("dial-num").textContent = state.dial;
 }
 
+// idle=soft/jade lamp, ringing=amber (ringing OWNS amber - the one-glow
+// rule, see premium/design/DIRECTION.md "signature elements"), busy=lit
+// coral, offline=dark/faint. CSS classes ported verbatim from
+// mockups/main.html's .fav.idle|.ring|.busy|.off (see app.css) - shape
+// (lamp-edge bar + pulse ring on .ring only) + color + word, never color
+// alone, per the design law's "never color alone" rule.
+const BLF_LABEL = { idle: "Available", ringing: "Ringing", busy: "On a call", offline: "Offline" };
+const BLF_CSS_STATE = { idle: "idle", ringing: "ring", busy: "busy", offline: "off" };
+
 function renderFavorites() {
   const grid = $("favorites-grid");
   grid.innerHTML = "";
   const slots = state.favorites.length ? state.favorites : [];
   for (const slot of slots) {
     const btn = document.createElement("button");
-    const hasExt = !!(slot.ext && slot.ext.trim());
-    btn.className = "fav off";
+    const ext = (slot.ext || "").trim();
+    const hasExt = !!ext;
+    const blfState = hasExt ? state.blf[ext] : null;
+    const cssState = hasExt ? BLF_CSS_STATE[blfState] || "off" : "off";
+    const label = !hasExt ? "Empty" : blfState ? BLF_LABEL[blfState] || "Offline" : "Not tracked yet";
+    btn.className = `fav ${cssState}`;
     btn.disabled = !hasExt;
-    btn.innerHTML = `<b>${escapeHtml(slot.label || (hasExt ? `Ext ${slot.ext}` : "Not set up"))}</b>
-      <span class="sub"><span class="plate">${hasExt ? "EXT " + escapeHtml(slot.ext) : "—"}</span><span class="st">${hasExt ? "Not tracked yet" : "Empty"}</span></span>`;
+    btn.innerHTML = `<b>${escapeHtml(slot.label || (hasExt ? `Ext ${ext}` : "Not set up"))}</b>
+      <span class="sub"><span class="plate">${hasExt ? "EXT " + escapeHtml(ext) : "—"}</span><span class="st">${label}</span></span>`;
     if (hasExt) {
-      btn.addEventListener("click", () => dialUri(slot.ext));
+      // Favorites in a real clinic are real people - always confirm, never
+      // dial straight from a click (see shell task spec).
+      const name = slot.label && slot.label.trim() ? slot.label.trim() : `Ext ${ext}`;
+      btn.addEventListener("click", () => confirmAndDial(ext, `Calling ${name}.`));
     }
     grid.appendChild(btn);
   }
@@ -211,6 +230,29 @@ function escapeHtml(s) {
   const d = document.createElement("div");
   d.textContent = s ?? "";
   return d.innerHTML;
+}
+
+// ---------------------------------------------------------------------------
+// dial confirmation - shared by favorites clicks, the click-to-call bridge,
+// and centinelo:// or tel: deep links (see handleClickToCall below). A busy
+// line never silently gets a second dial attempt: a request that arrives
+// mid-call is turned into an honest banner instead of a confirm prompt the
+// engine couldn't act on anyway.
+// ---------------------------------------------------------------------------
+function confirmAndDial(number, sourceText) {
+  if (state.call) {
+    showBanner(`Can't call ${number} — you're already on a call.`, "err");
+    return;
+  }
+  state.pendingDialNumber = number;
+  $("dial-confirm-source").textContent = sourceText;
+  $("dial-confirm-number").textContent = number;
+  $("dial-confirm-overlay").hidden = false;
+}
+
+function closeDialConfirm() {
+  state.pendingDialNumber = null;
+  $("dial-confirm-overlay").hidden = true;
 }
 
 async function loadRecents() {
@@ -371,6 +413,17 @@ function handleSidecarStatus(payload) {
     state.regState = "unregistered";
     state.transport = null;
   }
+  // A fresh process (crash-restart, settings save, "Restart engine") starts
+  // with no BLF subscriptions until it re-registers - clear stale lamps
+  // rather than showing a state that's no longer being watched. The backend
+  // re-issues blf_subscribe per favorite the moment it re-registers (see
+  // sidecar.rs), so this is a brief gap, not a lasting "off" state.
+  if (payload.status === "idle" || payload.status === "stopped" || payload.status === "starting") {
+    if (Object.keys(state.blf).length) {
+      state.blf = {};
+      renderFavorites();
+    }
+  }
   renderAll();
 }
 
@@ -387,12 +440,21 @@ function handleSidecarEvent(evt) {
     case "call_state":
       handleCallState(evt);
       break;
+    case "blf":
+      handleBlfEvent(evt);
+      break;
     case "error":
       showBanner(evt.message || "Something went wrong.", "err");
       break;
     default:
       break;
   }
+}
+
+function handleBlfEvent(evt) {
+  if (!evt.ext) return;
+  state.blf[evt.ext] = evt.state || "offline";
+  renderFavorites();
 }
 
 function handleCallState(evt) {
@@ -470,17 +532,66 @@ function applyLockUI() {
   saveBtn.disabled = !state.adminUnlocked;
 }
 
+function renderFavoritesFields(favorites) {
+  const container = $("favorites-fields");
+  container.innerHTML = "";
+  const slots = favorites && favorites.length ? favorites : [];
+  slots.forEach((slot, i) => {
+    const row = document.createElement("div");
+    row.className = "field-row";
+    row.innerHTML = `
+      <div class="field">
+        <label for="fav-label-${i}">Label</label>
+        <input id="fav-label-${i}" type="text" placeholder="Front desk" maxlength="40" style="font-family:var(--font-ui)">
+      </div>
+      <div class="field">
+        <label for="fav-ext-${i}">Extension</label>
+        <input id="fav-ext-${i}" type="text" placeholder="Empty" maxlength="20">
+      </div>`;
+    container.appendChild(row);
+    $(`fav-label-${i}`).value = slot.label || "";
+    $(`fav-ext-${i}`).value = slot.ext || "";
+  });
+}
+
+function collectFavoritesFields() {
+  const out = [];
+  for (let i = 0; i < 4; i++) {
+    const labelEl = $(`fav-label-${i}`);
+    const extEl = $(`fav-ext-${i}`);
+    if (!labelEl || !extEl) continue;
+    out.push({ label: labelEl.value.trim(), ext: extEl.value.trim() });
+  }
+  return out;
+}
+
+function setBoolRowUI(rowId, value) {
+  document.querySelectorAll(`#${rowId} button`).forEach((b) => {
+    b.classList.toggle("on", (b.dataset.boolChoice === "true") === value);
+  });
+}
+
+function renderBridgeFields(bridge) {
+  $("bridge-address").value = `127.0.0.1:${bridge.port}`;
+  $("bridge-token").value = bridge.token || "";
+  setBoolRowUI("auto-dial-row", !!bridge.auto_dial);
+  setBoolRowUI("tel-handler-row", !!bridge.register_tel_handler);
+}
+
 async function openSettings() {
   try {
-    const [account, theme, corePath, adminStatus] = await Promise.all([
+    const [account, theme, corePath, adminStatus, favorites, bridge] = await Promise.all([
       invoke("get_account_settings"),
       invoke("get_theme"),
       invoke("get_core_binary_path"),
       invoke("admin_status"),
+      invoke("get_favorites"),
+      invoke("get_bridge_settings"),
     ]);
     state.account = { ...state.account, ...account };
     state.adminConfigured = adminStatus.configured;
     state.adminUnlocked = adminStatus.unlocked;
+    state.bridge = bridge;
 
     $("in-display-name").value = account.display_name || "";
     $("in-host").value = account.host || "";
@@ -492,6 +603,8 @@ async function openSettings() {
     $("in-core-path").value = corePath || "";
     setTransportUI(account.transport_priority || "auto");
     setThemeUI(theme || "auto");
+    renderFavoritesFields(favorites);
+    renderBridgeFields(bridge);
     $("save-status").textContent = "";
     $("save-status").className = "status";
   } catch (e) {
@@ -540,6 +653,9 @@ async function saveAccountSettings() {
     });
     const corePathValue = $("in-core-path").value.trim();
     await invoke("set_core_binary_path", { path: corePathValue.length ? corePathValue : null });
+    const favorites = await invoke("save_favorites", { favorites: collectFavoritesFields() });
+    state.favorites = favorites;
+    renderFavorites();
     statusEl.textContent = "Saved — reconnecting…";
     statusEl.className = "status ok";
     const account = await invoke("get_account_settings");
@@ -648,17 +764,103 @@ function wireStaticHandlers() {
   });
 
   document.addEventListener("keydown", (e) => {
+    if (!$("dial-confirm-overlay").hidden) return; // handled by its own listener below
     if (!$("screen-settings").hidden) return;
     if (state.call) return;
     if (/^[0-9*#]$/.test(e.key)) appendDigit(e.key);
     else if (e.key === "Backspace") backspace();
     else if (e.key === "Enter") dialUri(state.dial);
   });
+
+  // ---- dial confirmation (favorites + click-to-call + deep links) --------
+  $("btn-dial-confirm-call").addEventListener("click", () => {
+    const number = state.pendingDialNumber;
+    closeDialConfirm();
+    if (number) dialUri(number);
+  });
+  $("btn-dial-confirm-cancel").addEventListener("click", closeDialConfirm);
+  document.addEventListener("keydown", (e) => {
+    if ($("dial-confirm-overlay").hidden) return;
+    if (e.key === "Enter") $("btn-dial-confirm-call").click();
+    else if (e.key === "Escape") $("btn-dial-confirm-cancel").click();
+  });
+
+  // ---- click-to-call bridge settings ---------------------------------
+  $("btn-copy-token").addEventListener("click", async () => {
+    const token = $("bridge-token").value;
+    const statusEl = $("copy-token-status");
+    try {
+      await navigator.clipboard.writeText(token);
+    } catch (e) {
+      // Fallback if the webview didn't grant the async Clipboard API.
+      const input = $("bridge-token");
+      input.removeAttribute("readonly");
+      input.select();
+      document.execCommand("copy");
+      input.setAttribute("readonly", "");
+    }
+    statusEl.textContent = "Copied.";
+    statusEl.className = "hint ok";
+    setTimeout(() => {
+      statusEl.textContent = "";
+    }, 2500);
+  });
+  document.querySelectorAll("#auto-dial-row button").forEach((b) => {
+    b.addEventListener("click", async () => {
+      const value = b.dataset.boolChoice === "true";
+      setBoolRowUI("auto-dial-row", value);
+      try {
+        await invoke("set_auto_dial", { auto_dial: value });
+        if (state.bridge) state.bridge.auto_dial = value;
+      } catch (e) {
+        showBanner(String(e), "err");
+      }
+    });
+  });
+  document.querySelectorAll("#tel-handler-row button").forEach((b) => {
+    b.addEventListener("click", async () => {
+      const value = b.dataset.boolChoice === "true";
+      setBoolRowUI("tel-handler-row", value);
+      try {
+        await invoke("set_register_tel_handler", { enabled: value });
+        if (state.bridge) state.bridge.register_tel_handler = value;
+      } catch (e) {
+        showBanner(String(e), "err");
+      }
+    });
+  });
+}
+
+// Mirrors v1's `broadcast('dial-request', number)` origin story (the
+// keypad/hotkey/protocol paths all funneled into one channel there too) -
+// here it's the click-to-call bridge (bridge.rs) and centinelo:// or tel:
+// deep links (deeplink.rs), unified into one "click-to-call" event so the
+// UI only needs one confirmation flow (see confirmAndDial above).
+const CLICK_TO_CALL_SOURCE_LABEL = {
+  bridge: "your browser",
+  tel: "a tel: link",
+  centinelo: "a centinelo: link",
+};
+
+function handleClickToCall(payload) {
+  if (!payload || !payload.number) return;
+  const sourceLabel = CLICK_TO_CALL_SOURCE_LABEL[payload.source] || "outside the app";
+  if (state.call) {
+    showBanner(`Can't dial ${payload.number} — you're already on a call.`, "err");
+    return;
+  }
+  if (payload.auto_dial) {
+    showBanner(`Dialing ${payload.number} from ${sourceLabel}.`, "info");
+    dialUri(payload.number);
+    return;
+  }
+  confirmAndDial(payload.number, `From ${sourceLabel}.`);
 }
 
 async function attachTauriListeners() {
   await listen("sidecar-status", (e) => handleSidecarStatus(e.payload));
   await listen("sidecar-event", (e) => handleSidecarEvent(e.payload));
+  await listen("click-to-call", (e) => handleClickToCall(e.payload));
 }
 
 async function boot() {
@@ -666,15 +868,17 @@ async function boot() {
   wireStaticHandlers();
 
   try {
-    const [account, favorites, theme, sidecarStatus] = await Promise.all([
+    const [account, favorites, theme, sidecarStatus, blfStates] = await Promise.all([
       invoke("get_account_settings"),
       invoke("get_favorites"),
       invoke("get_theme"),
       invoke("sidecar_status"),
+      invoke("get_blf_states"),
     ]);
     state.account = account;
     state.favorites = favorites;
     state.sidecarStatus = sidecarStatus;
+    state.blf = blfStates || {};
     applyTheme(theme || "auto");
   } catch (e) {
     console.error("boot load failed", e);

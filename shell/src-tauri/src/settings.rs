@@ -45,6 +45,53 @@ pub struct FavoriteSlot {
     pub label: String,
 }
 
+/// Free tier: 4 live BLF favorites (see core/PROTOCOL.md `blf_subscribe`).
+pub const MAX_FAVORITES: usize = 4;
+
+/// Always exactly `MAX_FAVORITES` slots (padding with empty ones), each
+/// trimmed - keeps the favorites grid's shape stable regardless of how many
+/// the operator actually filled in, matching `default_favorites()`.
+fn normalize_favorites(input: Vec<FavoriteSlot>) -> Vec<FavoriteSlot> {
+    let mut out: Vec<FavoriteSlot> = input
+        .into_iter()
+        .take(MAX_FAVORITES)
+        .map(|f| FavoriteSlot {
+            ext: f.ext.trim().to_string(),
+            label: f.label.trim().to_string(),
+        })
+        .collect();
+    while out.len() < MAX_FAVORITES {
+        let n = out.len() + 1;
+        out.push(FavoriteSlot {
+            ext: String::new(),
+            label: format!("Favorite {n}"),
+        });
+    }
+    out
+}
+
+/// Click-to-call bridge (localhost HTTP, see bridge.rs) + deep-link settings.
+/// `token` guards the bridge - minted once on first run (see
+/// `SettingsStore::load`), same shape as v1's `clickToCallToken`
+/// (`crypto.randomBytes(16).toString('hex')`, see src/main/main.js) so
+/// there's nothing new for a paired Chrome extension to learn.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BridgeSettings {
+    #[serde(default)]
+    pub token: String,
+    /// Skip the "call this number?" confirmation for both the click-to-call
+    /// bridge and centinelo:// or tel: deep links (same flow, one flag - see
+    /// bridge.rs/deeplink.rs). Off by default: an external dial request
+    /// always needs a human's yes first unless explicitly opted into.
+    #[serde(default)]
+    pub auto_dial: bool,
+    /// Opt-in OS-level `tel:` handler registration (`centinelo://` is always
+    /// claimed - it's this app's own scheme, no conflict risk). See
+    /// deeplink.rs for the macOS/Windows/Linux platform split.
+    #[serde(default)]
+    pub register_tel_handler: bool,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AccountSettings {
     #[serde(default)]
@@ -96,6 +143,8 @@ pub struct AppSettings {
     /// (see sidecar.rs `default_core_binary_path`).
     #[serde(default)]
     pub core_binary_path: Option<String>,
+    #[serde(default)]
+    pub bridge: BridgeSettings,
 }
 
 fn default_favorites() -> Vec<FavoriteSlot> {
@@ -123,7 +172,7 @@ impl SettingsStore {
         let path = app_data_dir.join(SETTINGS_FILE);
         let recents_path = app_data_dir.join(RECENTS_FILE);
 
-        let mut settings = if path.exists() {
+        let mut settings: AppSettings = if path.exists() {
             let raw = fs::read_to_string(&path)?;
             serde_json::from_str(&raw).unwrap_or_default()
         } else {
@@ -132,12 +181,26 @@ impl SettingsStore {
         if settings.favorites.is_empty() {
             settings.favorites = default_favorites();
         }
+        let mut dirty = false;
+        // First run (or an existing settings.json predating the bridge):
+        // mint a token once and persist it immediately, matching v1's own
+        // "mint on first read" behavior for `clickToCallToken` (see
+        // src/main/main.js `getSettings()`).
+        if settings.bridge.token.is_empty() {
+            settings.bridge.token = generate_bridge_token();
+            dirty = true;
+        }
 
-        Ok(Self {
+        let store = Self {
             path,
             recents_path,
             inner: Mutex::new(settings),
-        })
+        };
+        if dirty {
+            let snapshot = store.snapshot();
+            store.persist(&snapshot)?;
+        }
+        Ok(store)
     }
 
     pub fn snapshot(&self) -> AppSettings {
@@ -169,6 +232,24 @@ impl SettingsStore {
     pub fn update_theme(&self, theme: ThemePref) -> std::io::Result<()> {
         let mut guard = self.inner.lock().expect("settings mutex poisoned");
         guard.theme = theme;
+        self.persist(&guard)
+    }
+
+    pub fn update_favorites(&self, favorites: Vec<FavoriteSlot>) -> std::io::Result<()> {
+        let mut guard = self.inner.lock().expect("settings mutex poisoned");
+        guard.favorites = normalize_favorites(favorites);
+        self.persist(&guard)
+    }
+
+    pub fn update_bridge_auto_dial(&self, auto_dial: bool) -> std::io::Result<()> {
+        let mut guard = self.inner.lock().expect("settings mutex poisoned");
+        guard.bridge.auto_dial = auto_dial;
+        self.persist(&guard)
+    }
+
+    pub fn update_bridge_register_tel(&self, register: bool) -> std::io::Result<()> {
+        let mut guard = self.inner.lock().expect("settings mutex poisoned");
+        guard.bridge.register_tel_handler = register;
         self.persist(&guard)
     }
 
@@ -240,6 +321,20 @@ pub fn verify_password(password: &str, hash: &str) -> bool {
     Argon2::default()
         .verify_password(password.as_bytes(), &parsed)
         .is_ok()
+}
+
+/// 16 random bytes, hex-encoded (32 chars) - same shape as v1's
+/// `crypto.randomBytes(16).toString('hex')` (src/main/main.js
+/// `getSettings()`), just via `getrandom` (OS CSPRNG) instead of Node's.
+fn generate_bridge_token() -> String {
+    let mut buf = [0u8; 16];
+    // getrandom only fails if the OS entropy source itself is unavailable
+    // (never observed on macOS/Windows/Linux in practice) - falling back to
+    // an all-zero token would be a *worse* failure mode (a guessable bridge
+    // secret) than making the crash visible, so this stays a hard panic
+    // rather than a silent degrade.
+    getrandom::getrandom(&mut buf).expect("OS RNG unavailable - can't mint a bridge token");
+    hex::encode(buf)
 }
 
 // ---- Recents ------------------------------------------------------------
