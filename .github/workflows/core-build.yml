@@ -81,19 +81,40 @@ jobs:
     # See core/BUILD.md "Windows CI". Stays on until a run is confirmed green,
     # per that doc's note (do not flip without first seeing a green run).
     continue-on-error: true
-    env:
-      # Chocolatey's `openssl` package installs here on windows-latest; passed
-      # to both the libre and baresip CMake configs so find_package(OpenSSL)
-      # resolves the same headers/libs in both (baresip's configure pulls in
-      # core/deps/re/cmake/re-config.cmake, which re-runs find_package(OpenSSL)).
-      OPENSSL_ROOT_DIR: C:\Program Files\OpenSSL-Win64
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      - name: Install OpenSSL (Chocolatey, preinstalled on windows-latest)
+      - name: Install OpenSSL (Chocolatey)
         run: choco install openssl -y --no-progress
+
+      - name: Locate OpenSSL install dir (choco deploy path varies by pkg version)
+        # The Chocolatey `openssl` package changed its deploy dir between
+        # versions: v3.x installs to C:\Program Files\OpenSSL-Win64, but v4.x
+        # (current, ships the OpenSSL 3.x library) installs to
+        # C:\Program Files\OpenSSL (no -Win64 suffix). Hardcoding either path
+        # breaks the moment the other version is installed (the previous run
+        # failed here: find_package(OpenSSL) -> "missing: OPENSSL_CRYPTO_LIBRARY
+        # OPENSSL_INCLUDE_DIR", which in turn left the re `retest` target
+        # referencing NOTFOUND LIB_EAY_LIBRARY/SSL_EAY_LIBRARY). So we detect
+        # which candidate actually holds include/openssl/ssl.h and export it via
+        # $GITHUB_ENV. This MUST NOT be a job-level env: (that would take
+        # precedence over $GITHUB_ENV and silently re-break detection).
+        # Subsequent steps read $OPENSSL_ROOT_DIR and forward it to
+        # -DOPENSSL_ROOT_DIR so find_package(OpenSSL) resolves the same
+        # headers/libs for both libre and baresip (baresip's configure pulls in
+        # core/deps/re/cmake/re-config.cmake, which re-runs find_package(OpenSSL)).
+        shell: pwsh
+        run: |
+          $candidates = @('C:\Program Files\OpenSSL', 'C:\Program Files\OpenSSL-Win64')
+          $root = $candidates | Where-Object { Test-Path "$_\include\openssl\ssl.h" } | Select-Object -First 1
+          if (-not $root) {
+            Write-Error "OpenSSL headers (include/openssl/ssl.h) not found under: $($candidates -join ', ')"
+            exit 1
+          }
+          "OPENSSL_ROOT_DIR=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "OPENSSL_ROOT_DIR=$root"
 
       - name: Apply local re patches
         shell: bash
