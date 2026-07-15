@@ -2,11 +2,10 @@
   "name": "centinelo-phone",
   "productName": "Centinelo Phone",
   "version": "1.0.0",
-  "description": "Centinelo Phone — native WebRTC softphone (SIP over WSS) for the front desk. Windows first, macOS next.",
+  "description": "Centinelo Phone \u2014 native WebRTC softphone (SIP over WSS) for the front desk. Windows first, macOS next.",
   "main": "src/main/main.js",
   "author": "Felix Gonzalez",
   "license": "MIT",
-  
   "scripts": {
     "start": "electron .",
     "dev": "electron . --dev",
@@ -64,7 +63,8 @@
     "publish": {
       "provider": "github",
       "owner": "fegone",
-      "repo": "Centinelo-Phone"
+      "repo": "Centinelo-Phone",
+      "releaseType": "release"
     }
   },
   "allowScripts": {
