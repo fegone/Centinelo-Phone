@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Centinelo Click-to-Call — Options</title>
+  <style>
+    body { font-family: -apple-system, "Segoe UI", sans-serif; font-size: 13px; padding: 18px; width: 360px; }
+    label { display: block; margin: 10px 0 3px; color: #555; }
+    input { width: 100%; padding: 6px 8px; box-sizing: border-box; }
+    button { margin-top: 12px; padding: 8px 18px; }
+    #status { margin-left: 10px; color: green; }
+    .hint { font-size: 11px; color: #888; }
+  </style>
+</head>
+<body>
+  <h3>Centinelo Click-to-Call</h3>
+  <p class="hint">Copy the bridge token from Centinelo Phone → Settings → Hotkeys &amp; integration.</p>
+  <label for="port">Bridge port</label>
+  <input id="port" type="number" min="1024" max="65535" />
+  <label for="token">Bridge token</label>
+  <input id="token" type="text" />
+  <button id="save">Save</button><span id="status"></span>
+  <script src="options.js"></script>
+</body>
+</html>

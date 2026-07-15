@@ -1,0 +1,720 @@
+:root {
+  --teal: #14b8a6;
+  --teal-dark: #0f766e;
+  --teal-light: #5eead4;
+  --bg: #0b0f12;
+  --bg-elevated: #12181c;
+  --bg-card: #1a2126;
+  --key: #1e262c;
+  --key-hover: #28323a;
+  --border: #232d34;
+  --text: #eef3f5;
+  --text-muted: #7d909b;
+  --green: #16a34a;
+  --green-light: #22c55e;
+  --red: #dc2626;
+  --red-light: #ef4444;
+  --yellow: #f59e0b;
+  --radius: 12px;
+  --radius-sm: 9px;
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  font-size: 13px;
+  overflow: hidden;
+  user-select: none;
+}
+
+#app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+button:focus-visible,
+input:focus-visible,
+summary:focus-visible {
+  outline: 2px solid var(--teal-light);
+  outline-offset: 1px;
+}
+
+/* ---------- Slim header (~28px) ---------- */
+.header {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  height: 30px;
+  padding: 0 10px;
+  background: var(--bg-elevated);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #55636b;
+  flex-shrink: 0;
+}
+
+.status-dot.registered { background: var(--green-light); }
+.status-dot.disconnected { background: #55636b; }
+.status-dot.connecting {
+  background: var(--yellow);
+  animation: pulse-dot 1.2s infinite ease-in-out;
+}
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+
+.status-text {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-weight: 500;
+}
+
+.extension-label {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.icon-btn {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  font-size: 14px;
+  cursor: pointer;
+  padding: 3px 5px;
+  border-radius: 7px;
+  line-height: 1;
+}
+
+.icon-btn:hover {
+  background: rgba(255, 255, 255, 0.07);
+  color: var(--text);
+}
+
+/* ---------- Main / views ---------- */
+.main {
+  flex: 1;
+  overflow: hidden;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+}
+
+.view {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  flex: 1;
+  min-height: 0;
+}
+
+.hidden {
+  display: none !important;
+}
+
+/* ---------- Idle view: number + dialpad ---------- */
+.dial-input-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+#dialInput {
+  flex: 1;
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
+  font-size: 22px;
+  font-weight: 500;
+  text-align: center;
+  padding: 4px 2px 6px;
+  outline: none;
+  letter-spacing: 1px;
+  min-width: 0;
+  user-select: text;
+}
+
+#dialInput::placeholder {
+  color: var(--text-muted);
+  font-size: 15px;
+  font-weight: 400;
+  letter-spacing: 0.5px;
+}
+
+#dialInput:focus {
+  border-bottom-color: var(--teal-light);
+}
+
+.icon-btn.backspace {
+  font-size: 16px;
+  padding: 4px 6px;
+}
+
+.dialpad {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 7px;
+  justify-items: center;
+}
+
+.dial-key {
+  width: 100%;
+  max-width: 62px;
+  aspect-ratio: 1 / 1;
+  background: var(--key);
+  border: none;
+  border-radius: 50%;
+  color: var(--text);
+  font-size: 19px;
+  font-weight: 500;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 1px;
+  line-height: 1;
+  transition: background 0.1s ease, transform 0.05s ease;
+}
+
+.dial-key span {
+  font-size: 8px;
+  font-weight: 600;
+  color: var(--text-muted);
+  letter-spacing: 1px;
+}
+
+.dial-key:hover {
+  background: var(--key-hover);
+}
+
+.dial-key:active {
+  background: var(--teal-dark);
+  transform: scale(0.94);
+}
+
+/* ---------- Call button ---------- */
+.call-row {
+  display: flex;
+  justify-content: center;
+  padding-top: 1px;
+}
+
+.call-btn {
+  width: 52px;
+  height: 52px;
+  border-radius: 50%;
+  background: var(--green);
+  border: none;
+  color: white;
+  font-size: 24px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 2px 10px rgba(22, 163, 74, 0.35);
+  transition: background 0.12s ease, transform 0.05s ease;
+}
+
+.call-btn:disabled {
+  background: #2a343b;
+  color: var(--text-muted);
+  cursor: not-allowed;
+  box-shadow: none;
+}
+
+.call-btn:not(:disabled):hover { background: var(--green-light); }
+.call-btn:not(:disabled):active { transform: scale(0.94); }
+
+/* ---------- Recents (collapsed) ---------- */
+.recents {
+  border-top: 1px solid var(--border);
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.recents-summary {
+  list-style: none;
+  cursor: pointer;
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.7px;
+  padding: 7px 2px 5px;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.recents-summary::-webkit-details-marker { display: none; }
+
+.recents-summary::before {
+  content: "▸";
+  font-size: 9px;
+  transition: transform 0.15s ease;
+}
+
+.recents[open] .recents-summary::before {
+  transform: rotate(90deg);
+}
+
+.recents-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  max-height: 130px;
+}
+
+.recent-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 2px;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+}
+
+.recent-item:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.recent-dir {
+  width: 14px;
+  text-align: center;
+  font-size: 12px;
+  flex-shrink: 0;
+}
+
+.recent-dir.inbound { color: var(--teal-light); }
+.recent-dir.outbound { color: #60a5fa; }
+.recent-dir.missed { color: var(--red-light); }
+
+.recent-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.recent-name {
+  font-size: 12px;
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.recent-meta {
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+.recent-empty {
+  color: var(--text-muted);
+  font-size: 11px;
+  padding: 8px 2px;
+  text-align: center;
+}
+
+/* ---------- Caller card (ringing / calling / in-call) ---------- */
+.caller-card {
+  text-align: center;
+  padding: 14px 8px 4px;
+}
+
+.caller-name {
+  font-size: 19px;
+  font-weight: 700;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.caller-number {
+  font-size: 13px;
+  color: var(--text-muted);
+  margin-top: 3px;
+}
+
+.call-direction {
+  font-size: 10px;
+  color: var(--text-muted);
+  margin-top: 6px;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+}
+
+.call-timer {
+  font-size: 15px;
+  color: var(--teal-light);
+  margin-top: 8px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+
+.ringing-pulse .caller-name {
+  animation: ring-name-pulse 1.4s infinite ease-in-out;
+}
+
+@keyframes ring-name-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.65; }
+}
+
+/* ---------- Ring / calling actions ---------- */
+.ring-actions {
+  display: flex;
+  justify-content: center;
+  gap: 46px;
+  margin-top: auto;
+  padding-bottom: 16px;
+}
+
+.ring-actions.single { gap: 0; }
+
+.round-btn {
+  width: 58px;
+  height: 58px;
+  border-radius: 50%;
+  border: none;
+  font-size: 23px;
+  cursor: pointer;
+  color: white;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: transform 0.05s ease, background 0.12s ease;
+}
+
+.round-btn:active { transform: scale(0.94); }
+.round-btn.answer { background: var(--green); box-shadow: 0 2px 10px rgba(22, 163, 74, 0.35); }
+.round-btn.answer:hover { background: var(--green-light); }
+.round-btn.decline { background: var(--red); box-shadow: 0 2px 10px rgba(220, 38, 38, 0.32); }
+.round-btn.decline:hover { background: var(--red-light); }
+
+/* ---------- In-call controls ---------- */
+.hold-banner {
+  background: var(--yellow);
+  color: #1a1a1a;
+  font-weight: 700;
+  font-size: 11px;
+  letter-spacing: 0.5px;
+  padding: 6px 10px;
+  border-radius: var(--radius-sm);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.link-btn {
+  background: transparent;
+  border: none;
+  color: inherit;
+  text-decoration: underline;
+  font-size: 11px;
+  cursor: pointer;
+  padding: 0;
+}
+
+.incall-controls {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 6px;
+  margin-top: auto;
+}
+
+.ctrl-btn {
+  background: var(--key);
+  border: none;
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  padding: 8px 2px;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  font-size: 9px;
+  transition: background 0.1s ease;
+}
+
+.ctrl-btn:hover { background: var(--key-hover); }
+
+.ctrl-btn.active {
+  background: var(--teal-dark);
+  color: white;
+}
+
+.ctrl-icon { font-size: 16px; }
+
+.hangup-btn {
+  background: var(--red);
+  border: none;
+  color: white;
+  font-size: 14px;
+  font-weight: 600;
+  padding: 11px;
+  border-radius: 22px;
+  cursor: pointer;
+  margin-top: 8px;
+  box-shadow: 0 2px 10px rgba(220, 38, 38, 0.3);
+  transition: background 0.12s ease, transform 0.05s ease;
+}
+
+.hangup-btn:hover { background: var(--red-light); }
+.hangup-btn:active { transform: scale(0.98); }
+
+/* ---------- Transfer panel ---------- */
+.transfer-panel {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+#transferTarget {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  color: var(--text);
+  padding: 7px 9px;
+  font-size: 13px;
+  outline: none;
+  user-select: text;
+}
+
+#transferTarget:focus { border-color: var(--teal-light); }
+
+.transfer-buttons {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.secondary-btn {
+  flex: 1;
+  background: var(--teal-dark);
+  border: none;
+  color: white;
+  padding: 7px 8px;
+  border-radius: 7px;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.secondary-btn:hover { background: var(--teal); }
+
+.secondary-btn:disabled {
+  background: #2a343b;
+  color: var(--text-muted);
+  cursor: not-allowed;
+}
+
+.secondary-btn.danger { background: var(--red); }
+.secondary-btn.danger:hover { background: var(--red-light); }
+
+.transfer-status {
+  font-size: 11px;
+  color: var(--text-muted);
+  flex: 1;
+}
+
+/* ---------- DTMF keypad overlay ---------- */
+.keypad-overlay {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.dtmf-display {
+  text-align: center;
+  font-size: 15px;
+  letter-spacing: 2px;
+  color: var(--teal-light);
+  min-height: 18px;
+  font-variant-numeric: tabular-nums;
+}
+
+.keypad-overlay .dial-key.dtmf-key {
+  max-width: 46px;
+  font-size: 16px;
+}
+
+/* ---------- BLF favorites ---------- */
+.favorites-row {
+  display: flex;
+  gap: 6px;
+  padding: 2px 0 8px;
+}
+
+.fav-btn {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 7px 4px 6px;
+  cursor: pointer;
+  color: var(--text);
+  transition: background 0.15s;
+}
+
+.fav-btn:hover { background: var(--key-hover); }
+
+.fav-lamp {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  box-shadow: 0 0 0 rgba(0,0,0,0);
+}
+
+.fav-btn.blf-idle .fav-lamp {
+  background: var(--green-light);
+  box-shadow: 0 0 6px rgba(34, 197, 94, 0.6);
+}
+
+.fav-btn.blf-busy .fav-lamp {
+  background: var(--red-light);
+  box-shadow: 0 0 6px rgba(239, 68, 68, 0.7);
+}
+
+.fav-btn.blf-ringing .fav-lamp {
+  background: var(--yellow);
+  box-shadow: 0 0 6px rgba(245, 158, 11, 0.7);
+  animation: blf-blink 0.9s ease-in-out infinite;
+}
+
+@keyframes blf-blink {
+  50% { opacity: 0.25; }
+}
+
+.fav-label {
+  font-size: 10.5px;
+  line-height: 1.1;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+
+.fav-btn.blf-busy .fav-label,
+.fav-btn.blf-ringing .fav-label { color: var(--text); }
+
+/* ---------- Redial (call-row layout: redial | call | spacer) ---------- */
+.call-row {
+  align-items: center;
+  gap: 18px;
+}
+
+.icon-btn.redial {
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  font-size: 17px;
+}
+
+.icon-btn.redial:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.call-row-spacer {
+  width: 34px;
+  height: 34px;
+}
+
+/* ===================== Centinelo additions ===================== */
+
+/* Call-waiting bar */
+.waiting-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 10px;
+  background: #3d2f00;
+  border-bottom: 1px solid #6b5300;
+  animation: waitingPulse 2s ease-in-out infinite;
+}
+@keyframes waitingPulse {
+  0%, 100% { background: #3d2f00; }
+  50% { background: #524000; }
+}
+.waiting-info { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.waiting-label { font-size: 11px; color: #d4b106; font-weight: 600; }
+.waiting-name {
+  font-size: 12px; color: #f0e6c8; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis;
+}
+.waiting-actions { display: flex; gap: 6px; flex-shrink: 0; }
+.mini-btn {
+  border: none; border-radius: 50%; width: 28px; height: 28px;
+  font-size: 13px; cursor: pointer; color: #fff;
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.mini-btn.answer { background: #2e7d32; }
+.mini-btn.answer:hover { background: #388e3c; }
+.mini-btn.decline { background: #c62828; }
+.mini-btn.decline:hover { background: #d32f2f; }
+.mini-btn.swap {
+  border-radius: 14px; width: auto; padding: 0 10px; height: 24px;
+  background: #37474f; font-size: 11px;
+}
+.mini-btn.swap:hover { background: #455a64; }
+
+/* Held second line bar */
+.held-other-bar {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 8px; padding: 5px 10px; margin-bottom: 6px;
+  background: #263238; border-radius: 8px;
+}
+.held-other-name {
+  font-size: 12px; color: #b0bec5; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis;
+}
+
+/* DND button */
+.icon-btn.dnd { opacity: 0.45; }
+.icon-btn.dnd.active { opacity: 1; color: #d4b106; }
+
+/* Footer version */
+.footer {
+  padding: 3px 10px; text-align: center;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+}
+.version-label { font-size: 10px; color: #546e7a; }

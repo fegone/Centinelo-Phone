@@ -1,0 +1,10 @@
+node_modules/
+dist/
+*.log
+.DS_Store
+package-lock.json.bak
+# Never commit real credentials/settings
+settings.local.json
+*.pem
+*.key
+*.crt

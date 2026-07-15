@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;" />
+  <title>Centinelo Phone — Settings</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; padding: 20px 24px 40px;
+      background: #10151a; color: #cfd8dc;
+      font-family: -apple-system, "Segoe UI", Roboto, sans-serif; font-size: 13px;
+    }
+    h1 { font-size: 17px; color: #eceff1; margin: 0 0 4px; }
+    .sub { font-size: 11px; color: #607d8b; margin-bottom: 18px; }
+    fieldset {
+      border: 1px solid #263238; border-radius: 10px;
+      margin: 0 0 16px; padding: 12px 14px;
+    }
+    legend { font-size: 12px; font-weight: 600; color: #90a4ae; padding: 0 6px; }
+    label { display: block; margin: 8px 0 3px; font-size: 12px; color: #90a4ae; }
+    input[type="text"], input[type="password"], input[type="number"], select {
+      width: 100%; padding: 7px 9px; border-radius: 7px;
+      border: 1px solid #37474f; background: #1c2429; color: #eceff1; font-size: 13px;
+    }
+    input:focus, select:focus { outline: none; border-color: #4fc3f7; }
+    .row { display: flex; gap: 10px; }
+    .row > div { flex: 1; }
+    .check { display: flex; align-items: center; gap: 8px; margin: 7px 0; }
+    .check input { width: auto; }
+    .check label { margin: 0; color: #cfd8dc; cursor: pointer; }
+    .hint { font-size: 11px; color: #546e7a; margin: 2px 0 0; }
+    .fav-row { display: flex; gap: 8px; margin-bottom: 6px; }
+    .fav-row input.ext { width: 90px; flex: none; }
+    button.primary {
+      background: #1976d2; color: #fff; border: none; border-radius: 8px;
+      padding: 10px 22px; font-size: 14px; cursor: pointer; margin-top: 6px;
+    }
+    button.primary:hover { background: #1e88e5; }
+    button.ghost {
+      background: transparent; color: #90a4ae; border: 1px solid #37474f;
+      border-radius: 8px; padding: 8px 14px; font-size: 12px; cursor: pointer;
+    }
+    #saveStatus { margin-left: 12px; font-size: 12px; color: #66bb6a; }
+    .actions { position: sticky; bottom: 0; background: #10151a; padding: 12px 0; }
+  </style>
+</head>
+<body>
+  <h1>Centinelo Phone</h1>
+  <div class="sub" id="versionSub"></div>
+
+  <fieldset>
+    <legend>SIP account</legend>
+    <label for="wssUrl">WSS server</label>
+    <input id="wssUrl" type="text" placeholder="wss://pbx.example.com:8089/ws" />
+    <div class="row">
+      <div>
+        <label for="extension">Extension</label>
+        <input id="extension" type="text" inputmode="numeric" />
+      </div>
+      <div>
+        <label for="password">Password</label>
+        <input id="password" type="password" autocomplete="off" />
+      </div>
+    </div>
+    <label for="displayName">Display name (optional)</label>
+    <input id="displayName" type="text" />
+    <p class="hint">Codecs: Opus + G.722 (HD) + G.711 negotiated by the browser engine. G.729 trunks are served via PBX transcoding — no client config needed.</p>
+  </fieldset>
+
+  <fieldset>
+    <legend>Audio devices</legend>
+    <label for="micDevice">Microphone</label>
+    <select id="micDevice"></select>
+    <label for="speakerDevice">Speaker (call audio)</label>
+    <select id="speakerDevice"></select>
+    <label for="ringerDevice">Ringer (where it rings)</label>
+    <select id="ringerDevice"></select>
+    <p class="hint">Tip: voice in the headset, ringer on the PC speakers — you hear calls ring even without the headset on.</p>
+    <div class="check"><input id="echoCancellation" type="checkbox" /><label for="echoCancellation">Echo cancellation</label></div>
+    <div class="check"><input id="noiseSuppression" type="checkbox" /><label for="noiseSuppression">Noise suppression</label></div>
+    <div class="check"><input id="autoGainControl" type="checkbox" /><label for="autoGainControl">Auto gain control</label></div>
+    <button id="micPermBtn" class="ghost" type="button">Test microphone access</button>
+    <span id="micPermStatus" class="hint"></span>
+  </fieldset>
+
+  <fieldset>
+    <legend>Call behavior</legend>
+    <div class="check"><input id="callWaiting" type="checkbox" /><label for="callWaiting">Call waiting (second incoming line + swap)</label></div>
+    <div class="check"><input id="dnd" type="checkbox" /><label for="dnd">Do Not Disturb</label></div>
+    <div class="check"><input id="autoAnswer" type="checkbox" /><label for="autoAnswer">Auto-answer incoming calls</label></div>
+    <label for="autoAnswerDelayMs">Auto-answer delay (ms)</label>
+    <input id="autoAnswerDelayMs" type="number" min="0" step="500" />
+  </fieldset>
+
+  <fieldset>
+    <legend>BLF favorites (busy lamps, max 4)</legend>
+    <div id="favContainer"></div>
+    <p class="hint">Extension + label. Lamp: green = free, amber = ringing, red = busy.</p>
+  </fieldset>
+
+  <fieldset>
+    <legend>Hotkeys & integration</legend>
+    <div class="check"><input id="globalHotkeys" type="checkbox" /><label for="globalHotkeys">Global hotkeys</label></div>
+    <div class="row">
+      <div>
+        <label for="hotkeyAnswer">Answer</label>
+        <input id="hotkeyAnswer" type="text" />
+      </div>
+      <div>
+        <label for="hotkeyHangup">Hang up</label>
+        <input id="hotkeyHangup" type="text" />
+      </div>
+      <div>
+        <label for="hotkeyDialClipboard">Dial clipboard</label>
+        <input id="hotkeyDialClipboard" type="text" />
+      </div>
+    </div>
+    <div class="check"><input id="registerTelHandler" type="checkbox" /><label for="registerTelHandler">Handle tel: links (system-wide)</label></div>
+    <div class="check"><input id="clickToCallBridge" type="checkbox" /><label for="clickToCallBridge">Click-to-call bridge (browser extension)</label></div>
+    <div class="row">
+      <div>
+        <label for="clickToCallPort">Bridge port</label>
+        <input id="clickToCallPort" type="number" min="1024" max="65535" />
+      </div>
+      <div>
+        <label for="clickToCallToken">Bridge token (paste into the extension)</label>
+        <input id="clickToCallToken" type="text" readonly />
+      </div>
+    </div>
+  </fieldset>
+
+  <fieldset>
+    <legend>Patient lookup (optional)</legend>
+    <label for="lookupUrl">Lookup URL</label>
+    <input id="lookupUrl" type="text" placeholder="http://host:8791/lookup" />
+    <label for="lookupToken">Lookup token</label>
+    <input id="lookupToken" type="password" autocomplete="off" />
+    <label for="newPatientUrl">New-patient URL</label>
+    <input id="newPatientUrl" type="text" />
+  </fieldset>
+
+  <fieldset>
+    <legend>App</legend>
+    <div class="check"><input id="startOnBoot" type="checkbox" /><label for="startOnBoot">Start with Windows</label></div>
+    <div class="check"><input id="startMinimized" type="checkbox" /><label for="startMinimized">Start minimized to tray</label></div>
+    <div class="check"><input id="alwaysOnTop" type="checkbox" /><label for="alwaysOnTop">Always on top</label></div>
+    <div class="check"><input id="debug" type="checkbox" /><label for="debug">Debug logging (may log caller info — troubleshooting only)</label></div>
+  </fieldset>
+
+  <div class="actions">
+    <button id="saveBtn" class="primary" type="button">Save</button>
+    <span id="saveStatus"></span>
+  </div>
+
+  <script src="settings.js"></script>
+</body>
+</html>

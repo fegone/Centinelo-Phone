@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self'; connect-src 'self' wss: https:; media-src 'self' blob: mediastream:; img-src 'self' data:;" />
+  <title>Centinelo Phone</title>
+  <link rel="stylesheet" href="phone.css" />
+</head>
+<body>
+  <!-- Hidden audio sinks — the engine owns these. Voice + ringtone/beep. -->
+  <audio id="remoteAudio" autoplay hidden></audio>
+  <audio id="ringtoneAudio" autoplay hidden></audio>
+
+  <div id="app">
+    <!-- Slim header: status dot + extension + DND + settings -->
+    <header class="header">
+      <span id="statusDot" class="status-dot disconnected" title="Disconnected"></span>
+      <span id="statusText" class="status-text">Disconnected</span>
+      <span id="extensionLabel" class="extension-label"></span>
+      <button id="dndBtn" class="icon-btn dnd" title="Do Not Disturb" aria-label="Do Not Disturb">🌙</button>
+      <button id="settingsBtn" class="icon-btn" title="Settings" aria-label="Settings">⚙</button>
+    </header>
+
+    <!-- Call-waiting bar: shows when a 2nd call arrives while on a call -->
+    <div id="waitingBar" class="waiting-bar hidden">
+      <div class="waiting-info">
+        <span class="waiting-label">Waiting:</span>
+        <span id="waitingName" class="waiting-name"></span>
+      </div>
+      <div class="waiting-actions">
+        <button id="waitingAnswerBtn" class="mini-btn answer" title="Answer (puts current call on hold)">✆</button>
+        <button id="waitingRejectBtn" class="mini-btn decline" title="Decline">✕</button>
+      </div>
+    </div>
+
+    <main id="main" class="main">
+      <!-- ============ IDLE VIEW ============ -->
+      <section id="idleView" class="view">
+        <div id="favoritesRow" class="favorites-row hidden"></div>
+
+        <div class="dial-input-row">
+          <input id="dialInput" type="text" inputmode="tel" placeholder="Enter number" autocomplete="off" aria-label="Phone number" />
+          <button id="backspaceBtn" class="icon-btn backspace" title="Backspace" aria-label="Backspace">⌫</button>
+        </div>
+
+        <div class="dialpad">
+          <button class="dial-key" data-key="1" aria-label="1">1</button>
+          <button class="dial-key" data-key="2" aria-label="2 ABC">2<span>ABC</span></button>
+          <button class="dial-key" data-key="3" aria-label="3 DEF">3<span>DEF</span></button>
+          <button class="dial-key" data-key="4" aria-label="4 GHI">4<span>GHI</span></button>
+          <button class="dial-key" data-key="5" aria-label="5 JKL">5<span>JKL</span></button>
+          <button class="dial-key" data-key="6" aria-label="6 MNO">6<span>MNO</span></button>
+          <button class="dial-key" data-key="7" aria-label="7 PQRS">7<span>PQRS</span></button>
+          <button class="dial-key" data-key="8" aria-label="8 TUV">8<span>TUV</span></button>
+          <button class="dial-key" data-key="9" aria-label="9 WXYZ">9<span>WXYZ</span></button>
+          <button class="dial-key" data-key="*" aria-label="Star">*</button>
+          <button class="dial-key" data-key="0" aria-label="0 plus">0<span>+</span></button>
+          <button class="dial-key" data-key="#" aria-label="Pound">#</button>
+        </div>
+
+        <div class="call-row">
+          <button id="redialBtn" class="icon-btn redial" title="Redial last number" aria-label="Redial" disabled>↻</button>
+          <button id="callBtn" class="call-btn" aria-label="Call" disabled>✆</button>
+          <span class="call-row-spacer" aria-hidden="true"></span>
+        </div>
+
+        <details class="recents">
+          <summary class="recents-summary">Recent calls</summary>
+          <ul id="recentsList" class="recents-list"></ul>
+        </details>
+      </section>
+
+      <!-- ============ RINGING VIEW (incoming) ============ -->
+      <section id="ringingView" class="view hidden">
+        <div class="caller-card ringing-pulse">
+          <div class="caller-name" id="ringingName">Unknown</div>
+          <div class="caller-number" id="ringingNumber"></div>
+          <div class="call-direction">Incoming</div>
+        </div>
+        <div class="ring-actions">
+          <button id="declineBtn" class="round-btn decline" aria-label="Decline">✕</button>
+          <button id="answerBtn" class="round-btn answer" aria-label="Answer">✆</button>
+        </div>
+      </section>
+
+      <!-- ============ CALLING VIEW (outgoing, not yet answered) ============ -->
+      <section id="callingView" class="view hidden">
+        <div class="caller-card">
+          <div class="caller-name" id="callingNumber"></div>
+          <div class="call-direction">Calling…</div>
+        </div>
+        <div class="ring-actions single">
+          <button id="cancelCallBtn" class="round-btn decline" aria-label="Cancel">✕</button>
+        </div>
+      </section>
+
+      <!-- ============ IN-CALL VIEW ============ -->
+      <section id="inCallView" class="view hidden">
+        <div id="holdBanner" class="hold-banner hidden">
+          <span>⏸ ON HOLD</span>
+          <button id="resumeBtn" class="link-btn">Resume</button>
+        </div>
+
+        <!-- Second line parked on hold (call waiting answered) -->
+        <div id="heldOtherBar" class="held-other-bar hidden">
+          <span id="heldOtherName" class="held-other-name"></span>
+          <button id="swapBtn" class="mini-btn swap" title="Swap calls">⇄ Swap</button>
+        </div>
+
+        <div class="caller-card">
+          <div class="caller-name" id="inCallName">Unknown</div>
+          <div class="caller-number" id="inCallNumber"></div>
+          <div class="call-timer" id="callTimer">00:00</div>
+        </div>
+
+        <div class="incall-controls">
+          <button id="muteBtn" class="ctrl-btn" title="Mute" aria-label="Mute">
+            <span class="ctrl-icon">🎤</span><span class="ctrl-label">Mute</span>
+          </button>
+          <button id="holdBtn" class="ctrl-btn" title="Hold" aria-label="Hold">
+            <span class="ctrl-icon">⏸</span><span class="ctrl-label">Hold</span>
+          </button>
+          <button id="keypadBtn" class="ctrl-btn" title="Keypad" aria-label="Keypad">
+            <span class="ctrl-icon">⌨</span><span class="ctrl-label">Keys</span>
+          </button>
+          <button id="transferBtn" class="ctrl-btn" title="Transfer" aria-label="Transfer">
+            <span class="ctrl-icon">↪</span><span class="ctrl-label">Transfer</span>
+          </button>
+        </div>
+
+        <div id="transferPanel" class="transfer-panel hidden">
+          <input id="transferTarget" type="text" inputmode="tel" placeholder="Transfer to ext/number" aria-label="Transfer target" />
+          <div id="transferButtonsInitial" class="transfer-buttons">
+            <button id="blindTransferBtn" class="secondary-btn">Blind</button>
+            <button id="attendedTransferBtn" class="secondary-btn">Attended</button>
+          </div>
+          <div id="transferButtonsAttended" class="transfer-buttons hidden">
+            <span class="transfer-status">Second leg dialing…</span>
+            <button id="completeTransferBtn" class="secondary-btn">Complete</button>
+            <button id="cancelTransferBtn" class="secondary-btn danger">Cancel</button>
+          </div>
+          <button id="closeTransferBtn" class="link-btn">Close</button>
+        </div>
+
+        <div id="keypadOverlay" class="keypad-overlay hidden">
+          <div class="dtmf-display" id="dtmfDisplay"></div>
+          <div class="dialpad">
+            <button class="dial-key dtmf-key" data-key="1" aria-label="1">1</button>
+            <button class="dial-key dtmf-key" data-key="2" aria-label="2">2</button>
+            <button class="dial-key dtmf-key" data-key="3" aria-label="3">3</button>
+            <button class="dial-key dtmf-key" data-key="4" aria-label="4">4</button>
+            <button class="dial-key dtmf-key" data-key="5" aria-label="5">5</button>
+            <button class="dial-key dtmf-key" data-key="6" aria-label="6">6</button>
+            <button class="dial-key dtmf-key" data-key="7" aria-label="7">7</button>
+            <button class="dial-key dtmf-key" data-key="8" aria-label="8">8</button>
+            <button class="dial-key dtmf-key" data-key="9" aria-label="9">9</button>
+            <button class="dial-key dtmf-key" data-key="*" aria-label="Star">*</button>
+            <button class="dial-key dtmf-key" data-key="0" aria-label="0">0</button>
+            <button class="dial-key dtmf-key" data-key="#" aria-label="Pound">#</button>
+          </div>
+          <button id="closeKeypadBtn" class="link-btn">Close</button>
+        </div>
+
+        <button id="hangupBtn" class="hangup-btn" aria-label="Hang up">☎ End</button>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <span id="versionLabel" class="version-label"></span>
+    </footer>
+  </div>
+
+  <script src="vendor/sip-0.21.2.min.js"></script>
+  <script src="common.js"></script>
+  <script src="engine.js"></script>
+  <script src="ui.js"></script>
+</body>
+</html>

@@ -1,0 +1,73 @@
+{
+  "name": "centinelo-phone",
+  "productName": "Centinelo Phone",
+  "version": "1.0.0",
+  "description": "Centinelo Phone — native WebRTC softphone (SIP over WSS) for the front desk. Windows first, macOS next.",
+  "main": "src/main/main.js",
+  "author": "Felix Gonzalez",
+  "license": "MIT",
+  
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --dev",
+    "dist:win": "electron-builder --win",
+    "dist:mac": "electron-builder --mac",
+    "test": "node test/smoke.mjs"
+  },
+  "devDependencies": {
+    "electron": "^36.0.0",
+    "electron-builder": "^25.0.0"
+  },
+  "build": {
+    "appId": "com.centinelo.phone",
+    "productName": "Centinelo Phone",
+    "artifactName": "CentineloPhone-Setup-${version}.${ext}",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "src/**/*",
+      "build/icons-src/**/*",
+      "!**/*.map"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "deleteAppDataOnUninstall": false,
+      "runAfterFinish": true
+    },
+    "mac": {
+      "target": [
+        "dmg"
+      ],
+      "category": "public.app-category.business"
+    },
+    "protocols": [
+      {
+        "name": "Centinelo Phone",
+        "schemes": [
+          "centinelo"
+        ]
+      }
+    ],
+    "publish": {
+      "provider": "github",
+      "owner": "fegone",
+      "repo": "Centinelo-Phone"
+    }
+  },
+  "allowScripts": {
+    "electron@36.9.5": true
+  }
+}
