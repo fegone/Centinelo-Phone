@@ -74,6 +74,16 @@ const READ_TIMEOUT_MS: i32 = 300;
 /// immediately, which would otherwise leave a stale "Connected" status
 /// showing for an unplugged headset indefinitely.
 const PRESENCE_RECHECK: Duration = Duration::from_secs(2);
+/// Minimum time between two dispatched HID actions - 4R review finding M1
+/// (2026-07-16): edge-triggered dispatch alone doesn't stop a device
+/// sending reports faster than a human could physically press a button
+/// (buggy firmware re-sending the same report on a timer, or a
+/// deliberately hostile USB device) from replaying answer/hangup/mute
+/// against real call-center calls as fast as the bus allows.
+/// `READ_TIMEOUT_MS` is a *read* timeout, not a rate limit - it doesn't
+/// help here. 400ms is comfortably above any real human button-press
+/// cadence (even a fast double-tap) while still feeling instant.
+const MIN_ACTION_INTERVAL: Duration = Duration::from_millis(400);
 
 /// What the frontend (`hid_status` command) sees. Deliberately does not
 /// distinguish "no device plugged in" from "feature not enabled but would
@@ -107,8 +117,13 @@ struct Shared {
     /// Authoritative call/mute state for LED mirroring, kept independent of
     /// *who* changed it (the headset's own button, or the main window's
     /// UI) - see `listen_call_events` below. Read by the poll thread every
-    /// time it has fresh input to react to.
+    /// tick, not just when device input arrives (4R review finding A2 -
+    /// see `poll_once`'s doc).
     led: Mutex<LedState>,
+    /// When the last HID-triggered action actually dispatched - rate-limit
+    /// state for `dispatch_action`'s debounce (4R review finding M1, see
+    /// `MIN_ACTION_INTERVAL`'s doc).
+    last_dispatch: Mutex<Option<Instant>>,
 }
 
 /// Cloneable handle, managed as Tauri state - same shape as
@@ -130,6 +145,7 @@ impl HidHandle {
             sidecar,
             status: Mutex::new(HidStatus::Disabled),
             led: Mutex::new(LedState::default()),
+            last_dispatch: Mutex::new(None),
         });
         let handle = Self(shared.clone());
         handle.listen_call_events();
@@ -203,8 +219,42 @@ fn set_status(shared: &Shared, status: HidStatus) {
     }
 }
 
+/// Thin seam over the two `HidDevice` operations `poll_once` (below) needs,
+/// so that function - the scheduling logic deciding *when* to read and
+/// *when* to write LEDs - is unit testable with a fake implementation
+/// instead of real HID hardware, the same "keep the hidapi-touching
+/// surface small and isolated" principle `device.rs`'s own module doc
+/// describes, applied one level up. Real HID devices (`HidDevice`) and
+/// tests' fake ones both implement it; `OpenDevice` only ever holds a
+/// `Box<dyn ReportPort>`, never a concrete `HidDevice`, past `try_open`.
+trait ReportPort {
+    fn read_timeout(&self, buf: &mut [u8], timeout_ms: i32) -> Result<usize, String>;
+    fn send_output_report(&self, data: &[u8]) -> Result<(), String>;
+}
+
+impl ReportPort for HidDevice {
+    fn read_timeout(&self, buf: &mut [u8], timeout_ms: i32) -> Result<usize, String> {
+        HidDevice::read_timeout(self, buf, timeout_ms).map_err(|e| e.to_string())
+    }
+    fn send_output_report(&self, data: &[u8]) -> Result<(), String> {
+        HidDevice::send_output_report(self, data).map_err(|e| e.to_string())
+    }
+}
+
+/// Lets a test hand `poll_once` an `Arc<FakePort>` (so the test can keep a
+/// handle to assert against after the `Box<dyn ReportPort>` has taken
+/// ownership of a clone) without a second, near-identical trait impl.
+impl<T: ReportPort + ?Sized> ReportPort for Arc<T> {
+    fn read_timeout(&self, buf: &mut [u8], timeout_ms: i32) -> Result<usize, String> {
+        (**self).read_timeout(buf, timeout_ms)
+    }
+    fn send_output_report(&self, data: &[u8]) -> Result<(), String> {
+        (**self).send_output_report(data)
+    }
+}
+
 struct OpenDevice {
-    device: HidDevice,
+    device: Box<dyn ReportPort>,
     parsed: ParsedDescriptor,
     identity: crate::settings::HidDeviceIdentity,
     product_string: Option<String>,
@@ -290,28 +340,68 @@ fn poll_loop(shared: Arc<Shared>) {
             }
         }
 
-        let mut buf = vec![0u8; dev.max_input_report_len];
-        match dev.device.read_timeout(&mut buf, READ_TIMEOUT_MS) {
-            Ok(0) => { /* timeout, nothing new - loop again */ }
-            Ok(n) => {
-                let cur_state = mapping::extract_state(&dev.parsed.fields, &buf[..n]);
-                let phase = CallPhase::from_ping_state(shared.sidecar.ping_state());
-                for action in mapping::diff_actions(prev_state, cur_state, phase) {
-                    dispatch_action(&shared, action);
-                }
-                // Merge rather than overwrite: a multi-Report-ID device's
-                // single `read()` only ever returns *one* report, so a
-                // field this report didn't carry must keep its last known
-                // value, not silently reset to "unknown" (see
-                // `mapping::TelephonyInputState`'s doc).
-                prev_state = TelephonyInputState { hook: cur_state.hook.or(prev_state.hook), mute: cur_state.mute.or(prev_state.mute) };
-                sync_led(&shared, dev);
-            }
-            Err(e) => {
-                log::warn!("hid: read failed, treating as unplugged: {e}");
+        let led_now = *shared.led.lock().expect("poisoned");
+        let phase = CallPhase::from_ping_state(shared.sidecar.ping_state());
+        match poll_once(dev, prev_state, led_now, phase, |action| dispatch_action(&shared, action)) {
+            PollOutcome::Continue(new_state) => prev_state = new_state,
+            PollOutcome::Unplugged => {
                 current = None;
                 set_status(&shared, HidStatus::Searching);
             }
+        }
+    }
+}
+
+enum PollOutcome {
+    Continue(TelephonyInputState),
+    Unplugged,
+}
+
+/// One loop iteration's worth of read -> (maybe dispatch) -> LED sync.
+/// Entirely decoupled from `Shared`/`SidecarHandle`/`AppHandle` - takes
+/// plain values (`led`, `phase`) and a `dispatch` closure instead - so it's
+/// unit testable with a fake `ReportPort` and no Tauri runtime (see the
+/// `poll_once_tests` module below). `poll_loop` (the real caller) supplies
+/// `led`/`phase` freshly read from `Shared` every tick.
+///
+/// **LED sync happens on every successful read, timeout (`Ok(0)`) or real
+/// data (`Ok(n)`) alike** — not just when a button was pressed. 4R review
+/// finding A2 (2026-07-16): a call answered/muted from the UI, click-to-
+/// call, or the console never touches this device's own Input report;
+/// gating the LED write on "only after an Input report arrived" left it
+/// showing stale ring/off-hook/mute state until the next physical button
+/// press, which could be the entire rest of the call (or never, for calls
+/// answered/handled without touching the headset at all).
+fn poll_once(
+    dev: &mut OpenDevice,
+    prev_state: TelephonyInputState,
+    led: LedState,
+    phase: CallPhase,
+    mut dispatch: impl FnMut(HidAction),
+) -> PollOutcome {
+    let mut buf = vec![0u8; dev.max_input_report_len];
+    match dev.device.read_timeout(&mut buf, READ_TIMEOUT_MS) {
+        Ok(0) => {
+            sync_led(dev, led);
+            PollOutcome::Continue(prev_state)
+        }
+        Ok(n) => {
+            let cur_state = mapping::extract_state(&dev.parsed.fields, &buf[..n]);
+            for action in mapping::diff_actions(prev_state, cur_state, phase) {
+                dispatch(action);
+            }
+            // Merge rather than overwrite: a multi-Report-ID device's
+            // single `read()` only ever returns *one* report, so a field
+            // this report didn't carry must keep its last known value, not
+            // silently reset to "unknown" (see
+            // `mapping::TelephonyInputState`'s doc).
+            let merged = TelephonyInputState { hook: cur_state.hook.or(prev_state.hook), mute: cur_state.mute.or(prev_state.mute) };
+            sync_led(dev, led);
+            PollOutcome::Continue(merged)
+        }
+        Err(e) => {
+            log::warn!("hid: read failed, treating as unplugged: {e}");
+            PollOutcome::Unplugged
         }
     }
 }
@@ -369,7 +459,7 @@ fn try_open(cfg: &crate::settings::HidSettings) -> Result<Option<OpenDevice>, Hi
                 return Ok(Some(OpenDevice {
                     identity: target.identity(),
                     product_string: target.product_string.clone(),
-                    device,
+                    device: Box::new(device),
                     parsed,
                     max_input_report_len: max_len,
                     selected_at_open: cfg.selected.clone(),
@@ -404,7 +494,33 @@ fn try_open(cfg: &crate::settings::HidSettings) -> Result<Option<OpenDevice>, Hi
     }
 }
 
+/// Pure debounce decision, factored out of `dispatch_action` specifically
+/// so it's unit-testable without real clock timing (`Duration`s in, `bool`
+/// out - no `Instant`). `elapsed_since_last` is `None` on the very first
+/// action this session (always allowed) or `Some(d)` for how long it's
+/// been since the last one actually dispatched.
+fn should_dispatch(elapsed_since_last: Option<Duration>) -> bool {
+    match elapsed_since_last {
+        Some(d) => d >= MIN_ACTION_INTERVAL,
+        None => true,
+    }
+}
+
 fn dispatch_action(shared: &Shared, action: HidAction) {
+    {
+        let mut last = shared.last_dispatch.lock().expect("poisoned");
+        let elapsed = last.map(|t: Instant| t.elapsed());
+        if !should_dispatch(elapsed) {
+            // 4R review finding M1: rate-limit, not just edge-trigger - a
+            // device (buggy firmware or a deliberately hostile USB
+            // peripheral) resending reports faster than any human could
+            // press a button must not be able to replay answer/hangup/mute
+            // against a real call at bus speed.
+            log::warn!("hid: rate-limiting {action:?} - another HID action dispatched less than {MIN_ACTION_INTERVAL:?} ago");
+            return;
+        }
+        *last = Some(Instant::now());
+    }
     log::info!("hid: dispatching {action:?}");
     let cmd = match action {
         HidAction::Answer => serde_json::json!({ "cmd": "answer" }),
@@ -428,8 +544,7 @@ fn dispatch_action(shared: &Shared, action: HidAction) {
     }
 }
 
-fn sync_led(shared: &Shared, dev: &OpenDevice) {
-    let led = *shared.led.lock().expect("poisoned");
+fn sync_led(dev: &OpenDevice, led: LedState) {
     if let Some(report) = led::build_output_report(&dev.parsed, led) {
         if let Err(e) = dev.device.send_output_report(&report) {
             // Best-effort by design (module doc) - most cheap USB
@@ -456,5 +571,182 @@ mod tests {
         let json = serde_json::to_value(HidStatus::Connected { vendor_id: 1, product_id: 2, product_string: None }).unwrap();
         assert_eq!(json["state"], "connected");
         assert_eq!(json["vendor_id"], 1);
+    }
+
+    // ---- should_dispatch (4R finding M1: debounce) -----------------------
+
+    #[test]
+    fn should_dispatch_true_for_the_first_action_this_session() {
+        assert!(should_dispatch(None));
+    }
+
+    #[test]
+    fn should_dispatch_false_within_the_minimum_interval() {
+        assert!(!should_dispatch(Some(Duration::from_millis(0))));
+        assert!(!should_dispatch(Some(MIN_ACTION_INTERVAL - Duration::from_millis(1))));
+    }
+
+    #[test]
+    fn should_dispatch_true_at_or_beyond_the_minimum_interval() {
+        assert!(should_dispatch(Some(MIN_ACTION_INTERVAL)));
+        assert!(should_dispatch(Some(Duration::from_secs(5))));
+    }
+}
+
+#[cfg(test)]
+mod poll_once_tests {
+    use super::*;
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::Mutex as StdMutex;
+
+    /// A `ReportPort` test double: `read_timeout` replays a canned queue of
+    /// outcomes (an exhausted queue behaves like a real idle device -
+    /// `Ok(0)`, a plain timeout, forever after); `send_output_report`
+    /// records every write for assertions. `Arc`-wrapped so the test can
+    /// keep its own handle after a clone goes into `OpenDevice` as the
+    /// trait object (see `impl<T: ReportPort> ReportPort for Arc<T>` above).
+    struct FakePort {
+        reads: StdMutex<VecDeque<Result<Vec<u8>, String>>>,
+        writes: StdMutex<Vec<Vec<u8>>>,
+    }
+    impl FakePort {
+        fn new(reads: Vec<Result<Vec<u8>, String>>) -> Self {
+            Self { reads: StdMutex::new(reads.into()), writes: StdMutex::new(Vec::new()) }
+        }
+        fn write_count(&self) -> usize {
+            self.writes.lock().unwrap().len()
+        }
+    }
+    impl ReportPort for FakePort {
+        fn read_timeout(&self, buf: &mut [u8], _timeout_ms: i32) -> Result<usize, String> {
+            match self.reads.lock().unwrap().pop_front() {
+                Some(Ok(bytes)) => {
+                    buf[..bytes.len()].copy_from_slice(&bytes);
+                    Ok(bytes.len())
+                }
+                Some(Err(e)) => Err(e),
+                None => Ok(0), // exhausted queue = idle device, plain timeout
+            }
+        }
+        fn send_output_report(&self, data: &[u8]) -> Result<(), String> {
+            self.writes.lock().unwrap().push(data.to_vec());
+            Ok(())
+        }
+    }
+
+    /// A minimal `OpenDevice` whose descriptor has exactly one Output LED
+    /// field (Off-Hook) - enough for `led::build_output_report` to always
+    /// have something to write, so these tests can assert on write count
+    /// without depending on `led.rs`'s own field-selection details.
+    fn open_device_with(port: Arc<FakePort>) -> OpenDevice {
+        let mut report_bit_lengths = HashMap::new();
+        report_bit_lengths.insert((None, descriptor::MainKind::Output), 8u32);
+        let parsed = ParsedDescriptor {
+            fields: vec![descriptor::FieldLocation {
+                kind: descriptor::MainKind::Output,
+                report_id: None,
+                usage_page: mapping::USAGE_PAGE_LED,
+                usage: mapping::LED_OFF_HOOK,
+                bit_offset: 0,
+                bit_length: 1,
+            }],
+            report_bit_lengths,
+        };
+        OpenDevice {
+            device: Box::new(port),
+            parsed,
+            identity: crate::settings::HidDeviceIdentity { vendor_id: 1, product_id: 2, serial_number: None },
+            product_string: None,
+            max_input_report_len: 8,
+            selected_at_open: None,
+            auto_detect_at_open: true,
+        }
+    }
+
+    #[test]
+    fn led_syncs_on_a_timeout_tick_with_no_device_input_at_all() {
+        // 4R review finding A2: no queued reads at all - every
+        // read_timeout() call is a plain Ok(0) timeout, exactly like an
+        // idle device the operator never touched, which is exactly the
+        // "call answered/muted from the UI, not the headset" case the
+        // finding was about. LED must still be written.
+        let port = Arc::new(FakePort::new(vec![]));
+        let mut dev = open_device_with(Arc::clone(&port));
+
+        let outcome = poll_once(&mut dev, TelephonyInputState::default(), LedState { off_hook: true, ..Default::default() }, CallPhase::Active, |_| {
+            panic!("no device input was queued - nothing should have dispatched")
+        });
+
+        assert!(matches!(outcome, PollOutcome::Continue(_)));
+        assert_eq!(port.write_count(), 1, "LED must sync even on a pure timeout tick");
+    }
+
+    #[test]
+    fn led_syncs_again_on_every_subsequent_timeout_tick() {
+        // Not just once - every idle tick keeps the LED synced, since the
+        // call-state driving `led` can change between any two ticks.
+        let port = Arc::new(FakePort::new(vec![]));
+        let mut dev = open_device_with(Arc::clone(&port));
+        let mut state = TelephonyInputState::default();
+        for _ in 0..3 {
+            match poll_once(&mut dev, state, LedState::default(), CallPhase::Idle, |_| {}) {
+                PollOutcome::Continue(s) => state = s,
+                PollOutcome::Unplugged => panic!("fake port never errors"),
+            }
+        }
+        assert_eq!(port.write_count(), 3);
+    }
+
+    #[test]
+    fn led_also_syncs_when_real_device_input_arrives() {
+        // Regression coverage for the Ok(n) path (worked before this 4R
+        // pass too, but now goes through the same shared sync_led call as
+        // the Ok(0) path - worth asserting explicitly).
+        let port = Arc::new(FakePort::new(vec![Ok(vec![0b0000_0000])]));
+        let mut dev = open_device_with(Arc::clone(&port));
+        let _ = poll_once(&mut dev, TelephonyInputState::default(), LedState::default(), CallPhase::Idle, |_| {});
+        assert_eq!(port.write_count(), 1);
+    }
+
+    #[test]
+    fn a_read_error_reports_unplugged_and_never_syncs_led() {
+        let port = Arc::new(FakePort::new(vec![Err("device disconnected".to_string())]));
+        let mut dev = open_device_with(Arc::clone(&port));
+        let outcome = poll_once(&mut dev, TelephonyInputState::default(), LedState::default(), CallPhase::Idle, |_| {});
+        assert!(matches!(outcome, PollOutcome::Unplugged));
+        assert_eq!(port.write_count(), 0);
+    }
+
+    #[test]
+    fn device_input_dispatches_the_expected_action_via_the_closure() {
+        // Hook Switch (usage 0x20) at bit 0, no Report ID - matches
+        // mapping.rs's own fixture shape. Going off-hook while ringing
+        // must dispatch exactly one Answer through the closure.
+        let mut report_bit_lengths = HashMap::new();
+        report_bit_lengths.insert((None, descriptor::MainKind::Input), 1u32);
+        let parsed = ParsedDescriptor {
+            fields: vec![descriptor::FieldLocation {
+                kind: descriptor::MainKind::Input,
+                report_id: None,
+                usage_page: mapping::USAGE_PAGE_TELEPHONY,
+                usage: mapping::USAGE_HOOK_SWITCH,
+                bit_offset: 0,
+                bit_length: 1,
+            }],
+            report_bit_lengths,
+        };
+        let port = Arc::new(FakePort::new(vec![Ok(vec![0b0000_0001])]));
+        let mut dev = OpenDevice {
+            device: Box::new(port),
+            parsed,
+            identity: crate::settings::HidDeviceIdentity { vendor_id: 1, product_id: 2, serial_number: None },
+            product_string: None,
+            max_input_report_len: 8,
+            selected_at_open: None,
+            auto_detect_at_open: true,
+        };
+        let mut dispatched = Vec::new();
+        let _ = poll_once(&mut dev, TelephonyInputState { hook: Some(false), mute: None }, LedState::default(), CallPhase::Ringing, |a| dispatched.push(a));
+        assert_eq!(dispatched, vec![HidAction::Answer]);
     }
 }

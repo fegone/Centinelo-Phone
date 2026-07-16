@@ -232,7 +232,8 @@ pub struct HidSettings {
     /// is used automatically the moment it's plugged in - the "just works"
     /// default once `enabled` is on. When off, only `selected` (if it's
     /// actually present) is ever used - see
-    /// `crate::hid::device::select_target`'s doc for the exact precedence.
+    /// `crate::hid::device::select_candidates_to_try`'s doc for the exact
+    /// precedence.
     #[serde(default = "default_true")]
     pub auto_detect: bool,
     #[serde(default)]

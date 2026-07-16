@@ -119,10 +119,10 @@ pub enum HidAction {
 /// collection usage, yet its real descriptor nests a `usage_page=0x0B
 /// usage=0x20` (Hook Switch) Input field *inside* that collection — a
 /// composite device whose outermost collection usage doesn't reflect every
-/// control cluster nested within it. See `crate::hid::device::try_open`'s
-/// (in `crate::hid::mod`) doc for how the two checks are combined: the
-/// enumeration-level usage_page is still used as a *cheap pre-filter*
-/// (worth the `open()` syscall or not), this function is the actual
+/// control cluster nested within it. See `crate::hid::try_open` (the free
+/// function in `hid/mod.rs`, not `hid::device`) for how the two checks are
+/// combined: the enumeration-level usage_page is still used as a *cheap
+/// pre-filter* (worth the `open()` syscall or not), this function is the actual
 /// decision once a candidate's descriptor is in hand.
 pub fn has_telephony_controls(fields: &[FieldLocation]) -> bool {
     fields
