@@ -73,6 +73,8 @@ PREMIUM_DYLIB=""
 PREMIUM_SIG=""
 PREMIUM_CONSOLE_ASSETS=""
 OUTPUT_DIR=""
+OPENSSL_DLL_DIR=""
+SKIP_OPENSSL_DLLS=0
 
 # Self-contained --help text (4R/READABILITY fix 2026-07-16: this used to be
 # `sed -n '2,55p' "$0"` against the header comment above — fragile hardcoded
@@ -125,6 +127,22 @@ Options:
                                    unlocks the capability (assets missing).
   --output-dir DIR                Where to stage/report the final layout.
                                    Default: dist/<target>/.
+  --openssl-dll-dir DIR            Windows only, effectively REQUIRED: directory
+                                   holding the OpenSSL runtime DLLs (e.g. the
+                                   Chocolatey openssl package's bin/ dir,
+                                   "$OPENSSL_ROOT_DIR\bin" in core-build.yml's
+                                   Windows job). baresip.exe links OpenSSL
+                                   dynamically even in its STATIC build and
+                                   will not start without these DLLs beside
+                                   it on a clean machine (no dev tools). Every
+                                   *.dll directly in this dir is copied flat
+                                   into core-engine/ beside baresip.exe.
+  --skip-openssl-dlls             Explicit opt-out of the above, for local
+                                   iteration only (e.g. exercising the rest
+                                   of the packaging pipeline without a full
+                                   OpenSSL install to hand). CI must NOT pass
+                                   this for a build meant to run on a real
+                                   machine.
   -h, --help                      Show this help.
 
 Secrets/paths are ALWAYS CLI flags or env, NEVER hardcoded. This script
@@ -160,6 +178,11 @@ while [[ $# -gt 0 ]]; do
         --output-dir)
             [[ $# -ge 2 ]] || { echo "error: --output-dir requires a value" >&2; exit 1; }
             OUTPUT_DIR="$2"; shift 2 ;;
+        --openssl-dll-dir)
+            [[ $# -ge 2 ]] || { echo "error: --openssl-dll-dir requires a value" >&2; exit 1; }
+            OPENSSL_DLL_DIR="$2"; shift 2 ;;
+        --skip-openssl-dlls)
+            SKIP_OPENSSL_DLLS=1; shift ;;
         -h|--help)
             usage; exit 0 ;;
         *)
@@ -187,6 +210,7 @@ resolve_abs_path() {
 [[ -n "$PREMIUM_SIG" ]] && PREMIUM_SIG="$(resolve_abs_path "$PREMIUM_SIG")"
 [[ -n "$PREMIUM_CONSOLE_ASSETS" ]] && PREMIUM_CONSOLE_ASSETS="$(resolve_abs_path "$PREMIUM_CONSOLE_ASSETS")"
 [[ -n "$OUTPUT_DIR" ]] && OUTPUT_DIR="$(resolve_abs_path "$OUTPUT_DIR")"
+[[ -n "$OPENSSL_DLL_DIR" ]] && OPENSSL_DLL_DIR="$(resolve_abs_path "$OPENSSL_DLL_DIR")"
 
 # ---------------------------------------------------------------------------
 # 1. Resolve repo root + target platform
@@ -267,6 +291,43 @@ if [[ "$IS_COMMUNITY" -eq 1 ]]; then
     echo "This is a supported, intentional mode (shell/README.md 'Premium module"
     echo "loader': a missing dylib degrades to free mode, never fails startup)."
     echo
+fi
+
+# ---------------------------------------------------------------------------
+# 2b. Validate OpenSSL DLL dir (Windows runtime requirement)
+# ---------------------------------------------------------------------------
+# core/ links OpenSSL dynamically on Windows even though baresip itself
+# builds STATIC there - the static re/baresip libs still reference OpenSSL's
+# import libs, not a statically-linked copy of libssl/libcrypto (see
+# core-build.yml's Windows job "Sanity" step comment: "the static build
+# still links OpenSSL's import libs and would need the OpenSSL DLLs on PATH
+# at runtime"). Without libssl-3-x64.dll/libcrypto-3-x64.dll (or whichever
+# names the installed OpenSSL version uses) sitting beside baresip.exe, the
+# packaged core.exe fails to even start on a clean machine with no dev tools
+# - this was the #1 blocker for Edgar's Windows beta (docs/HANDOFF.md). Fixed
+# here (2026-07-16, release-ci pass) - closes "Known gaps" #1 at the bottom
+# of this file.
+if [[ "$TARGET" == "windows" ]]; then
+    if [[ -n "$OPENSSL_DLL_DIR" ]]; then
+        [[ -d "$OPENSSL_DLL_DIR" ]] || { echo "error: --openssl-dll-dir not a directory: $OPENSSL_DLL_DIR" >&2; exit 1; }
+        shopt -s nullglob
+        _openssl_dll_check=("$OPENSSL_DLL_DIR"/*.dll)
+        shopt -u nullglob
+        [[ ${#_openssl_dll_check[@]} -gt 0 ]] || { echo "error: --openssl-dll-dir has no *.dll files: $OPENSSL_DLL_DIR" >&2; exit 1; }
+    elif [[ "$SKIP_OPENSSL_DLLS" -eq 1 ]]; then
+        echo "-- --skip-openssl-dlls given: packaging a Windows build WITHOUT the OpenSSL"
+        echo "   runtime DLLs. core.exe will NOT start on a machine without OpenSSL"
+        echo "   already on PATH (dev machines only). Do not ship this."
+        echo
+    else
+        echo "error: --target windows requires --openssl-dll-dir (or the explicit" >&2
+        echo "       --skip-openssl-dlls opt-out for local-only iteration) - without" >&2
+        echo "       it, the packaged core.exe cannot start on a clean end-user machine" >&2
+        echo "       (missing libssl/libcrypto DLLs at runtime). See core-build.yml's" >&2
+        echo "       Windows job for how it locates OPENSSL_ROOT_DIR; pass" >&2
+        echo "       \"\$OPENSSL_ROOT_DIR\\bin\"." >&2
+        exit 1
+    fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -487,6 +548,25 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 6b. Copy OpenSSL runtime DLLs beside baresip.exe (Windows only)
+# ---------------------------------------------------------------------------
+# See "2b. Validate OpenSSL DLL dir" above for why this is required. Flat
+# copy into the SAME directory as baresip.exe (CORE_ENGINE_DIR) - Windows's
+# default DLL search order checks the launching executable's own directory
+# first, before PATH, so this is sufficient without touching PATH at all.
+# tauri.official.conf.json's `"../dist-injected/core-engine/*": "core-engine/"`
+# resource mapping is already a flat glob over this whole directory, so no
+# config change was needed to carry these into the installer once they land
+# here - verified in windows-installer.yml's smoke-test job (synthetic DLL
+# fixtures, same marker-string + same-directory-as-baresip.exe checks used
+# for the other staged files).
+if [[ "$TARGET" == "windows" && -n "$OPENSSL_DLL_DIR" ]]; then
+    cp "$OPENSSL_DLL_DIR"/*.dll "$CORE_ENGINE_DIR/"
+    echo "-- copied OpenSSL runtime DLLs -> $CORE_ENGINE_DIR:"
+    ls "$CORE_ENGINE_DIR"/*.dll
+fi
+
+# ---------------------------------------------------------------------------
 # 7. Copy premium dylib + .sig (Pro builds only)
 # ---------------------------------------------------------------------------
 # 4R/RESILIENCE fixes 2026-07-16, two issues in the previous version:
@@ -594,18 +674,28 @@ fi
 
 # ---------------------------------------------------------------------------
 # Known gaps (honest, not hidden — see also inline comments above):
-#   1. --target windows still does not build core itself (needs the
-#      re-install-prefix dance core-build.yml's Windows job already runs —
-#      porting it here is a follow-up, not done this pass; use
-#      --skip-core-build with a CI-produced Windows build in the meantime).
-#      Also note (found this pass, reading core-build.yml's Windows job
-#      closely): that build is STATIC (no ctrl_json.dll, no separate
-#      OpenSSL linked in - see the step 6 comment above) and needs the
-#      Chocolatey-installed OpenSSL DLLs on PATH at *runtime*, which this
-#      script does not stage anywhere - a real Windows installer needs
-#      either core/ switched to static-link OpenSSL, or this script (or
-#      the workflow) to know where those DLLs live and bundle them too.
-#      Neither is done here; flagged for core-engine/core-win.
+#   1. [Partially closed 2026-07-16, release-ci pass] --target windows still
+#      does not build core itself (needs the re-install-prefix dance
+#      core-build.yml's Windows job already runs — porting it here is a
+#      follow-up, not done this pass; use --skip-core-build with a
+#      CI-produced Windows build in the meantime). The OTHER half of this
+#      gap - baresip.exe's STATIC build still needing the Chocolatey-
+#      installed OpenSSL DLLs beside it at *runtime* (no ctrl_json.dll, no
+#      statically-linked OpenSSL - see the step 6 comment above) - IS now
+#      closed: `--openssl-dll-dir DIR` (see "2b. Validate OpenSSL DLL dir"
+#      and "6b. Copy OpenSSL runtime DLLs" above) copies every *.dll from
+#      the given dir flat into core-engine/ beside baresip.exe, required by
+#      default for --target windows. windows-installer.yml's
+#      official-pro-build job passes "$OPENSSL_ROOT_DIR\bin" (the same dir
+#      core-build.yml's Windows job resolves OpenSSL to); the
+#      resources-mechanism-smoke-test job proves the DLLs ride into the
+#      actual NSIS/MSI installer beside baresip.exe using synthetic
+#      fixtures. This was blocker #1 for Edgar's Windows beta
+#      (docs/HANDOFF.md) — closing it here does not by itself prove it on a
+#      real end-user machine (that still needs qa-e2e with a physical
+#      Windows box + the official-pro-build job actually run, which is
+#      still gated behind PREMIUM_REPO_PAT per gap #4 below), but the
+#      packaging mechanism itself is now verified end-to-end in CI.
 #   2. [Partially closed 2026-07-16, windows-installer pass] Windows now HAS
 #      an installer path: tauri.official.conf.json's `bundle.resources`
 #      (merged via `tauri build --config`, see step 9b) turns the artifacts
