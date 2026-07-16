@@ -71,3 +71,4 @@ ed25519-dalek = "2"
 # reimplementation", 2026-07-16 review finding M4) rather than pulling in
 # ureq/sha2 for a second copy of the same logic.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+hidapi = "2"

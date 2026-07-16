@@ -4,6 +4,7 @@ mod console;
 mod deeplink;
 #[cfg(debug_assertions)]
 mod e2e;
+mod hid;
 mod premium;
 mod settings;
 mod sidecar;
@@ -60,6 +61,15 @@ pub fn run() {
 
             bridge::start(app.handle().clone(), settings.clone(), sidecar.clone());
             deeplink::setup(app, settings.clone());
+
+            // HID headset support (F4 ola 2, spec §5) - independent of the
+            // premium loader/transcription below, so it only needs
+            // settings + a way to send answer/hangup/mute commands, both
+            // already available here. Never fails app startup (no headset
+            // plugged in - or hidapi itself unavailable on this machine -
+            // just means the background thread stays in a "searching"/
+            // "disabled" state forever, see src/hid/mod.rs).
+            app.manage(hid::HidHandle::new(app.handle().clone(), settings.clone(), sidecar.clone()));
 
             // Looks for centinelo_premium next to this executable, verifies
             // + loads it if present, silently stays in free mode if not -
@@ -147,6 +157,10 @@ pub fn run() {
             commands::transcription_model_status,
             commands::download_transcription_model,
             commands::reveal_in_file_manager,
+            hid::commands::hid_status,
+            hid::commands::hid_list_devices,
+            hid::commands::get_hid_settings,
+            hid::commands::save_hid_settings,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
