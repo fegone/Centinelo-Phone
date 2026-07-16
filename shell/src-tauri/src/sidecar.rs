@@ -230,6 +230,17 @@ mod call_phase_tests {
     }
 }
 
+/// One direction's device names from the most recent `devices` event this
+/// session has seen - see `Shared::known_devices`'s doc for the full
+/// rationale (2026-07-16 4R re-review, resilience: cross-checking a
+/// persisted device against stale/no-longer-connected hardware before
+/// referencing it in a spawn's config).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct KnownDevices {
+    input: Vec<String>,
+    output: Vec<String>,
+}
+
 struct Shared {
     app: AppHandle,
     settings: Arc<SettingsStore>,
@@ -285,6 +296,35 @@ struct Shared {
     /// tolerate-missing-state style elsewhere (e.g. `blf_states` starting
     /// empty).
     transcription: Mutex<Option<TranscriptionHandle>>,
+    /// Cache of the most recent `devices` event's own device names
+    /// (2026-07-16 4R re-review, resilience): a persisted device
+    /// (`AudioSettings.input_device`/`output_device`) that's no longer
+    /// actually plugged in - e.g. a headset unplugged while the app was
+    /// idle - must not get silently referenced in a fresh spawn's config.
+    /// baresip's own `ausrc_alloc`/`auplay_alloc` ENODEV in that case gets
+    /// discarded by `call.c`'s `sipsess_estab_handler` (`(void)
+    /// update_streams`), so the call establishes anyway - muted/deaf, with
+    /// no error event, no banner - the exact "user mute with no warning"
+    /// class of bug A1 above closes for a *missing module*; this closes it
+    /// for a *missing device*. `sidecar::resolve_device` cross-checks a
+    /// persisted device against this cache before referencing it.
+    ///
+    /// Deliberately **not** cleared alongside `blf_states`/`call_phases`/
+    /// `subscribed_exts` when the child process exits (see
+    /// `supervisor_loop`'s "the engine ... is gone with the process"
+    /// comment) - those describe live engine state that's genuinely gone
+    /// with the process; this describes real-world hardware that's still
+    /// plugged in (or not) regardless of whether the engine happens to be
+    /// running right now, so the *last* enumeration this session ever saw
+    /// stays the best available answer across a respawn. `None` until the
+    /// first `devices` event of this session ever arrives - a cold start
+    /// (or a session where `list_devices`/an admin device-save was never
+    /// triggered) has no data to cross-check against, so `resolve_device`
+    /// fails open (honors the persisted device as before this fix) rather
+    /// than rejecting every persisted device on principle - same
+    /// conservative "no data yet" default this file already uses for
+    /// `blf_states` starting empty.
+    known_devices: Mutex<Option<KnownDevices>>,
 }
 
 #[derive(Clone)]
@@ -309,6 +349,7 @@ impl SidecarHandle {
             blf_states: Mutex::new(HashMap::new()),
             subscribed_exts: Mutex::new(HashSet::new()),
             transcription: Mutex::new(None),
+            known_devices: Mutex::new(None),
         }))
     }
 
@@ -575,7 +616,11 @@ fn supervisor_loop(shared: Arc<Shared>) {
         }
 
         let transport = choose_transport(&account, &shared);
-        let plan = match SpawnPlan::build(&shared.settings, &account, transport) {
+        // Snapshot before build() (2026-07-16 4R re-review, resilience) -
+        // see SpawnPlan::build's doc for why the cache lives on Shared but
+        // gets passed in as a plain value here.
+        let known_devices_snapshot = shared.known_devices.lock().expect("poisoned").clone();
+        let plan = match SpawnPlan::build(&shared.settings, &account, transport, known_devices_snapshot.as_ref()) {
             Ok(p) => p,
             Err(e) => {
                 let attempt = shared.attempts.fetch_add(1, Ordering::SeqCst) + 1;
@@ -804,6 +849,19 @@ fn spawn_stdout_reader(
             if event_name == "ready" {
                 shared.attempts.store(0, Ordering::SeqCst);
                 shared.emit_status_from_thread(StatusPayload::Running);
+                // Proactively refresh Shared::known_devices on every spawn
+                // (2026-07-16 4R re-review, resilience) - without this, the
+                // cache would only ever populate from an explicit
+                // `sidecar_list_devices` call (frontend/e2e), which nothing
+                // in the normal register-then-dial flow ever triggers on
+                // its own; a persisted device would then never get
+                // cross-checked in the common case. Fire-and-forget, same
+                // as the favorites auto-subscribe below - a failure here
+                // just means the cache stays whatever it was (or `None` on
+                // a cold session), the documented fail-open default.
+                if let Err(e) = send_cmd_raw(&shared, serde_json::json!({"cmd": "devices"})) {
+                    log::warn!("sidecar: couldn't request the initial devices enumeration: {e}");
+                }
             } else if event_name == "reg_state" {
                 let state = value.get("state").and_then(Value::as_str).unwrap_or("");
                 if state == "registered" {
@@ -888,6 +946,31 @@ fn spawn_stdout_reader(
                         .expect("poisoned")
                         .insert(ext.to_string(), blf_state.to_string());
                 }
+            } else if event_name == "devices" {
+                // Cache the engine's own device enumeration (2026-07-16 4R
+                // re-review, resilience) - `sidecar::resolve_device` cross-
+                // checks a persisted device against this on the *next*
+                // spawn, so a device that's disappeared since it was
+                // selected doesn't get silently referenced again. Extracts
+                // just the "name" fields (core/PROTOCOL.md's own
+                // `"<module>[,<device>]"` shape, the exact string
+                // `AudioSettings.input_device`/`output_device` stores) -
+                // `"active"` is irrelevant here, this is an existence
+                // check, not a "what's currently selected" one.
+                fn extract_names(arr: Option<&Value>) -> Vec<String> {
+                    arr.and_then(Value::as_array)
+                        .map(|items| {
+                            items
+                                .iter()
+                                .filter_map(|d| d.get("name").and_then(Value::as_str).map(str::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                }
+                *shared.known_devices.lock().expect("poisoned") = Some(KnownDevices {
+                    input: extract_names(value.get("input")),
+                    output: extract_names(value.get("output")),
+                });
             }
 
             let _ = shared.app.emit(EVENT_LINE, value);
@@ -911,10 +994,16 @@ struct SpawnPlan {
 }
 
 impl SpawnPlan {
+    /// `known_devices` (2026-07-16 4R re-review, resilience) is a snapshot
+    /// of `Shared::known_devices` - taken by the caller (`supervisor_loop`)
+    /// since this function only ever gets `&Arc<SettingsStore>`, not
+    /// `&Arc<Shared>`, matching this function's existing narrow-inputs
+    /// shape (it doesn't need the rest of `Shared` either).
     fn build(
         settings: &Arc<SettingsStore>,
         account: &AccountSettings,
         transport: &str,
+        known_devices: Option<&KnownDevices>,
     ) -> Result<Self, String> {
         let binary = resolve_core_binary(settings)?;
         let module_path = binary
@@ -938,8 +1027,13 @@ impl SpawnPlan {
         let ws_path = "/ws".to_string();
 
         write_accounts_file(&scratch_dir, account, transport, port)?;
-        let audio_notice =
-            write_config_file(&scratch_dir, &module_path, transport, &settings.snapshot().audio)?;
+        let audio_notice = write_config_file(
+            &scratch_dir,
+            &module_path,
+            transport,
+            &settings.snapshot().audio,
+            known_devices,
+        )?;
 
         Ok(Self {
             binary,
@@ -1110,18 +1204,42 @@ pub(crate) fn platform_default_device_string() -> Option<String> {
 /// `write_config_file`'s raw `format!` interpolation with an unvalidated
 /// string; belt-and-suspenders, not redundant, matching this file's own
 /// `write_accounts_file` precedent.
-fn resolve_device(persisted: Option<&str>, driver: AudioDriver) -> (String, Option<String>) {
+///
+/// `known` (2026-07-16 4R re-review, resilience): this direction's own
+/// slice of `Shared::known_devices`'s cache, if this session has ever
+/// actually queried `devices`. A syntactically-valid persisted value that
+/// isn't in `known` gets the same treatment as a validation failure -
+/// falls back to the platform default with a notice - because it's
+/// exactly the same underlying failure mode: referencing it in config
+/// would have baresip's `ausrc_alloc`/`auplay_alloc` fail ENODEV, which
+/// `call.c`'s `sipsess_estab_handler` silently discards (`(void)
+/// update_streams`) rather than surfacing as an error event, establishing
+/// the call anyway - muted/deaf, with no warning anywhere. `known == None`
+/// (never queried this session - see `Shared::known_devices`'s doc for
+/// when that's still the case) fails OPEN: honors the persisted device
+/// exactly as before this fix, since there's no data to reject it with,
+/// and rejecting every persisted device on a cache miss would be a worse
+/// regression than the bug this closes.
+fn resolve_device(persisted: Option<&str>, driver: AudioDriver, known: Option<&[String]>) -> (String, Option<String>) {
     let default = format!("{},default", driver.name());
     match persisted.map(str::trim).filter(|d| !d.is_empty()) {
         None => (default, None),
         Some(d) => match crate::settings::validate_device_name(d) {
-            Ok(()) => (d.to_string(), None),
             Err(e) => (
                 default,
                 Some(format!(
                     "the persisted audio device name was rejected ({e}) - using the platform default instead"
                 )),
             ),
+            Ok(()) => match known {
+                Some(names) if !names.iter().any(|n| n == d) => (
+                    default,
+                    Some(format!(
+                        "the persisted audio device '{d}' is no longer available - using the platform default instead"
+                    )),
+                ),
+                _ => (d.to_string(), None),
+            },
         },
     }
 }
@@ -1174,11 +1292,16 @@ struct AudioConfigLines {
 /// 4. `driver` is `None` (no real driver known for this platform/build) -
 ///    degrades to the same synthetic pair as branch 1; `write_config_file`
 ///    turns this into a real, visible notice (not silent).
+///
+/// `known` (2026-07-16 4R re-review, resilience) is passed straight
+/// through to `resolve_device` for each direction - see that function's
+/// doc for the stale-device cross-check this enables.
 fn audio_config_lines(
     audio: &AudioSettings,
     synthetic: bool,
     driver: Option<AudioDriver>,
     scratch_dir_display: &str,
+    known: Option<&KnownDevices>,
 ) -> AudioConfigLines {
     if synthetic || driver.is_none() {
         let rx_wav = format!("aufile,{scratch_dir_display}/rx.wav");
@@ -1191,12 +1314,14 @@ fn audio_config_lines(
         };
     }
     let driver = driver.expect("checked is_none above");
-    let (source, source_notice) = resolve_device(audio.input_device.as_deref(), driver);
+    let (source, source_notice) =
+        resolve_device(audio.input_device.as_deref(), driver, known.map(|k| k.input.as_slice()));
     // Ring tone through the same real output device as the call audio -
     // `aufile` (silently writing the alert to a scratch WAV nobody looks
     // at) would mean an incoming call never actually rings audibly, same
     // bug class this whole fix addresses for mic/speaker.
-    let (player, player_notice) = resolve_device(audio.output_device.as_deref(), driver);
+    let (player, player_notice) =
+        resolve_device(audio.output_device.as_deref(), driver, known.map(|k| k.output.as_slice()));
     let alert = player.clone();
     let fallback_notice = match (source_notice, player_notice) {
         (Some(a), Some(b)) => Some(format!("{a}; {b}")),
@@ -1216,7 +1341,7 @@ mod audio_config_lines_tests {
             input_device: Some("coreaudio,Some Mic".to_string()),
             output_device: Some("coreaudio,Some Speaker".to_string()),
         };
-        let lines = audio_config_lines(&audio, true, Some(AudioDriver::CoreAudio), "/tmp/x");
+        let lines = audio_config_lines(&audio, true, Some(AudioDriver::CoreAudio), "/tmp/x", None);
         assert_eq!(lines.modules, vec!["ausine.so", "aufile.so"]);
         assert_eq!(lines.source, "ausine,440");
         assert_eq!(lines.player, "aufile,/tmp/x/rx.wav");
@@ -1227,7 +1352,7 @@ mod audio_config_lines_tests {
     #[test]
     fn macos_default_with_no_persisted_device_uses_coreaudio_default() {
         let audio = AudioSettings::default();
-        let lines = audio_config_lines(&audio, false, Some(AudioDriver::CoreAudio), "/tmp/x");
+        let lines = audio_config_lines(&audio, false, Some(AudioDriver::CoreAudio), "/tmp/x", None);
         assert_eq!(lines.modules, vec!["coreaudio.so"]);
         assert_eq!(lines.source, "coreaudio,default");
         assert_eq!(lines.player, "coreaudio,default");
@@ -1238,7 +1363,7 @@ mod audio_config_lines_tests {
     #[test]
     fn windows_default_with_no_persisted_device_uses_wasapi_default() {
         let audio = AudioSettings::default();
-        let lines = audio_config_lines(&audio, false, Some(AudioDriver::Wasapi), "/tmp/x");
+        let lines = audio_config_lines(&audio, false, Some(AudioDriver::Wasapi), "/tmp/x", None);
         assert_eq!(lines.modules, vec!["wasapi.so"]);
         assert_eq!(lines.source, "wasapi,default");
         assert_eq!(lines.player, "wasapi,default");
@@ -1251,7 +1376,7 @@ mod audio_config_lines_tests {
             input_device: Some("coreaudio,MacBook Pro Microphone".to_string()),
             output_device: Some("coreaudio,MacBook Pro Speakers".to_string()),
         };
-        let lines = audio_config_lines(&audio, false, Some(AudioDriver::CoreAudio), "/tmp/x");
+        let lines = audio_config_lines(&audio, false, Some(AudioDriver::CoreAudio), "/tmp/x", None);
         assert_eq!(lines.modules, vec!["coreaudio.so"]);
         assert_eq!(lines.source, "coreaudio,MacBook Pro Microphone");
         assert_eq!(lines.player, "coreaudio,MacBook Pro Speakers");
@@ -1265,7 +1390,7 @@ mod audio_config_lines_tests {
             input_device: Some("coreaudio,USB Mic".to_string()),
             output_device: None,
         };
-        let lines = audio_config_lines(&audio, false, Some(AudioDriver::CoreAudio), "/tmp/x");
+        let lines = audio_config_lines(&audio, false, Some(AudioDriver::CoreAudio), "/tmp/x", None);
         assert_eq!(lines.source, "coreaudio,USB Mic");
         assert_eq!(lines.player, "coreaudio,default");
     }
@@ -1278,7 +1403,7 @@ mod audio_config_lines_tests {
         // platform default rather than sending baresip a bare "coreaudio,"
         // device string, and does NOT count as a rejection (no notice).
         let audio = AudioSettings { input_device: Some("  ".to_string()), output_device: None };
-        let lines = audio_config_lines(&audio, false, Some(AudioDriver::CoreAudio), "/tmp/x");
+        let lines = audio_config_lines(&audio, false, Some(AudioDriver::CoreAudio), "/tmp/x", None);
         assert_eq!(lines.source, "coreaudio,default");
         assert_eq!(lines.fallback_notice, None);
     }
@@ -1290,7 +1415,7 @@ mod audio_config_lines_tests {
         // back to ausine/aufile keeps `cargo tauri dev` usable there
         // rather than failing to spawn at all.
         let audio = AudioSettings::default();
-        let lines = audio_config_lines(&audio, false, None, "/tmp/x");
+        let lines = audio_config_lines(&audio, false, None, "/tmp/x", None);
         assert_eq!(lines.modules, vec!["ausine.so", "aufile.so"]);
         assert_eq!(lines.source, "ausine,440");
         assert_eq!(lines.player, "aufile,/tmp/x/rx.wav");
@@ -1312,7 +1437,7 @@ mod audio_config_lines_tests {
             input_device: Some("coreaudio,Mic\nmodule cons.so".to_string()),
             output_device: None,
         };
-        let lines = audio_config_lines(&audio, false, Some(AudioDriver::CoreAudio), "/tmp/x");
+        let lines = audio_config_lines(&audio, false, Some(AudioDriver::CoreAudio), "/tmp/x", None);
         assert_eq!(lines.source, "coreaudio,default");
         assert!(!lines.source.contains('\n'));
         let notice = lines.fallback_notice.expect("must report the rejection, not stay silent");
@@ -1325,7 +1450,7 @@ mod audio_config_lines_tests {
             input_device: None,
             output_device: Some("coreaudio,Speaker\nrtp_timeout\t99999".to_string()),
         };
-        let lines = audio_config_lines(&audio, false, Some(AudioDriver::CoreAudio), "/tmp/x");
+        let lines = audio_config_lines(&audio, false, Some(AudioDriver::CoreAudio), "/tmp/x", None);
         assert_eq!(lines.player, "coreaudio,default");
         assert_eq!(lines.alert, "coreaudio,default");
         assert!(lines.fallback_notice.is_some());
@@ -1337,11 +1462,84 @@ mod audio_config_lines_tests {
             input_device: Some("coreaudio,Mic\nmodule cons.so".to_string()),
             output_device: Some("coreaudio,Speaker\nmodule httpd.so".to_string()),
         };
-        let lines = audio_config_lines(&audio, false, Some(AudioDriver::CoreAudio), "/tmp/x");
+        let lines = audio_config_lines(&audio, false, Some(AudioDriver::CoreAudio), "/tmp/x", None);
         assert_eq!(lines.source, "coreaudio,default");
         assert_eq!(lines.player, "coreaudio,default");
         let notice = lines.fallback_notice.expect("must report both rejections");
         assert!(notice.contains(';'), "expected both notices joined: {notice}");
+    }
+
+    // ---- stale/disconnected device cross-check (2026-07-16 4R re-review,
+    // resilience: a headset unplugged while the app was idle must not get
+    // silently referenced again in a fresh spawn's config - see
+    // `resolve_device`'s and `Shared::known_devices`'s docs for the full
+    // scenario and why baresip's own ENODEV handling can't be relied on to
+    // surface this any other way) --------------------------------------
+
+    #[test]
+    fn persisted_device_absent_from_known_list_degrades_to_default_with_a_notice() {
+        let audio = AudioSettings {
+            input_device: Some("coreaudio,USB Headset (unplugged)".to_string()),
+            output_device: None,
+        };
+        let known = KnownDevices {
+            input: vec!["coreaudio,AirPods Pro".to_string(), "coreaudio,Built-in Microphone".to_string()],
+            output: vec!["coreaudio,Mac mini Speakers".to_string()],
+        };
+        let lines = audio_config_lines(&audio, false, Some(AudioDriver::CoreAudio), "/tmp/x", Some(&known));
+        assert_eq!(lines.source, "coreaudio,default");
+        let notice = lines.fallback_notice.expect("must report the stale device, not stay silent");
+        assert!(notice.contains("no longer available"), "unexpected notice: {notice}");
+        assert!(notice.contains("USB Headset"), "notice should name the missing device: {notice}");
+    }
+
+    #[test]
+    fn persisted_device_present_in_known_list_is_honored_as_before() {
+        let audio = AudioSettings {
+            input_device: Some("coreaudio,AirPods Pro".to_string()),
+            output_device: Some("coreaudio,Mac mini Speakers".to_string()),
+        };
+        let known = KnownDevices {
+            input: vec!["coreaudio,AirPods Pro".to_string()],
+            output: vec!["coreaudio,Mac mini Speakers".to_string()],
+        };
+        let lines = audio_config_lines(&audio, false, Some(AudioDriver::CoreAudio), "/tmp/x", Some(&known));
+        assert_eq!(lines.source, "coreaudio,AirPods Pro");
+        assert_eq!(lines.player, "coreaudio,Mac mini Speakers");
+        assert_eq!(lines.fallback_notice, None);
+    }
+
+    #[test]
+    fn no_known_devices_cache_yet_fails_open_honors_the_persisted_device() {
+        // Cold session (or a session where the "ready"-triggered devices
+        // auto-query hasn't answered yet) - `known: None`, not an empty
+        // list. Must NOT be treated as "nothing is valid" - that would be
+        // a worse regression (every persisted device rejected on every
+        // fresh spawn) than the bug this fix closes.
+        let audio = AudioSettings {
+            input_device: Some("coreaudio,Some Mic".to_string()),
+            output_device: None,
+        };
+        let lines = audio_config_lines(&audio, false, Some(AudioDriver::CoreAudio), "/tmp/x", None);
+        assert_eq!(lines.source, "coreaudio,Some Mic");
+        assert_eq!(lines.fallback_notice, None);
+    }
+
+    #[test]
+    fn only_output_stale_input_still_honored_independently() {
+        let audio = AudioSettings {
+            input_device: Some("coreaudio,AirPods Pro".to_string()),
+            output_device: Some("coreaudio,Old USB Speaker (unplugged)".to_string()),
+        };
+        let known = KnownDevices {
+            input: vec!["coreaudio,AirPods Pro".to_string()],
+            output: vec!["coreaudio,Mac mini Speakers".to_string()],
+        };
+        let lines = audio_config_lines(&audio, false, Some(AudioDriver::CoreAudio), "/tmp/x", Some(&known));
+        assert_eq!(lines.source, "coreaudio,AirPods Pro"); // still there, honored
+        assert_eq!(lines.player, "coreaudio,default"); // gone, degraded
+        let notice = lines.fallback_notice.expect("output side should report the stale device");
+        assert!(notice.contains("Old USB Speaker"), "unexpected notice: {notice}");
     }
 }
 
@@ -1355,11 +1553,17 @@ mod audio_config_lines_tests {
 /// file. The caller (`SpawnPlan::build` -> `supervisor_loop`) turns
 /// `Some(notice)` into a real, visible signal via `emit_shell_notice` once
 /// it has `shared`/`AppHandle` back in scope.
+///
+/// `known` (2026-07-16 4R re-review, resilience) is `Shared::known_devices`'s
+/// cache, snapshotted by `SpawnPlan::build` before this call - see
+/// `resolve_device`'s doc for the stale/disconnected-device cross-check it
+/// enables.
 fn write_config_file(
     scratch_dir: &Path,
     module_path: &Path,
     transport: &str,
     audio: &AudioSettings,
+    known: Option<&KnownDevices>,
 ) -> Result<Option<String>, String> {
     let _ = transport; // media requirements are unconditional, see run-spike.sh
     let module_path_str = module_path.display().to_string();
@@ -1378,7 +1582,7 @@ fn write_config_file(
         None
     };
 
-    let mut lines = audio_config_lines(audio, synthetic, driver, &scratch_str);
+    let mut lines = audio_config_lines(audio, synthetic, driver, &scratch_str, known);
     notice = merge_notice(notice, lines.fallback_notice.take());
 
     // A1 (2026-07-16 4R review): don't just ask baresip to load a module

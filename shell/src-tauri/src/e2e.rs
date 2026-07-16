@@ -10,7 +10,8 @@
 //!
 //! Script grammar: `|`-separated steps, e.g.
 //!   "wait:5|dial:sip:*43@192.0.2.10|wait:8|hangup|wait:2"
-//! Steps: `wait:<secs>`, `dial:<uri>`, `answer`, `hangup`,
+//! Steps: `wait:<secs>`, `dial:<uri>`, `answer`, `hangup`, `restart`
+//! (forces a fresh sidecar spawn - see `commands::sidecar_restart`),
 //! `hold`, `resume`, `mute:on`/`mute:off`,
 //! `blind_transfer:<uri>`, `attended_transfer:<uri>`,
 //! `complete_transfer`, `abort_transfer`,
@@ -111,6 +112,17 @@ pub fn maybe_run_e2e_script(app: &AppHandle) {
                     Ok(()) => log::info!("e2e: hangup -> ok"),
                     Err(e) => log::error!("e2e: hangup -> err: {e}"),
                 }
+            } else if step == "restart" {
+                // Forces a fresh spawn (config regenerated from scratch,
+                // same path `save_account_settings`/`save_favorites`/
+                // `provisioning_apply` already trigger) - added 2026-07-16
+                // 4R re-review to script the stale-device cross-check's own
+                // scenario end to end: persist a device, then force a
+                // respawn, and confirm `sidecar::resolve_device` degrades
+                // it using `Shared::known_devices`'s cache from the prior
+                // spawn's own "ready"-triggered devices query.
+                commands::sidecar_restart(sidecar);
+                log::info!("e2e: restart -> ok");
             } else if step == "hold" {
                 match commands::sidecar_hold(sidecar, None) {
                     Ok(()) => log::info!("e2e: hold -> ok"),
