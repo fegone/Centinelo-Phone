@@ -54,7 +54,14 @@ pub fn maybe_run_e2e_script(app: &AppHandle) {
     };
     let app = app.clone();
     std::thread::spawn(move || {
-        log::info!("e2e: script starting: {script}");
+        // Redact before logging the whole script (2026-07-16 qa-e2e finding
+        // #3): a `provisioning_resolve:<link>` step's `config=`/`url=` query
+        // value can carry a SIP secret (base64 is not encryption - trivially
+        // reversible) straight from a `centinelo://provision` deep link.
+        // Logging `script` verbatim put that secret in this debug log the
+        // moment the script *started*, before `provisioning_resolve`'s own
+        // existing secret-free preview ever ran. See `redact_script_for_log`.
+        log::info!("e2e: script starting: {}", redact_script_for_log(&script));
         for raw_step in script.split('|') {
             let step = raw_step.trim();
             if step.is_empty() {
@@ -209,4 +216,84 @@ pub fn maybe_run_e2e_script(app: &AppHandle) {
         log::info!("e2e: final blf_states = {:?}", sidecar.blf_states());
         log::info!("e2e: script complete");
     });
+}
+
+/// Redacts any embedded provisioning secret before the full script is
+/// logged (see the doc on the `log::info!` call above). Only a
+/// `provisioning_resolve:<link>` step ever carries a link with a
+/// `config=`/`url=` query value - every other step (`dial`, `mute`, ...)
+/// has nothing sensitive to redact and passes through byte-for-byte.
+fn redact_script_for_log(script: &str) -> String {
+    script
+        .split('|')
+        .map(|raw_step| match raw_step.strip_prefix("provisioning_resolve:") {
+            Some(link) => format!("provisioning_resolve:{}", redact_provisioning_link(link)),
+            None => raw_step.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+/// Redacts the value of a `config=`/`url=` query parameter in a
+/// `centinelo://provision?...` deep link, leaving the scheme/host/other
+/// params visible (still useful for debugging which link shape a script
+/// exercised, just not the secret-bearing payload itself).
+fn redact_provisioning_link(link: &str) -> String {
+    let Some((base, query)) = link.split_once('?') else {
+        return link.to_string(); // no query string at all - nothing to redact
+    };
+    let redacted_query = query
+        .split('&')
+        .map(|pair| match pair.split_once('=') {
+            Some((key, _)) if key == "config" || key == "url" => format!("{key}=<redacted>"),
+            _ => pair.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("{base}?{redacted_query}")
+}
+
+#[cfg(test)]
+mod redact_tests {
+    use super::*;
+
+    #[test]
+    fn embedded_config_payload_is_redacted() {
+        let script = "wait:2|provisioning_resolve:centinelo://provision?config=eyJzZWNyZXQiOiJzM2NyZXQifQ|wait:1";
+        let redacted = redact_script_for_log(script);
+        assert!(!redacted.contains("eyJzZWNyZXQiOiJzM2NyZXQifQ"), "secret payload leaked: {redacted}");
+        assert!(redacted.contains("provisioning_resolve:centinelo://provision?config=<redacted>"));
+        // Untouched steps still readable, unredacted.
+        assert!(redacted.contains("wait:2"));
+        assert!(redacted.contains("wait:1"));
+    }
+
+    #[test]
+    fn fetch_url_param_is_redacted_too() {
+        let script = "provisioning_resolve:centinelo://provision?url=https://example.invalid/cfg?token=abc123";
+        let redacted = redact_script_for_log(script);
+        assert!(!redacted.contains("https://example.invalid/cfg?token=abc123"), "fetch URL leaked: {redacted}");
+        assert!(redacted.contains("url=<redacted>"));
+    }
+
+    #[test]
+    fn other_params_alongside_config_are_preserved() {
+        let script = "provisioning_resolve:centinelo://provision?tls_pin=abcd&config=SECRETPAYLOAD";
+        let redacted = redact_script_for_log(script);
+        assert!(!redacted.contains("SECRETPAYLOAD"));
+        assert!(redacted.contains("tls_pin=abcd"), "non-secret param should survive: {redacted}");
+        assert!(redacted.contains("config=<redacted>"));
+    }
+
+    #[test]
+    fn steps_without_provisioning_resolve_are_unchanged() {
+        let script = "wait:5|dial:sip:*43@192.0.2.10|hangup";
+        assert_eq!(redact_script_for_log(script), script);
+    }
+
+    #[test]
+    fn link_with_no_query_string_passes_through() {
+        let script = "provisioning_resolve:not-a-real-link-no-query";
+        assert_eq!(redact_script_for_log(script), script);
+    }
 }

@@ -65,15 +65,167 @@ enum ControlSignal {
 /// `held` - F2/F3's shell UI has no hold control wired to the v1 protocol's
 /// `hold` command yet (see shell/README.md "Known limitations"), so that
 /// state can't actually be reached here and isn't fabricated.
+///
+/// No `None` variant on purpose (2026-07-16, fixing the qa-e2e-reported R4
+/// bug below): this used to be a single `Mutex<CallPhase>` with a `None`
+/// resting state, which meant *any* call_id's `closed` event reset the
+/// whole thing to `None` - including an unrelated, already-cancelled leg
+/// (e.g. dual-contact's own auto-ring cancelling itself) closing while a
+/// real call on a *different* `call_id` was still established/on hold/
+/// muted. `has_active_call()` would then report `false` mid-call and
+/// `provisioning_apply` would restart the sidecar and drop the real call
+/// with no warning - exactly what R4 was supposed to prevent. Now phases
+/// are tracked per `call_id` in `Shared::call_phases`, and "no active
+/// call" is simply "the map is empty", not a variant a stray event can
+/// force onto an unrelated call_id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CallPhase {
-    None,
     /// `call_state:"incoming"` - someone is calling us.
     Incoming,
-    /// `call_state:"ringing"` with no prior `incoming` for this process - an
-    /// outbound call we placed is ringing out.
+    /// `call_state:"ringing"` with no prior `incoming` for this call_id -
+    /// an outbound call we placed is ringing out.
     Calling,
     InCall,
+}
+
+/// Applies one `call_state` transition to `phases`, scoped to `call_id` -
+/// pulled out as a free function (not inlined in the stdout-reader match)
+/// specifically so it's unit-testable without spinning up a `Shared`/
+/// `AppHandle` (see the `call_phase_tests` module below, which reproduces
+/// the exact 2026-07-16 qa-e2e R4 bug: an unrelated call_id's `closed`
+/// event used to wipe a real, still-established call's tracked state).
+fn apply_call_state_transition(phases: &mut HashMap<String, CallPhase>, call_id: &str, call_state: &str) {
+    match call_state {
+        "incoming" => {
+            phases.insert(call_id.to_string(), CallPhase::Incoming);
+        }
+        "ringing" => {
+            // Don't downgrade an already-incoming call_id to Calling - a
+            // call we're being rung for stays "ringing" (Incoming) in the
+            // vocabulary even if the far end's own signaling also fires a
+            // `ringing` transition for the same call_id.
+            if phases.get(call_id) != Some(&CallPhase::Incoming) {
+                phases.insert(call_id.to_string(), CallPhase::Calling);
+            }
+        }
+        "established" => {
+            phases.insert(call_id.to_string(), CallPhase::InCall);
+        }
+        "closed" => {
+            phases.remove(call_id);
+        }
+        // hold/resumed/muted/unmuted: attributes of an already-established
+        // call, not a lifecycle change - see core/PROTOCOL.md "Events".
+        // Deliberately a no-op, same as before this fix.
+        _ => {}
+    }
+}
+
+/// Picks the phase [`SidecarHandle::ping_state`] should report when more
+/// than one call_id is tracked at once: `InCall` wins over `Incoming`
+/// over `Calling`, so a genuine ongoing conversation (e.g. the original
+/// call during an attended-transfer consultation) is never masked by some
+/// other leg still ringing or dialing out. Returns `None` when `phases` is
+/// empty (no active call at all).
+fn dominant_call_phase(phases: &HashMap<String, CallPhase>) -> Option<CallPhase> {
+    if phases.values().any(|p| *p == CallPhase::InCall) {
+        Some(CallPhase::InCall)
+    } else if phases.values().any(|p| *p == CallPhase::Incoming) {
+        Some(CallPhase::Incoming)
+    } else if phases.values().any(|p| *p == CallPhase::Calling) {
+        Some(CallPhase::Calling)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod call_phase_tests {
+    use super::*;
+
+    /// The exact bug qa-e2e reproduced twice against the real PBX
+    /// (`.claude/reports/qa-e2e-2026-07-16-sprint-final.md`, finding #2):
+    /// dual-contact's own auto-ring cancels itself (a `closed` on a
+    /// call_id that was never the real call) while the real call, on a
+    /// different call_id, is still established - `has_active_call()` must
+    /// keep reporting `true` throughout.
+    #[test]
+    fn unrelated_leg_closing_does_not_clear_a_different_active_call() {
+        let mut phases = HashMap::new();
+        apply_call_state_transition(&mut phases, "real-call", "ringing");
+        apply_call_state_transition(&mut phases, "real-call", "established");
+        apply_call_state_transition(&mut phases, "ghost-leg", "incoming");
+        apply_call_state_transition(&mut phases, "ghost-leg", "closed");
+
+        assert!(!phases.is_empty(), "the real call must still be tracked");
+        assert_eq!(phases.get("real-call"), Some(&CallPhase::InCall));
+        assert!(!phases.contains_key("ghost-leg"));
+    }
+
+    /// A subsequent hold/mute on the real call must not be undone by
+    /// (or need) the ghost leg's own teardown - full lifecycle sanity
+    /// check matching qa-e2e's log timeline (established -> hold ->
+    /// resumed -> muted -> unmuted, all on the same call_id, closed
+    /// event from the other call_id in between).
+    #[test]
+    fn hold_mute_after_an_unrelated_close_still_leave_the_real_call_active() {
+        let mut phases = HashMap::new();
+        apply_call_state_transition(&mut phases, "real-call", "established");
+        apply_call_state_transition(&mut phases, "ghost-leg", "incoming");
+        apply_call_state_transition(&mut phases, "ghost-leg", "closed");
+        apply_call_state_transition(&mut phases, "real-call", "hold");
+        apply_call_state_transition(&mut phases, "real-call", "resumed");
+        apply_call_state_transition(&mut phases, "real-call", "muted");
+        apply_call_state_transition(&mut phases, "real-call", "unmuted");
+
+        assert!(!phases.is_empty());
+        assert_eq!(phases.get("real-call"), Some(&CallPhase::InCall));
+    }
+
+    /// The normal, single-call case: closing the only tracked call_id
+    /// must still clear the active-call state (no regression from the
+    /// per-call_id scoping).
+    #[test]
+    fn single_call_closing_clears_active_state() {
+        let mut phases = HashMap::new();
+        apply_call_state_transition(&mut phases, "only-call", "incoming");
+        apply_call_state_transition(&mut phases, "only-call", "established");
+        apply_call_state_transition(&mut phases, "only-call", "closed");
+
+        assert!(phases.is_empty());
+    }
+
+    #[test]
+    fn incoming_ring_is_not_downgraded_to_calling() {
+        let mut phases = HashMap::new();
+        apply_call_state_transition(&mut phases, "inbound", "incoming");
+        apply_call_state_transition(&mut phases, "inbound", "ringing");
+
+        assert_eq!(phases.get("inbound"), Some(&CallPhase::Incoming));
+    }
+
+    #[test]
+    fn outbound_ringing_with_no_prior_incoming_is_calling() {
+        let mut phases = HashMap::new();
+        apply_call_state_transition(&mut phases, "outbound", "ringing");
+
+        assert_eq!(phases.get("outbound"), Some(&CallPhase::Calling));
+    }
+
+    #[test]
+    fn dominant_phase_prefers_in_call_over_other_legs() {
+        let mut phases = HashMap::new();
+        apply_call_state_transition(&mut phases, "original", "established");
+        apply_call_state_transition(&mut phases, "consult", "ringing"); // attended-transfer consultation leg
+
+        assert_eq!(dominant_call_phase(&phases), Some(CallPhase::InCall));
+    }
+
+    #[test]
+    fn dominant_phase_is_none_when_no_calls_tracked() {
+        let phases: HashMap<String, CallPhase> = HashMap::new();
+        assert_eq!(dominant_call_phase(&phases), None);
+    }
 }
 
 struct Shared {
@@ -95,7 +247,12 @@ struct Shared {
     /// `ping_state()` (bridge.rs `/ping`) and used to gate the one-time BLF
     /// auto-subscribe below.
     registered: AtomicBool,
-    call_phase: Mutex<CallPhase>,
+    /// Per-`call_id` phase - see [`CallPhase`]'s doc for why this is a map
+    /// keyed by `call_id` and not a single global flag. An entry exists
+    /// only while its call_id is live; `"closed"` removes it rather than
+    /// resetting a shared value, so one leg's teardown can never affect
+    /// another's tracked state.
+    call_phases: Mutex<HashMap<String, CallPhase>>,
     /// Last-known state per watched extension (ext -> "idle"|"ringing"|
     /// "busy"|"offline"), from `blf` events - the same data the frontend's
     /// own `state.blf` derives from, kept here too so (a) a devtools
@@ -146,7 +303,7 @@ impl SidecarHandle {
             pending_transport_override: Mutex::new(None),
             last_status: Mutex::new(StatusPayload::Idle),
             registered: AtomicBool::new(false),
-            call_phase: Mutex::new(CallPhase::None),
+            call_phases: Mutex::new(HashMap::new()),
             blf_states: Mutex::new(HashMap::new()),
             subscribed_exts: Mutex::new(HashSet::new()),
             transcription: Mutex::new(None),
@@ -177,25 +334,34 @@ impl SidecarHandle {
     }
 
     /// Coarse call/registration state for the click-to-call bridge's
-    /// Any call phase other than `None` (incoming/calling/in-call) -
-    /// backs `commands::provisioning_apply`'s pre-restart check (2026-07-16
-    /// 4R re-review, R4): applying a provisioning config restarts this
-    /// sidecar unconditionally, which drops whatever call is in progress
-    /// with no warning - a real risk specifically because a provisioning
-    /// request can arrive via a `centinelo://provision` deep link (email/
-    /// IM) at any time, not just from a deliberate "I'm between calls,
-    /// let's reconfigure" moment the way opening Settings usually is. A
-    /// fresh install (no account configured yet, the common first-run
-    /// case) can never be mid-call - the supervisor loop never even
-    /// starts before an account exists - so this is a safe, always-
+    /// `/ping` and for `commands::provisioning_apply`'s pre-restart check
+    /// (2026-07-16 4R re-review, R4): applying a provisioning config
+    /// restarts this sidecar unconditionally, which drops whatever call is
+    /// in progress with no warning - a real risk specifically because a
+    /// provisioning request can arrive via a `centinelo://provision` deep
+    /// link (email/IM) at any time, not just from a deliberate "I'm
+    /// between calls, let's reconfigure" moment the way opening Settings
+    /// usually is. A fresh install (no account configured yet, the common
+    /// first-run case) can never be mid-call - the supervisor loop never
+    /// even starts before an account exists - so this is a safe, always-
     /// accurate check to run unconditionally rather than only when
     /// re-provisioning an already-configured install.
+    ///
+    /// True iff *any* call_id currently has a tracked phase - see
+    /// `Shared::call_phases`'s doc for why this must be scoped per
+    /// call_id rather than one flag a single leg's `closed` could reset
+    /// for every other leg too (2026-07-16 qa-e2e R4 finding).
     pub fn has_active_call(&self) -> bool {
-        !matches!(*self.0.call_phase.lock().expect("poisoned"), CallPhase::None)
+        !self.0.call_phases.lock().expect("poisoned").is_empty()
     }
 
     /// `/ping` (bridge.rs) - see `CallPhase`'s doc comment for the
-    /// vocabulary and why `held` is deliberately absent.
+    /// vocabulary and why `held` is deliberately absent. When more than
+    /// one call_id is tracked at once (e.g. an attended-transfer
+    /// consultation leg alongside the original call), `dominant_call_phase`
+    /// makes this prefer reporting `InCall` over `Incoming` over `Calling`,
+    /// so a genuine ongoing conversation is never masked by some other leg
+    /// still ringing/dialing out.
     pub fn ping_state(&self) -> &'static str {
         match self.status() {
             StatusPayload::Idle | StatusPayload::Stopped | StatusPayload::Failed { .. } => {
@@ -206,11 +372,11 @@ impl SidecarHandle {
                 if !self.0.registered.load(Ordering::SeqCst) {
                     "connecting"
                 } else {
-                    match *self.0.call_phase.lock().expect("poisoned") {
-                        CallPhase::None => "registered",
-                        CallPhase::Incoming => "ringing",
-                        CallPhase::Calling => "calling",
-                        CallPhase::InCall => "in-call",
+                    match dominant_call_phase(&self.0.call_phases.lock().expect("poisoned")) {
+                        None => "registered",
+                        Some(CallPhase::Incoming) => "ringing",
+                        Some(CallPhase::Calling) => "calling",
+                        Some(CallPhase::InCall) => "in-call",
                     }
                 }
             }
@@ -457,7 +623,7 @@ fn supervisor_loop(shared: Arc<Shared>) {
         // process - a stale "registered"/"in-call" ping_state() would be a
         // straightforward lie to the click-to-call bridge.
         shared.registered.store(false, Ordering::SeqCst);
-        *shared.call_phase.lock().expect("poisoned") = CallPhase::None;
+        shared.call_phases.lock().expect("poisoned").clear();
         shared.blf_states.lock().expect("poisoned").clear();
         // A fresh process starts with no subscriptions either - matches
         // blf_states being cleared above, and lets a respawned process's
@@ -639,23 +805,16 @@ fn spawn_stdout_reader(
                 // Coarse phase for ping_state() only - the frontend gets the
                 // full event (with call_id/peer/...) via the emit() below
                 // regardless and does its own richer state machine.
+                //
+                // Scoped to this event's own call_id (2026-07-16, fixing
+                // the qa-e2e R4 finding - see `CallPhase`'s doc): every
+                // other in-flight call_id's tracked phase is left alone,
+                // so an unrelated leg closing can never stomp on a real,
+                // still-established call's state.
                 let call_state = value.get("state").and_then(Value::as_str).unwrap_or("");
-                {
-                    let mut phase = shared.call_phase.lock().expect("poisoned");
-                    match call_state {
-                        "incoming" => *phase = CallPhase::Incoming,
-                        "ringing" => {
-                            if *phase != CallPhase::Incoming {
-                                *phase = CallPhase::Calling;
-                            }
-                        }
-                        "established" => *phase = CallPhase::InCall,
-                        "closed" => *phase = CallPhase::None,
-                        // hold/resumed/muted/unmuted: attributes of an
-                        // established call, not a lifecycle change - see
-                        // core/PROTOCOL.md "Events".
-                        _ => {}
-                    }
+                if let Some(call_id) = value.get("call_id").and_then(Value::as_str) {
+                    let mut phases = shared.call_phases.lock().expect("poisoned");
+                    apply_call_state_transition(&mut phases, call_id, call_state);
                 }
                 if let Some(t) = shared.transcription.lock().expect("poisoned").as_ref() {
                     t.on_call_state(&value);
