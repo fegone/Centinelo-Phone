@@ -71,3 +71,16 @@ ed25519-dalek = "2"
 # reimplementation", 2026-07-16 review finding M4) rather than pulling in
 # ureq/sha2 for a second copy of the same logic.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# Auto-provisioning (spec §5, src/provisioning.rs): fetches a small JSON
+# config from an https:// URL the operator pastes (or a
+# centinelo://provision?url=... deep link supplies) - an installer-hosted
+# provisioning file, unrelated to the model-download path the comment
+# above deliberately avoided reimplementing. `default-features = false` +
+# only the "tls" feature: rustls, not native-tls/openssl - sidesteps the
+# system-openssl path that already broke Windows CI once for a different
+# crate (see shell/README.md's Windows CI notes); no proxy/cookie/gzip
+# support needed for one small GET.
+ureq = { version = "2", default-features = false, features = ["tls"] }
+# Decodes the optional embedded `centinelo://provision?config=<base64>`
+# form (no network fetch at all - see provisioning.rs "two ways in").
+base64 = "0.22"

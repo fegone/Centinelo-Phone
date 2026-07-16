@@ -104,6 +104,17 @@ pub struct AccountSettings {
     pub display_name: String,
     #[serde(default)]
     pub transport_priority: TransportPriority,
+    /// Hex SHA-256 leaf-certificate pin (colons optional), applied to the
+    /// sidecar as the `CENT_TLS_PIN` env var it already documents
+    /// (`core/PROTOCOL.md` "CENT_TLS_PIN is one flat env var" - see
+    /// sidecar.rs's `spawn()`). `None` = no pinning beyond whatever the
+    /// OS trust store does for the negotiated transport, same as before
+    /// this field existed. Set via provisioning (provisioning.rs) today -
+    /// there's no manual-entry field for it in Settings yet (advanced/
+    /// security value, provisioning is the intended path - see
+    /// shell/PROVISIONING.md).
+    #[serde(default)]
+    pub tls_pin_sha256: Option<String>,
 }
 
 impl AccountSettings {

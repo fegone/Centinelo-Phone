@@ -383,15 +383,26 @@ fn supervisor_loop(shared: Arc<Shared>) {
 
         shared.emit_status_from_thread(StatusPayload::Starting);
 
-        let mut child = match Command::new(&plan.binary)
-            .arg("-f")
+        // CENT_TLS_PIN: core/PROTOCOL.md's own documented env var ("one
+        // flat env var - single pin, checked for every TLS/WSS
+        // connection", see that file's TLS verification section) - only
+        // set when the account actually has one (provisioning.rs is the
+        // only writer today, see settings.rs AccountSettings doc). Built
+        // as a plain `Command` rather than one long builder chain so this
+        // one env var can be conditional without duplicating every other
+        // `.arg()`/`.env()`/`.stdio()` call across two branches.
+        let mut cmd = Command::new(&plan.binary);
+        cmd.arg("-f")
             .arg(&plan.scratch_dir)
             .env("CENT_WS_PATH", &plan.ws_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-        {
+            .stderr(Stdio::piped());
+        if let Some(pin) = account.tls_pin_sha256.as_deref().filter(|p| !p.is_empty()) {
+            cmd.env("CENT_TLS_PIN", pin);
+        }
+
+        let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
                 let _ = std::fs::remove_dir_all(&plan.scratch_dir);

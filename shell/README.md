@@ -531,6 +531,22 @@ the surviving channel).
   installed, and the in-app toggle there instead gates whether an incoming
   `tel:` link is acted on at all.
 
+## F4 addition: auto-provisioning
+
+**`PROVISIONING.md`** has the full design (JSON config schema, the three
+link forms, admin-lock carve-out, security notes, what's in/out of scope).
+Short version: `provisioning.rs` + a new `#setup-prompt` paste field and
+`#provision-confirm-overlay` confirmation screen (`ui/index.html`/
+`ui/js/app.js`) let a fresh install go from "paste a link" to "registered"
+without touching Settings by hand, per spec §5. Reuses the deep-link
+plumbing `deeplink.rs` already had for `tel:`/`centinelo:` dial links —
+`centinelo://provision?...` is routed away from that dial-target
+extraction before it runs. The secret never round-trips to the frontend at
+any point (two-step `provisioning_resolve`/`provisioning_apply`, see that
+module's doc). QR is explicitly out of scope for this pass (webcam capture
+specifically) — see `PROVISIONING.md` "QR" for what's left for a future
+pass to build on.
+
 ## Known limitations (F2/F3/F4 scope)
 
 - No `hold`/`mute`/`transfer`/`dtmf` **in the main window's own UI** — F4
@@ -542,8 +558,16 @@ the surviving channel).
   though the protocol and backend now support it), tracked as follow-up,
   not this round's scope (F4 was "integrate the premium module + console",
   not "redesign the free-tier call UI").
-- No cert pinning (`sip_verify_server no`) — matches `core/BUILD.md`'s own
-  documented TODO; the v1 app's `pinnedCertSha256` setting isn't ported.
+- Cert pinning (`CENT_TLS_PIN`, `core/BUILD.md` "TLS leaf-certificate
+  pinning") is now wired end to end (`settings.rs` `AccountSettings.tls_pin_sha256`
+  -> `sidecar.rs` spawn env, this session's auto-provisioning work) —
+  v1's `pinnedCertSha256` setting *is* ported, functionally. What's still
+  missing is a **manual-entry field for it in Settings**: the only way to
+  set it today is through a provisioning config (`PROVISIONING.md`'s
+  `tls_pin_sha256` field) — an operator can't paste a pin into the UI by
+  hand. `sip_verify_server no` (self-signed-CA-friendly, unconditional) is
+  unchanged, matching `core/BUILD.md`'s own note that pinning, not CA
+  verification, is this engine's real trust boundary.
 - Transcript/recording UI — still Pro/later-phase surfaces per
   `DIRECTION.md`, not part of F4 (F4 scope was specifically the loader +
   the `blf_console` capability/console window).

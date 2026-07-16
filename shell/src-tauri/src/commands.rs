@@ -105,10 +105,16 @@ pub fn save_account_settings(
     if input.host.trim().is_empty() || input.ext.trim().is_empty() {
         return Err("Host and extension are required.".to_string());
     }
-    let previous_secret = settings.snapshot().account.secret;
+    // Pulls the *whole* previous account, not just the secret (was
+    // `previous_secret` only, pre-provisioning) - `..previous` below
+    // preserves `tls_pin_sha256` across a manual Settings save instead of
+    // silently dropping it, since there's no manual-entry field for that
+    // one yet (see settings.rs AccountSettings doc) - a provisioned pin
+    // shouldn't vanish the next time someone edits the host in Settings.
+    let previous = settings.snapshot().account;
     let secret = match input.secret {
         Some(s) if !s.is_empty() => s,
-        _ => previous_secret,
+        _ => previous.secret.clone(),
     };
     let account = AccountSettings {
         host: input.host.trim().to_string(),
@@ -116,6 +122,7 @@ pub fn save_account_settings(
         secret,
         display_name: input.display_name.trim().to_string(),
         transport_priority: input.transport_priority,
+        ..previous
     };
     settings.update_account(account).map_err(|e| e.to_string())?;
     sidecar.restart_now();
@@ -325,6 +332,70 @@ pub fn set_register_tel_handler(
         .map_err(|e| e.to_string())?;
     crate::deeplink::apply_tel_registration(&app, enabled);
     Ok(())
+}
+
+// ---- auto-provisioning (spec §5) ---------------------------------------
+//
+// Two-step resolve/apply so a fetched config's secret never round-trips
+// to the frontend (see provisioning.rs's module doc): `provisioning_resolve`
+// parses + (if remote) fetches + validates, stashes the result server-side
+// in `ProvisioningPending`, and hands back a secret-free preview for the
+// confirmation screen; `provisioning_apply` commits whatever's currently
+// pending. The deep-link entry path (provisioning.rs `handle_deep_link`,
+// wired from deeplink.rs) fills the same `ProvisioningPending` slot and
+// emits the same preview shape as an event instead of a command return
+// value - see ui/js/app.js's `showProvisioningConfirm`, shared by both.
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn provisioning_resolve(
+    provisioning: State<crate::provisioning::ProvisioningPending>,
+    input: String,
+) -> Result<crate::provisioning::ProvisioningPreviewView, String> {
+    let config = crate::provisioning::resolve_input(&input)?;
+    let preview = crate::provisioning::ProvisioningPreviewView::from(&config);
+    provisioning.set(config);
+    Ok(preview)
+}
+
+/// Admin-gated *unless* this is the very first provisioning on a clean
+/// install (no account configured yet) - matches the task spec's explicit
+/// carve-out ("salvo el primer provisioning en instalación limpia, que es
+/// el caso de setup inicial"): a brand-new install has no admin password
+/// set yet either in the common case (see settings.rs `AdminSettings`,
+/// `password_hash: None` until the operator sets one), so requiring
+/// unlock here would strand a fresh install with the very
+/// `admin_set_password` UI this account is needed to even reach. Any
+/// later re-provision of an already-configured install goes through the
+/// same `require_unlocked` check `save_account_settings` already applies
+/// to a manual account edit - provisioning isn't a lesser-privileged way
+/// to change the account than typing it in by hand.
+#[tauri::command(rename_all = "snake_case")]
+pub fn provisioning_apply(
+    settings: State<Arc<SettingsStore>>,
+    admin: State<AdminSession>,
+    sidecar: State<SidecarHandle>,
+    provisioning: State<crate::provisioning::ProvisioningPending>,
+) -> Result<(), String> {
+    let already_configured = settings.snapshot().account.is_configured();
+    if already_configured {
+        require_unlocked(&admin)?;
+    }
+    let config = provisioning
+        .take()
+        .ok_or_else(|| "Nothing pending - paste a provisioning link first.".to_string())?;
+    settings.update_account(config.into()).map_err(|e| e.to_string())?;
+    sidecar.restart_now();
+    Ok(())
+}
+
+/// Backs the confirmation screen's "Cancel" - discards a pending config
+/// without applying it. Also safe to call defensively any time (e.g. the
+/// frontend closing the confirmation screen for any reason); a
+/// second/stale pending config left over from a dismissed confirmation
+/// should never be applicable by some other, unrelated path later.
+#[tauri::command(rename_all = "snake_case")]
+pub fn provisioning_cancel(provisioning: State<crate::provisioning::ProvisioningPending>) {
+    provisioning.clear();
 }
 
 // ---- premium ---------------------------------------------------------
