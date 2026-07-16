@@ -91,10 +91,13 @@ enum CallPhase {
 /// Applies one `call_state` transition to `phases`, scoped to `call_id` -
 /// pulled out as a free function (not inlined in the stdout-reader match)
 /// specifically so it's unit-testable without spinning up a `Shared`/
-/// `AppHandle` (see the `call_phase_tests` module below, which reproduces
-/// the exact 2026-07-16 qa-e2e R4 bug: an unrelated call_id's `closed`
-/// event used to wipe a real, still-established call's tracked state).
-fn apply_call_state_transition(phases: &mut HashMap<String, CallPhase>, call_id: &str, call_state: &str) {
+/// `AppHandle` (see the `call_phase_tests` module below, and `CallPhase`'s
+/// doc for why this must be scoped per call_id).
+fn apply_call_state_transition(
+    phases: &mut HashMap<String, CallPhase>,
+    call_id: &str,
+    call_state: &str,
+) {
     match call_state {
         "incoming" => {
             phases.insert(call_id.to_string(), CallPhase::Incoming);
@@ -143,9 +146,8 @@ fn dominant_call_phase(phases: &HashMap<String, CallPhase>) -> Option<CallPhase>
 mod call_phase_tests {
     use super::*;
 
-    /// The exact bug qa-e2e reproduced twice against the real PBX
-    /// (`.claude/reports/qa-e2e-2026-07-16-sprint-final.md`, finding #2):
-    /// dual-contact's own auto-ring cancels itself (a `closed` on a
+    /// The exact bug this fix addresses, reproduced twice against a real
+    /// PBX: dual-contact's own auto-ring cancels itself (a `closed` on a
     /// call_id that was never the real call) while the real call, on a
     /// different call_id, is still established - `has_active_call()` must
     /// keep reporting `true` throughout.
@@ -348,20 +350,15 @@ impl SidecarHandle {
     /// re-provisioning an already-configured install.
     ///
     /// True iff *any* call_id currently has a tracked phase - see
-    /// `Shared::call_phases`'s doc for why this must be scoped per
-    /// call_id rather than one flag a single leg's `closed` could reset
-    /// for every other leg too (2026-07-16 qa-e2e R4 finding).
+    /// `CallPhase`'s doc for the per-call_id rationale.
     pub fn has_active_call(&self) -> bool {
         !self.0.call_phases.lock().expect("poisoned").is_empty()
     }
 
     /// `/ping` (bridge.rs) - see `CallPhase`'s doc comment for the
-    /// vocabulary and why `held` is deliberately absent. When more than
-    /// one call_id is tracked at once (e.g. an attended-transfer
-    /// consultation leg alongside the original call), `dominant_call_phase`
-    /// makes this prefer reporting `InCall` over `Incoming` over `Calling`,
-    /// so a genuine ongoing conversation is never masked by some other leg
-    /// still ringing/dialing out.
+    /// vocabulary and why `held` is deliberately absent, and
+    /// `dominant_call_phase`'s doc for how this picks a single phase to
+    /// report when more than one call_id is live at once.
     pub fn ping_state(&self) -> &'static str {
         match self.status() {
             StatusPayload::Idle | StatusPayload::Stopped | StatusPayload::Failed { .. } => {
@@ -815,6 +812,16 @@ fn spawn_stdout_reader(
                 if let Some(call_id) = value.get("call_id").and_then(Value::as_str) {
                     let mut phases = shared.call_phases.lock().expect("poisoned");
                     apply_call_state_transition(&mut phases, call_id, call_state);
+                } else {
+                    // Silently dropping this would be R4 all over again via
+                    // a different trigger: a tracked call_id's own
+                    // eventual "closed" arriving without a call_id would
+                    // never remove its entry from `call_phases`, and
+                    // has_active_call() would stay stuck reporting `true`
+                    // forever. Loud (not silent) so a future engine-side
+                    // protocol regression is visible instead of quietly
+                    // reintroducing this class of bug.
+                    log::warn!("sidecar: call_state event missing call_id, phase not updated: {value}");
                 }
                 if let Some(t) = shared.transcription.lock().expect("poisoned").as_ref() {
                     t.on_call_state(&value);
