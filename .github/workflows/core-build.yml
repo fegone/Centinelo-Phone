@@ -164,6 +164,17 @@ jobs:
         # the re *source* tree, where re.h lives (same ../re/include the macOS
         # job resolves via FindRE.cmake); RE_LIBRARY at the just-installed
         # static archive re-static.lib (OUTPUT_NAME re-static on MSVC).
+        #
+        # MODULES now mirrors macOS's media set (ausine/aufile/ice/dtls_srtp)
+        # plus `wasapi`, the Windows-native audio backend (WASAPI, guarded
+        # `if(NOT WIN32) return()` in its own CMakeLists.txt, so it's a no-op
+        # everywhere else) - see core/BUILD.md "Windows CI" for why the
+        # previous, smaller list (`account;g711;auconv;auresamp;menu`) was a
+        # real functional gap: without ice/dtls_srtp this engine cannot
+        # produce real media on a `webrtc=yes` endpoint (mandatory
+        # DTLS-SRTP+ICE regardless of signaling transport, see BUILD.md
+        # "Findings"), and without a native audio module there is no
+        # microphone/speaker path at all on Windows.
         shell: bash
         run: |
           set -o pipefail
@@ -173,7 +184,7 @@ jobs:
             -DRE_LIBRARY="$RE_INSTALL/lib/re-static.lib" \
             -DRE_INCLUDE_DIR="$(pwd -W)/core/deps/re/include" \
             -DOPENSSL_ROOT_DIR="$OPENSSL_ROOT_DIR" \
-            -DMODULES="account;g711;auconv;auresamp;menu" \
+            -DMODULES="account;g711;auconv;auresamp;ausine;aufile;ice;dtls_srtp;menu;wasapi" \
             -DAPP_MODULES="ctrl_json" \
             -DAPP_MODULES_DIR="$(pwd -W)/core/modules" \
             2>&1 | tee baresip-configure.log
@@ -187,12 +198,37 @@ jobs:
         # only confirm the artifacts exist; baresip.exe is not run, as the
         # static build still links OpenSSL's import libs and would need the
         # OpenSSL DLLs on PATH at runtime.
+        #
+        # Also assert every module actually requested got detected: a module
+        # whose own CMakeLists.txt hits an early `return()` (e.g. an
+        # unsatisfied optional dependency) silently drops out of
+        # MODULES_DETECTED instead of failing configure - baresip's
+        # CMakeLists.txt prints `MODULES_DETECTED=...` unconditionally
+        # (`message(...)`, not `message(STATUS ...)`, so it's always in the
+        # tee'd log) right after the per-module add_subdirectory() loop. A
+        # green build + link with a module silently missing from that line
+        # would otherwise look identical to a real success.
         shell: bash
         run: |
           RE_INSTALL="$(pwd -W)/re-install-prefix"
           test -x core/deps/baresip/build/Release/baresip.exe
           test -f "$RE_INSTALL/lib/re-static.lib"
-          echo "OK: re + baresip(+ctrl_json) built on Windows"
+          detected_line="$(grep '^MODULES_DETECTED=' baresip-configure.log || true)"
+          echo "$detected_line"
+          if [ -z "$detected_line" ]; then
+            echo "error: MODULES_DETECTED line not found in baresip-configure.log" >&2
+            exit 1
+          fi
+          for mod in ausine aufile ice dtls_srtp wasapi; do
+            case "$detected_line" in
+              *"$mod"*) ;;
+              *)
+                echo "error: module '$mod' missing from MODULES_DETECTED - it was requested but silently dropped (check its CMakeLists.txt for an early return())" >&2
+                exit 1
+                ;;
+            esac
+          done
+          echo "OK: re + baresip(+ctrl_json, +ausine, +aufile, +ice, +dtls_srtp, +wasapi) built on Windows"
 
       - name: Upload build logs (pass or fail)
         if: always()
