@@ -164,6 +164,7 @@ html[data-os="mac"] .titlebar #btn-close { display: none; }
 .call-overlay .ringing-label { font: 600 13px/1 var(--font-ui); color: var(--amber); display: flex; align-items: center; gap: 8px; }
 .call-overlay .ringing-label .rdot { width: 8px; height: 8px; border-radius: 50%; background: var(--amber-fill); animation: ringPulse 1.2s var(--ease) infinite; }
 .call-overlay .foot { flex: none; }
+.call-overlay .manual-transcribe { display: block; margin: 0 auto 8px; }
 .secure { display: flex; align-items: center; justify-content: center; gap: 6px; font: 600 9.5px/1 var(--font-mono); letter-spacing: .12em; color: var(--text-3); text-transform: uppercase; padding: 10px 0; }
 .secure svg { color: var(--st-idle); }
 .call-actions { display: flex; gap: 10px; }

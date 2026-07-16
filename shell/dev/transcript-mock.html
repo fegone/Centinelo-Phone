@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Centinelo — transcript panel dev harness</title>
+<link rel="stylesheet" href="../ui/css/tokens.css">
+<link rel="stylesheet" href="../ui/css/app.css">
+<link rel="stylesheet" href="../ui/css/transcript.css">
+<style>
+  /* Harness-only chrome (never shipped/loaded by the real app - this file
+     is not referenced from index.html). Puts the real .transcript-screen
+     markup inside a fixed 380x680 frame matching the app's actual main
+     window (tauri.conf.json), plus a state switcher, so screenshots are
+     representative of what the real window shows. */
+  html, body { margin: 0; background: var(--canvas); }
+  body { min-height: 100vh; display: flex; align-items: flex-start; justify-content: center; gap: 24px; padding: 32px; font-family: var(--font-ui); }
+  .frame { width: 380px; height: 680px; border-radius: 10px; overflow: hidden; box-shadow: var(--shadow-win); position: relative; background: var(--bg-0); }
+  .controls { display: flex; flex-direction: column; gap: 8px; }
+  .controls button { display: block; width: 220px; text-align: left; height: 32px; padding: 0 10px; border-radius: 8px; border: 1px solid var(--border-1); background: var(--bg-1); color: var(--text-2); font: 500 12px/1 var(--font-ui); cursor: pointer; }
+  .controls button.on { background: var(--amber-soft); color: var(--amber); border-color: var(--amber-fill); }
+  .controls h2 { font: 700 10px/1 var(--font-mono); letter-spacing: .12em; color: var(--text-3); text-transform: uppercase; margin: 10px 0 2px; }
+</style>
+</head>
+<body>
+
+<div class="controls" role="group" aria-label="Scenario picker">
+  <h2>Phase</h2>
+  <button data-scenario="live" class="on">01 Live</button>
+  <button data-scenario="writing">02 Writing</button>
+  <button data-scenario="done">03 Done (clean)</button>
+  <button data-scenario="done-partial">04 Done (channel failed)</button>
+  <button data-scenario="done-audio">05 Done (audio kept)</button>
+  <button data-scenario="error">06 Error (folder down)</button>
+  <button data-scenario="live-with-other-pending">07 Live + other pending (M2)</button>
+  <button data-scenario="pending-only">08 Pending only, no current (M2)</button>
+  <h2>Theme</h2>
+  <button data-theme="auto" class="on">Auto</button>
+  <button data-theme="light">Light</button>
+  <button data-theme="dark">Dark</button>
+</div>
+
+<div class="frame">
+  <div class="transcript-screen" id="screen-transcript">
+    <div class="transcript-header">
+      <button class="back" id="transcript-back" aria-label="Back">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 6l-6 6 6 6"/></svg>
+      </button>
+      <div class="th-id">
+        <span class="th-name" id="tr-peer-name">Transcript</span>
+        <span class="th-state" id="tr-state-label"></span>
+      </div>
+    </div>
+    <div class="transcript-body" id="transcript-body"></div>
+  </div>
+</div>
+
+<script type="module">
+import { renderTranscriptBody, renderPendingRetriesOnly } from "../ui/js/transcript-panel.js";
+
+const STARTED = Date.now() - 8 * 60_000 - 42_000; // 8m42s ago, like the mockup's own "lasted 08:42"
+
+const BASE_SEGMENTS = [
+  { speaker: "agent", t0Ms: 2_000, t1Ms: 6_000, text: "Riverbend Dental, this is Valentina — how can I help?" },
+  { speaker: "caller", t0Ms: 7_000, t1Ms: 13_000, text: "Hi, good morning. I'd like to move my Thursday appointment to sometime next week if that's possible." },
+  { speaker: "agent", t0Ms: 19_000, t1Ms: 28_000, text: "Of course — let me look at next week. I have Tuesday at 9:40 or Wednesday at 2:15." },
+  { speaker: "caller", t0Ms: 31_000, t1Ms: 40_000, text: "Wednesday at 2:15 works great for me. Should I bring anything for the new insurance?" },
+  { speaker: "agent", t0Ms: 44_000, t1Ms: 52_000, text: "Just the new card — we'll copy it at the desk. Everything else carries over." },
+];
+
+function baseModel(overrides) {
+  return {
+    peerName: "Dana Whitfield",
+    peerNumber: "+1 (352) 555-0164",
+    direction: "inbound",
+    startedAt: STARTED,
+    endedAt: null,
+    segments: BASE_SEGMENTS.map((s) => ({ ...s })),
+    done: null,
+    error: null,
+    ...overrides,
+  };
+}
+
+const SCENARIOS = {
+  live: () => baseModel({ phase: "live" }),
+  writing: () => baseModel({ phase: "writing", endedAt: STARTED + 8 * 60_000 + 42_000 }),
+  done: () =>
+    baseModel({
+      phase: "done",
+      endedAt: STARTED + 8 * 60_000 + 42_000,
+      done: { txtPath: "/tmp/calls/2026/07/16/104200-call.txt", jsonPath: "/tmp/calls/2026/07/16/104200-call.json", audioKept: false, channelsFailed: [] },
+    }),
+  "done-partial": () =>
+    baseModel({
+      phase: "done",
+      endedAt: STARTED + 8 * 60_000 + 42_000,
+      segments: BASE_SEGMENTS.filter((s) => s.speaker === "agent"),
+      done: { txtPath: "/tmp/calls/2026/07/16/104200-call.txt", jsonPath: "/tmp/calls/2026/07/16/104200-call.json", audioKept: false, channelsFailed: ["caller"] },
+    }),
+  "done-audio": () =>
+    baseModel({
+      phase: "done",
+      endedAt: STARTED + 8 * 60_000 + 42_000,
+      done: { txtPath: "/tmp/calls/2026/07/16/104200-call.txt", jsonPath: "/tmp/calls/2026/07/16/104200-call.json", audioKept: true, channelsFailed: [] },
+    }),
+  error: () =>
+    baseModel({
+      phase: "error",
+      endedAt: STARTED + 8 * 60_000 + 42_000,
+      error: { message: "could not write to storage_dir: No such file or directory", retryable: true, localTxtPath: "/tmp/centinelo-transcribe-tap.call-abc/transcript.txt", localJsonPath: null, channelsFailed: [] },
+    }),
+  // M2 (2026-07-16 4R re-review): a NEW call is live while an EARLIER
+  // call's save is still pending - proves beginTranscript no longer
+  // silently drops the earlier one.
+  "live-with-other-pending": () =>
+    baseModel({
+      phase: "live",
+      otherPendingRetries: [
+        { callId: "call-earlier-1", peer: "+1 (352) 555-0199", lastError: "could not write to storage_dir: No such file or directory" },
+      ],
+    }),
+  // M2: nothing currently live/writing/done - only pending saves from a
+  // previous session (app restart re-hydration case).
+  "pending-only": () => null,
+};
+
+const TRANSCRIPT_STATE_LABEL = { live: "Live", writing: "Writing…", done: "Saved", error: "Couldn't save" };
+const PENDING_ONLY_RETRIES = [
+  { callId: "call-earlier-1", peer: "+1 (352) 555-0199", lastError: "could not write to storage_dir: No such file or directory" },
+  { callId: "call-earlier-2", peer: "Front desk transfer", lastError: "disk full" },
+];
+
+function render(scenarioKey) {
+  const model = SCENARIOS[scenarioKey]();
+  const handlers = {
+    onCopy: (text) => console.log("copy:", text),
+    onShowFolder: (path) => console.log("show in folder:", path),
+    onShowLocal: (path) => console.log("show local copy:", path),
+    onRetry: () => console.log("retry"),
+    onRetryOther: (callId) => console.log("retry other:", callId),
+  };
+  if (!model) {
+    document.getElementById("tr-peer-name").textContent = "Transcript";
+    document.getElementById("tr-state-label").textContent = "Couldn't save";
+    renderPendingRetriesOnly(document.getElementById("transcript-body"), PENDING_ONLY_RETRIES, handlers);
+    return;
+  }
+  document.getElementById("tr-peer-name").textContent = model.peerName || "Transcript";
+  document.getElementById("tr-state-label").textContent = TRANSCRIPT_STATE_LABEL[model.phase] || "";
+  renderTranscriptBody(document.getElementById("transcript-body"), model, handlers);
+}
+
+document.querySelectorAll(".controls button[data-scenario]").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".controls button[data-scenario]").forEach((b) => b.classList.remove("on"));
+    btn.classList.add("on");
+    render(btn.dataset.scenario);
+  });
+});
+document.querySelectorAll(".controls button[data-theme]").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".controls button[data-theme]").forEach((b) => b.classList.remove("on"));
+    btn.classList.add("on");
+    const v = btn.dataset.theme;
+    if (v === "auto") document.documentElement.removeAttribute("data-theme");
+    else document.documentElement.setAttribute("data-theme", v);
+  });
+});
+
+render("live");
+</script>
+</body>
+</html>

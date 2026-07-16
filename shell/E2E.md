@@ -826,3 +826,156 @@ scenario-c-console-live.log:0
   custom URI scheme protocol registration are implemented for all three
   platforms per the vendored ABI crate and Tauri's own cross-platform
   `register_uri_scheme_protocol`, but only exercised on macOS this session.
+
+## Transcript panel (F4 ola 2, 2026-07-16) — headless render, not desktop GUI automation
+
+The transcript panel (`ui/js/transcript-panel.js`, wired into `ui/index.html`'s
+`#screen-transcript` by `ui/js/app.js`) is a Tauri-free rendering module by
+design — it takes a plain state object and produces DOM, with all
+`invoke`/`listen` wiring living in `app.js`. That split is what made this
+round's verification possible without ever touching desktop GUI automation
+(hard rule, both this project's and Felix's global "never GUI-automation
+del desktop, choca con otros agentes en la Mini"):
+
+1. **Backend (real, spawned-process integration tests, not mocks of
+   `parse_transcribe_line` alone)**: `cargo test --lib` — 69 passed, 0
+   failed, including three tests that spawn the real
+   `tests/fixtures/mock-transcribe.sh` as a child process through the
+   exact `spawn_transcribe`/`parse_transcribe_line` code path the live app
+   uses — one of them (`mock_binary_reports_channels_failed_when_env_set`)
+   proves the new `channels_failed` field (added to `centinelo-transcribe`'s
+   real `done` event in a 2026-07-16 reliability re-review, after this
+   shell's ola-1 contract reconciliation had already landed) round-trips
+   end to end, not just through `parse_transcribe_line`'s own unit tests.
+   `cargo clippy --all-targets -- -D warnings`: clean.
+2. **Frontend render, both themes, five scenarios**: served `ui/` over a
+   plain local static file server (`python3 -m http.server`, no Tauri
+   runtime needed — the panel has none as a dependency) and loaded
+   `dev/transcript-mock.html` (a harness, never referenced by
+   `index.html`, feeding fabricated `TranscriptPanel` models through the
+   exact same `renderTranscriptBody` the real app calls) in the Browser
+   pane. Cycled all five phases — `live`, `writing`, `done` (clean), `done`
+   with `channels_failed:["caller"]`, `error` (folder-down) — across
+   `auto`/`light`/`dark` themes. Zero console errors across every
+   transition.
+3. **Amber-discipline check, programmatic not visual**: resolved
+   `--amber`/`--amber-fill`/`--amber-soft`/`--amber-glow` to their actual
+   `rgb()` values and swept every element under `.transcript-screen` for a
+   `color`/`background-color`/`border-*-color` match — zero hits on the
+   `live` phase (the state creative-vigilia's report flagged as the one
+   Plate 02 got wrong before its correction). The one deliberate exception
+   — a user-typed find query — was exercised separately: searching
+   "Wednesday" against the clean-done fixture produced exactly `2 OF 2`
+   hits with `<mark>` styled in `--amber-soft`/`--amber`, matching the
+   mockup's own footnote ("found terms are the one amber use here").
+4. **A real bug found and fixed this way**: the find bar's hit counter
+   initially read `container.querySelectorAll("mark").length` *before*
+   re-rendering the tape with the new query, so it always reported the
+   *previous* query's count (visually confirmed as `0 OF 0` on the very
+   first search in the harness). Fixed by reordering the tape re-render
+   ahead of the count in `transcript-panel.js`'s `findInput` handler;
+   re-verified `2 OF 2` after the fix. Also fixed: at exactly this app's
+   default 380px window width, `Copy`/`Show in folder` forced the caller's
+   own name/number to wrap — `transcript.css`'s `.idrow` now wraps the
+   actions onto their own row below 460px (a CSS container query on
+   `.transcript-body`, `container-type: inline-size`) instead.
+5. **`reveal_in_file_manager`** (new command backing "Show in
+   folder"/"Show local copy") got its own `CENTINELO_E2E_SCRIPT` step
+   (`reveal_in_file_manager:<path>`) exercising the real command dispatch
+   path the same way every other step in this file does — **not run this
+   session** (needs a real display/window to launch `cargo tauri dev`
+   against, which this verification pass didn't have); the path-validation
+   logic itself (must resolve under the configured `storage_dir` or a
+   `centinelo-transcribe-tap.*` temp dir) has no separate unit test yet
+   either — flagged for qa-e2e or a follow-up pass.
+
+## Known limitations (transcript panel, F4 ola 2)
+
+- No real call was driven through the actual `core/` engine this round —
+  the panel consumes `transcription://segment|done|error`, which ola-1's
+  own module (`transcription.rs`) already proved fires correctly off real
+  `tap_state` events (`shell-tauri-2026-07-16-transcription-shell.md`);
+  this round only proves the *panel* renders whatever those events already
+  carry, correctly and without amber leakage.
+- Only one call/transcript is tracked client-side at a time
+  (`app.js`'s `state.transcript`) — matches the engine's own one-UA,
+  one-call-in-flight design (`core/PROTOCOL.md` "Multi-account support"),
+  but a transcript still `writing`/`error` when a *second* call somehow
+  starts (shouldn't happen given the engine's own constraint) would be
+  silently replaced in the UI, even though the backend's own finalize
+  pipeline for the first call keeps running independently.
+- The audio-playback button in the "kept audio" state (`.playbtn`) is
+  presentational only this round — no actual playback wiring (the mockup
+  itself doesn't specify a source; this shell has no `<audio>`-servable
+  path for a WAV outside `storage_dir` yet). Flagged, not silently shipped
+  as if it worked.
+- WCAG AA: inherited by construction (same tokens, same contrast ratios
+  documented in `premium/design/TOKENS.md` §8) rather than independently
+  re-audited with an automated tool (e.g. axe-core) this round — the
+  premium console got that treatment (`premium/console-ui/A11Y.md`); this
+  panel didn't, since axe-core needs a real DOM+browser harness beyond
+  what this round's plain `node --check` + manual Browser-pane pass covered.
+
+## Transcript panel — 4R fix pass (2026-07-16, same day)
+
+The panel's first 4R review FAILED all four lenses (A1/M1-M4/T1-T2/B1-B3,
+see `README.md`'s own "4R fix pass" summary for what each finding was and
+how it was closed). Re-verification after the fixes:
+
+1. **Backend**: `cargo test --lib` → **77 passed, 0 failed** (was 69) -
+   14 new tests in `commands::reveal_in_file_manager_tests` (T2), covering
+   allowed-inside-`storage_dir`, allowed-inside-a-temp-tap-dir,
+   rejected-outside-both-roots, rejected-with-no-`storage_dir`-configured,
+   a Unix-only symlink-escape case (a link inside `storage_dir` pointing
+   outside it - `canonicalize()` resolves it to the real, outside target
+   before the check ever runs), and three `strip_windows_extended_prefix`
+   string-transform tests (M3, deliberately not `cfg`'d so they run on
+   this repo's own macOS dev machine). **This test suite caught a second,
+   real, pre-existing bug while writing it**: the temp-tap-dir branch of
+   `reveal_path_is_allowed` compared an *unresolved* `std::env::temp_dir()`
+   against an *already-`canonicalize()`d* candidate path - on macOS,
+   `/var` is itself a symlink to `/private/var`, so `strip_prefix` never
+   matched and "Show local copy" for a pending retry would have silently
+   failed on every developer's own Mac (confirmed by the test failing
+   before the fix - `temp_root.canonicalize()` closes it). `cargo clippy
+   --all-targets -- -D warnings`: clean.
+2. **Frontend**: `npm test` (`node --test ui/js/*.test.js`, Node's
+   built-in runner, no new dependency) → **25 passed, 0 failed** -
+   `sortedSegments` (out-of-order input, ties, empty/undefined),
+   `speakerLabel` (never inverted You/Caller), `highlightQuery`
+   (regex-special-character queries treated literally, don't throw),
+   `escapeHtml`/`escapeAttr` (the M1 fix's own contract - an
+   `escapeAttr`'d malicious string embedded in a double-quoted attribute
+   leaves exactly the two real delimiter quotes), `fmtDuration`/
+   `fmtTurnClock`, `tapeHtml`'s `capLive` behavior (M4 - bounds to the
+   most recent `LIVE_TAPE_MAX_TURNS`, is a no-op below the cap, never
+   caps the `done`/`error` phases), and `plainTextTranscript` (always
+   full, never capped). Made possible by rewriting `escapeHtml` to not
+   need a live `document` (was the module's only DOM dependency outside
+   the actual render functions).
+3. **Headless render, same harness, now at `shell/dev/transcript-mock.html`
+   (moved out of `ui/` - B3, `frontendDist` bundles `ui/` verbatim into
+   every build regardless of whether `index.html` links to a file)**: 2
+   new scenarios added (`live-with-other-pending`, `pending-only`) proving
+   M2's fix end-to-end - a live call correctly shows an earlier call's
+   still-pending save as a distinct "Other calls waiting to save" section,
+   and a fully cold state (nothing current, only pending saves - the app-
+   restart case) renders via the new `renderPendingRetriesOnly`. All 8
+   scenarios × 3 themes swept again: **0 console errors, 0 amber-token
+   hits** (same programmatic sweep as the original pass). The find-bar's
+   own hit count re-verified as `2 matches` (B1's simplified copy).
+4. **M1 (XSS) re-verified live, not just by the unit tests**: typed
+   `Wednesday" onmouseover="alert(1)` into the harness's real find input
+   and confirmed, by walking the live DOM (not a naive string search
+   against serialized/auto-escaped HTML, which produces false positives -
+   see the actual test transcript in this branch's own tool-call history
+   if reproducing), that no element anywhere in the page gained an actual
+   `onmouseover` attribute or handler.
+5. **A1 (the async-race crash)**: verified by code inspection + the fix's
+   own shape (capture-before-`await`, a standard, well-understood pattern
+   for this exact class of bug) rather than an automated regression test -
+   reproducing the real race (a `call_state:"closed"` IPC event landing
+   between `invoke()` and its `await` resolving) needs a running Tauri
+   app with a live sidecar connection, out of reach for this round's
+   headless-only verification. Flagged for qa-e2e if a scripted repro is
+   wanted.

@@ -5,6 +5,8 @@
 // app.withGlobalTauri = true) — never touches the sidecar process or the
 // settings file directly.
 
+import { renderTranscriptBody, renderPendingRetriesOnly } from "./transcript-panel.js";
+
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 const { getCurrentWindow } = window.__TAURI__.window;
@@ -23,12 +25,24 @@ const state = {
   regState: "unregistered", // unregistered|registering|registered|failed
   transport: null,
   sidecarStatus: { status: "idle" },
-  call: null, // { direction, state, peer, createdAt, establishedAt }
+  call: null, // { direction, state, peer, callId, createdAt, establishedAt }
   adminConfigured: false,
   adminUnlocked: false,
   theme: "auto",
   callTimerHandle: null,
   pendingDialNumber: null, // set while #dial-confirm-overlay is showing
+  // ---- transcription (F4 ola 2) ------------------------------------------
+  transcription: { unlocked: false, mode: "off", activation: "all_calls" },
+  // The current/last call's transcript, or null ("absent" - unlicensed, off,
+  // or manual activation never started for this call). See
+  // ui/js/transcript-panel.js's header comment for the full shape.
+  transcript: null,
+  // Every call (any call, not just state.transcript's own) whose save is
+  // still pending backend-side - independent of which one is "current"
+  // client-side, so switching calls never loses visibility into an
+  // earlier one's unresolved failure (2026-07-16 4R re-review, M2).
+  // [{callId, peer, startedAt, lastError, channelsFailed, localTxtPath, localJsonPath}]
+  pendingRetries: [],
 };
 
 const $ = (id) => document.getElementById(id);
@@ -357,6 +371,7 @@ function renderCallOverlay() {
   if (!established && state.callTimerHandle) {
     stopCallTimer();
   }
+  renderManualTranscribeButton();
 }
 
 function startCallTimer() {
@@ -399,6 +414,288 @@ async function finalizeClosedCall() {
   } catch (e) {
     console.error("add_recent failed", e);
   }
+}
+
+// ---------------------------------------------------------------------------
+// transcription panel (F4 ola 2)
+//
+// "Absent, not disabled": state.transcript stays null (and every entry
+// point stays hidden) unless the `transcription` premium capability is
+// licensed AND a call actually has one in flight - no locked ghost, no
+// upsell in the panel itself (Pro is mentioned once, in Settings - not
+// built this sprint). See premium/design/mockups/transcript-panel.html
+// specimen 04 and creative-vigilia's 2026-07-16 report.
+// ---------------------------------------------------------------------------
+const TRANSCRIPT_STATE_LABEL = { live: "Live", writing: "Writing…", done: "Saved", error: "Couldn't save" };
+
+async function applyTranscriptionUI() {
+  try {
+    const status = await invoke("premium_capability_status", { capability: "transcription" });
+    const unlocked = status === "available" || status === "not_implemented";
+    state.transcription.unlocked = unlocked;
+    if (unlocked) {
+      const settings = await invoke("get_transcription_settings");
+      if (settings) {
+        state.transcription.mode = settings.mode;
+        state.transcription.activation = settings.activation;
+      }
+    }
+  } catch (e) {
+    console.error("applyTranscriptionUI failed", e);
+    state.transcription.unlocked = false;
+  }
+  renderTranscriptButton();
+  renderManualTranscribeButton();
+}
+
+/// Reveals a transcript-owned path (a finished save, or the local copy
+/// kept during a pending retry) in the OS file manager - the one place
+/// `reveal_in_file_manager` is ever invoked from, shared by "Show in
+/// folder" (done phase) and "Show local copy" (error phase), which used
+/// to be two byte-identical closures (2026-07-16 4R re-review, B2).
+function revealInFileManager(path) {
+  invoke("reveal_in_file_manager", { path }).catch((e) => showBanner(String(e), "err"));
+}
+
+/// Re-runs a save for `callId` and refreshes the pending-retries list
+/// afterward either way (success removes it backend-side; failure
+/// re-stashes it with a - possibly different - reason) so the UI never
+/// shows a stale entry.
+function retryTranscript(callId) {
+  invoke("transcription_retry", { call_id: callId })
+    .then(refreshPendingRetriesList)
+    .catch((e) => {
+      showBanner(String(e), "err");
+      refreshPendingRetriesList();
+    });
+}
+
+function renderTranscriptButton() {
+  $("btn-transcript").hidden = !(state.transcript || state.pendingRetries.length);
+}
+
+/// Starts tracking a transcript the moment the backend is expected to
+/// auto-tap (`transcription.rs`'s `should_auto_tap` - mirrors that same
+/// decision client-side purely for *when to start showing UI*; the actual
+/// tap/gate decision always happens backend-side regardless of what this
+/// function guesses). Manual activation is handled by the call overlay's
+/// own "Transcribe this call" button instead (see
+/// `wireStaticHandlers`/`renderManualTranscribeButton`).
+function maybeAutoStartTranscript(callId, peer, direction) {
+  if (!callId || !state.transcription.unlocked || state.transcription.mode === "off") return;
+  if (state.transcription.activation !== "all_calls") {
+    renderManualTranscribeButton();
+    return;
+  }
+  beginTranscript(callId, peer, direction);
+}
+
+/// `callId`/`peer`/`direction` are always caller-supplied values, never
+/// read from `state.call` here - see the `btn-transcribe-manual` click
+/// handler's own comment (2026-07-16 4R re-review, A1) for why: `state.call`
+/// can already be null (a `closed` event raced an in-flight
+/// `transcription_manual_start`) by the time this runs.
+function beginTranscript(callId, peer, direction) {
+  if (state.transcript && state.transcript.callId === callId) return; // already tracking (re-entrant established)
+  if (state.transcript && state.transcript.phase === "error") {
+    // Don't silently drop an unresolved save failure for the PREVIOUS
+    // call just because a new one started (2026-07-16 4R re-review, M2)
+    // - transcription_pending_retries already tracks it backend-side
+    // independent of state.transcript; refresh state.pendingRetries from
+    // it before this call's own info is overwritten, so "Retry now" for
+    // the earlier call stays reachable (rendered as part of the new
+    // model's own otherPendingRetries, or via the titlebar button's
+    // fallback view once nothing is "live").
+    refreshPendingRetriesList();
+  }
+  state.transcript = {
+    callId,
+    peer: peer || "",
+    phase: "live",
+    direction: direction || "inbound",
+    startedAt: Date.now(),
+    endedAt: null,
+    segments: [],
+    done: null,
+    error: null,
+  };
+  renderTranscriptButton();
+  renderManualTranscribeButton();
+}
+
+function maybeTranscriptCallEnded(callId) {
+  if (!state.transcript || !callId || state.transcript.callId !== callId) return;
+  if (state.transcript.phase !== "live") return; // already writing/done/error - a race or a repeat "closed"
+  state.transcript.phase = "writing";
+  state.transcript.endedAt = Date.now();
+  renderTranscriptButton();
+  // The "just ended - writing" moment (mockup specimen 02) is worth
+  // surfacing on its own - the call overlay just disappeared, so opening
+  // this doesn't hide any call controls the way it would mid-call.
+  openTranscriptScreen();
+}
+
+function openTranscriptScreen() {
+  if (!state.transcript && !state.pendingRetries.length) return;
+  $("tr-peer-name").textContent = state.transcript ? extractUser(state.transcript.peer) || "Transcript" : "Transcript";
+  renderTranscriptScreenBody();
+  $("screen-transcript").hidden = false;
+}
+
+function closeTranscriptScreen() {
+  $("screen-transcript").hidden = true;
+}
+
+function renderTranscriptScreenBody() {
+  if (state.transcript) {
+    $("tr-state-label").textContent = TRANSCRIPT_STATE_LABEL[state.transcript.phase] || "";
+    const model = {
+      ...state.transcript,
+      otherPendingRetries: state.pendingRetries.filter((r) => r.callId !== state.transcript.callId),
+    };
+    renderTranscriptBody($("transcript-body"), model, {
+      onCopy: async (text) => {
+        try {
+          await navigator.clipboard.writeText(text);
+          showBanner("Transcript copied.", "info");
+        } catch (e) {
+          console.error("clipboard write failed", e);
+        }
+      },
+      onShowFolder: revealInFileManager,
+      onShowLocal: revealInFileManager,
+      onRetry: () => {
+        if (state.transcript) retryTranscript(state.transcript.callId);
+      },
+      onRetryOther: retryTranscript,
+    });
+  } else if (state.pendingRetries.length) {
+    $("tr-state-label").textContent = "Couldn't save";
+    renderPendingRetriesOnly($("transcript-body"), state.pendingRetries, { onRetryOther: retryTranscript });
+  } else {
+    $("tr-state-label").textContent = "";
+    $("transcript-body").innerHTML = "";
+  }
+}
+
+function handleTranscriptSegment(payload) {
+  if (!state.transcript || !payload || state.transcript.callId !== payload.call_id) return;
+  state.transcript.segments.push({ speaker: payload.speaker, t0Ms: payload.t0_ms, t1Ms: payload.t1_ms, text: payload.text });
+  if (!$("screen-transcript").hidden) renderTranscriptScreenBody();
+}
+
+function handleTranscriptDone(payload) {
+  if (!state.transcript || !payload || state.transcript.callId !== payload.call_id) return;
+  state.transcript.phase = "done";
+  state.transcript.done = {
+    txtPath: payload.txt_path,
+    jsonPath: payload.json_path,
+    audioKept: !!payload.audio_kept,
+    channelsFailed: payload.channels_failed || [],
+  };
+  state.transcript.error = null;
+  renderTranscriptButton();
+  if (!$("screen-transcript").hidden) {
+    renderTranscriptScreenBody();
+  } else {
+    showBanner(`Transcript ready — ${extractUser(state.transcript.peer) || "call"}.`, "info");
+  }
+  // This call may have just resolved an entry in the pending list (e.g.
+  // it had errored once, then a live-process-died-early retry - A3 in
+  // transcription.rs - quietly succeeded on its own) - keep the list
+  // honest either way.
+  refreshPendingRetriesList();
+}
+
+function handleTranscriptError(payload) {
+  if (!state.transcript || !payload || state.transcript.callId !== payload.call_id) return;
+  if (!payload.retryable) {
+    // Non-terminal notice (e.g. a live process died early - transcription.rs
+    // will run a full post-call pass once the call actually ends). The
+    // pipeline resolves itself via a later done/error; nothing to change
+    // about the visible phase yet.
+    showBanner(payload.message || "Transcription had a hiccup — it will keep trying.", "info");
+    return;
+  }
+  state.transcript.phase = "error";
+  state.transcript.error = {
+    message: payload.message,
+    retryable: true,
+    localTxtPath: null,
+    localJsonPath: null,
+    channelsFailed: state.transcript.done ? state.transcript.done.channelsFailed : [],
+  };
+  renderTranscriptButton();
+  if ($("screen-transcript").hidden) openTranscriptScreen();
+  else renderTranscriptScreenBody();
+  // `transcription://error` only carries {call_id, message, retryable} -
+  // the local-copy paths and any channels_failed the engine already knew
+  // about live in the backend's pending_retries map instead
+  // (PendingRetryView, commands::transcription_pending_retries).
+  // refreshPendingRetriesList both populates state.transcript.error with
+  // those extra fields (when its callId matches) AND keeps
+  // state.pendingRetries - the list every OTHER call's unresolved
+  // failure lives in - in sync (M2).
+  refreshPendingRetriesList();
+}
+
+/// Fetches the backend's full pending-retries list (every call whose
+/// transcript couldn't be moved into storage_dir yet, not just the
+/// currently-displayed one) and reconciles `state.pendingRetries` +
+/// `state.transcript.error` (when it's one of the entries) from it.
+/// Called at boot (so an app restart doesn't lose visibility into a
+/// retry that was pending when it last quit - 2026-07-16 4R re-review,
+/// M2), and after any event that could change the set (a new retryable
+/// error, a done that might have resolved one, a retry attempt either
+/// way).
+async function refreshPendingRetriesList() {
+  try {
+    const list = await invoke("transcription_pending_retries");
+    state.pendingRetries = (list || []).map((r) => ({
+      callId: r.call_id,
+      peer: r.peer,
+      startedAt: r.started_at,
+      lastError: r.last_error,
+      channelsFailed: r.channels_failed || [],
+      localTxtPath: r.local_txt_path || null,
+      localJsonPath: r.local_json_path || null,
+    }));
+    if (state.transcript) {
+      const mine = state.pendingRetries.find((r) => r.callId === state.transcript.callId);
+      if (mine) {
+        state.transcript.error = {
+          message: mine.lastError,
+          retryable: true,
+          localTxtPath: mine.localTxtPath,
+          localJsonPath: mine.localJsonPath,
+          channelsFailed: mine.channelsFailed,
+        };
+      }
+    }
+    renderTranscriptButton();
+    if (!$("screen-transcript").hidden) renderTranscriptScreenBody();
+  } catch (e) {
+    console.error("transcription_pending_retries failed", e);
+  }
+}
+
+/// The manual-activation call-overlay button ("Transcribe this call") -
+/// only meaningful mid-call, before a transcript has started for *this*
+/// call. Hidden the rest of the time, including once started (there's no
+/// mid-call "stop" affordance this sprint - the transcript panel itself,
+/// reachable via the titlebar button once it exists, is the surface for
+/// everything after that).
+function renderManualTranscribeButton() {
+  const btn = $("btn-transcribe-manual");
+  if (!btn) return;
+  const eligible =
+    !!state.call &&
+    state.call.state === "established" &&
+    state.transcription.unlocked &&
+    state.transcription.mode !== "off" &&
+    state.transcription.activation === "manual" &&
+    !(state.transcript && state.transcript.callId === state.call.callId);
+  btn.hidden = !eligible;
 }
 
 // ---------------------------------------------------------------------------
@@ -458,13 +755,18 @@ function handleBlfEvent(evt) {
 }
 
 function handleCallState(evt) {
+  // core/PROTOCOL.md carries both "id" (v0-compat) and "call_id" (v1+) with
+  // the same value on every call_state event - captured uniformly here
+  // (not just on "incoming", as before) since the transcript lifecycle
+  // needs it on "established"/"closed" too.
+  const callId = evt.call_id || evt.id || null;
   switch (evt.state) {
     case "incoming":
       state.call = {
         direction: "inbound",
         state: "incoming",
         peer: evt.peer || "",
-        id: evt.id,
+        callId,
         createdAt: Date.now(),
         establishedAt: null,
       };
@@ -473,20 +775,24 @@ function handleCallState(evt) {
       if (state.call) {
         state.call.state = "ringing";
         if (evt.peer) state.call.peer = evt.peer;
+        if (callId) state.call.callId = callId;
       } else {
-        state.call = { direction: "outbound", state: "ringing", peer: evt.peer || "", createdAt: Date.now(), establishedAt: null };
+        state.call = { direction: "outbound", state: "ringing", peer: evt.peer || "", callId, createdAt: Date.now(), establishedAt: null };
       }
       break;
     case "established":
       if (!state.call) {
-        state.call = { direction: "inbound", state: "established", peer: evt.peer || "", createdAt: Date.now(), establishedAt: Date.now() };
+        state.call = { direction: "inbound", state: "established", peer: evt.peer || "", callId, createdAt: Date.now(), establishedAt: Date.now() };
       } else {
         state.call.state = "established";
         state.call.establishedAt = Date.now();
         if (evt.peer) state.call.peer = evt.peer;
+        if (callId) state.call.callId = callId;
       }
+      maybeAutoStartTranscript(state.call.callId, state.call.peer, state.call.direction);
       break;
     case "closed":
+      maybeTranscriptCallEnded(callId);
       finalizeClosedCall();
       renderAll();
       return;
@@ -684,6 +990,37 @@ function wireStaticHandlers() {
     invoke("open_console").catch((e) => showBanner(String(e), "err"));
   });
 
+  $("btn-transcript").addEventListener("click", openTranscriptScreen);
+  $("transcript-back").addEventListener("click", closeTranscriptScreen);
+  $("btn-transcribe-manual").addEventListener("click", async () => {
+    if (!state.call || !state.call.callId) return;
+    const btn = $("btn-transcribe-manual");
+    // Capture everything BEFORE the await (4R re-review 2026-07-16, A1):
+    // a call_state:"closed" can land while this invoke is still in
+    // flight, and its handler sets state.call = null synchronously
+    // (finalizeClosedCall). Reading state.call.* again after the await
+    // would then throw (crashing this handler as an uncaught rejection,
+    // shown to the operator as a raw JS error banner) AND skip
+    // beginTranscript entirely - even though the backend already
+    // accepted the tap and will transcribe the call regardless, so every
+    // transcription:// event for it would be silently dropped
+    // (handleTranscriptSegment/Done/Error all require a live
+    // state.transcript.callId match). beginTranscript itself never reads
+    // state.call - only these captured values do.
+    const callId = state.call.callId;
+    const peer = state.call.peer || "";
+    const direction = state.call.direction;
+    btn.disabled = true;
+    try {
+      await invoke("transcription_manual_start", { call_id: callId, peer });
+      beginTranscript(callId, peer, direction);
+    } catch (e) {
+      showBanner(String(e), "err");
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
   $("setup-open-settings").addEventListener("click", openSettings);
 
   document.querySelectorAll("#dialpad .key").forEach((key) => {
@@ -864,6 +1201,9 @@ async function attachTauriListeners() {
   await listen("sidecar-status", (e) => handleSidecarStatus(e.payload));
   await listen("sidecar-event", (e) => handleSidecarEvent(e.payload));
   await listen("click-to-call", (e) => handleClickToCall(e.payload));
+  await listen("transcription://segment", (e) => handleTranscriptSegment(e.payload));
+  await listen("transcription://done", (e) => handleTranscriptDone(e.payload));
+  await listen("transcription://error", (e) => handleTranscriptError(e.payload));
 }
 
 // Premium receptionist console entry point - hidden unless the license
@@ -911,6 +1251,12 @@ async function boot() {
   await loadRecents();
   await attachTauriListeners();
   await applyPremiumUI();
+  await applyTranscriptionUI();
+  // Re-hydrate any transcript(s) still waiting to save from a previous
+  // run (2026-07-16 4R re-review, M2) - transcription_pending_retries is
+  // backend-tracked independent of this window's own lifetime, so a
+  // restart while a NAS was down, say, shouldn't lose visibility into it.
+  if (state.transcription.unlocked) await refreshPendingRetriesList();
 }
 
 boot();

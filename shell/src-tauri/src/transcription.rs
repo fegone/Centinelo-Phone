@@ -427,12 +427,13 @@ impl TranscriptionHandle {
                                 "txt_path": result.txt.display().to_string(),
                                 "json_path": result.json.display().to_string(),
                                 "audio_kept": result.audio_kept,
+                                "channels_failed": retry.channels_failed.clone(),
                             }),
                         );
                         Ok(())
                     }
                     Err(e) => {
-                        stash_pending_retry(&self.0, &ctx, Some(txt.clone()), Some(json.clone()), e.clone());
+                        stash_pending_retry(&self.0, &ctx, Some(txt.clone()), Some(json.clone()), retry.channels_failed.clone(), e.clone());
                         Err(e)
                     }
                 };
@@ -728,6 +729,17 @@ struct PendingRetry {
     started_at: DateTime<Local>,
     settings: TranscriptionSettings,
     last_error: String,
+    /// Which channels the engine itself already reported as failed on this
+    /// run, if it got far enough to know (empty when the failure happened
+    /// before the engine ever produced a `done` line - e.g. binary not
+    /// found, spawn failed). Carried forward so a later `transcription_
+    /// retry` that only re-attempts the `storage_dir` move (the
+    /// `txt_path`/`json_path`-already-known fast path in
+    /// [`TranscriptionHandle::retry`]) still reports the same partial-
+    /// transcript notice on its own `transcription://done` re-emit,
+    /// instead of silently dropping it (panel ola-2 - "no un transcript de
+    /// aspecto completo").
+    channels_failed: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -736,6 +748,17 @@ pub struct PendingRetryView {
     pub peer: String,
     pub started_at: String,
     pub last_error: String,
+    pub channels_failed: Vec<String>,
+    /// The transcript's own already-written location on this computer -
+    /// `Some` only when the engine finished (`done` fired) but the move
+    /// into `storage_dir` is what failed (see `PendingRetry::txt_path`'s
+    /// doc). Lets the panel's "Show local copy" action
+    /// (`transcript-panel.html` plate 07, specimen 03) open a real path
+    /// via `reveal_in_file_manager` instead of being decorative - `None`
+    /// means the engine itself never got that far, so there is nothing
+    /// local to show yet.
+    pub local_txt_path: Option<String>,
+    pub local_json_path: Option<String>,
 }
 
 impl From<&PendingRetry> for PendingRetryView {
@@ -745,6 +768,9 @@ impl From<&PendingRetry> for PendingRetryView {
             peer: r.peer.clone(),
             started_at: r.started_at.to_rfc3339(),
             last_error: r.last_error.clone(),
+            channels_failed: r.channels_failed.clone(),
+            local_txt_path: r.txt_path.as_ref().map(|p| p.display().to_string()),
+            local_json_path: r.json_path.as_ref().map(|p| p.display().to_string()),
         }
     }
 }
@@ -754,6 +780,7 @@ fn stash_pending_retry(
     ctx: &FinalizeContext,
     txt_path: Option<PathBuf>,
     json_path: Option<PathBuf>,
+    channels_failed: Vec<String>,
     reason: String,
 ) {
     let retry = PendingRetry {
@@ -767,6 +794,7 @@ fn stash_pending_retry(
         started_at: ctx.started_at,
         settings: ctx.settings.clone(),
         last_error: reason.clone(),
+        channels_failed,
     };
     inner
         .pending_retries
@@ -873,7 +901,7 @@ fn spawn_transcribe_for(inner: &Arc<Inner>, ctx: &FinalizeContext, mode: &'stati
                 "transcription://error",
                 serde_json::json!({"call_id": ctx.call_id, "message": e}),
             );
-            stash_pending_retry(inner, ctx, None, None, e);
+            stash_pending_retry(inner, ctx, None, None, Vec::new(), e);
             return None;
         }
     };
@@ -885,7 +913,7 @@ fn spawn_transcribe_for(inner: &Arc<Inner>, ctx: &FinalizeContext, mode: &'stati
                 "transcription://error",
                 serde_json::json!({"call_id": ctx.call_id, "message": e}),
             );
-            stash_pending_retry(inner, ctx, None, None, e);
+            stash_pending_retry(inner, ctx, None, None, Vec::new(), e);
             return None;
         }
     };
@@ -908,7 +936,7 @@ fn spawn_transcribe_for(inner: &Arc<Inner>, ctx: &FinalizeContext, mode: &'stati
                 "transcription://error",
                 serde_json::json!({"call_id": ctx.call_id, "message": e.to_string()}),
             );
-            stash_pending_retry(inner, ctx, None, None, e.to_string());
+            stash_pending_retry(inner, ctx, None, None, Vec::new(), e.to_string());
             None
         }
     }
@@ -917,7 +945,25 @@ fn spawn_transcribe_for(inner: &Arc<Inner>, ctx: &FinalizeContext, mode: &'stati
 #[derive(Debug, Clone, PartialEq)]
 enum TranscribeLine {
     Segment { speaker: String, t0_ms: i64, t1_ms: i64, text: String },
-    Done { txt_path: Option<String>, json_path: Option<String> },
+    Done {
+        txt_path: Option<String>,
+        json_path: Option<String>,
+        /// Which channels (`"agent"`/`"caller"`, `Speaker`'s own lowercase
+        /// wire form) failed and were dropped from this transcript -
+        /// mirrors `centinelo-transcribe`'s `Transcript::channels_failed`
+        /// (added to the real binary's `done` event in a 2026-07-16
+        /// reliability re-review, after this shell's own ola-1 contract
+        /// reconciliation had already landed - confirmed by reading
+        /// `premium` repo `main.rs`'s `Event::Done` variant, read-only).
+        /// Always present on the wire (an empty array for a fully clean
+        /// run, never omitted - `Event::Done`'s own doc), but parsed with
+        /// `unwrap_or_default()` here anyway so an *older* `centinelo-
+        /// transcribe` binary (or `tests/fixtures/mock-transcribe.sh`
+        /// before this same change) that never had the field still
+        /// parses cleanly - forward-compatible on the added-field
+        /// direction, matching every other line-parser in this module.
+        channels_failed: Vec<String>,
+    },
     Error { message: String },
     Unknown,
 }
@@ -925,8 +971,8 @@ enum TranscribeLine {
 /// Pure parser for one line of `run`'s stdout - see this module's doc for
 /// the exact JSON shape (confirmed against transcribe-engine's real
 /// implementation, 2026-07-16: `"type"` discriminator, `done`'s fields
-/// are `txt`/`json`). Unit-tested without spawning any process (`mod
-/// tests` below).
+/// are `txt`/`json`/`channels_failed`). Unit-tested without spawning any
+/// process (`mod tests` below).
 fn parse_transcribe_line(line: &str) -> Option<TranscribeLine> {
     let trimmed = line.trim();
     if trimmed.is_empty() || !trimmed.starts_with('{') {
@@ -944,6 +990,11 @@ fn parse_transcribe_line(line: &str) -> Option<TranscribeLine> {
         "done" => TranscribeLine::Done {
             txt_path: v.get("txt").and_then(Value::as_str).map(str::to_string),
             json_path: v.get("json").and_then(Value::as_str).map(str::to_string),
+            channels_failed: v
+                .get("channels_failed")
+                .and_then(Value::as_array)
+                .map(|arr| arr.iter().filter_map(Value::as_str).map(str::to_string).collect())
+                .unwrap_or_default(),
         },
         "error" => TranscribeLine::Error {
             message: v.get("message").and_then(Value::as_str).unwrap_or("unknown error").to_string(),
@@ -973,6 +1024,7 @@ fn spawn_reader_and_finalize(inner: Arc<Inner>, ctx: FinalizeContext, mut child:
 
         let mut done_txt: Option<PathBuf> = None;
         let mut done_json: Option<PathBuf> = None;
+        let mut done_channels_failed: Vec<String> = Vec::new();
         let mut last_error: Option<String> = None;
         if let Some(stdout) = child.stdout.take() {
             let reader = BufReader::new(stdout);
@@ -990,9 +1042,10 @@ fn spawn_reader_and_finalize(inner: Arc<Inner>, ctx: FinalizeContext, mut child:
                             }),
                         );
                     }
-                    Some(TranscribeLine::Done { txt_path, json_path }) => {
+                    Some(TranscribeLine::Done { txt_path, json_path, channels_failed }) => {
                         done_txt = txt_path.map(PathBuf::from);
                         done_json = json_path.map(PathBuf::from);
+                        done_channels_failed = channels_failed;
                     }
                     Some(TranscribeLine::Error { message }) => {
                         last_error = Some(message.clone());
@@ -1059,12 +1112,13 @@ fn spawn_reader_and_finalize(inner: Arc<Inner>, ctx: FinalizeContext, mut child:
                             "txt_path": result.txt.display().to_string(),
                             "json_path": result.json.display().to_string(),
                             "audio_kept": result.audio_kept,
+                            "channels_failed": done_channels_failed,
                         }),
                     );
                 }
                 Err(e) => {
                     log::warn!("transcription: could not finalize artifacts for {}: {e}", ctx.call_id);
-                    stash_pending_retry(&inner, &ctx, Some(txt), Some(json), e);
+                    stash_pending_retry(&inner, &ctx, Some(txt), Some(json), done_channels_failed, e);
                 }
             },
             _ => {
@@ -1072,7 +1126,7 @@ fn spawn_reader_and_finalize(inner: Arc<Inner>, ctx: FinalizeContext, mut child:
                     "transcription engine exited without a done event".to_string()
                 });
                 log::warn!("transcription: {reason} (call {})", ctx.call_id);
-                stash_pending_retry(&inner, &ctx, None, None, reason);
+                stash_pending_retry(&inner, &ctx, None, None, done_channels_failed, reason);
             }
         }
     });
@@ -1596,12 +1650,34 @@ mod tests {
 
     #[test]
     fn parses_done_line() {
+        // No channels_failed key at all - the pre-2026-07-16 shape (older
+        // binary / this test's own value before that field existed).
+        // Forward-compatible: defaults to empty, doesn't fail to parse.
         let line = r#"{"type":"done","txt":"/tmp/a.txt","json":"/tmp/a.json"}"#;
         assert_eq!(
             parse_transcribe_line(line),
             Some(TranscribeLine::Done {
                 txt_path: Some("/tmp/a.txt".to_string()),
                 json_path: Some("/tmp/a.json".to_string()),
+                channels_failed: Vec::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_done_line_with_channels_failed() {
+        // The real, current contract (2026-07-16 reliability re-review on
+        // transcribe-engine's side, confirmed by reading their real
+        // `main.rs` `Event::Done` variant, read-only) - a partial
+        // transcript (one channel dropped) still emits `done`, never
+        // `error`, with the failed channel(s) named.
+        let line = r#"{"type":"done","txt":"/tmp/a.txt","json":"/tmp/a.json","channels_failed":["agent"]}"#;
+        assert_eq!(
+            parse_transcribe_line(line),
+            Some(TranscribeLine::Done {
+                txt_path: Some("/tmp/a.txt".to_string()),
+                json_path: Some("/tmp/a.json".to_string()),
+                channels_failed: vec!["agent".to_string()],
             })
         );
     }
@@ -1962,9 +2038,12 @@ mod tests {
         assert!(status.success());
         assert_eq!(segments, 2, "mock binary should emit exactly 2 segment events");
 
-        let TranscribeLine::Done { txt_path, json_path } = done.expect("mock binary should emit a done event") else {
+        let TranscribeLine::Done { txt_path, json_path, channels_failed } =
+            done.expect("mock binary should emit a done event")
+        else {
             unreachable!()
         };
+        assert!(channels_failed.is_empty(), "mock binary's default run is a clean transcript");
         let txt_path = PathBuf::from(txt_path.expect("done event should carry txt path"));
         let json_path = PathBuf::from(json_path.expect("done event should carry json path"));
         assert!(txt_path.is_file(), "mock binary should have actually written the txt file");
@@ -1981,6 +2060,69 @@ mod tests {
         assert!(result.json.is_file());
 
         let _ = std::fs::remove_dir_all(&storage_dir);
+        let _ = std::fs::remove_dir_all(&out_dir);
+    }
+
+    /// Same as `mock_binary_post_mode_emits_segments_then_done_with_real_files`
+    /// but with `CENTINELO_MOCK_CHANNELS_FAILED` set - proves the real
+    /// child-process spawn/parse path (not just `parse_transcribe_line`'s
+    /// unit tests above) round-trips a partial transcript's
+    /// `channels_failed` correctly (panel ola-2's "no un transcript de
+    /// aspecto completo" requirement).
+    #[cfg(unix)]
+    #[test]
+    fn mock_binary_reports_channels_failed_when_env_set() {
+        let out_dir = scratch_dir("mock-partial");
+        let meta_path = write_test_meta(&out_dir);
+        let args = TranscribeArgs {
+            bin: mock_binary_path(),
+            rx: out_dir.join("call-rx.wav"),
+            tx: out_dir.join("call-tx.wav"),
+            model: PathBuf::from("/dev/null"),
+            lang: "es".to_string(),
+            mode: "post",
+            out_dir: out_dir.clone(),
+            meta_path,
+        };
+        let mut child = std::process::Command::new(&args.bin)
+            .arg("run")
+            .arg("--rx")
+            .arg(&args.rx)
+            .arg("--tx")
+            .arg(&args.tx)
+            .arg("--model")
+            .arg(&args.model)
+            .arg("--lang")
+            .arg(&args.lang)
+            .arg("--mode")
+            .arg(args.mode)
+            .arg("--out-dir")
+            .arg(&args.out_dir)
+            .arg("--meta")
+            .arg(&args.meta_path)
+            .env("CENTINELO_MOCK_CHANNELS_FAILED", "agent")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("mock binary should spawn");
+        let stdout = child.stdout.take().expect("piped");
+        let reader = BufReader::new(stdout);
+
+        let mut done: Option<TranscribeLine> = None;
+        for line in reader.lines().map_while(Result::ok) {
+            if let Some(d @ TranscribeLine::Done { .. }) = parse_transcribe_line(&line) {
+                done = Some(d);
+            }
+        }
+        let status = child.wait().expect("mock binary should exit cleanly");
+        assert!(status.success());
+
+        let TranscribeLine::Done { channels_failed, .. } = done.expect("mock binary should emit a done event") else {
+            unreachable!()
+        };
+        assert_eq!(channels_failed, vec!["agent".to_string()]);
+
         let _ = std::fs::remove_dir_all(&out_dir);
     }
 

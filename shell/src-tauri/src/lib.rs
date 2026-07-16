@@ -146,6 +146,7 @@ pub fn run() {
             commands::transcription_retry,
             commands::transcription_model_status,
             commands::download_transcription_model,
+            commands::reveal_in_file_manager,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

@@ -17,7 +17,14 @@
 //! `blf_subscribe:<ext>`, `blf_unsubscribe:<ext>`,
 //! `open_console`, `premium_diagnostic`,
 //! `transcription_manual_start:<call_id>`, `transcription_manual_stop:<call_id>`,
-//! `transcription_pending_retries`, `transcription_model_status:accurate|light`.
+//! `transcription_pending_retries`, `transcription_model_status:accurate|light`,
+//! `reveal_in_file_manager:<path>` (panel ola-2 - "Show in folder"/"Show
+//! local copy"; expected to `Err` on a plain scripted run since it
+//! validates `path` against the configured `storage_dir`/temp tap-dir
+//! roots - see `commands::reveal_in_file_manager`'s doc - the point of
+//! this step is confirming the command dispatches and rejects an
+//! out-of-scope path exactly like it would from the real UI, not that it
+//! succeeds without a real transcript on disk).
 //!
 //! Every step targets "the current call" (no `call_id`) - matching the
 //! frontend's own single-call-at-a-time UI; there's no scripted way here
@@ -145,6 +152,12 @@ pub fn maybe_run_e2e_script(app: &AppHandle) {
                 };
                 let status = commands::transcription_model_status(app.clone(), parsed_tier);
                 log::info!("e2e: transcription_model_status({tier}) present={} path={}", status.present, status.path);
+            } else if let Some(path) = step.strip_prefix("reveal_in_file_manager:") {
+                let settings: tauri::State<std::sync::Arc<crate::settings::SettingsStore>> = app.state();
+                match commands::reveal_in_file_manager(settings, path.to_string()) {
+                    Ok(()) => log::info!("e2e: reveal_in_file_manager({path}) -> ok"),
+                    Err(e) => log::info!("e2e: reveal_in_file_manager({path}) -> err: {e}"),
+                }
             } else {
                 log::warn!("e2e: unknown step '{step}'");
             }

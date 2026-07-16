@@ -645,3 +645,260 @@ pub fn download_transcription_model(
     crate::transcription::spawn_model_download(app, tier);
     Ok(())
 }
+
+/// Opens the OS file manager with `path` selected (macOS Finder/Windows
+/// Explorer) - backs the transcript panel's "Show in folder"/"Show local
+/// copy" actions (`premium/design/mockups/transcript-panel.html`).
+///
+/// # Why this validates `path` before ever spawning anything
+///
+/// `path` comes straight from the frontend, which itself only ever got it
+/// from a `transcription://done` event payload or a
+/// `transcription_pending_retries` entry - both backend-sourced, not
+/// user-typed - but a Tauri command is still reachable by any script
+/// running in the webview (e.g. via devtools), same threat model
+/// `console.rs`'s `asset_protocol_handler` documents for its own
+/// path-traversal guard. Revealing an arbitrary OS path in the file
+/// manager doesn't execute anything, but it's still a real information
+/// disclosure ("does this file exist, what's its icon/preview") this
+/// shell shouldn't hand to arbitrary webview content unchecked. Bounded
+/// to two known-safe roots: the operator's configured transcription
+/// `storage_dir` (where a finished transcript actually lives) and the OS
+/// temp directory's `centinelo-transcribe-tap.*` prefix (where a
+/// not-yet-moved one sits during a pending retry - see
+/// `transcription.rs`'s `start_tap`) - the only two places this feature
+/// ever writes a transcript.
+#[tauri::command(rename_all = "snake_case")]
+pub fn reveal_in_file_manager(settings: State<Arc<SettingsStore>>, path: String) -> Result<(), String> {
+    let candidate = std::path::PathBuf::from(&path);
+    let canonical = candidate
+        .canonicalize()
+        .map_err(|_| "That file is no longer on disk.".to_string())?;
+
+    let storage_dir = settings.snapshot().transcription.storage_dir;
+    if !reveal_path_is_allowed(&canonical, &storage_dir) {
+        log::warn!("reveal_in_file_manager: refusing path outside known transcription roots: {path:?}");
+        return Err("That location isn't part of a transcript this app saved.".to_string());
+    }
+
+    reveal_path(&canonical)
+}
+
+/// Pure check: does `canonical` (an already-`canonicalize()`d path - the
+/// caller resolved it, which is also what neutralizes a symlink planted
+/// inside `storage_dir` pointing outside it, since `canonicalize()`
+/// follows the link to its real target before this function ever sees
+/// it) fall under the configured `storage_dir` or a
+/// `centinelo-transcribe-tap.*` OS-temp-dir prefix - the only two places
+/// this feature ever writes a transcript (`transcription.rs`'s
+/// `start_tap`/`finalize_artifacts`). Extracted from
+/// `reveal_in_file_manager` so it's unit-testable without a Tauri
+/// `State`/`AppHandle` (2026-07-16 4R re-review, T2 - this validation had
+/// no test coverage at all before, despite being this command's entire
+/// security boundary).
+fn reveal_path_is_allowed(canonical: &std::path::Path, storage_dir: &str) -> bool {
+    let mut allowed_roots = Vec::new();
+    if !storage_dir.trim().is_empty() {
+        if let Ok(root) = std::path::PathBuf::from(storage_dir.trim()).canonicalize() {
+            allowed_roots.push(root);
+        }
+    }
+    // canonicalize() here too, not just on storage_dir above - macOS's own
+    // std::env::temp_dir() (e.g. /var/folders/...) is itself commonly a
+    // symlink target (/var -> /private/var), which canonicalize() on
+    // `canonical` above already resolved through; comparing an
+    // unresolved temp_root against an already-resolved `canonical` via
+    // strip_prefix would never match (found by this fn's own test suite,
+    // 2026-07-16 4R re-review follow-up: T2's test coverage caught this
+    // on the very platform this repo develops on).
+    let temp_root = std::env::temp_dir().canonicalize().unwrap_or_else(|_| std::env::temp_dir());
+    let within_temp_tap_dir = canonical.strip_prefix(&temp_root).is_ok_and(|rest| {
+        rest.components()
+            .next()
+            .and_then(|c| c.as_os_str().to_str())
+            .is_some_and(|first| first.starts_with("centinelo-transcribe-tap."))
+    });
+    let within_storage_dir = allowed_roots.iter().any(|root| canonical.starts_with(root));
+    within_storage_dir || within_temp_tap_dir
+}
+
+/// Strips Windows' `\\?\`/`\\?\UNC\` extended-length path prefix - what
+/// `Path::canonicalize()` actually returns on Windows (see the stdlib's
+/// own `fs::canonicalize` docs, "On Windows...") - before handing a path
+/// to `explorer.exe`. `explorer /select,<path>` frequently fails to
+/// resolve that prefix silently (`spawn()` still returns `Ok`, but
+/// Explorer opens with nothing selected, or a plain window) - most
+/// relevant precisely for this command's own `storage_dir` case, since a
+/// NAS/SMB-mounted `storage_dir` canonicalizes to the `\\?\UNC\server\
+/// share\...` form (2026-07-16 4R re-review, M3). Pure string transform,
+/// deliberately not `cfg`'d (only its Windows-only call site,
+/// [`reveal_path`], is) so it's unit-testable on any host - stripping a
+/// literal backslash-prefixed string doesn't depend on the host's actual
+/// filesystem semantics. `allow(dead_code)`: genuinely unused outside a
+/// Windows build (its only non-test caller is `cfg`'d to
+/// `target_os = "windows"`) - kept un-`cfg`'d on purpose, see above, so
+/// `cargo test` on any host (including this repo's own macOS dev
+/// machine) still exercises it directly.
+#[allow(dead_code)]
+fn strip_windows_extended_prefix(path: &std::path::Path) -> std::path::PathBuf {
+    let s = path.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        return std::path::PathBuf::from(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        return std::path::PathBuf::from(rest);
+    }
+    path.to_path_buf()
+}
+
+#[cfg(target_os = "macos")]
+fn reveal_path(path: &std::path::Path) -> Result<(), String> {
+    std::process::Command::new("open")
+        .arg("-R")
+        .arg(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("could not open Finder: {e}"))
+}
+
+#[cfg(target_os = "windows")]
+fn reveal_path(path: &std::path::Path) -> Result<(), String> {
+    let normalized = strip_windows_extended_prefix(path);
+    // explorer.exe's /select, syntax wants one argument, comma-glued to
+    // the path, not a separate argv entry.
+    let mut arg = std::ffi::OsString::from("/select,");
+    arg.push(normalized.as_os_str());
+    std::process::Command::new("explorer")
+        .arg(arg)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("could not open Explorer: {e}"))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn reveal_path(path: &std::path::Path) -> Result<(), String> {
+    let dir = if path.is_dir() { path } else { path.parent().unwrap_or(path) };
+    std::process::Command::new("xdg-open")
+        .arg(dir)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("could not open a file manager: {e}"))
+}
+
+#[cfg(test)]
+mod reveal_in_file_manager_tests {
+    use super::*;
+
+    fn scratch_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("centinelo-reveal-test.{name}.{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn allowed_inside_storage_dir() {
+        let storage = scratch_dir("storage-ok");
+        let nested = storage.join("2026").join("07");
+        std::fs::create_dir_all(&nested).unwrap();
+        let file = nested.join("call.txt");
+        std::fs::write(&file, b"hi").unwrap();
+
+        let canonical = file.canonicalize().unwrap();
+        assert!(reveal_path_is_allowed(&canonical, &storage.to_string_lossy()));
+
+        let _ = std::fs::remove_dir_all(&storage);
+    }
+
+    #[test]
+    fn allowed_inside_temp_tap_dir_even_without_storage_dir_configured() {
+        let tap_dir = std::env::temp_dir().join(format!("centinelo-transcribe-tap.test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tap_dir);
+        std::fs::create_dir_all(&tap_dir).unwrap();
+        let file = tap_dir.join("call-rx.wav");
+        std::fs::write(&file, b"hi").unwrap();
+
+        let canonical = file.canonicalize().unwrap();
+        assert!(reveal_path_is_allowed(&canonical, "")); // storage_dir not configured yet
+
+        let _ = std::fs::remove_dir_all(&tap_dir);
+    }
+
+    #[test]
+    fn rejected_outside_both_roots() {
+        let storage = scratch_dir("storage-unrelated");
+        let outside = scratch_dir("outside");
+        let file = outside.join("secret.txt");
+        std::fs::write(&file, b"hi").unwrap();
+
+        let canonical = file.canonicalize().unwrap();
+        assert!(!reveal_path_is_allowed(&canonical, &storage.to_string_lossy()));
+
+        let _ = std::fs::remove_dir_all(&storage);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn rejected_when_storage_dir_not_configured_and_not_temp_tap_dir() {
+        let outside = scratch_dir("no-storage-configured");
+        let file = outside.join("secret.txt");
+        std::fs::write(&file, b"hi").unwrap();
+
+        let canonical = file.canonicalize().unwrap();
+        assert!(!reveal_path_is_allowed(&canonical, ""));
+
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// A symlink planted *inside* `storage_dir` pointing at a file
+    /// *outside* it must not grant access - `reveal_in_file_manager`
+    /// canonicalizes the candidate path before ever calling
+    /// `reveal_path_is_allowed`, and `canonicalize()` follows symlinks to
+    /// their real target, so the check below sees the real (outside)
+    /// path, not the symlink's own (inside) location. Unix-only:
+    /// `std::os::unix::fs::symlink` (2026-07-16 4R re-review, T2 -
+    /// explicitly requested "symlink escape rechazado").
+    #[cfg(unix)]
+    #[test]
+    fn rejected_for_a_symlink_inside_storage_dir_pointing_outside_it() {
+        let storage = scratch_dir("storage-symlink-victim");
+        let outside = scratch_dir("symlink-target-outside");
+        let secret = outside.join("secret.txt");
+        std::fs::write(&secret, b"hi").unwrap();
+        let link = storage.join("innocuous-looking-link.txt");
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+
+        // This mirrors what reveal_in_file_manager itself does: canonicalize
+        // the frontend-supplied path BEFORE checking it.
+        let canonical = link.canonicalize().unwrap();
+        assert_eq!(canonical, secret.canonicalize().unwrap(), "canonicalize should follow the symlink to its real target");
+        assert!(!reveal_path_is_allowed(&canonical, &storage.to_string_lossy()));
+
+        let _ = std::fs::remove_dir_all(&storage);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    // ---- strip_windows_extended_prefix (M3) - pure string transform,
+    // deliberately not cfg'd, so these run on every host. ----
+
+    #[test]
+    fn strip_windows_extended_prefix_removes_plain_prefix() {
+        let p = strip_windows_extended_prefix(std::path::Path::new(r"\\?\C:\Users\front-desk\calls\2026\07"));
+        assert_eq!(p, std::path::PathBuf::from(r"C:\Users\front-desk\calls\2026\07"));
+    }
+
+    #[test]
+    fn strip_windows_extended_prefix_removes_unc_prefix_and_restores_leading_slashes() {
+        // canonicalize()'s own UNC form for a NAS-mounted storage_dir - the
+        // exact case M3 flagged: explorer.exe fails to resolve \\?\UNC\...
+        // silently.
+        let p = strip_windows_extended_prefix(std::path::Path::new(r"\\?\UNC\nas01\front-desk\calls\2026\07"));
+        assert_eq!(p, std::path::PathBuf::from(r"\\nas01\front-desk\calls\2026\07"));
+    }
+
+    #[test]
+    fn strip_windows_extended_prefix_leaves_a_plain_path_unchanged() {
+        let p = strip_windows_extended_prefix(std::path::Path::new(r"C:\Users\front-desk\calls"));
+        assert_eq!(p, std::path::PathBuf::from(r"C:\Users\front-desk\calls"));
+    }
+}
