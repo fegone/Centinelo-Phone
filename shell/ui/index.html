@@ -7,6 +7,7 @@
 <title>Centinelo Phone</title>
 <link rel="stylesheet" href="css/tokens.css">
 <link rel="stylesheet" href="css/app.css">
+<link rel="stylesheet" href="css/transcript.css">
 </head>
 <body>
 <div class="app" id="app">
@@ -28,6 +29,13 @@
            tray menu's own "entry absent" gating (tray.rs). -->
       <button class="wbtn" id="btn-console" aria-label="Console" title="Open the receptionist console" hidden>
         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="4" y="4" width="7" height="7" rx="1.6"/><rect x="13" y="4" width="7" height="7" rx="1.6"/><rect x="4" y="13" width="7" height="7" rx="1.6"/><rect x="13" y="13" width="7" height="7" rx="1.6"/></svg>
+      </button>
+      <!-- Transcript panel entry point - hidden until a transcript for the
+           current/last call exists (see ui/js/app.js's transcript state).
+           Absent by default, not merely disabled: matches btn-console's own
+           "entry absent" gating for unlicensed/idle states. -->
+      <button class="wbtn" id="btn-transcript" aria-label="Transcript" title="View this call's transcript" hidden>
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M7 4h7l4 4v12a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1z"/><path d="M9 12h6M9 15.5h6M9 8.5h3"/></svg>
       </button>
       <button class="wbtn" id="btn-settings" aria-label="Settings">
         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M4 7h10M18 7h2M4 12h4M12 12h8M4 17h13"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="19" cy="17" r="2"/></svg>
@@ -115,6 +123,12 @@
       </div>
 
       <div class="foot">
+        <!-- Manual-activation transcription: transcription.mode != off and
+             activation == "manual" only (see ui/js/app.js
+             renderManualTranscribeButton). Absent, not disabled, the rest
+             of the time - matching every other premium-gated entry point
+             in this window. -->
+        <button class="ghost manual-transcribe" id="btn-transcribe-manual" hidden>Transcribe this call</button>
         <div class="secure">
           <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>
           Encrypted call
@@ -296,6 +310,29 @@
       <button class="ghost" id="btn-cancel-settings">Cancel</button>
       <button class="primary" id="btn-save-settings">Save</button>
     </div>
+  </div>
+
+  <!-- ================= transcript panel (F4 ola 2) =================
+       "The four lives of a call" (premium/design/mockups/transcript-panel.html,
+       plate 07): live while the call is up, writing right after hangup,
+       the full viewer once saved, or the calm folder-down card if the
+       final save failed. Structure/tokens ported verbatim; content is
+       rendered by ui/js/transcript-panel.js (js/app.js wires state into
+       it) - see that module's header comment for the model shape. Never
+       shown at all when transcription isn't licensed or no transcript
+       exists yet - "absent", not a disabled ghost, matching the mockup's
+       own free-tier specimen. -->
+  <div class="transcript-screen" id="screen-transcript" hidden>
+    <div class="transcript-header" data-tauri-drag-region>
+      <button class="back" id="transcript-back" aria-label="Back">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 6l-6 6 6 6"/></svg>
+      </button>
+      <div class="th-id">
+        <span class="th-name" id="tr-peer-name">Transcript</span>
+        <span class="th-state" id="tr-state-label"></span>
+      </div>
+    </div>
+    <div class="transcript-body" id="transcript-body"></div>
   </div>
 
   <!-- ================= dial confirmation (favorites + click-to-call + centinelo/tel deep links) =================

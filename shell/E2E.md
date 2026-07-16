@@ -826,3 +826,92 @@ scenario-c-console-live.log:0
   custom URI scheme protocol registration are implemented for all three
   platforms per the vendored ABI crate and Tauri's own cross-platform
   `register_uri_scheme_protocol`, but only exercised on macOS this session.
+
+## Transcript panel (F4 ola 2, 2026-07-16) — headless render, not desktop GUI automation
+
+The transcript panel (`ui/js/transcript-panel.js`, wired into `ui/index.html`'s
+`#screen-transcript` by `ui/js/app.js`) is a Tauri-free rendering module by
+design — it takes a plain state object and produces DOM, with all
+`invoke`/`listen` wiring living in `app.js`. That split is what made this
+round's verification possible without ever touching desktop GUI automation
+(hard rule, both this project's and Felix's global "never GUI-automation
+del desktop, choca con otros agentes en la Mini"):
+
+1. **Backend (real, spawned-process integration tests, not mocks of
+   `parse_transcribe_line` alone)**: `cargo test --lib` — 69 passed, 0
+   failed, including three tests that spawn the real
+   `tests/fixtures/mock-transcribe.sh` as a child process through the
+   exact `spawn_transcribe`/`parse_transcribe_line` code path the live app
+   uses — one of them (`mock_binary_reports_channels_failed_when_env_set`)
+   proves the new `channels_failed` field (added to `centinelo-transcribe`'s
+   real `done` event in a 2026-07-16 reliability re-review, after this
+   shell's ola-1 contract reconciliation had already landed) round-trips
+   end to end, not just through `parse_transcribe_line`'s own unit tests.
+   `cargo clippy --all-targets -- -D warnings`: clean.
+2. **Frontend render, both themes, five scenarios**: served `ui/` over a
+   plain local static file server (`python3 -m http.server`, no Tauri
+   runtime needed — the panel has none as a dependency) and loaded
+   `ui/dev/transcript-mock.html` (a harness, never referenced by
+   `index.html`, feeding fabricated `TranscriptPanel` models through the
+   exact same `renderTranscriptBody` the real app calls) in the Browser
+   pane. Cycled all five phases — `live`, `writing`, `done` (clean), `done`
+   with `channels_failed:["caller"]`, `error` (folder-down) — across
+   `auto`/`light`/`dark` themes. Zero console errors across every
+   transition.
+3. **Amber-discipline check, programmatic not visual**: resolved
+   `--amber`/`--amber-fill`/`--amber-soft`/`--amber-glow` to their actual
+   `rgb()` values and swept every element under `.transcript-screen` for a
+   `color`/`background-color`/`border-*-color` match — zero hits on the
+   `live` phase (the state creative-vigilia's report flagged as the one
+   Plate 02 got wrong before its correction). The one deliberate exception
+   — a user-typed find query — was exercised separately: searching
+   "Wednesday" against the clean-done fixture produced exactly `2 OF 2`
+   hits with `<mark>` styled in `--amber-soft`/`--amber`, matching the
+   mockup's own footnote ("found terms are the one amber use here").
+4. **A real bug found and fixed this way**: the find bar's hit counter
+   initially read `container.querySelectorAll("mark").length` *before*
+   re-rendering the tape with the new query, so it always reported the
+   *previous* query's count (visually confirmed as `0 OF 0` on the very
+   first search in the harness). Fixed by reordering the tape re-render
+   ahead of the count in `transcript-panel.js`'s `findInput` handler;
+   re-verified `2 OF 2` after the fix. Also fixed: at exactly this app's
+   default 380px window width, `Copy`/`Show in folder` forced the caller's
+   own name/number to wrap — `transcript.css`'s `.idrow` now wraps the
+   actions onto their own row below 460px (a CSS container query on
+   `.transcript-body`, `container-type: inline-size`) instead.
+5. **`reveal_in_file_manager`** (new command backing "Show in
+   folder"/"Show local copy") got its own `CENTINELO_E2E_SCRIPT` step
+   (`reveal_in_file_manager:<path>`) exercising the real command dispatch
+   path the same way every other step in this file does — **not run this
+   session** (needs a real display/window to launch `cargo tauri dev`
+   against, which this verification pass didn't have); the path-validation
+   logic itself (must resolve under the configured `storage_dir` or a
+   `centinelo-transcribe-tap.*` temp dir) has no separate unit test yet
+   either — flagged for qa-e2e or a follow-up pass.
+
+## Known limitations (transcript panel, F4 ola 2)
+
+- No real call was driven through the actual `core/` engine this round —
+  the panel consumes `transcription://segment|done|error`, which ola-1's
+  own module (`transcription.rs`) already proved fires correctly off real
+  `tap_state` events (`shell-tauri-2026-07-16-transcription-shell.md`);
+  this round only proves the *panel* renders whatever those events already
+  carry, correctly and without amber leakage.
+- Only one call/transcript is tracked client-side at a time
+  (`app.js`'s `state.transcript`) — matches the engine's own one-UA,
+  one-call-in-flight design (`core/PROTOCOL.md` "Multi-account support"),
+  but a transcript still `writing`/`error` when a *second* call somehow
+  starts (shouldn't happen given the engine's own constraint) would be
+  silently replaced in the UI, even though the backend's own finalize
+  pipeline for the first call keeps running independently.
+- The audio-playback button in the "kept audio" state (`.playbtn`) is
+  presentational only this round — no actual playback wiring (the mockup
+  itself doesn't specify a source; this shell has no `<audio>`-servable
+  path for a WAV outside `storage_dir` yet). Flagged, not silently shipped
+  as if it worked.
+- WCAG AA: inherited by construction (same tokens, same contrast ratios
+  documented in `premium/design/TOKENS.md` §8) rather than independently
+  re-audited with an automated tool (e.g. axe-core) this round — the
+  premium console got that treatment (`premium/console-ui/A11Y.md`); this
+  panel didn't, since axe-core needs a real DOM+browser harness beyond
+  what this round's plain `node --check` + manual Browser-pane pass covered.

@@ -22,12 +22,16 @@ shell/
       deeplink.rs  centinelo:// / tel: deep-link handling (F3)
       premium.rs   premium module loader (F4, see "Premium module loader")
       console.rs   premium console window (F4, see "Premium console window")
+      transcription.rs  local transcription orchestration (F4, tap->transcribe->save)
       e2e.rs       debug-only scripted e2e driver (see "e2e verification")
   ui/            static frontend, served directly as `frontendDist`
-    index.html     single-page app: main window + settings + call overlay
+    index.html     single-page app: main window + settings + call overlay + transcript panel
     css/tokens.css   verbatim copy of the Vigilia design tokens
     css/app.css      component styles ported from the design mockups
+    css/transcript.css  transcript panel styles (F4 ola 2, see "Transcript panel")
     js/app.js        all frontend logic (Tauri invoke/event wiring)
+    js/transcript-panel.js  transcript panel rendering (pure - no Tauri dependency)
+    dev/transcript-mock.html  standalone harness for screenshot verification (not shipped/loaded by the app)
 ```
 
 ## Architecture: shell <-> sidecar
@@ -228,6 +232,67 @@ independent of whether either button happened to be visible.
   `data-tauri-drag-region` attribute is possible on console-ui's
   JS-constructed DOM, so dragging goes through the explicit
   `startDragging()` API instead).
+
+## Transcript panel (F4 ola 2)
+
+The "four lives of a call" (`premium/design/mockups/transcript-panel.html`,
+plate 07) — live while a call is up, writing right after hangup, the full
+viewer once saved, or a calm folder-down card if the final save failed —
+consuming the `transcription://segment`/`done`/`error` events `transcription.rs`
+(ola 1, F4 "plomería") already emits. Unlike the premium console
+(`console.rs`, above), this panel's UI is **public**: the task that built it
+was scoped to `phone/shell/ui/` directly (not a `premium-console://`-style
+runtime asset directory), matching how BLF favorites/click-to-call/deep
+links already ship public with the *feature itself* gated by a license
+check, not the UI code.
+
+- **Full-screen overlay inside the real window, not a second Tauri
+  window.** The mockup's own 680×648 standalone "win" doesn't fit this
+  app's 380px default width (`tauri.conf.json`) — rather than open a
+  second, differently-sized window (the console's own pattern, justified
+  there by needing to serve premium-only assets from outside this repo),
+  `#screen-transcript` adapts the settings-screen precedent (`#screen-settings`):
+  a full-screen overlay (`z-index:25`, above the call overlay's `20`) using
+  this window's own real titlebar/chrome. `transcript.css` scopes every
+  selector under `.transcript-screen` specifically so generic mockup class
+  names (`banner`, `plates`, ...) can't leak onto unrelated elements that
+  happen to share the name elsewhere in `app.css`.
+- **`ui/js/transcript-panel.js` has zero Tauri dependency on purpose** —
+  it exports pure `renderTranscriptBody(container, model, handlers)` /
+  `plainTextTranscript(model)` functions operating on a plain state object;
+  `app.js` owns all `invoke`/`listen` wiring and hands the module a `model`
+  built from real events. This is what let `ui/dev/transcript-mock.html`
+  (a harness, not referenced by `index.html`, never shipped/loaded by the
+  real app) verify all five phases × both themes via a headless Browser
+  pane instead of desktop GUI automation — see `E2E.md` "Transcript panel
+  (F4 ola 2)".
+- **Entry points**: a titlebar button (`#btn-transcript`, same "absent
+  unless active" pattern as `#btn-console`) appears the instant a
+  transcript starts tracking client-side, so a `live`-mode call can be
+  watched mid-call; the panel also **auto-opens once** at the exact
+  `established → closed` transition if a transcript was tracking (the
+  "just ended - writing" moment, `app.js`'s `maybeTranscriptCallEnded`) -
+  safe to auto-open there specifically because the call overlay has
+  already disappeared by then, so nothing hides call controls.
+  `activation == "manual"` calls get a small "Transcribe this call" ghost
+  button in the call overlay's `.foot` instead of auto-starting
+  (`#btn-transcribe-manual`, `renderManualTranscribeButton`).
+- **`reveal_in_file_manager`** (new command, `commands.rs`) backs "Show in
+  folder"/"Show local copy" — reveals a path in Finder/Explorer/`xdg-open`,
+  but only after canonicalizing it and checking it resolves under either
+  the configured `transcription.storage_dir` or a
+  `centinelo-transcribe-tap.*` temp directory (the only two places this
+  feature ever writes a transcript) — never an arbitrary frontend-supplied
+  path, same "verify, don't assume" discipline `console.rs`'s own asset
+  protocol handler documents for its path-traversal guard.
+- **`channels_failed`** (added to `centinelo-transcribe`'s real `done`
+  event in a 2026-07-16 reliability re-review, after ola-1's own contract
+  reconciliation had already landed) is now parsed (`transcription.rs`'s
+  `TranscribeLine::Done`) and threaded onto `transcription://done`'s
+  payload and `PendingRetryView` (for a retried save) - the panel renders
+  it as a calm, non-alarming notice ("Part of this call wasn't
+  transcribed...") above the tape, never a full-looking transcript that's
+  silently missing a channel.
 
 ## Design fidelity notes
 

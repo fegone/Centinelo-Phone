@@ -645,3 +645,89 @@ pub fn download_transcription_model(
     crate::transcription::spawn_model_download(app, tier);
     Ok(())
 }
+
+/// Opens the OS file manager with `path` selected (macOS Finder/Windows
+/// Explorer) - backs the transcript panel's "Show in folder"/"Show local
+/// copy" actions (`premium/design/mockups/transcript-panel.html`).
+///
+/// # Why this validates `path` before ever spawning anything
+///
+/// `path` comes straight from the frontend, which itself only ever got it
+/// from a `transcription://done` event payload or a
+/// `transcription_pending_retries` entry - both backend-sourced, not
+/// user-typed - but a Tauri command is still reachable by any script
+/// running in the webview (e.g. via devtools), same threat model
+/// `console.rs`'s `asset_protocol_handler` documents for its own
+/// path-traversal guard. Revealing an arbitrary OS path in the file
+/// manager doesn't execute anything, but it's still a real information
+/// disclosure ("does this file exist, what's its icon/preview") this
+/// shell shouldn't hand to arbitrary webview content unchecked. Bounded
+/// to two known-safe roots: the operator's configured transcription
+/// `storage_dir` (where a finished transcript actually lives) and the OS
+/// temp directory's `centinelo-transcribe-tap.*` prefix (where a
+/// not-yet-moved one sits during a pending retry - see
+/// `transcription.rs`'s `start_tap`) - the only two places this feature
+/// ever writes a transcript.
+#[tauri::command(rename_all = "snake_case")]
+pub fn reveal_in_file_manager(settings: State<Arc<SettingsStore>>, path: String) -> Result<(), String> {
+    let candidate = std::path::PathBuf::from(&path);
+    let canonical = candidate
+        .canonicalize()
+        .map_err(|_| "That file is no longer on disk.".to_string())?;
+
+    let storage_dir = settings.snapshot().transcription.storage_dir;
+    let mut allowed_roots = Vec::new();
+    if !storage_dir.trim().is_empty() {
+        if let Ok(root) = std::path::PathBuf::from(storage_dir.trim()).canonicalize() {
+            allowed_roots.push(root);
+        }
+    }
+    let temp_root = std::env::temp_dir();
+    let within_temp_tap_dir = canonical.strip_prefix(&temp_root).is_ok_and(|rest| {
+        rest.components()
+            .next()
+            .and_then(|c| c.as_os_str().to_str())
+            .is_some_and(|first| first.starts_with("centinelo-transcribe-tap."))
+    });
+    let within_storage_dir = allowed_roots.iter().any(|root| canonical.starts_with(root));
+
+    if !within_storage_dir && !within_temp_tap_dir {
+        log::warn!("reveal_in_file_manager: refusing path outside known transcription roots: {path:?}");
+        return Err("That location isn't part of a transcript this app saved.".to_string());
+    }
+
+    reveal_path(&canonical)
+}
+
+#[cfg(target_os = "macos")]
+fn reveal_path(path: &std::path::Path) -> Result<(), String> {
+    std::process::Command::new("open")
+        .arg("-R")
+        .arg(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("could not open Finder: {e}"))
+}
+
+#[cfg(target_os = "windows")]
+fn reveal_path(path: &std::path::Path) -> Result<(), String> {
+    // explorer.exe's /select, syntax wants one argument, comma-glued to
+    // the path, not a separate argv entry.
+    let mut arg = std::ffi::OsString::from("/select,");
+    arg.push(path.as_os_str());
+    std::process::Command::new("explorer")
+        .arg(arg)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("could not open Explorer: {e}"))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn reveal_path(path: &std::path::Path) -> Result<(), String> {
+    let dir = if path.is_dir() { path } else { path.parent().unwrap_or(path) };
+    std::process::Command::new("xdg-open")
+        .arg(dir)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("could not open a file manager: {e}"))
+}

@@ -1,0 +1,163 @@
+/* == transcript panel (F4 ola 2) ==========================================
+   Ported from premium/design/mockups/transcript-panel.html (plate 07) -
+   structure and tokens verbatim; adapted from that mockup's standalone
+   680x648 "win" chrome to a full-screen overlay inside this app's real
+   380px (resizable) window, the same way settings-screen already adapts
+   the wider settings mockup (see shell/README.md "Design fidelity
+   notes"). Every selector below is scoped under .transcript-screen so
+   nothing here can leak onto unrelated elements that happen to share a
+   generic mockup class name (banner, plates, ...).
+   Design law: no amber except a user-requested find highlight (<mark>) -
+   see TOKENS.md §1.4 and transcript-panel.js's own header comment.
+   ======================================================================= */
+
+.transcript-screen {
+  position: absolute; inset: 0; z-index: 25; background: var(--bg-0);
+  display: flex; flex-direction: column; animation: fadeSlide var(--t-med) var(--ease) both;
+}
+
+.transcript-header {
+  flex: none; height: 38px; display: flex; align-items: center; gap: 10px;
+  padding: 0 10px; border-bottom: 1px solid var(--border-1); -webkit-app-region: drag;
+}
+html[data-os="mac"] .transcript-header { padding-left: 78px; }
+.transcript-header .back {
+  -webkit-app-region: no-drag; width: 28px; height: 28px; flex: none;
+  display: grid; place-items: center; border-radius: 7px; color: var(--text-2);
+}
+.transcript-header .back:hover { background: var(--bg-3); color: var(--text-1); }
+.transcript-header .th-id { min-width: 0; display: flex; flex-direction: column; }
+.transcript-header .th-name {
+  font: 650 12.5px/1.2 var(--font-ui); letter-spacing: -.01em;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.transcript-header .th-state { margin-top: 2px; font: 400 10px/1 var(--font-ui); color: var(--text-3); }
+
+.transcript-body { flex: 1; min-height: 0; overflow: auto; padding: 14px 16px 20px; container-type: inline-size; }
+.transcript-body.tr-phase-writing { display: flex; }
+
+/* == live / writing chip row ============================================ */
+.transcript-screen .tr-toprow { flex: none; display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+.transcript-screen .workchip {
+  display: inline-flex; align-items: center; gap: 5px; font: 700 8.5px/1 var(--font-mono);
+  letter-spacing: .16em; color: var(--text-3); border: 1px solid var(--border-2);
+  background: var(--bg-1); border-radius: 5px; padding: 3px 6px 2.5px; text-transform: uppercase;
+}
+.transcript-screen .workchip i { width: 5px; height: 5px; border-radius: 50%; background: var(--text-3); animation: tr-fade 2.4s var(--ease) infinite; }
+@keyframes tr-fade { 0%, 100% { opacity: 1; } 50% { opacity: .3; } }
+.transcript-screen .trail { margin: 11px 0 0; font: 400 11px/1.5 var(--font-ui); color: var(--text-3); }
+
+/* == the tape (shared by live/done/error) =============================== */
+.transcript-screen .tape { display: flex; flex-direction: column; gap: 13px; }
+.transcript-screen .tmark { flex: none; display: flex; align-items: center; gap: 10px; margin: 2px 0; }
+.transcript-screen .tmark span { font: 700 8.5px/1 var(--font-mono); letter-spacing: .16em; color: var(--text-3); text-transform: uppercase; }
+.transcript-screen .tmark::before, .transcript-screen .tmark::after { content: ""; flex: 1; height: 1px; background: var(--border-1); }
+.transcript-screen .turn { padding-left: 11px; border-left: 2px dotted var(--voice-caller); }
+.transcript-screen .turn.you { border-left: 2px solid var(--voice-you); }
+.transcript-screen .turn .tag { display: block; font: 700 8.5px/1 var(--font-mono); letter-spacing: .16em; color: var(--text-3); text-transform: uppercase; margin-bottom: 4px; }
+.transcript-screen .turn p { margin: 0; font: 400 12.5px/1.55 var(--font-ui); color: var(--text-1); word-break: break-word; }
+.transcript-screen .turn mark { background: var(--amber-soft); color: var(--amber); border-radius: 3px; padding: 0 2px; font-weight: 600; }
+.transcript-screen .tr-empty { margin: 0; font: 400 12px/1.5 var(--font-ui); color: var(--text-3); }
+
+/* live: listening row */
+.transcript-screen .listening { display: flex; align-items: center; gap: 8px; padding-left: 11px; border-left: 2px dotted var(--border-2); }
+.transcript-screen .dots { display: inline-flex; gap: 3px; }
+.transcript-screen .dots i { width: 4px; height: 4px; border-radius: 50%; background: var(--text-3); animation: tr-listen 2.4s var(--ease) infinite; }
+.transcript-screen .dots i:nth-child(2) { animation-delay: .3s; }
+.transcript-screen .dots i:nth-child(3) { animation-delay: .6s; }
+@keyframes tr-listen { 0%, 100% { opacity: .25; } 30% { opacity: 1; } }
+.transcript-screen .listening span { font: 700 8.5px/1 var(--font-mono); letter-spacing: .16em; color: var(--text-3); text-transform: uppercase; }
+
+/* == writing: the scribe ring ============================================ */
+.transcript-screen .writing {
+  margin: auto; display: flex; flex-direction: column; align-items: center;
+  text-align: center; padding: 30px 14px;
+}
+.transcript-screen .scribe { width: 44px; height: 44px; }
+.transcript-screen .scribe .ring { transform-origin: 22px 22px; animation: tr-scribe 2.4s linear infinite; }
+@keyframes tr-scribe { to { transform: rotate(360deg); } }
+.transcript-screen .writing b { display: block; margin-top: 12px; font: 600 13.5px/1.35 var(--font-ui); }
+.transcript-screen .writing .sub { margin: 5px 0 0; font: 400 11.5px/1.5 var(--font-ui); color: var(--text-2); max-width: 260px; }
+
+/* == done: call header (identity + facts) ================================ */
+.transcript-screen .callhead { flex: none; padding-bottom: 12px; margin-bottom: 12px; border-bottom: 1px solid var(--border-1); }
+.transcript-screen .idrow { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 10px; }
+.transcript-screen .idrow .medal { width: 40px; height: 40px; font: 600 13px/1 var(--font-ui); flex: none; }
+.transcript-screen .idrow .who { min-width: 0; flex: 1; }
+.transcript-screen .idrow .who b { display: block; font: 650 15px/1.2 var(--font-ui); letter-spacing: -.01em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.transcript-screen .idrow .who .num {
+  display: block; margin-top: 3px; font: 500 11.5px/1 var(--font-mono); color: var(--text-2); letter-spacing: .02em;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+/* Copy/Show-in-folder wrap to their own full-width row on this window's
+   narrow default width (380px, tauri.conf.json) rather than forcing the
+   caller's own name/number to wrap - flex-basis:100% is the standard
+   "next flex line, full width" trick, only engaging once .idrow itself
+   wraps (i.e. exactly when the row is tight). */
+.transcript-screen .idrow .acts { display: flex; gap: 6px; flex: 1 0 100%; justify-content: flex-end; }
+@container (min-width: 460px) {
+  .transcript-screen .idrow .acts { flex: none; justify-content: normal; }
+}
+.transcript-screen .ghostbtn {
+  display: inline-flex; align-items: center; gap: 6px; height: 28px; padding: 0 9px;
+  border-radius: 8px; border: 1px solid var(--border-1); background: var(--bg-1);
+  font: 500 11px/1 var(--font-ui); color: var(--text-2); white-space: nowrap;
+}
+.transcript-screen .ghostbtn:hover:not(:disabled) { background: var(--bg-3); color: var(--text-1); }
+.transcript-screen .ghostbtn:disabled { opacity: .45; cursor: default; }
+.transcript-screen .plates { display: flex; gap: 6px; margin-top: 10px; flex-wrap: wrap; }
+.transcript-screen .mchip {
+  font: 700 8.5px/1 var(--font-mono); letter-spacing: .1em; color: var(--text-3);
+  border: 1px solid var(--border-2); border-radius: 5px; padding: 3.5px 6px 3px;
+  text-transform: uppercase; background: var(--bg-1);
+}
+.transcript-screen .mchip.ok { color: var(--st-idle); border-color: color-mix(in srgb, var(--st-idle) 45%, transparent); }
+
+/* channels_failed - calm, not alarming; still not the "acromatic folder"
+   banner grammar (that's reserved for the save-failed state) but never
+   green/red either - a plain ink notice card. */
+.transcript-screen .tr-partial {
+  display: flex; gap: 9px; padding: 10px 11px; margin-bottom: 12px;
+  background: var(--bg-2); border: 1px solid var(--border-1); border-radius: var(--r-2);
+}
+.transcript-screen .tr-partial svg { flex: none; color: var(--text-2); margin-top: 1px; }
+.transcript-screen .tr-partial p { margin: 0; font: 400 11.5px/1.5 var(--font-ui); color: var(--text-2); }
+
+/* == find bar ============================================================= */
+.transcript-screen .findrow { flex: none; display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+.transcript-screen .find {
+  flex: 1; display: flex; align-items: center; gap: 8px; height: 32px; padding: 0 10px;
+  background: var(--bg-2); border: 1px solid var(--border-1); border-radius: 9px; color: var(--text-3);
+}
+.transcript-screen .find input { flex: 1; border: 0; background: none; font: 400 12px/1 var(--font-ui); color: var(--text-1); outline: none; }
+.transcript-screen .find input::placeholder { color: var(--text-3); }
+.transcript-screen .hits { font: 500 10.5px/1 var(--font-mono); color: var(--text-3); font-variant-numeric: tabular-nums; flex: none; }
+
+/* == audio strip (keep-audio on) ========================================= */
+.transcript-screen .audiorow {
+  display: flex; align-items: center; gap: 10px; margin-top: 12px; padding: 9px 12px;
+  background: var(--bg-1); border: 1px solid var(--border-1); border-radius: var(--r-2); box-shadow: var(--edge);
+}
+.transcript-screen .playbtn { width: 26px; height: 26px; border-radius: 50%; background: var(--bg-2); border: 1px solid var(--border-2); display: grid; place-items: center; color: var(--text-2); flex: none; }
+.transcript-screen .playbtn:hover { background: var(--bg-3); color: var(--text-1); }
+.transcript-screen .wave { flex: 1; height: 14px; }
+.transcript-screen .aud { font: 600 9px/1 var(--font-mono); letter-spacing: .12em; color: var(--text-3); text-transform: uppercase; white-space: nowrap; }
+
+/* == footer trust line ==================================================== */
+.transcript-screen .tfoot {
+  display: flex; align-items: center; gap: 7px; justify-content: center; margin-top: 16px; padding: 4px 0 6px;
+  font: 600 9.5px/1 var(--font-mono); letter-spacing: .12em; color: var(--text-3); text-transform: uppercase;
+}
+.transcript-screen .tfoot svg { color: var(--st-idle); }
+
+/* == error: folder-down card ============================================= */
+.transcript-screen .tr-foldercard { margin-bottom: 14px; }
+.transcript-screen .tr-fc-body {
+  display: flex; gap: 10px; padding: 11px 12px; background: var(--bg-2);
+  border: 1px solid var(--border-1); border-radius: var(--r-2);
+}
+.transcript-screen .tr-fc-body svg { flex: none; color: var(--text-2); margin-top: 1px; }
+.transcript-screen .tr-fc-body .bx { min-width: 0; }
+.transcript-screen .tr-fc-body .bx b { display: block; font: 600 12px/1.35 var(--font-ui); }
+.transcript-screen .tr-fc-body .bx p { margin: 3px 0 0; font: 400 11px/1.5 var(--font-ui); color: var(--text-2); }
+.transcript-screen .bacts { display: flex; gap: 8px; margin-top: 10px; }
