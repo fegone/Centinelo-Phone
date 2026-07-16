@@ -16,9 +16,10 @@
  * core/modules/ctrl_json/test/) and is unit tested without a running
  * engine or a live SUBSCRIBE dialog.
  *
- * See core/PROTOCOL.md ("blf_subscribe") for the wire event this feeds,
- * and core/E2E-F1.md for a real NOTIFY body captured against the test PBX
- * (Asterisk chan_pjsip hint dialog-info).
+ * See core/PROTOCOL.md ("blf_subscribe", "Changes from v1.2") for the wire
+ * event this feeds and the full presence_override (held/dnd) contract, and
+ * core/E2E-F1.md ("F5") for real captured NOTIFY bodies and this engine's
+ * actual real-PBX verification status for each state.
  *
  * Copyright (C) 2026 Neola Dental / Centinelo Phone
  */
@@ -30,12 +31,27 @@
 
 /**
  * BLF line state, matching PROTOCOL.md's
- * {"event":"blf",...,"state":"idle|ringing|busy|offline"}.
+ * {"event":"blf",...,"state":"idle|ringing|busy|held|dnd|offline"}.
+ *
+ * CENT_BLF_HELD/CENT_BLF_DND are v1.3 ("presence_override" - see
+ * PROTOCOL.md "Changes from v1.2" and dialog_info_parse()'s own doc
+ * comment below for exactly what triggers each and their real-PBX
+ * verification status).
  */
 enum cent_blf_state {
 	CENT_BLF_IDLE = 0,
 	CENT_BLF_RINGING,
 	CENT_BLF_BUSY,
+	CENT_BLF_HELD,     /**< v1.3 - a confirmed dialog whose NOTIFY body
+			     *   also carries the RFC 4235/3840 standard hold
+			     *   indication (a <target> "+sip.rendering" param,
+			     *   pvalue="no"). Not observed on this engine's
+			     *   real test PBX - see PROTOCOL.md/E2E-F1.md. */
+	CENT_BLF_DND,      /**< v1.3 - best-effort, non-standard, only
+			     *   overrides what would otherwise be "idle"
+			     *   (no <dialog> element) - never a genuinely
+			     *   active dialog. Unverified against a real
+			     *   PBX - see PROTOCOL.md/E2E-F1.md. */
 	CENT_BLF_OFFLINE,
 };
 
@@ -45,15 +61,21 @@ const char *cent_blf_state_name(enum cent_blf_state state);
  * Parse a NOTIFY body for the "Event: dialog" package
  * (application/dialog-info+xml, RFC 4235) into a BLF line state.
  *
- * Rules (see core/E2E-F1.md for the real captured body this was tuned
- * against):
+ * Rules (see core/E2E-F1.md for the real captured bodies this was tuned
+ * against, and PROTOCOL.md "Changes from v1.2" for the full
+ * presence_override design/verification write-up):
  *   - NULL/empty body, or no "<dialog-info" root element at all (not a
  *     dialog-info document)                            -> CENT_BLF_OFFLINE
- *   - a "<dialog-info" document with no "<dialog" element (state="full",
- *     zero dialogs - the idle/no-active-call case)      -> CENT_BLF_IDLE
+ *   - no "<dialog" element at all (state="full", zero dialogs) AND a
+ *     "<dnd>true</dnd>" element/"dnd=" attribute is present (v1.3,
+ *     best-effort, non-standard - never overrides a real dialog state
+ *     below, only this "would otherwise be idle" case) -> CENT_BLF_DND
+ *   - no "<dialog" element, no dnd marker              -> CENT_BLF_IDLE
  *   - a "<dialog" element whose "<state>" is "trying"/"proceeding"/
  *     "early"                                           -> CENT_BLF_RINGING
- *   - "<state>confirmed</state>"                        -> CENT_BLF_BUSY
+ *   - "<state>confirmed</state>", RFC 4235/3840 "+sip.rendering"
+ *     pvalue="no" hold signal ALSO present (v1.3)        -> CENT_BLF_HELD
+ *   - "<state>confirmed</state>", no hold signal found  -> CENT_BLF_BUSY
  *   - "<state>terminated</state>" (a dialog that just ended - back to
  *     no active dialogs)                                -> CENT_BLF_IDLE
  *   - a "<dialog" element with no parseable "<state>"    -> CENT_BLF_OFFLINE

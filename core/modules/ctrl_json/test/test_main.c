@@ -25,6 +25,7 @@
 #include <string.h>
 #include "../cmd.h"
 #include "../dialog_info.h"
+#include "../pathsafe.h"
 #include "../wav_writer.h"
 
 
@@ -233,6 +234,68 @@ static void test_cmd_quality_stats_and_blf(void)
 }
 
 
+/* v1.3: "answer" now optionally decodes call_id (see PROTOCOL.md
+ * "answer") - retrocompatible, byte-for-byte unchanged when omitted. */
+static void test_cmd_answer_call_id(void)
+{
+	struct cent_cmd cmd;
+	const char *err = NULL;
+
+	CHECK(CENT_CMD_ANSWER == decode("{\"cmd\":\"answer\"}", &cmd, &err),
+	      "answer: type (no call_id)");
+	CHECK(!cmd.have_call_id,
+	      "answer: no call_id -> have_call_id false (v1/v1.1/v1.2"
+	      " behavior unchanged)");
+
+	CHECK(CENT_CMD_ANSWER ==
+	      decode("{\"cmd\":\"answer\",\"call_id\":\"c42\"}", &cmd, &err),
+	      "answer+call_id: type");
+	CHECK(cmd.have_call_id, "answer+call_id: have_call_id true");
+	CHECK_STREQ(cmd.call_id, "c42", "answer+call_id: call_id value");
+
+	/* quit never decodes call_id, even though it shares the same
+	 * process_line() switch case in ctrl_json.c as answer. */
+	CHECK(CENT_CMD_QUIT ==
+	      decode("{\"cmd\":\"quit\",\"call_id\":\"ignored\"}", &cmd, &err),
+	      "quit: type (call_id field, if present, is simply not"
+	      " decoded for quit)");
+	CHECK(!cmd.have_call_id,
+	      "quit: call_id never decoded, regardless of input");
+}
+
+
+/* v1.3: "park" (see PROTOCOL.md "park") - required ext, same shape as
+ * blf_subscribe's, optional call_id, same shape as blind_transfer's. */
+static void test_cmd_park(void)
+{
+	struct cent_cmd cmd;
+	const char *err = NULL;
+
+	CHECK(CENT_CMD_PARK ==
+	      decode("{\"cmd\":\"park\",\"ext\":\"70\"}", &cmd, &err),
+	      "park: type");
+	CHECK_STREQ(cmd.ext, "70", "park: ext value");
+	CHECK(!cmd.have_call_id, "park: no call_id -> have_call_id false");
+
+	CHECK(CENT_CMD_PARK ==
+	      decode("{\"cmd\":\"park\",\"ext\":\"70\",\"call_id\":\"c1\"}",
+		     &cmd, &err), "park+call_id: type");
+	CHECK_STREQ(cmd.ext, "70", "park+call_id: ext value");
+	CHECK(cmd.have_call_id, "park+call_id: have_call_id true");
+	CHECK_STREQ(cmd.call_id, "c1", "park+call_id: call_id value");
+
+	CHECK(CENT_CMD_NONE == decode("{\"cmd\":\"park\"}", &cmd, &err),
+	      "park: missing ext -> NONE");
+	CHECK(err != NULL && strstr(err, "ext") != NULL,
+	      "park: missing ext -> errmsg mentions 'ext'");
+
+	CHECK(CENT_CMD_NONE ==
+	      decode("{\"cmd\":\"park\",\"ext\":\"\"}", &cmd, &err),
+	      "park: empty ext -> NONE (require_str treats empty as missing,"
+	      " same as blf_subscribe's ext)");
+}
+
+
 static void test_cmd_unknown_and_malformed(void)
 {
 	struct cent_cmd cmd;
@@ -415,6 +478,336 @@ static void test_cmd_tap(void)
 	      "tap_stop+call_id: type");
 	CHECK(cmd.have_call_id, "tap_stop+call_id: have_call_id true");
 	CHECK_STREQ(cmd.call_id, "c1", "tap_stop+call_id: call_id value");
+}
+
+
+/*
+ * v1.3 security fix - pathsafe_component() (see ../pathsafe.h's own top
+ * comment for the full story: audiotap.c's tap_start interpolates
+ * call_id(call) - the raw SIP Call-ID header for an incoming call,
+ * caller-controlled, not engine-generated - directly into a filesystem
+ * path; this is the fix, and these are its tests).
+ */
+static void test_pathsafe_component(void)
+{
+	char out[64];
+
+	pathsafe_component("abc123", out, sizeof(out));
+	CHECK_STREQ(out, "abc123", "pathsafe: plain alnum passes through"
+		    " unchanged");
+
+	pathsafe_component("a1b2c3@pbx.example.com", out, sizeof(out));
+	CHECK_STREQ(out, "a1b2c3@pbx.example.com",
+		    "pathsafe: '@'/'.' (legal Call-ID chars) pass through");
+
+	pathsafe_component("../../etc/passwd", out, sizeof(out));
+	CHECK(NULL == strchr(out, '/'),
+	      "pathsafe: '/' never survives - no traversal separator left"
+	      " in the output, regardless of what else is in it");
+	CHECK(NULL == strchr(out, '\\'),
+	      "pathsafe: '\\' never survives either (Windows separator)");
+
+	pathsafe_component("..", out, sizeof(out));
+	CHECK(0 != str_cmp(out, ".."),
+	      "pathsafe: bare '..' input is never returned verbatim"
+	      " (leading dots are neutralized)");
+	CHECK_STREQ(out, "__", "pathsafe: '..' -> '__' exactly");
+
+	pathsafe_component(".", out, sizeof(out));
+	CHECK_STREQ(out, "_", "pathsafe: bare '.' -> '_'");
+
+	pathsafe_component("...hidden", out, sizeof(out));
+	CHECK_STREQ(out, "___hidden",
+		    "pathsafe: leading dot RUN is neutralized, not just the"
+		    " first one");
+
+	pathsafe_component("call.id.with.dots", out, sizeof(out));
+	CHECK_STREQ(out, "call.id.with.dots",
+		    "pathsafe: non-leading '.' characters are legal and"
+		    " pass through (a real Call-ID commonly has these,"
+		    " e.g. an '@' domain suffix)");
+
+	pathsafe_component("weird;`$(rm -rf /)`", out, sizeof(out));
+	CHECK(NULL == strchr(out, '/') && NULL == strchr(out, ' ') &&
+	      NULL == strchr(out, '('),
+	      "pathsafe: shell-metacharacter-laden input is fully"
+	      " neutralized (not a shell-injection fix per se - this engine"
+	      " never shells out with this string - but confirms the"
+	      " whitelist is a whitelist, not an ad-hoc blacklist)");
+
+	/* Truncation: output never exceeds out_size (including NUL), and
+	 * is always NUL-terminated even when the input is longer than the
+	 * buffer. */
+	{
+		char in[256];
+		char small[8];
+		size_t i;
+
+		for (i = 0; i < sizeof(in) - 1; i++)
+			in[i] = 'a';
+		in[sizeof(in) - 1] = '\0';
+
+		pathsafe_component(in, small, sizeof(small));
+		CHECK(str_len(small) == sizeof(small) - 1,
+		      "pathsafe: output truncated to out_size - 1 chars");
+		CHECK(small[sizeof(small) - 1] == '\0',
+		      "pathsafe: output always NUL-terminated");
+	}
+
+	/* NULL/empty input, and the out_size edge cases - never crashes,
+	 * always leaves `out` in a defined, NUL-terminated state. */
+	pathsafe_component(NULL, out, sizeof(out));
+	CHECK_STREQ(out, "", "pathsafe: NULL input -> empty string");
+
+	pathsafe_component("", out, sizeof(out));
+	CHECK_STREQ(out, "", "pathsafe: empty input -> empty string");
+
+	out[0] = 'X';
+	pathsafe_component("abc", out, 1);
+	CHECK(out[0] == '\0',
+	      "pathsafe: out_size == 1 -> just the NUL terminator, no"
+	      " overflow");
+
+	/* No crash with a NULL/zero-size `out` - a defensive no-op, same
+	 * convention as this codebase's other pure decode functions
+	 * (e.g. cent_cmd_decode() with a NULL `out`). */
+	pathsafe_component("abc", NULL, 0);
+	pathsafe_component("abc", out, 0);
+}
+
+
+struct fake_taken_ctx {
+	const char **taken;
+	size_t count;
+};
+
+
+static bool fake_is_taken(const char *candidate, void *arg)
+{
+	const struct fake_taken_ctx *ctx = arg;
+	size_t i;
+
+	for (i = 0; i < ctx->count; i++) {
+		if (0 == str_cmp(ctx->taken[i], candidate))
+			return true;
+	}
+	return false;
+}
+
+
+/*
+ * v1.3 4R finding (R1) regression guard: pathsafe_component() is
+ * many-to-one by construction ("abc/def" and "abc_def" both sanitize to
+ * "abc_def") - audiotap.c's real collision-avoidance (checking the live
+ * tap registry + filesystem) isn't itself pure/unit-testable, but the
+ * retry/suffix algorithm it's built on (pathsafe_unique_component()) is
+ * - tested here with a fake is_taken predicate.
+ */
+static void test_pathsafe_unique_component(void)
+{
+	char out[64];
+	bool ok;
+
+	ok = pathsafe_unique_component("abc123", out, sizeof(out), NULL,
+					NULL, 10);
+	CHECK(ok, "pathsafe_unique: no is_taken -> always succeeds");
+	CHECK_STREQ(out, "abc123",
+		    "pathsafe_unique: no collision -> filename unchanged"
+		    " from plain pathsafe_component() (common case stays"
+		    " byte-identical)");
+
+	{
+		const char *taken[] = { "abc_def" };
+		struct fake_taken_ctx ctx = { taken, 1 };
+
+		/* R1: "abc/def" sanitizes to "abc_def", same as a
+		 * DIFFERENT raw call_id "abc_def" would - simulate that
+		 * second one already being active. */
+		ok = pathsafe_unique_component("abc/def", out, sizeof(out),
+						fake_is_taken, &ctx, 10);
+		CHECK(ok, "pathsafe_unique: one collision -> still succeeds");
+		CHECK(0 != str_cmp(out, "abc_def"),
+		      "pathsafe_unique: R1 regression - a taken candidate is"
+		      " never returned as-is");
+		CHECK_STREQ(out, "abc_def-2",
+			    "pathsafe_unique: first retry is '-2'");
+	}
+
+	{
+		const char *taken[] = { "x", "x-2", "x-3" };
+		struct fake_taken_ctx ctx = { taken, 3 };
+
+		ok = pathsafe_unique_component("x", out, sizeof(out),
+						fake_is_taken, &ctx, 10);
+		CHECK(ok, "pathsafe_unique: 3 chained collisions -> still"
+		      " succeeds within max_attempts");
+		CHECK_STREQ(out, "x-4",
+			    "pathsafe_unique: skips every already-taken"
+			    " suffix in order");
+	}
+
+	{
+		const char *taken[] = { "y", "y-2", "y-3" };
+		struct fake_taken_ctx ctx = { taken, 3 };
+
+		ok = pathsafe_unique_component("y", out, sizeof(out),
+						fake_is_taken, &ctx, 2);
+		CHECK(!ok, "pathsafe_unique: max_attempts exhausted -> false,"
+		      " never a silent false-success");
+	}
+
+	ok = pathsafe_unique_component(NULL, out, sizeof(out), NULL, NULL, 5);
+	CHECK(ok, "pathsafe_unique: NULL input, no is_taken -> succeeds");
+	CHECK_STREQ(out, "", "pathsafe_unique: NULL input -> empty string");
+
+	CHECK(!pathsafe_unique_component("abc", NULL, 0, NULL, NULL, 5),
+	      "pathsafe_unique: NULL out -> false, no crash");
+}
+
+
+/*
+ * v1.3 4R finding (F2, resilience) regression guard: pathsafe_unique_
+ * component()'s first fix truncated its sanitized `base` to the FULL
+ * out_size-1 width before ever appending a "-N" suffix - for an input
+ * long enough to fill the whole output buffer on its own (a SIP Call-ID
+ * has no length cap this engine enforces before this point, and the far
+ * end controls it), every suffixed retry truncated right back down to
+ * the identical bytes, so a genuinely resolvable collision looked
+ * unresolvable and a real caller (audiotap_start()) would have wrongly
+ * denied recording. Fixed by reserving room for the largest possible
+ * suffix in `base` up front - these tests exercise inputs at/over
+ * out_size to prove retries now actually change the result.
+ */
+static void test_pathsafe_unique_component_long_input(void)
+{
+	char out[128];
+	char long_in[200];
+	size_t i;
+	bool ok;
+
+	for (i = 0; i < sizeof(long_in) - 1; i++)
+		long_in[i] = 'a';
+	long_in[sizeof(long_in) - 1] = '\0';
+
+	ok = pathsafe_unique_component(long_in, out, sizeof(out), NULL, NULL,
+					5);
+	CHECK(ok, "pathsafe_unique: long input (> out_size), no collision"
+	      " -> succeeds");
+	CHECK(str_len(out) < sizeof(out) - 1,
+	      "pathsafe_unique: F2 fix - the plain candidate leaves room"
+	      " for a suffix (shorter than the full buffer), rather than"
+	      " filling it completely the way the pre-fix truncation did");
+
+	/* Force a collision on that exact candidate - the retry MUST
+	 * produce something different, not the same truncated bytes again. */
+	{
+		char first_candidate[128];
+		const char *taken1[1];
+		struct fake_taken_ctx ctx;
+
+		str_ncpy(first_candidate, out, sizeof(first_candidate));
+		taken1[0] = first_candidate;
+		ctx.taken = taken1;
+		ctx.count = 1;
+
+		ok = pathsafe_unique_component(long_in, out, sizeof(out),
+						fake_is_taken, &ctx, 5);
+		CHECK(ok, "pathsafe_unique: long input, one collision ->"
+		      " still succeeds (pre-fix: exhausted every retry on"
+		      " the identical truncated candidate, returned false)");
+		CHECK(0 != str_cmp(out, first_candidate),
+		      "pathsafe_unique: F2 regression guard - retry produces"
+		      " a DIFFERENT candidate even for an input long enough"
+		      " to fill the entire output buffer on its own");
+	}
+
+	/* Two distinct long call_ids sharing a common prefix long enough to
+	 * collide once naively truncated (the real-world shape this bug
+	 * actually denies recording for) must still resolve to two
+	 * different final paths once a real is_taken predicate reports the
+	 * first one active. */
+	{
+		char long_in_b[200];
+		char out_a[128], out_b[128];
+		const char *taken1[1];
+		struct fake_taken_ctx ctx;
+
+		memcpy(long_in_b, long_in, sizeof(long_in_b));
+		long_in_b[sizeof(long_in_b) - 2] = 'b';
+
+		ok = pathsafe_unique_component(long_in, out_a, sizeof(out_a),
+						NULL, NULL, 5);
+		CHECK(ok, "pathsafe_unique: long input A -> succeeds");
+
+		taken1[0] = out_a;
+		ctx.taken = taken1;
+		ctx.count = 1;
+
+		ok = pathsafe_unique_component(long_in_b, out_b,
+						sizeof(out_b), fake_is_taken,
+						&ctx, 5);
+		CHECK(ok, "pathsafe_unique: long input B colliding with A's"
+		      " candidate -> still succeeds");
+		CHECK(0 != str_cmp(out_a, out_b),
+		      "pathsafe_unique: two long, distinct call_ids that"
+		      " collide after truncation end up with two DIFFERENT"
+		      " final paths, not silently the same one (the real"
+		      " bug this finding describes: silent denial of"
+		      " recording for a legitimate call)");
+	}
+
+	/* max_attempts genuinely exhausted (every candidate the retry loop
+	 * could ever try, including the suffixed one, reported taken)
+	 * still fails cleanly - the fix doesn't turn a real exhaustion into
+	 * an infinite loop or a false success. Learn what the base (attempt
+	 * 0) and "-2" (attempt 1, the only retry max_attempts=1 allows)
+	 * candidates actually are first, rather than guessing their exact
+	 * bytes. */
+	{
+		char base_cand[128], suffixed_cand[128];
+		const char *taken1[1];
+		struct fake_taken_ctx ctx;
+
+		ok = pathsafe_unique_component(long_in, base_cand,
+						sizeof(base_cand), NULL, NULL,
+						0);
+		CHECK(ok, "pathsafe_unique: setup - learn the base candidate"
+		      " (max_attempts=0, no retries possible)");
+
+		taken1[0] = base_cand;
+		ctx.taken = taken1;
+		ctx.count = 1;
+
+		ok = pathsafe_unique_component(long_in, suffixed_cand,
+						sizeof(suffixed_cand),
+						fake_is_taken, &ctx, 1);
+		CHECK(ok, "pathsafe_unique: setup - learn the '-2' candidate"
+		      " (base taken, exactly 1 retry allowed, must succeed)");
+		CHECK(0 != str_cmp(base_cand, suffixed_cand),
+		      "pathsafe_unique: setup - the two learned candidates"
+		      " are themselves distinct (sanity check for this"
+		      " sub-test, not a new assertion about the fix)");
+
+		/* Now both are taken, with max_attempts=1 (still only one
+		 * retry allowed) - genuinely exhausted, must report false. */
+		{
+			const char *taken2[2];
+
+			taken2[0] = base_cand;
+			taken2[1] = suffixed_cand;
+			ctx.taken = taken2;
+			ctx.count = 2;
+
+			ok = pathsafe_unique_component(long_in, out,
+							sizeof(out),
+							fake_is_taken, &ctx,
+							1);
+			CHECK(!ok, "pathsafe_unique: long input, real"
+			      " exhaustion (both reachable candidates taken,"
+			      " max_attempts=1) -> false, not a false"
+			      " success");
+		}
+	}
 }
 
 
@@ -776,12 +1169,171 @@ static void test_dialog_info_real_capture_ext510_idle(void)
 }
 
 
+/*
+ * v1.3 presence_override - real capture, mid-hold (see core/E2E-F1.md
+ * "F5 presence_override" and dialog_info.h's own header comment on
+ * CENT_BLF_HELD for the full story). Captured via SIP trace (-s) while
+ * ext 1100 (this engine's own test account, dual-contact trick) had a
+ * live bridged call on local hold (this engine's own `hold` command) -
+ * this exact body (only `version=` differs across the 3 NOTIFYs actually
+ * captured spanning the hold window - all byte-identical otherwise) is
+ * what a real FreePBX 17.0.30 / Asterisk 22.8.2 chan_pjsip hint sends:
+ * plain `<state>confirmed</state>`, no rendering param, no
+ * <local>/<remote>/<target> at all - indistinguishable from a plain busy
+ * call at this layer. This is a *regression guard*, not a bug report:
+ * proves this parser correctly reads what the real PBX actually sends
+ * (busy, not a false "held") rather than what RFC 4235 merely allows a
+ * compliant implementation to send.
+ */
+static void test_dialog_info_real_capture_1100_confirmed_no_hold_signal(void)
+{
+	static const char real_body[] =
+		"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n"
+		"<dialog-info xmlns=\"urn:ietf:params:xml:ns:dialog-info\""
+		" version=\"2\" state=\"full\""
+		" entity=\"sip:1100@192.0.2.10\">\r\n"
+		" <dialog id=\"1100\">\r\n"
+		"  <state>confirmed</state>\r\n"
+		" </dialog>\r\n"
+		"</dialog-info>\r\n";
+
+	CHECK(CENT_BLF_BUSY ==
+	      dialog_info_parse(real_body, str_len(real_body)),
+	      "dialog_info: real ext-1100 capture, mid-hold (state=full,"
+	      " dialog state=confirmed, NO rendering param) -> busy, NOT"
+	      " held - this real PBX doesn't signal hold via dialog-info"
+	      " (see dialog_info.h's CENT_BLF_HELD comment)");
+}
+
+
+/*
+ * v1.3 presence_override - HELD: RFC 4235/RFC 3840 "+sip.rendering"
+ * pvalue="no" target param on a confirmed dialog (see dialog_info.h's
+ * header comment for the full rationale). Synthetic fixtures, built
+ * strictly to the RFC 4235/3840 documented shape - see
+ * core/E2E-F1.md "F5 presence_override" for whether/how this was also
+ * confirmed against a real captured NOTIFY body from this repo's test
+ * PBX (update this comment - and swap in the real body as an additional
+ * fixture, matching test_dialog_info_real_capture_ext510_idle()'s own
+ * precedent - the moment that capture exists).
+ */
+static void test_dialog_info_held(void)
+{
+	static const char confirmed_local_held[] =
+		"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n"
+		"<dialog-info xmlns=\"urn:ietf:params:xml:ns:dialog-info\""
+		" version=\"1\" state=\"partial\""
+		" entity=\"sip:ext@pbx.example.com\">\r\n"
+		" <dialog id=\"1\">\r\n"
+		"  <state>confirmed</state>\r\n"
+		"  <local>\r\n"
+		"   <target uri=\"sip:ext@pbx.example.com\">\r\n"
+		"    <param pname=\"+sip.rendering\" pvalue=\"no\"/>\r\n"
+		"   </target>\r\n"
+		"  </local>\r\n"
+		" </dialog>\r\n"
+		"</dialog-info>\r\n";
+	static const char remote_target[] =
+		"<dialog-info state=\"full\">"
+		"<dialog id=\"abc\"><state>confirmed</state>"
+		"<remote><target uri=\"sip:peer@host\">"
+		"<param pname=\"+sip.rendering\" pvalue=\"no\"/>"
+		"</target></remote>"
+		"</dialog></dialog-info>";
+	static const char rendering_yes[] =
+		"<dialog-info state=\"full\">"
+		"<dialog id=\"abc\"><state>confirmed</state>"
+		"<local><target uri=\"sip:x@host\">"
+		"<param pname=\"+sip.rendering\" pvalue=\"yes\"/>"
+		"</target></local>"
+		"</dialog></dialog-info>";
+
+	CHECK(CENT_BLF_HELD ==
+	      dialog_info_parse(confirmed_local_held,
+				 str_len(confirmed_local_held)),
+	      "dialog_info: confirmed + local target rendering=no -> held");
+	CHECK(CENT_BLF_HELD ==
+	      dialog_info_parse(remote_target, str_len(remote_target)),
+	      "dialog_info: confirmed + remote target rendering=no -> held");
+	CHECK(CENT_BLF_BUSY ==
+	      dialog_info_parse(rendering_yes, str_len(rendering_yes)),
+	      "dialog_info: confirmed + rendering=yes (not held) -> busy,"
+	      " not held");
+}
+
+
+/*
+ * v1.3 presence_override - DND: best-effort, non-standard hook, NOT
+ * confirmed against a real Asterisk capture (see dialog_info.h). Scope
+ * is deliberately narrow (v1.3 4R finding R1... R4 - see dialog_info.c's
+ * own comment): only overrides what would otherwise be "idle" (no
+ * <dialog> element at all) - never a genuinely active dialog, including
+ * one that's merely "terminated" (still a real <dialog> element, handled
+ * by the normal <state> parsing path, unaffected by dnd).
+ */
+static void test_dialog_info_dnd(void)
+{
+	static const char dnd_element[] =
+		"<dialog-info state=\"full\" entity=\"sip:510@host\">"
+		"<dnd>true</dnd>"
+		"</dialog-info>";
+	static const char dnd_attr[] =
+		"<dialog-info state=\"full\" entity=\"sip:510@host\""
+		" dnd=\"true\">"
+		"</dialog-info>";
+	static const char dnd_with_terminated_dialog[] =
+		"<dialog-info state=\"full\">"
+		"<dnd>true</dnd>"
+		"<dialog id=\"abc\"><state>terminated</state></dialog>"
+		"</dialog-info>";
+	static const char dnd_with_confirmed_dialog[] =
+		"<dialog-info state=\"full\">"
+		"<dnd>true</dnd>"
+		"<dialog id=\"abc\"><state>confirmed</state></dialog>"
+		"</dialog-info>";
+	static const char dnd_with_early_dialog[] =
+		"<dialog-info state=\"full\">"
+		"<dnd>true</dnd>"
+		"<dialog id=\"abc\"><state>early</state></dialog>"
+		"</dialog-info>";
+
+	CHECK(CENT_BLF_DND ==
+	      dialog_info_parse(dnd_element, str_len(dnd_element)),
+	      "dialog_info: <dnd>true</dnd> element, no <dialog> -> dnd,"
+	      " overrides the idle fallback");
+	CHECK(CENT_BLF_DND ==
+	      dialog_info_parse(dnd_attr, str_len(dnd_attr)),
+	      "dialog_info: dnd=\"true\" attribute -> dnd");
+
+	/* R4 regression guard: a dnd marker must NEVER override a real
+	 * active dialog state - only the "no <dialog> at all" case. */
+	CHECK(CENT_BLF_IDLE ==
+	      dialog_info_parse(dnd_with_terminated_dialog,
+				 str_len(dnd_with_terminated_dialog)),
+	      "dialog_info: dnd marker + a real (terminated) <dialog>"
+	      " element -> idle, NOT dnd (a terminated dialog is a real"
+	      " <dialog>, handled by the normal <state> path)");
+	CHECK(CENT_BLF_BUSY ==
+	      dialog_info_parse(dnd_with_confirmed_dialog,
+				 str_len(dnd_with_confirmed_dialog)),
+	      "dialog_info: dnd marker + <state>confirmed</state> -> busy,"
+	      " NOT dnd - dnd never overrides a genuinely active dialog");
+	CHECK(CENT_BLF_RINGING ==
+	      dialog_info_parse(dnd_with_early_dialog,
+				 str_len(dnd_with_early_dialog)),
+	      "dialog_info: dnd marker + <state>early</state> -> ringing,"
+	      " NOT dnd - same guarantee for the ringing case");
+}
+
+
 static void test_blf_state_name(void)
 {
 	CHECK_STREQ(cent_blf_state_name(CENT_BLF_IDLE), "idle", "name: idle");
 	CHECK_STREQ(cent_blf_state_name(CENT_BLF_RINGING), "ringing",
 		    "name: ringing");
 	CHECK_STREQ(cent_blf_state_name(CENT_BLF_BUSY), "busy", "name: busy");
+	CHECK_STREQ(cent_blf_state_name(CENT_BLF_HELD), "held", "name: held");
+	CHECK_STREQ(cent_blf_state_name(CENT_BLF_DND), "dnd", "name: dnd");
 	CHECK_STREQ(cent_blf_state_name(CENT_BLF_OFFLINE), "offline",
 		    "name: offline");
 }
@@ -800,6 +1352,8 @@ int main(void)
 	test_cmd_dial();
 	test_cmd_simple_noargs();
 	test_cmd_call_id_optional();
+	test_cmd_answer_call_id();
+	test_cmd_park();
 	test_cmd_dtmf();
 	test_cmd_mute();
 	test_cmd_transfer();
@@ -808,6 +1362,10 @@ int main(void)
 	test_cmd_id_correlation();
 	test_cmd_devices_and_set_device();
 	test_cmd_tap();
+
+	test_pathsafe_component();
+	test_pathsafe_unique_component();
+	test_pathsafe_unique_component_long_input();
 
 	test_wav_writer_basic();
 	test_wav_writer_multi_write();
@@ -820,6 +1378,9 @@ int main(void)
 	test_dialog_info_busy();
 	test_dialog_info_terminated_and_unknown();
 	test_dialog_info_real_capture_ext510_idle();
+	test_dialog_info_held();
+	test_dialog_info_real_capture_1100_confirmed_no_hold_signal();
+	test_dialog_info_dnd();
 	test_blf_state_name();
 
 	libre_close();

@@ -10,7 +10,7 @@
 
 project(ctrl_json)
 
-set(SRCS ctrl_json.c cmd.c dialog_info.c wav_writer.c audiotap.c)
+set(SRCS ctrl_json.c cmd.c dialog_info.c wav_writer.c audiotap.c pathsafe.c)
 
 if(STATIC)
   add_library(${PROJECT_NAME} OBJECT ${SRCS})
