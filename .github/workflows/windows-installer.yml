@@ -9,10 +9,27 @@ name: windows installer (F5 packaging)
 # stage-then-bundle shape exists — NSIS/MSI package a manifest, not
 # whatever's sitting in target/release/ afterward, unlike macOS's .app).
 #
-# workflow_dispatch only (not on every push) - this pipeline is expensive
-# (a full Windows Tauri build) and, for its "official Pro build" job, needs
-# a private-repo secret that does not exist yet. See job comments below.
+# workflow_dispatch is the intended long-term trigger for the gated
+# official-pro-build job (manual, on purpose - it's expensive and needs a
+# secret that doesn't exist yet, see that job's comments) - but GitHub only
+# allows dispatching a workflow that already exists on the repo's DEFAULT
+# branch, which for this repo is `main` (v1, permanently off-limits per
+# CLAUDE.md's hard rules; v2 hasn't been promoted to default yet). So
+# workflow_dispatch here is NOT currently invokable via CLI/API/UI - it's
+# left in place for when v2 (or wherever this file ends up) eventually
+# becomes the default branch. For now, verification happens via the `push`
+# trigger below (same pattern core-build.yml/shell-build.yml already use
+# for v2/v2-shell), scoped to this feature branch for its initial
+# smoke-test run - whoever integrates this into v2 should retarget these
+# `branches:` entries the same way shell-build.yml targets `v2-shell`.
 on:
+  push:
+    branches: [feature/windows-installer]
+    paths:
+      - 'shell/src-tauri/tauri.conf.json'
+      - 'shell/src-tauri/tauri.official.conf.json'
+      - 'scripts/package-official.sh'
+      - '.github/workflows/windows-installer.yml'
   workflow_dispatch:
     inputs:
       build_official_pro:
@@ -168,7 +185,7 @@ jobs:
   #      workflow or any GitHub Actions runner.
   official-pro-build:
     name: Official Pro build (core + shell + signed premium)
-    if: ${{ inputs.build_official_pro == true }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.build_official_pro == true }}
     runs-on: windows-latest
     steps:
       - name: Checkout phone (public, this ref)
