@@ -5,10 +5,7 @@
       "../dist-injected/core-engine/*": "core-engine/",
       "../dist-injected/centinelo_premium.dll": "centinelo_premium.dll",
       "../dist-injected/centinelo_premium.dll.sig": "centinelo_premium.dll.sig",
-      "../dist-injected/premium-console-assets/*": "premium-console-assets/",
-      "../dist-injected/premium-console-assets/components/**/*": "premium-console-assets/components/",
-      "../dist-injected/premium-console-assets/store/**/*": "premium-console-assets/store/",
-      "../dist-injected/premium-console-assets/bridge/**/*": "premium-console-assets/bridge/"
+      "../dist-injected/premium-console-assets/*": "premium-console-assets/"
     }
   }
 }

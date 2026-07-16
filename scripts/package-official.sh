@@ -28,13 +28,20 @@
 # in target/release/ afterward. So on Windows this script stages artifacts
 # into shell/dist-injected/ (gitignored) instead of beside a pre-built exe,
 # and the actual installer only gets built at the very end (step 9b), via
-# `tauri build --config tauri.official.conf.json` — that override file
-# (added this pass, sibling to tauri.conf.json) is the one place
-# `bundle.resources` is declared, kept OUT of the base tauri.conf.json on
-# purpose so plain community/dev builds and shell-build.yml's existing
-# Windows CI job are entirely unaffected. Verified end-to-end with synthetic
-# fixtures via .github/workflows/windows-installer.yml (run URL in the
-# report) — not yet against a real core-win build or a real signed dylib.
+# `tauri build --config tauri.official.generated.json` — step 9a generates
+# that file by filtering shell/src-tauri/tauri.official.conf.json (a
+# template, sibling to tauri.conf.json, checked in) down to only the
+# bundle.resources entries this run actually staged (4R/RELIABILITY fix
+# 2026-07-16: the template alone unconditionally declared every resource,
+# which made tauri build hard-fail for Community/Pro-without-console runs —
+# see step 9a's own comment). tauri.conf.json's base config never declares
+# `bundle.resources` at all, so plain community/dev builds and
+# shell-build.yml's existing Windows CI job are entirely unaffected.
+# Verified end-to-end with synthetic fixtures via
+# .github/workflows/windows-installer.yml's resources-mechanism-smoke-test
+# job (matrix over Community / Pro-without-console / Pro-with-console, run
+# URL in the report) — not yet against a real core-win build or a real
+# signed dylib.
 #
 # 🚨 This script NEVER embeds, generates, or receives a signing key. It only
 # copies already-built, already-signed artifacts whose paths are passed in
@@ -103,7 +110,9 @@ Options:
                                    into shell/dist-injected/, then a real
                                    NSIS/MSI installer is built around them
                                    via `tauri build --config
-                                   tauri.official.conf.json` (see "Windows
+                                   tauri.official.generated.json` (a
+                                   filtered copy of tauri.official.conf.json
+                                   this script generates - see "Windows
                                    target" in this file's header comment).
   --skip-core-build               Reuse an existing core/deps/baresip/build
                                    instead of rebuilding it (faster local
@@ -127,7 +136,7 @@ Options:
                                    unlocks the capability (assets missing).
   --output-dir DIR                Where to stage/report the final layout.
                                    Default: dist/<target>/.
-  --openssl-dll-dir DIR            Windows only, effectively REQUIRED: directory
+  --openssl-dll-dir DIR           Windows only, effectively REQUIRED: directory
                                    holding the OpenSSL runtime DLLs (e.g. the
                                    Chocolatey openssl package's bin/ dir,
                                    "$OPENSSL_ROOT_DIR\bin" in core-build.yml's
@@ -136,13 +145,20 @@ Options:
                                    will not start without these DLLs beside
                                    it on a clean machine (no dev tools). Every
                                    *.dll directly in this dir is copied flat
-                                   into core-engine/ beside baresip.exe.
+                                   into core-engine/ beside baresip.exe, but
+                                   the dir MUST contain at least one
+                                   libssl-*.dll and one libcrypto-*.dll (case
+                                   insensitive) - those two are what
+                                   baresip.exe actually needs to start.
+                                   Mutually exclusive with
+                                   --skip-openssl-dlls.
   --skip-openssl-dlls             Explicit opt-out of the above, for local
                                    iteration only (e.g. exercising the rest
                                    of the packaging pipeline without a full
                                    OpenSSL install to hand). CI must NOT pass
                                    this for a build meant to run on a real
-                                   machine.
+                                   machine. Mutually exclusive with
+                                   --openssl-dll-dir.
   -h, --help                      Show this help.
 
 Secrets/paths are ALWAYS CLI flags or env, NEVER hardcoded. This script
@@ -191,6 +207,16 @@ while [[ $# -gt 0 ]]; do
             exit 1 ;;
     esac
 done
+
+# 4R/RESILIENCE nit fix 2026-07-16: --openssl-dll-dir and --skip-openssl-dlls
+# are opposite instructions for the same question ("where do the OpenSSL
+# runtime DLLs come from") - giving both silently let --openssl-dll-dir win
+# (it's checked first in section 2b below), hiding a caller mistake instead
+# of surfacing it.
+if [[ -n "$OPENSSL_DLL_DIR" && "$SKIP_OPENSSL_DLLS" -eq 1 ]]; then
+    echo "error: --openssl-dll-dir and --skip-openssl-dlls are contradictory (both given) - pick one: either point at a real OpenSSL DLL dir, or explicitly skip bundling them for local-only iteration" >&2
+    exit 1
+fi
 
 # Resolve every path-shaped flag to an absolute path against $ORIGINAL_PWD
 # right here — before anything below `cd`s to $REPO_ROOT. 4R/RESILIENCE fix
@@ -307,13 +333,33 @@ fi
 # - this was the #1 blocker for Edgar's Windows beta (docs/HANDOFF.md). Fixed
 # here (2026-07-16, release-ci pass) - closes "Known gaps" #1 at the bottom
 # of this file.
+#
+# 4R/RESILIENCE fix 2026-07-16 (blocker #2): the original check here only
+# asserted "at least one *.dll exists in the dir" - a directory containing
+# the WRONG DLLs (e.g. only a legacy provider .dll, or a totally unrelated
+# *.dll someone pointed --openssl-dll-dir at by mistake) passed this check
+# and produced an installer that still fails to start baresip.exe, silently,
+# on a clean machine. Now asserts the two basenames baresip.exe actually
+# needs - libssl-*.dll and libcrypto-*.dll (case-insensitive: Chocolatey's
+# openssl package, and OpenSSL builds in general, are not consistent about
+# casing) - are each present by name, not just "some .dll exists".
 if [[ "$TARGET" == "windows" ]]; then
     if [[ -n "$OPENSSL_DLL_DIR" ]]; then
         [[ -d "$OPENSSL_DLL_DIR" ]] || { echo "error: --openssl-dll-dir not a directory: $OPENSSL_DLL_DIR" >&2; exit 1; }
-        shopt -s nullglob
-        _openssl_dll_check=("$OPENSSL_DLL_DIR"/*.dll)
-        shopt -u nullglob
-        [[ ${#_openssl_dll_check[@]} -gt 0 ]] || { echo "error: --openssl-dll-dir has no *.dll files: $OPENSSL_DLL_DIR" >&2; exit 1; }
+        shopt -s nullglob nocaseglob
+        _openssl_libssl_check=("$OPENSSL_DLL_DIR"/libssl-*.dll)
+        _openssl_libcrypto_check=("$OPENSSL_DLL_DIR"/libcrypto-*.dll)
+        shopt -u nullglob nocaseglob
+        if [[ ${#_openssl_libssl_check[@]} -eq 0 ]]; then
+            echo "error: --openssl-dll-dir has no libssl-*.dll file: $OPENSSL_DLL_DIR" >&2
+            echo "       (found: $(ls "$OPENSSL_DLL_DIR" 2>/dev/null | tr '\n' ' '))" >&2
+            exit 1
+        fi
+        if [[ ${#_openssl_libcrypto_check[@]} -eq 0 ]]; then
+            echo "error: --openssl-dll-dir has no libcrypto-*.dll file: $OPENSSL_DLL_DIR" >&2
+            echo "       (found: $(ls "$OPENSSL_DLL_DIR" 2>/dev/null | tr '\n' ' '))" >&2
+            exit 1
+        fi
     elif [[ "$SKIP_OPENSSL_DLLS" -eq 1 ]]; then
         echo "-- --skip-openssl-dlls given: packaging a Windows build WITHOUT the OpenSSL"
         echo "   runtime DLLs. core.exe will NOT start on a machine without OpenSSL"
@@ -445,9 +491,10 @@ fi
 #
 # Windows: NOT the exe dir (see step 4's comment above) - this is
 # shell/dist-injected/, the staging directory tauri.official.conf.json's
-# `bundle.resources` reads from. Step 9b's `tauri build --config
-# tauri.official.conf.json` is what actually copies these into the
-# NSIS/MSI installer, at the SAME per-file destinations
+# `bundle.resources` template reads from (step 9a filters it per-run, step
+# 9b's `tauri build --config tauri.official.generated.json` is what
+# actually copies the filtered set into the NSIS/MSI installer), at the
+# SAME per-file destinations
 # (core-engine/, centinelo_premium.dll(.sig), premium-console-assets/)
 # this script has always used for macOS - kept identical on purpose so the
 # runtime lookup code (premium.rs, PROTOCOL.md's ctrl_json contract) sees
@@ -637,14 +684,80 @@ echo "== Done. Layout written to $LAYOUT_FILE =="
 cat "$LAYOUT_FILE"
 
 # ---------------------------------------------------------------------------
+# 9a. Windows only: generate a FILTERED tauri.official.conf.json — dropping
+#     any bundle.resources entry whose source is NOT actually staged this
+#     run (skipped if --skip-shell-build, since no build happens then)
+# ---------------------------------------------------------------------------
+# 4R/RELIABILITY fix 2026-07-16 (BLOCKER #1): tauri.official.conf.json (the
+# checked-in template) unconditionally declares the premium dylib/.sig and
+# premium-console-assets/ resources. tauri build hard-fails with
+# ResourcePathNotFound/GlobPathNotFound the moment a declared resource
+# doesn't exist on disk — which is exactly what a Community edition (no
+# --premium-dylib) or a Pro-without-console build (no
+# --premium-console-assets) produces, since steps 7-8 above only populate
+# those paths when the corresponding flag was given. Every combination
+# package-official.sh --help documents as supported (Community /
+# Pro-without-console / Pro-with-console) must actually build. Fixed by
+# filtering the template down to only the entries this run's staging
+# directory actually has content for, via jq, and building against that
+# filtered copy instead of the static template.
+generate_windows_resources_config() {
+    local template="$REPO_ROOT/shell/src-tauri/tauri.official.conf.json"
+    local generated="$REPO_ROOT/shell/src-tauri/tauri.official.generated.json"
+    command -v jq >/dev/null 2>&1 || {
+        echo "error: jq is required to generate the Windows installer resources config" >&2
+        echo "       (--target windows) and was not found on PATH." >&2
+        exit 1
+    }
+
+    local include_premium=0 include_console=0
+    [[ "$IS_COMMUNITY" -eq 0 ]] && include_premium=1
+    [[ -n "$PREMIUM_CONSOLE_ASSETS" ]] && include_console=1
+
+    local filtered
+    filtered="$(jq --argjson premium "$include_premium" --argjson console "$include_console" '
+        .bundle.resources |= with_entries(
+            select(
+                (.key | startswith("../dist-injected/core-engine/"))
+                or (($premium == 1) and (.key | contains("centinelo_premium.dll")))
+                or (($console == 1) and (.key == "../dist-injected/premium-console-assets/*"))
+            )
+        )
+    ' "$template")"
+
+    # premium-console-assets/ SUBFOLDER entries (components/, store/,
+    # bridge/, and any future one) are synthesized here from the REAL
+    # subfolders present under --premium-console-assets, instead of a fixed
+    # list hardcoded in the template (4R/READABILITY fix 2026-07-16 — see
+    # tauri.official.conf.json for why a plain "premium-console-assets/*"
+    # entry alone is not enough: Tauri's glob resources are non-recursive,
+    # so each subfolder genuinely needs its own "**/*" entry, and a new
+    # subfolder added to the private premium-console-ui source would
+    # otherwise silently never make it into the installer until someone
+    # remembered to also hand-edit this JSON file).
+    if [[ "$include_console" -eq 1 ]]; then
+        local subdir name
+        while IFS= read -r subdir; do
+            name="$(basename "$subdir")"
+            filtered="$(printf '%s' "$filtered" | jq --arg name "$name" \
+                '.bundle.resources["../dist-injected/premium-console-assets/" + $name + "/**/*"] = ("premium-console-assets/" + $name + "/")')"
+        done < <(find "$PREMIUM_CONSOLE_ASSETS" -mindepth 1 -maxdepth 1 -type d)
+    fi
+
+    printf '%s\n' "$filtered" > "$generated"
+    echo "-- generated Windows installer resources config (community=$([[ $include_premium -eq 1 ]] && echo no || echo yes), console=$([[ $include_console -eq 1 ]] && echo yes || echo no)) -> $generated"
+    jq '.bundle.resources' "$generated"
+}
+
+# ---------------------------------------------------------------------------
 # 9b. Windows only: build the actual NSIS/MSI installer around the staged
 #     artifacts (skip with --skip-shell-build to just leave the staging
 #     directory populated for manual inspection)
 # ---------------------------------------------------------------------------
 # This is the step that makes step 5's "staging dir, not exe dir" comment
-# true: `tauri build --config tauri.official.conf.json` reads
-# tauri.official.conf.json's `bundle.resources` map (added 2026-07-16,
-# windows-installer pass), which points at shell/dist-injected/ - the exact
+# true: `tauri build --config tauri.official.generated.json` (generated by
+# 9a immediately above, see BLOCKER #1 fix there) reads the FILTERED
+# `bundle.resources` map, which points at shell/dist-injected/ - the exact
 # directory steps 6-8 just populated - and copies each entry into the
 # NSIS/MSI installer at build time. This only runs NOW, after staging,
 # because both bundlers are config/manifest-driven: they package what
@@ -653,12 +766,12 @@ cat "$LAYOUT_FILE"
 # rely on - a .app is just a directory, an NSIS/MSI installer is not).
 #
 # tauri.conf.json's base config intentionally does NOT declare these
-# resources (only tauri.official.conf.json, merged in here via --config)
-# so a plain community `cargo tauri build`/`tauri dev`, or shell-build.yml's
-# existing Windows CI job, is completely unaffected by this file's
-# existence - it never passes --config, so it never looks at
-# shell/dist-injected/ at all, and doesn't care whether that directory
-# exists or is empty.
+# resources (only tauri.official.conf.json / tauri.official.generated.json,
+# merged in here via --config) so a plain community `cargo tauri
+# build`/`tauri dev`, or shell-build.yml's existing Windows CI job, is
+# completely unaffected by this file's existence - it never passes
+# --config, so it never looks at shell/dist-injected/ at all, and doesn't
+# care whether that directory exists or is empty.
 if [[ "$TARGET" == "windows" ]]; then
     if [[ "$SKIP_SHELL_BUILD" -eq 1 ]]; then
         echo
@@ -666,8 +779,22 @@ if [[ "$TARGET" == "windows" ]]; then
         echo "   sitting in $ARTIFACT_DEST_DIR but no .msi/.exe was produced this run."
     else
         echo
-        echo "-- Building the Windows installer (tauri build --config tauri.official.conf.json, nsis+msi)"
-        (cd shell && npm install && npx tauri build --config src-tauri/tauri.official.conf.json --bundles nsis,msi)
+        generate_windows_resources_config
+        echo "-- Building the Windows installer (tauri build --config tauri.official.generated.json, nsis+msi)"
+        (cd shell && npm install && npx tauri build --config src-tauri/tauri.official.generated.json --bundles nsis,msi)
+        NSIS_OUT_DIR="$REPO_ROOT/shell/src-tauri/target/release/bundle/nsis"
+        MSI_OUT_DIR="$REPO_ROOT/shell/src-tauri/target/release/bundle/msi"
+        # 4R/RESILIENCE fix 2026-07-16: `tauri build` exiting 0 is not proof
+        # either bundler actually produced its installer file — assert both
+        # explicitly, same shape as every other post-copy check in this
+        # script, rather than letting a silently-empty bundle/ dir surface
+        # three steps later as a confusing "no artifact to upload" in CI.
+        shopt -s nullglob
+        _nsis_check=("$NSIS_OUT_DIR"/*.exe)
+        _msi_check=("$MSI_OUT_DIR"/*.msi)
+        shopt -u nullglob
+        [[ ${#_nsis_check[@]} -gt 0 ]] || { echo "error: tauri build reported success but no .exe found in $NSIS_OUT_DIR" >&2; exit 1; }
+        [[ ${#_msi_check[@]} -gt 0 ]] || { echo "error: tauri build reported success but no .msi found in $MSI_OUT_DIR" >&2; exit 1; }
         echo "-- installer(s) at: shell/src-tauri/target/release/bundle/{nsis,msi}/"
     fi
 fi
@@ -691,17 +818,33 @@ fi
 #      resources-mechanism-smoke-test job proves the DLLs ride into the
 #      actual NSIS/MSI installer beside baresip.exe using synthetic
 #      fixtures. This was blocker #1 for Edgar's Windows beta
-#      (docs/HANDOFF.md) — closing it here does not by itself prove it on a
-#      real end-user machine (that still needs qa-e2e with a physical
-#      Windows box + the official-pro-build job actually run, which is
-#      still gated behind PREMIUM_REPO_PAT per gap #4 below), but the
-#      packaging mechanism itself is now verified end-to-end in CI.
+#      (docs/HANDOFF.md). 4R/RELIABILITY correction 2026-07-16: an earlier
+#      draft of this paragraph said this was "verified end-to-end via
+#      windows-installer.yml" — that overclaimed. What is actually verified
+#      end-to-end in CI, this pass, is the STAGING+PACKAGING MECHANISM
+#      (--openssl-dll-dir copying flat into core-engine/, and
+#      bundle.resources carrying that into the real NSIS/MSI installer at
+#      the right path) using synthetic fixture DLLs — not real Chocolatey
+#      OpenSSL DLLs, not a real core-win build, and not the
+#      official-pro-build job (still gated off, see gap #4). The real path
+#      (`--openssl-dll-dir "$OPENSSL_ROOT_DIR/bin"` against a genuine
+#      Chocolatey install, feeding a genuine core-win-built baresip.exe)
+#      has NOT had a first real run yet — that only happens once
+#      official-pro-build is actually dispatched with
+#      i_understand_public_artifact_risk=true, which needs PREMIUM_REPO_PAT
+#      to exist first (gap #4) — and until then this closes the packaging
+#      MECHANISM half of blocker #1, not the blocker itself. Final proof on
+#      a real end-user machine additionally needs qa-e2e with a physical
+#      Windows box.
 #   2. [Partially closed 2026-07-16, windows-installer pass] Windows now HAS
 #      an installer path: tauri.official.conf.json's `bundle.resources`
-#      (merged via `tauri build --config`, see step 9b) turns the artifacts
-#      this script stages in shell/dist-injected/ into a real NSIS/MSI
-#      installer — verified end-to-end with synthetic fixtures against
-#      resources placement + build succeeding, see
+#      template, filtered per-run into tauri.official.generated.json (step
+#      9a) and merged via `tauri build --config` (step 9b), turns the
+#      artifacts this script stages in shell/dist-injected/ into a real
+#      NSIS/MSI installer — verified end-to-end with synthetic fixtures
+#      against resources placement + build succeeding across all three
+#      supported combinations (Community / Pro-without-console /
+#      Pro-with-console), see
 #      .claude/reports/release-ci-2026-07-16-windows-installer.md for the
 #      run URL. Still open: macOS DMG signing/notarization, and Windows OV
 #      cert code-signing (`bundle.windows.certificateThumbprint` is
@@ -733,14 +876,19 @@ fi
 #      dir — e.g. Community right after Pro — no longer leaves stale
 #      premium artifacts behind. core-engine/ (step 6) is likewise now
 #      `rm -rf`'d before each repopulation.
-#   6. The four core/ patches (0001-0004) are listed independently in THREE
-#      places: this script's apply_patch() calls, core-build.yml's macOS
-#      job, and core-build.yml's Windows job — no shared source, so a new
-#      patch (or a reordering) has to be hand-added in three places or
-#      silently drifts. Proposed fix (not implemented here — touches CI,
-#      out of this pass's scope): a `core/patches/series.txt` listing
+#   6. [Count corrected 2026-07-16, windows-installer pass] The four core/
+#      patches (0001-0004) are listed independently in FOUR places: this
+#      script's apply_patch() calls, core-build.yml's macOS job,
+#      core-build.yml's Windows job, and — added this pass —
+#      windows-installer.yml's official-pro-build job ("Apply local
+#      re/baresip patches" step, four inline `git apply` calls) — no shared
+#      source, so a new patch (or a reordering) has to be hand-added in all
+#      four places or silently drifts. Proposed fix (not implemented here —
+#      touches CI, out of this pass's scope, and would need core-build.yml's
+#      Windows job — GATING per CLAUDE.md — re-verified green before
+#      merging any change to it): a `core/patches/series.txt` listing
 #      `<submodule-dir> <patch-file>` pairs in apply order, read by a tiny
-#      shared shell function all three consumers call instead of hardcoding
+#      shared shell function all four consumers call instead of hardcoding
 #      the list each.
 #   7. PREMIUM_LIB_NAME (step 5) duplicates
 #      centinelo-premium-abi::expected_library_filename()'s per-OS naming
