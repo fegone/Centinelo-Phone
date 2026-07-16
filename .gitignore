@@ -21,3 +21,4 @@ core/**/*.so
 core/**/*.dylib
 centinelo-spike.*/
 *.baresip-scratch/
+graphify-out/
