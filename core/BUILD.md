@@ -489,9 +489,15 @@ still uploaded as an artifact on every run (pass or fail) via
 things that only show up in the raw CMake/MSVC output.
 
 **Confirmed green run** (not "should work" — an actual passing run,
-checked): [`29459035249`](https://github.com/fegone/Centinelo-Phone/actions/runs/29459035249)
-(`5be8dbf`, `v2-winci` branch) — `macOS (supported)` in 38s, `Windows
-(experimental)` in 4m9s, both ✓.
+checked): [`29533068908`](https://github.com/fegone/Centinelo-Phone/actions/runs/29533068908)
+(`db5f7e6`, `v2-winci` branch, 2026-07-16) — `macOS (supported)` in 1m6s,
+`Windows (experimental)` in 4m34s, both ✓, with the full media module set
+below (`ausine;aufile;ice;dtls_srtp;wasapi`) compiled in — confirmed from
+the job's own log, not inferred: `MODULES_DETECTED=account;g711;auconv;
+auresamp;ausine;aufile;ice;dtls_srtp;menu;wasapi;ctrl_json`. Prior run
+([`29459035249`](https://github.com/fegone/Centinelo-Phone/actions/runs/29459035249),
+`5be8dbf`) confirmed only the smaller pre-fix module set — see "Windows
+media modules" below for what changed and why.
 
 ### What's actually different on Windows (read the workflow file, not this doc, for the literal commands — this section explains *why*)
 
@@ -527,16 +533,11 @@ checked): [`29459035249`](https://github.com/fegone/Centinelo-Phone/actions/runs
    `FindRE.cmake` itself (upstream file, would need to survive the next
    `git submodule update`).
 
-3. **Smaller `MODULES` set on Windows** than macOS:
-   `account;g711;auconv;auresamp;menu` — **`ausine`, `aufile`, `ice`, and
-   `dtls_srtp` are not built on Windows today.** This is a real,
-   intentional-for-now scope reduction (not yet investigated further, so
-   flagged here rather than left silently implicit): the Windows job
-   only proves the engine + `ctrl_json` **link and produce a runnable
-   `baresip.exe`**, not that a full WSS/ICE/DTLS-SRTP call actually
-   works on Windows — see "Sanity" below. core-engine owns closing this
-   gap (getting `ice`/`dtls_srtp` building under MSVC) before Windows can
-   be a real e2e target, not just a green compile.
+3. **`MODULES` set on Windows now matches macOS's media set, plus the
+   Windows-native audio backend**: `account;g711;auconv;auresamp;ausine;
+   aufile;ice;dtls_srtp;menu;wasapi`. See "Windows media modules" below
+   for the full rationale (what was missing before 2026-07-16, why, and
+   what a green run does/doesn't prove) — not repeated here.
 
 4. **No runtime smoke test** — the Windows job only checks the artifacts
    exist (`test -x .../Release/baresip.exe`, `test -f
@@ -545,7 +546,93 @@ checked): [`29459035249`](https://github.com/fegone/Centinelo-Phone/actions/runs
    OpenSSL's import libs, and the OpenSSL DLLs aren't on `PATH` at
    sanity-check time — actually invoking the binary would need that
    sorted out first. So a green Windows run today means "builds and
-   links cleanly on MSVC", not "runs".
+   links cleanly on MSVC", not "runs". The sanity step does additionally
+   assert every module actually got compiled in, not just requested: for
+   a `STATIC` build there's no per-module `.dll` file to `test -f` (they
+   become `OBJECT` libraries baked into `baresip`'s own static lib and
+   the generated `src/static.c` exports table — see
+   `core/deps/baresip/CMakeLists.txt`'s `MODULES_DETECTED` handling), so
+   the CI step instead greps the tee'd configure log for baresip's own
+   `message("MODULES_DETECTED=...")` line and fails the job if any of
+   `ausine`/`aufile`/`ice`/`dtls_srtp`/`wasapi` is missing from it — this
+   is the mechanism that would have caught the pre-2026-07-16 state (or
+   any future module silently dropping out via an early `return()` in its
+   own `CMakeLists.txt`, e.g. an unsatisfied optional dependency) as a
+   hard CI failure instead of a silently-smaller green build. The check
+   is a token-exact match against the `;`-separated list (wraps both
+   sides in `;` and matches `;name;`), not a plain substring check — a
+   substring check would wrongly pass a module whose name is contained
+   inside another present module's name.
+
+### Windows media modules (fixed 2026-07-16)
+
+Before this date the Windows CI `MODULES` list was
+`account;g711;auconv;auresamp;menu` — a real functional gap, not a
+cosmetic one: **no path to real call media at all** on Windows. Fixed by
+adding `ausine;aufile;ice;dtls_srtp;wasapi` (now
+`account;g711;auconv;auresamp;ausine;aufile;ice;dtls_srtp;menu;wasapi`,
+matching macOS's media set plus the one genuinely-platform-specific
+module).
+
+- **`ice`, `dtls_srtp`, `ausine`, `aufile`**: read all four modules'
+  source (`core/deps/baresip/modules/{ice,dtls_srtp,ausine,aufile}/*.c`)
+  before enabling them — none has a `WIN32`/`_WIN32` guard in its
+  `CMakeLists.txt` (unlike `wasapi`, see below), and none calls a raw
+  POSIX function MSVC lacks (they use `re`'s own portable wrappers
+  throughout — `pl_strcasecmp`, `re_snprintf`, `sys_msleep`, confirmed by
+  grepping for `strcasecmp`/`usleep`/`alloca`/`gettimeofday`/... and
+  finding none). `dtls_srtp`'s own gate (`if(NOT USE_OPENSSL) return()`)
+  was already satisfiable on Windows before this fix too: baresip's
+  `CMakeLists.txt` line 100 (`find_package(re CONFIG REQUIRED HINTS
+  ../re/cmake)`) unconditionally re-includes
+  `core/deps/re/cmake/re-config.cmake` — independent of the platform's
+  `find_package(RE)` (module-mode, line 39, satisfied via the explicit
+  `-DRE_LIBRARY`/`-DRE_INCLUDE_DIR` flags on Windows) — which derives
+  `USE_OPENSSL` fresh from `find_package(OpenSSL)` using whatever
+  `OPENSSL_ROOT_DIR` this job's own configure step passes. Since the
+  Windows job already forwards `-DOPENSSL_ROOT_DIR="$OPENSSL_ROOT_DIR"`
+  to the baresip configure (needed by `dtls_srtp` itself, and also by
+  `re-config.cmake`'s own `find_package(OpenSSL)` call), `USE_OPENSSL`
+  was already true there before this change — the module was simply
+  never requested. Confirmed for real, not just by reading: the Windows
+  CI run below shows `dtls_srtp` present in `MODULES_DETECTED`.
+- **`wasapi`**: baresip v4.9.0 does not have a `winwave` module (checked
+  `core/deps/baresip/modules/` directly — no such directory); `wasapi`
+  (Windows Audio Session API, the modern backend) is the one Windows
+  audio module that exists, gated `if(NOT WIN32) return()` in its own
+  `CMakeLists.txt` (so requesting it on macOS/Linux would be a silent
+  no-op — this is exactly the case the new `MODULES_DETECTED` assertion
+  above does *not* check for, since the assertion only runs in the
+  Windows job). Its four source files (`wasapi.c`, `play.c`, `src.c`,
+  `util.c`) only include Windows SDK COM headers
+  (`mmdeviceapi.h`/`audioclient.h`/...) plus `re`/`baresip`'s own — no
+  extra CMake wiring was needed for linking either: baresip's top-level
+  `CMakeLists.txt` already appends `ole32`/`oleaut32` (among others) to
+  `LINKLIBS` whenever `WIN32` (line ~268), which is what WASAPI's COM
+  interfaces need; the module doesn't touch MMCSS
+  (`Avrt`/`AvSetMmThreadCharacteristics`), so no `avrt` link dependency
+  either.
+- **What this does *not* yet prove**: CI only proves these modules
+  *compile and link* on MSVC (via the `MODULES_DETECTED` assertion) — it
+  does not run `baresip.exe` at all (see point 4 above), so it cannot
+  confirm a real WSS/ICE/DTLS-SRTP call actually completes, or that
+  `wasapi` actually opens a real microphone/speaker, on real Windows
+  hardware. No Windows machine was available this session (same
+  constraint as "F1 status" below) — this is a CI-only, link-level
+  verification, stated explicitly rather than implied.
+- **Separate, real gap this does *not* close (shell-tauri's scope, not
+  core-engine's)**: `shell/src-tauri/src/sidecar.rs`'s
+  `write_config_file()` hardcodes `audio_source ausine,440` /
+  `audio_player aufile,<scratch>/rx.wav` unconditionally, on **every**
+  platform including macOS — i.e. the shell's real, shipped config never
+  actually selects a real microphone/speaker device today, on any OS.
+  Compiling `wasapi` in on Windows makes the module available; it does
+  nothing by itself until `write_config_file()` is made
+  platform-conditional (`wasapi,default` and an analogous mac path — no
+  `coreaudio` module is enabled on macOS either, same file, same gap) to
+  actually select it as `audio_source`/`audio_player`. Flagged to
+  shell-tauri, not fixed here — out of `phone/core/` scope, and
+  `shell/src-tauri/` isn't touched by this file or workflow.
 
 **F1 status** (`ctrl_json.c`'s stdin path, still accurate, unchanged by
 the above): the previously-flagged Windows blocker (`unistd.h`/`read()`/
