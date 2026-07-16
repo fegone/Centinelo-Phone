@@ -13,7 +13,7 @@ to what this engine actually needs.
 
 **v1.1 status: every command below is implemented and e2e-verified
 against the real test PBX** (FreePBX 17 / Asterisk 22 at
-`100.119.230.80`) — see `core/E2E-F1.md` for the v1 evidence and its "F3
+`<pbx host>`) — see `core/E2E-F1.md` for the v1 evidence and its "F3
 regression" section for v1.1's. v1.1 is **fully backward compatible with
 v1**: every v1 command/event is byte-for-byte unchanged in shape and
 behavior; v1.1 only *adds* the optional `id` field (§"Commands"), two new
@@ -44,7 +44,7 @@ byte-for-byte unchanged; v1.3 only *adds* an optional `call_id` on
 `answer`, one new command (`park`) and its `park` event, and two new
 `blf` event `state` values (`held`/`dnd`). Per-feature status, each
 e2e-verified against the real test PBX (`core/E2E-F1.md` "F5
-presence_override"/"F5 park", dual-contact ext 1100 trick):
+presence_override"/"F5 park", dual-contact ext 1000 trick):
 - **`answer` with explicit `call_id`**: e2e **PASS** — a specific
   incoming call (not just "the" incoming call) answers correctly.
 - **`held`**: the parser rule is implemented correctly to the RFC
@@ -426,7 +426,7 @@ verification status of each, and `core/E2E-F1.md` "F5 presence_override"/
   (`test_pathsafe_component()`, `core/modules/ctrl_json/test/test_main.c`)
   cover the charset whitelist, `../` / bare `..`/`.` neutralization,
   truncation, and NULL/zero-size edge cases; e2e-confirmed (dual-contact
-  1100, real UUID-shaped call_id) that a normal call_id's filename is
+  1000, real UUID-shaped call_id) that a normal call_id's filename is
   unaffected — see `core/E2E-F1.md` "F5 pathsafe regression".
 
 ## Planned (still not in v1.3)

@@ -1,7 +1,7 @@
 # F2 e2e verification — evidence
 
 **Verdict: PASS.** The real Tauri app (debug build, `cargo tauri dev`)
-registered extension **1100** on **100.119.230.80** over **WSS**, placed a
+registered extension **1000** on **<pbx host>** over **WSS**, placed a
 real call to the `*43` echo test extension through its own sidecar
 supervisor (`shell/src-tauri/src/sidecar.rs`), and independent,
 Asterisk-side, read-only verification confirmed real bidirectional RTP
@@ -11,8 +11,8 @@ registered, established, carried real audio, and closed cleanly.
 
 ## Setup
 
-- Test PBX: `100.119.230.80` (FreePBX/Asterisk, Tailscale), extension
-  `1100`, secret read from the v1 app's own settings file
+- Test PBX: `<pbx host>` (FreePBX/Asterisk, Tailscale), extension
+  `1000`, secret read from the v1 app's own settings file
   (`~/Library/Application Support/Centinelo Phone/settings.json`,
   never printed/logged/committed — see "How settings were configured"
   below).
@@ -22,7 +22,7 @@ registered, established, carried real audio, and closed cleanly.
 - Transport: `wss` (explicit, not `auto`) for determinism — `auto`'s
   wss->udp fallback is a startup-time decision (see README "Architecture"),
   not something worth re-testing per call.
-- Dial target: `sip:*43@100.119.230.80` (Asterisk's built-in echo test —
+- Dial target: `sip:*43@<pbx host>` (Asterisk's built-in echo test —
   answers immediately, loops audio back, exactly what `core/BUILD.md`'s own
   spike testing used).
 
@@ -66,16 +66,16 @@ Captured from the running app's own log (`sidecar.rs` logs every parsed
 own `e2e: ...` lines) — this run held the call 16 seconds:
 
 ```
-21:55:22 e2e: script starting: wait:6|dial:sip:*43@100.119.230.80|wait:16|hangup|wait:3
+21:55:22 e2e: script starting: wait:6|dial:sip:*43@<pbx host>|wait:16|hangup|wait:3
 21:55:22 e2e: waiting 6s
 21:55:22 sidecar event: {"event":"ready"}
-21:55:22 sidecar event: {"account":"sip:1100@100.119.230.80:8089","event":"reg_state","state":"registered","transport":"wss"}
-21:55:28 e2e: dial(sip:*43@100.119.230.80) -> ok
+21:55:22 sidecar event: {"account":"sip:1000@<pbx host>:8089","event":"reg_state","state":"registered","transport":"wss"}
+21:55:28 e2e: dial(sip:*43@<pbx host>) -> ok
 21:55:28 e2e: waiting 16s
-21:55:28 sidecar event: {"event":"call_state","id":"4f64f9c1cbf47ffb","peer":"sip:*43@100.119.230.80;transport=wss","state":"established"}
+21:55:28 sidecar event: {"event":"call_state","id":"4f64f9c1cbf47ffb","peer":"sip:*43@<pbx host>;transport=wss","state":"established"}
 21:55:44 e2e: hangup -> ok
 21:55:44 e2e: waiting 3s
-21:55:44 sidecar event: {"event":"call_state","id":"4f64f9c1cbf47ffb","peer":"sip:*43@100.119.230.80;transport=wss","state":"closed"}
+21:55:44 sidecar event: {"event":"call_state","id":"4f64f9c1cbf47ffb","peer":"sip:*43@<pbx host>;transport=wss","state":"closed"}
 21:55:47 e2e: script complete
 ```
 
@@ -85,22 +85,22 @@ immediately (Asterisk's echo test answers instantly, no separate
 
 ## Evidence: PBX-side RTP confirmation (read-only, independent of the app)
 
-Per the task's instructions: `ssh -i ~/.ssh/id_neola_vps root@100.119.230.80
+Per the task's instructions: `ssh -i ~/.ssh/id_pbx_test root@<pbx host>
 "asterisk -rx 'pjsip show channelstats'"`, polled every ~3-5s during the
 held call. Cleanest single-channel run (20s hold):
 
 ```
 === poll 1 at 17:56:56 ===
  BridgeId ChannelId ........ UpTime.. Codec.   Count    Lost Pct  Jitter   Count    Lost Pct  Jitter RTT....
-          1100-00000863      00:00:08 ulaw      244       0    0   0.000    244       0    0   0.002   0.000
+          1000-00000863      00:00:08 ulaw      244       0    0   0.000    244       0    0   0.002   0.000
 Objects found: 1
 
 === poll 2 at 17:56:59 ===
-          1100-00000863      00:00:11 ulaw      399       0    0   0.000    399       0    0   0.001   0.000
+          1000-00000863      00:00:11 ulaw      399       0    0   0.000    399       0    0   0.001   0.000
 Objects found: 1
 
 === poll 3 at 17:57:03 ===
-          1100-00000863      00:00:15 ulaw      555       0    0   0.000    555       0    0   0.001   0.000
+          1000-00000863      00:00:15 ulaw      555       0    0   0.000    555       0    0   0.001   0.000
 Objects found: 1
 ```
 
@@ -113,7 +113,7 @@ evidence of real, live, flowing bidirectional RTP audio, independently
 confirmed from the PBX side, not just the app's own event log.
 
 A second, later run (25s hold) additionally showed **two** RTP legs
-(`1100-00000865` / `...866`, both counts climbing together, still 0% loss)
+(`1000-00000865` / `...866`, both counts climbing together, still 0% loss)
 — consistent with Asterisk's echo-test channel plus its bridged peer leg.
 
 Every poll taken *after* the scripted `hangup` returned `No objects
@@ -154,7 +154,7 @@ reproducible evidence is the log/RTP data above). What was directly
 observed on the real running app:
 
 1. **Idle main window** — titlebar "Centinelo · Ready" with the breathing
-   amber watchlamp dot; identity card "E2E Test / EXT 1100" with a green
+   amber watchlamp dot; identity card "E2E Test / EXT 1000" with a green
    "WSS" registration pill; empty dial display; full 3x4 keypad; green call
    button; 4 favorite tiles all showing "Empty"; recents list showing
    `*43 / Incoming / <time> / 00:2X` rows, newest first, matching
@@ -206,7 +206,7 @@ check: a temporary debug line in `lib.rs` calling
 invokes) and logging its JSON output on startup:
 
 ```
-diag: get_account_settings -> {"host":"100.119.230.80","ext":"1100","display_name":"E2E Test","transport_priority":"wss","secret_set":true}
+diag: get_account_settings -> {"host":"<pbx host>","ext":"1000","display_name":"E2E Test","transport_priority":"wss","secret_set":true}
 ```
 
 This confirms the backend-to-frontend contract returns `"wss"` correctly,
@@ -246,13 +246,13 @@ a debug-build verification pass. See "Known limitations" below and
 
 ## Setup
 
-Same test PBX/extension as F2 (`100.119.230.80`, ext `1100`, secret from
+Same test PBX/extension as F2 (`<pbx host>`, ext `1000`, secret from
 the v1 app's own settings file, transport `wss`) — see F2's "Setup" above.
 Two new things this session:
 
 - **Second baresip instance ("instance B")**: a *separate* process, run
   directly via `core/run-spike.sh` (not through the shell) with its own
-  scratch dir, registered as the **same** extension `1100` — ext `1100`
+  scratch dir, registered as the **same** extension `1000` — ext `1000`
   allows `max_contacts=2`, so this is a legitimate dual-contact
   registration, not a conflict. Driven by piping a persistent `tail -f
   cmds.txt` into its stdin (a plain FIFO would EOF - and per
@@ -265,7 +265,7 @@ Two new things this session:
   (`~/Library/Application Support/com.centinelo.phone/settings.json`)
   edited directly (host/ext/secret/transport already present from F2's own
   testing; only `favorites` was changed) to set `favorites[0] =
-  {"ext":"1100","label":"Self (BLF)"}` and `favorites[1] =
+  {"ext":"1000","label":"Self (BLF)"}` and `favorites[1] =
   {"ext":"510","label":"Test 510"}` — this is what makes the shell
   `blf_subscribe` both on registration, exercising the actual free-tier
   feature rather than a synthetic backend-only call. Editing settings.json
@@ -302,50 +302,50 @@ Two full runs were captured; the second (below) is the clean one — the
 first surfaced and fixed a test-harness timing bug (see "Investigated, not
 a bug" below), not a product bug.
 
-`CENTINELO_E2E_SCRIPT="wait:5|dial:sip:1100@100.119.230.80|wait:15|hangup|wait:3"`,
+`CENTINELO_E2E_SCRIPT="wait:5|dial:sip:1000@<pbx host>|wait:15|hangup|wait:3"`,
 instance B already registered and its auto-answer loop already armed
 before instance A started:
 
 ```
-23:29:05 sidecar event: {"account":"sip:1100@100.119.230.80:8089","event":"reg_state","state":"registered","transport":"wss"}
-23:29:05 sidecar event: {"event":"blf","ext":"1100","state":"idle"}
+23:29:05 sidecar event: {"account":"sip:1000@<pbx host>:8089","event":"reg_state","state":"registered","transport":"wss"}
+23:29:05 sidecar event: {"event":"blf","ext":"1000","state":"idle"}
 23:29:05 sidecar event: {"event":"blf","ext":"510","state":"idle"}
-23:29:09 e2e: dial(sip:1100@100.119.230.80) -> ok
-23:29:10 sidecar event: {...,"event":"call_state",...,"peer":"sip:1100@pbx.neoladental.com","state":"incoming"}
-23:29:10 sidecar event: {"event":"blf","ext":"1100","state":"busy"}
-23:29:10 sidecar event: {...,"event":"call_state","peer":"sip:1100@100.119.230.80;transport=wss","state":"ringing"}
-23:29:10 sidecar event: {...,"event":"call_state","peer":"sip:1100@100.119.230.80;transport=wss","state":"established"}
-23:29:10 sidecar event: {...,"event":"call_state",...,"peer":"sip:1100@pbx.neoladental.com","state":"closed"}
-23:29:10 sidecar event: {"event":"blf","ext":"1100","state":"busy"}
+23:29:09 e2e: dial(sip:1000@<pbx host>) -> ok
+23:29:10 sidecar event: {...,"event":"call_state",...,"peer":"sip:1000@<pbx host>","state":"incoming"}
+23:29:10 sidecar event: {"event":"blf","ext":"1000","state":"busy"}
+23:29:10 sidecar event: {...,"event":"call_state","peer":"sip:1000@<pbx host>;transport=wss","state":"ringing"}
+23:29:10 sidecar event: {...,"event":"call_state","peer":"sip:1000@<pbx host>;transport=wss","state":"established"}
+23:29:10 sidecar event: {...,"event":"call_state",...,"peer":"sip:1000@<pbx host>","state":"closed"}
+23:29:10 sidecar event: {"event":"blf","ext":"1000","state":"busy"}
 23:29:24 e2e: hangup -> ok
-23:29:24 sidecar event: {...,"event":"call_state","peer":"sip:1100@100.119.230.80;transport=wss","state":"closed"}
-23:29:25 sidecar event: {"event":"blf","ext":"1100","state":"idle"}
-23:29:27 e2e: final blf_states = {"1100": "idle", "510": "idle"}
+23:29:24 sidecar event: {...,"event":"call_state","peer":"sip:1000@<pbx host>;transport=wss","state":"closed"}
+23:29:25 sidecar event: {"event":"blf","ext":"1000","state":"idle"}
+23:29:27 e2e: final blf_states = {"1000": "idle", "510": "idle"}
 23:29:27 e2e: script complete
 ```
 
 Confirms, in order: (1) registration; (2) **auto-subscribe on registration**
-— `blf_subscribe` fired for *both* configured favorites (`1100` and `510`)
+— `blf_subscribe` fired for *both* configured favorites (`1000` and `510`)
 with no explicit command in the e2e script, purely from `favorites` in
 settings — this is the actual F3 feature, not a manual trigger; (3) instance
-A dialing `1100` forks to instance B (the dual-contact "truco" — B's own
+A dialing `1000` forks to instance B (the dual-contact "truco" — B's own
 log shows `incoming` -> auto-answered -> `established` in under a second,
 confirmed independently, see below); (4) A's own outbound leg goes
 `ringing` -> `established`, i.e. a **real, answered, two-way call**, not
-just a ring; (5) BLF for `1100` transitions `idle` -> `busy` and back to
+just a ring; (5) BLF for `1000` transitions `idle` -> `busy` and back to
 `idle` -> tracked correctly end to end; (6) `510` never moves — stays
 `idle` for the entire run, confirmed in the final backend-state dump; (7)
-nothing else was dialed or subscribed — only `1100` and its own watched
-extensions, matching "nothing rings in the clinic (1100 only)".
+nothing else was dialed or subscribed — only `1000` and its own watched
+extensions, matching "nothing rings in the clinic (1000 only)".
 
 Instance B's independent log for the same window (own scratch process, own
 PBX-side registration):
 
 ```
-{"event":"reg_state","account":"sip:1100@100.119.230.80:8089","state":"registered","transport":"wss"}
-{"event":"call_state","state":"incoming","peer":"sip:1100@pbx.neoladental.com","id":"dd3c4008-...","call_id":"dd3c4008-..."}
-{"event":"call_state","state":"established","peer":"sip:1100@pbx.neoladental.com","id":"dd3c4008-...","call_id":"dd3c4008-..."}
-{"event":"call_state","state":"closed","peer":"sip:1100@pbx.neoladental.com","id":"dd3c4008-...","call_id":"dd3c4008-..."}
+{"event":"reg_state","account":"sip:1000@<pbx host>:8089","state":"registered","transport":"wss"}
+{"event":"call_state","state":"incoming","peer":"sip:1000@<pbx host>","id":"dd3c4008-...","call_id":"dd3c4008-..."}
+{"event":"call_state","state":"established","peer":"sip:1000@<pbx host>","id":"dd3c4008-...","call_id":"dd3c4008-..."}
+{"event":"call_state","state":"closed","peer":"sip:1000@<pbx host>","id":"dd3c4008-...","call_id":"dd3c4008-..."}
 ```
 (auto-answer log: `AUTO-ANSWERED: {"event":"call_state","state":"incoming",...}` — fired
 the instant the `incoming` line appeared, before Asterisk's own ring-no-answer
@@ -362,19 +362,19 @@ being a fluke.
 
 The task's own framing expected a `ringing` -> `busy(confirmed)` sequence.
 What was actually observed, consistently across both successful runs, was
-`idle` -> `busy` with no intervening `ringing` NOTIFY for `1100`, even
+`idle` -> `busy` with no intervening `ringing` NOTIFY for `1000`, even
 though instance A's *own* call leg was independently confirmed `ringing`
 for a full ~0.3-15s before `established`. Read `core/modules/ctrl_json/dialog_info.c`'s
 mapping (not modified here, core/ is out of scope for this agent) confirms
 `busy` only ever comes from a NOTIFY body literally containing
 `<state>confirmed</state>` — so this is what the PBX actually sent, not a
 shell-side misparse. The most likely explanation, consistent with standard
-Asterisk hint/devicestate behavior: extension `1100`'s dialog-info hint
+Asterisk hint/devicestate behavior: extension `1000`'s dialog-info hint
 reports the AoR "in use" the moment *any* channel touches it — including
 the watching UA's *own* outbound leg to its *own* AoR, self-dial being an
 inherent property of the dual-contact trick (both "instance A" and
 "instance B" are, from the PBX's perspective, just two contacts of the same
-`1100`). This is PBX/Asterisk hint configuration, outside this agent's
+`1000`). This is PBX/Asterisk hint configuration, outside this agent's
 scope (`core/` is read-only reference here, and PBX config changes are
 prohibited per the workspace's PBX rules) — flagged for whoever owns
 Asterisk hint config if a cleaner `ringing` phase is wanted for this
@@ -436,7 +436,7 @@ $ curl -w ' [HTTP %{http_code}]' -X POST -H "X-Centinelo-Token: $TOKEN" \
 App's own log for the `auto_dial=false` `/dial` request above:
 ```
 23:34:52 click-to-call bridge: listening on 127.0.0.1:38911
-23:34:52 sidecar event: {"account":"sip:1100@100.119.230.80:8089","event":"reg_state","state":"registered","transport":"wss"}
+23:34:52 sidecar event: {"account":"sip:1000@<pbx host>:8089","event":"reg_state","state":"registered","transport":"wss"}
 23:35:02 click-to-call bridge: /dial request for *60 (auto_dial=false) - asking for confirmation
 ```
 Zero `call_state` events appear anywhere in this run's log (`grep -c
@@ -457,7 +457,7 @@ $ curl -X POST -H "X-Centinelo-Token: $TOKEN" -H 'Content-Type: application/json
 App log:
 ```
 23:32:11 click-to-call bridge: /dial request for *43 (auto_dial=true) - dialing immediately
-23:32:12 sidecar event: {"call_id":"89532783c58e9bf7","event":"call_state",...,"peer":"sip:*43@100.119.230.80;transport=wss","state":"established"}
+23:32:12 sidecar event: {"call_id":"89532783c58e9bf7","event":"call_state",...,"peer":"sip:*43@<pbx host>;transport=wss","state":"established"}
 ```
 This is the **full real path**, not a backend bypass: the HTTP request only
 ever emits a Tauri event (`bridge.rs`); it is `ui/js/app.js`'s own
@@ -470,9 +470,9 @@ second later.
 Independent, read-only PBX-side confirmation (`ssh ... "asterisk -rx
 'pjsip show channelstats'"`), polled twice ~9s apart:
 ```
-          1100-00000885      00:00:15 ulaw      597       0    0   0.000    598       0    0   0.002   0.000
+          1000-00000885      00:00:15 ulaw      597       0    0   0.000    598       0    0   0.002   0.000
 ...
-          1100-00000885      00:00:24 ulaw     1084       0    0   0.000   1085       0    0   0.003   0.000
+          1000-00000885      00:00:24 ulaw     1084       0    0   0.000   1085       0    0   0.003   0.000
 ```
 Same channel, UpTime and Rx/Tx counts climbing together (597->1084,
 598->1085, ~54 pps, 0% loss both polls) — real, live, bidirectional RTP,
@@ -522,7 +522,7 @@ the surviving channel).
 
 ## Setup
 
-Same test PBX/extension as F2/F3 (`100.119.230.80`, ext `1100`, secret from
+Same test PBX/extension as F2/F3 (`<pbx host>`, ext `1000`, secret from
 the v1 app's own settings file, transport `wss`) — see F2's "Setup" above.
 New for F4:
 
@@ -551,7 +551,7 @@ New for F4:
   swapped between runs without restarting anything mid-test.
 - **Dual-contact "instance B"**: same trick as F3 — a second baresip
   process via `core/run-spike.sh` directly (not through the shell),
-  registered as the same extension `1100` (`max_contacts=2`), driven by a
+  registered as the same extension `1000` (`max_contacts=2`), driven by a
   persistent `tail -f cmds.txt | ./run-spike.sh` (stdin never EOFs) plus a
   `tail -F instanceB.log | grep '"state":"incoming"'` loop appending
   `{"cmd":"answer"}` the instant an incoming call appears — sub-second,
@@ -585,7 +585,7 @@ App launched with `CENTINELO_E2E_SCRIPT="wait:2|premium_diagnostic|open_console|
   the entry points to it.
 - **Zero errors, app ran normally**: `grep -c '\]\[ERROR\]'` = `0` for the
   whole run; the sidecar registered and subscribed BLF for both favorites
-  in the same run (`{"event":"blf","ext":"1100","state":"idle"}`,
+  in the same run (`{"event":"blf","ext":"1000","state":"idle"}`,
   `...ext":"510"...`) — premium gating is fully independent of ordinary
   call/registration function, confirmed by them both working in the same
   process. Process was still running (not crashed) when torn down after 6s.
@@ -623,7 +623,7 @@ just a length-check short-circuit).
 ## Evidence: gating scenario (c) + console live e2e — valid dylib, founder license
 
 Valid `.sig` restored, `premium-console-assets/` in place.
-`CENTINELO_E2E_SCRIPT="wait:2|premium_diagnostic|open_console|wait:3|dial:sip:1100@100.119.230.80|wait:5|blind_transfer:sip:*43@100.119.230.80|wait:6|premium_diagnostic"`,
+`CENTINELO_E2E_SCRIPT="wait:2|premium_diagnostic|open_console|wait:3|dial:sip:1000@<pbx host>|wait:5|blind_transfer:sip:*43@<pbx host>|wait:6|premium_diagnostic"`,
 instance B already registered and its auto-answer loop already armed
 before instance A started (same ordering as F3).
 
@@ -665,7 +665,7 @@ the *same* extensions through `blf_subscribe_raw` directly, never through
 this `#[tauri::command]` at all, so a hit here is unambiguous:
 
 ```
-[app_lib::commands][INFO] commands: sidecar_blf_subscribe(1100) invoked over IPC
+[app_lib::commands][INFO] commands: sidecar_blf_subscribe(1000) invoked over IPC
 [app_lib::commands][INFO] commands: sidecar_blf_subscribe(510) invoked over IPC
 ```
 
@@ -680,11 +680,11 @@ i.e. **EngineBridge live**, established without any GUI automation, by
 observing the one code path only the real vendored console-ui package
 could have taken.
 
-### (c3) BLF tiles — "subscribe 1100 + 510", 1100 goes busy
+### (c3) BLF tiles — "subscribe 1000 + 510", 1000 goes busy
 
-Both favorites (`1100`, `510` — the same two configured since F3) are the
+Both favorites (`1000`, `510` — the same two configured since F3) are the
 console's roster (sourced from `get_favorites`, see `shell/README.md`
-"Premium console window"); `selfExt` is left unset specifically so `1100`
+"Premium console window"); `selfExt` is left unset specifically so `1000`
 is *not* treated as "self" and gets a real, subscribed grid tile rather
 than being suppressed — see `console.rs`'s module doc for why. The dual-
 contact trick (instance A dials its own extension, forking to instance B)
@@ -692,15 +692,15 @@ produces the exact same wire-level `blf` transition F3 already proved
 reaches the frontend correctly, this time also reaching the console:
 
 ```
-[app_lib::sidecar][INFO] sidecar event: {"account":"sip:1100@100.119.230.80:8089","event":"reg_state","state":"registered","transport":"wss"}
-[app_lib::sidecar][INFO] sidecar event: {"event":"blf","ext":"1100","state":"idle"}
+[app_lib::sidecar][INFO] sidecar event: {"account":"sip:1000@<pbx host>:8089","event":"reg_state","state":"registered","transport":"wss"}
+[app_lib::sidecar][INFO] sidecar event: {"event":"blf","ext":"1000","state":"idle"}
 [app_lib::sidecar][INFO] sidecar event: {"event":"blf","ext":"510","state":"idle"}
 ...
-[app_lib::e2e][INFO] e2e: dial(sip:1100@100.119.230.80) -> ok
-[app_lib::sidecar][INFO] sidecar event: {"event":"blf","ext":"1100","state":"busy"}
+[app_lib::e2e][INFO] e2e: dial(sip:1000@<pbx host>) -> ok
+[app_lib::sidecar][INFO] sidecar event: {"event":"blf","ext":"1000","state":"busy"}
 ...
 [app_lib::sidecar][INFO] sidecar event: {"call_id":"9b56c63a198f461c",...,"state":"established"}
-[app_lib::sidecar][INFO] sidecar event: {"event":"blf","ext":"1100","state":"busy"}
+[app_lib::sidecar][INFO] sidecar event: {"event":"blf","ext":"1000","state":"busy"}
 ```
 
 **Why this necessarily also updates the console's own tiles, not just the
@@ -731,10 +731,10 @@ established for the main window — same command, same backend logic, zero
 GUI-automation dependency either way.
 
 ```
-[app_lib::e2e][INFO] e2e: blind_transfer(sip:*43@100.119.230.80) -> ok
-[app_lib::sidecar][DEBUG] core: ... transferring call to sip:*43@100.119.230.80
+[app_lib::e2e][INFO] e2e: blind_transfer(sip:*43@<pbx host>) -> ok
+[app_lib::sidecar][DEBUG] core: ... transferring call to sip:*43@<pbx host>
 [app_lib::sidecar][INFO] sidecar event: {"call_id":"9b56c63a198f461c",...,"state":"closed"}
-[app_lib::sidecar][DEBUG] core: sip:1100@100.119.230.80:8089: Call with sip:1100@100.119.230.80;transport=wss terminated (duration: 5 secs)
+[app_lib::sidecar][DEBUG] core: sip:1000@<pbx host>:8089: Call with sip:1000@<pbx host>;transport=wss terminated (duration: 5 secs)
 ```
 
 `call_id` was omitted (`None`) on purpose — instance A had exactly one
@@ -749,29 +749,29 @@ the bridged party — A is not supposed to still have a call afterward.
 
 ### (c5) PBX-side confirmation — the surviving channel lands on the echo test
 
-Per the task's exact instruction: `ssh -i ~/.ssh/id_neola_vps root@100.119.230.80 "asterisk -rx 'core show channels'"`, read-only, polled three times starting ~3s after the transfer was issued:
+Per the task's exact instruction: `ssh -i ~/.ssh/id_pbx_test root@<pbx host> "asterisk -rx 'core show channels'"`, read-only, polled three times starting ~3s after the transfer was issued:
 
 ```
 === poll 1 (~3s after blind_transfer) ===
 Channel                       Location                    State   Application(Data)
-PJSIP/1100-00000889           *43@from-internal-xfer:7    Up      BackGround(demo-echotest,,,app...
+PJSIP/1000-00000889           *43@from-internal-xfer:7    Up      BackGround(demo-echotest,,,app...
 1 active channel
 1 active call
 
 === poll 2 (~6s after) ===
-PJSIP/1100-00000889           *43@from-internal-xfer:7    Up      BackGround(demo-echotest,,,app...
+PJSIP/1000-00000889           *43@from-internal-xfer:7    Up      BackGround(demo-echotest,,,app...
 
 === poll 3 (~9s after) ===
-PJSIP/1100-00000889           *43@from-internal-xfer:7    Up      BackGround(demo-echotest,,,app...
+PJSIP/1000-00000889           *43@from-internal-xfer:7    Up      BackGround(demo-echotest,,,app...
 ```
 
-One surviving channel (`PJSIP/1100-00000889` — instance B's own contact,
+One surviving channel (`PJSIP/1000-00000889` — instance B's own contact,
 the far side of the transfer), consistently in the `from-internal-xfer`
 dialplan context targeting `*43`, running Asterisk's own echo-test
 application (`BackGround(demo-echotest,...)`) across all three polls — the
 transferor's (instance A's) channel is gone, exactly matching "the
 surviving channel lands on the echo test". No PBX config was read-write
-touched at any point; only `1100` (the provisioned test extension) and
+touched at any point; only `1000` (the provisioned test extension) and
 `*43` (the sanctioned echo test) were ever dialed — no real extensions, no
 `600`/`601` ring groups.
 
