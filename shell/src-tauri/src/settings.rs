@@ -322,6 +322,60 @@ impl Default for TranscriptionSettings {
     }
 }
 
+// ---- HID headsets (F4 ola 2, spec §5) ------------------------------------
+//
+// Admin-gated like account/favorites/transcription - a call-center agent
+// can use whichever headset is plugged in, but can't repoint the app at a
+// device via settings (see commands in `crate::hid::commands`).
+
+/// A device's stable identity - VID+PID, optionally narrowed by serial
+/// number - not a raw OS device path. Paths can and do change across
+/// replug on some platforms (notably macOS's IOHID registry-entry-based
+/// paths), so persisting one could silently stop resolving to anything by
+/// the next launch; this is what a device actually advertises about
+/// itself. `crate::hid::device::DeviceIdentity::matches` (not this file -
+/// keeps `hidapi`-shaped matching logic out of settings.rs) is where this
+/// gets compared against a live enumeration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HidDeviceIdentity {
+    pub vendor_id: u16,
+    pub product_id: u16,
+    #[serde(default)]
+    pub serial_number: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HidSettings {
+    /// Off by default - matches this file's existing conservative-default
+    /// convention for anything that reaches outside this app on its own
+    /// (`bridge.auto_dial`, `bridge.register_tel_handler`, both also
+    /// off-by-default) - opening a HID device can prompt for OS-level
+    /// Input Monitoring permission on macOS the first time it happens, and
+    /// an operator with no headset shouldn't see that unprompted.
+    #[serde(default)]
+    pub enabled: bool,
+    /// When on, an unrecognized (never-selected) telephony-page HID device
+    /// is used automatically the moment it's plugged in - the "just works"
+    /// default once `enabled` is on. When off, only `selected` (if it's
+    /// actually present) is ever used - see
+    /// `crate::hid::device::select_candidates_to_try`'s doc for the exact
+    /// precedence.
+    #[serde(default = "default_true")]
+    pub auto_detect: bool,
+    #[serde(default)]
+    pub selected: Option<HidDeviceIdentity>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for HidSettings {
+    fn default() -> Self {
+        Self { enabled: false, auto_detect: true, selected: None }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AdminSettings {
     /// Argon2 PHC hash string, e.g. "$argon2id$v=19$...". `None` until the
@@ -357,6 +411,8 @@ pub struct AppSettings {
     pub bridge: BridgeSettings,
     #[serde(default)]
     pub transcription: TranscriptionSettings,
+    #[serde(default)]
+    pub hid: HidSettings,
 }
 
 fn default_favorites() -> Vec<FavoriteSlot> {
@@ -486,6 +542,12 @@ impl SettingsStore {
     pub fn update_transcription(&self, transcription: TranscriptionSettings) -> std::io::Result<()> {
         let mut guard = self.inner.lock().expect("settings mutex poisoned");
         guard.transcription = transcription;
+        self.persist(&guard)
+    }
+
+    pub fn update_hid(&self, hid: HidSettings) -> std::io::Result<()> {
+        let mut guard = self.inner.lock().expect("settings mutex poisoned");
+        guard.hid = hid;
         self.persist(&guard)
     }
 
@@ -702,5 +764,54 @@ mod transcription_settings_tests {
         assert_eq!(serde_json::to_string(&TranscriptionMode::Live).unwrap(), "\"live\"");
         assert_eq!(serde_json::to_string(&TranscriptionActivation::AllCalls).unwrap(), "\"all_calls\"");
         assert_eq!(serde_json::to_string(&ModelTier::Accurate).unwrap(), "\"accurate\"");
+    }
+}
+
+#[cfg(test)]
+mod hid_settings_tests {
+    use super::*;
+
+    #[test]
+    fn defaults_are_disabled_but_auto_detect_ready() {
+        // Off by default (see HidSettings's own doc - avoids a surprise
+        // macOS Input Monitoring permission prompt for an operator with no
+        // headset) but auto_detect stays on, so flipping `enabled` alone is
+        // enough to "just work" for the common case.
+        let hid = HidSettings::default();
+        assert!(!hid.enabled);
+        assert!(hid.auto_detect);
+        assert!(hid.selected.is_none());
+    }
+
+    #[test]
+    fn app_settings_without_hid_key_defaults_gracefully() {
+        // Pre-this-feature settings.json (or a hand-edited one missing the
+        // key) must still load - same #[serde(default)] discipline as
+        // every other AppSettings field.
+        let json = r#"{"account":{"host":"pbx.example.test","ext":"9999","secret":"x"}}"#;
+        let app: AppSettings = serde_json::from_str(json).unwrap();
+        assert!(!app.hid.enabled);
+        assert!(app.hid.auto_detect);
+    }
+
+    #[test]
+    fn selected_identity_round_trips_through_json() {
+        let hid = HidSettings {
+            enabled: true,
+            auto_detect: false,
+            selected: Some(HidDeviceIdentity { vendor_id: 0x1234, product_id: 0x5678, serial_number: Some("SN1".to_string()) }),
+        };
+        let json = serde_json::to_string(&hid).unwrap();
+        let back: HidSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(hid, back);
+    }
+
+    #[test]
+    fn selected_without_serial_number_key_defaults_to_none() {
+        // An older/hand-edited selected identity missing serial_number must
+        // still deserialize.
+        let json = r#"{"vendor_id":1,"product_id":2}"#;
+        let id: HidDeviceIdentity = serde_json::from_str(json).unwrap();
+        assert_eq!(id.serial_number, None);
     }
 }

@@ -84,3 +84,5 @@ ureq = { version = "2", default-features = false, features = ["tls"] }
 # Decodes the optional embedded `centinelo://provision?config=<base64>`
 # form (no network fetch at all - see provisioning.rs "two ways in").
 base64 = "0.22"
+# HID headsets (src/hid.rs) - hook switch answer/hangup, mute, LED mirror.
+hidapi = "2"
