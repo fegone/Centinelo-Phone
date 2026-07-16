@@ -238,6 +238,89 @@ mod validate_account_fields_tests {
     }
 }
 
+// ---- audio device name validation (2026-07-16 4R review, S1 VETO) -------
+//
+// `sidecar.rs`'s `write_config_file` interpolates a device name unescaped
+// into baresip's `audio_source`/`audio_player`/`audio_alert` config lines
+// (`"<line>\t\t{name}\n"`) - same injection shape `validate_account_fields`
+// above already guards against for the SIP account fields: a `\n` embedded
+// in `name` would inject an arbitrary extra config line (rewriting
+// `sip_verify_server`/`rtp_timeout`, or loading an unauthenticated control
+// module like `cons`/`httpd`). The attacker surface here isn't only a human
+// typing into a settings field either - a device name round-trips from
+// `core/PROTOCOL.md`'s own `devices` event, which in turn comes from
+// whatever a USB/Bluetooth peripheral advertises as its own name over
+// CoreAudio/WASAPI. A crafted device name (`"Mic\nmodule cons.so"`) would
+// show up as a normal, selectable entry in that enumeration.
+//
+// Called at BOTH the persist site (`commands::save_audio_settings`'s
+// `merge_device_choice`) AND again at the sink
+// (`sidecar::resolve_device`, right before interpolation) - the same
+// defense-in-depth shape `write_accounts_file` already uses for
+// `validate_account_fields`, so the check holds even if some future third
+// writer of `AudioSettings` forgets to validate before persisting.
+pub const MAX_DEVICE_LEN: usize = 256;
+
+pub fn validate_device_name(name: &str) -> Result<(), String> {
+    if name.chars().count() > MAX_DEVICE_LEN {
+        return Err("Device name is too long.".to_string());
+    }
+    if name.chars().any(|c| c.is_control()) {
+        return Err(
+            "Device name contains characters that aren't allowed (control characters, including newlines).".to_string(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod validate_device_name_tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_device_names_pass() {
+        assert!(validate_device_name("coreaudio,MacBook Pro Microphone").is_ok());
+        assert!(validate_device_name("wasapi,default").is_ok());
+        // Real hardware names seen in this fix's own e2e verification -
+        // punctuation/parens/commas from a manufacturer string must not
+        // trip this up.
+        assert!(validate_device_name("coreaudio,USB PnP Sound Device (2.0)").is_ok());
+    }
+
+    #[test]
+    fn embedded_newline_rejected_config_line_injection() {
+        let err = validate_device_name("coreaudio,Mic\nmodule cons.so").unwrap_err();
+        assert!(err.contains("control"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn embedded_carriage_return_rejected() {
+        assert!(validate_device_name("coreaudio,Mic\rrtp_timeout\t99999").is_err());
+    }
+
+    #[test]
+    fn embedded_tab_rejected() {
+        // A literal tab could still shift baresip's own whitespace-based
+        // config parsing even without a full newline - reject any control
+        // character, not just \n/\r.
+        assert!(validate_device_name("coreaudio,Mic\tsip_verify_server\tno").is_err());
+    }
+
+    #[test]
+    fn too_long_rejected() {
+        assert!(validate_device_name(&"a".repeat(MAX_DEVICE_LEN + 1)).is_err());
+    }
+
+    #[test]
+    fn empty_string_passes_requiredness_is_the_callers_job() {
+        // Mirrors validate_account_fields's own convention - "is this
+        // field required at all" is each caller's business rule
+        // (sidecar::resolve_device treats an empty/absent device as "use
+        // the platform default", not an error).
+        assert!(validate_device_name("").is_ok());
+    }
+}
+
 // ---- transcription (F4) --------------------------------------------------
 //
 // All fields here are admin-gated, same as account/favorites - see
@@ -376,6 +459,36 @@ impl Default for HidSettings {
     }
 }
 
+// ---- audio devices (real-audio-devices fix) ------------------------------
+//
+// Selects which real input/output device `sidecar.rs`'s `write_config_file`
+// wires up for the engine (`coreaudio` on macOS, `wasapi` on Windows - see
+// `sidecar::platform_audio_driver`), instead of the `ausine`/`aufile`
+// synthetic pair the config generator hardcoded unconditionally before this
+// fix. `None` on either field = that platform's driver at its own `default`
+// pseudo-device, which is what a fresh install gets with zero settings
+// changes - the whole point of this feature (a beta tester who never opens
+// Settings still hears/is heard). Admin-gated
+// (`commands::save_audio_settings`), same rationale as `HidSettings`: an
+// agent shouldn't be able to silently repoint the app at a different mic/
+// speaker than the one an admin verified.
+//
+// A `CENTINELO_E2E_AUDIO=synthetic` env var overrides both fields at spawn
+// time regardless of what's persisted here - qa-e2e's driver depends on
+// deterministic synthetic audio and must never be silently switched to a
+// real device by whatever happens to be persisted in a given test profile's
+// `settings.json`. See `sidecar::audio_config_lines`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AudioSettings {
+    /// `"<module>[,<device>]"` - `core/PROTOCOL.md`'s own `devices` event
+    /// "name" shape, round-tripped verbatim from that event via
+    /// `commands::save_audio_settings`. Never hand-typed by a human.
+    #[serde(default)]
+    pub input_device: Option<String>,
+    #[serde(default)]
+    pub output_device: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AdminSettings {
     /// Argon2 PHC hash string, e.g. "$argon2id$v=19$...". `None` until the
@@ -438,6 +551,8 @@ pub struct AppSettings {
     pub transcription: TranscriptionSettings,
     #[serde(default)]
     pub hid: HidSettings,
+    #[serde(default)]
+    pub audio: AudioSettings,
 }
 
 fn default_favorites() -> Vec<FavoriteSlot> {
@@ -579,6 +694,12 @@ impl SettingsStore {
     pub fn update_hid(&self, hid: HidSettings) -> std::io::Result<()> {
         let mut guard = self.inner.lock().expect("settings mutex poisoned");
         guard.hid = hid;
+        self.persist(&guard)
+    }
+
+    pub fn update_audio(&self, audio: AudioSettings) -> std::io::Result<()> {
+        let mut guard = self.inner.lock().expect("settings mutex poisoned");
+        guard.audio = audio;
         self.persist(&guard)
     }
 
@@ -924,5 +1045,42 @@ mod locale_pref_tests {
         assert!(json.contains(r#""locale":"pt-BR""#), "expected a literal pt-BR in the wire JSON, got: {json}");
         let back: AppSettings = serde_json::from_str(&json).unwrap();
         assert_eq!(back.locale, LocalePref::PtBr);
+    }
+}
+
+#[cfg(test)]
+mod audio_settings_tests {
+    use super::*;
+
+    #[test]
+    fn defaults_to_no_explicit_device_either_side() {
+        // No settings.json entry yet (fresh install) = the platform's real
+        // driver default device, per sidecar::audio_config_lines - nothing
+        // persisted here forces that, it's just "no override".
+        let audio = AudioSettings::default();
+        assert_eq!(audio.input_device, None);
+        assert_eq!(audio.output_device, None);
+    }
+
+    #[test]
+    fn app_settings_without_audio_key_defaults_gracefully() {
+        // Pre-this-feature settings.json (or hand-edited, missing the key)
+        // must still load - same #[serde(default)] discipline as every
+        // other AppSettings field (transcription/hid above).
+        let json = r#"{"account":{"host":"pbx.example.test","ext":"9999","secret":"x"}}"#;
+        let app: AppSettings = serde_json::from_str(json).unwrap();
+        assert_eq!(app.audio.input_device, None);
+        assert_eq!(app.audio.output_device, None);
+    }
+
+    #[test]
+    fn selected_devices_round_trip_through_json() {
+        let audio = AudioSettings {
+            input_device: Some("coreaudio,MacBook Pro Microphone".to_string()),
+            output_device: Some("coreaudio,MacBook Pro Speakers".to_string()),
+        };
+        let json = serde_json::to_string(&audio).unwrap();
+        let back: AudioSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(audio, back);
     }
 }

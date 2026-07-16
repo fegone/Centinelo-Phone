@@ -10,7 +10,8 @@
 //!
 //! Script grammar: `|`-separated steps, e.g.
 //!   "wait:5|dial:sip:*43@192.0.2.10|wait:8|hangup|wait:2"
-//! Steps: `wait:<secs>`, `dial:<uri>`, `answer`, `hangup`,
+//! Steps: `wait:<secs>`, `dial:<uri>`, `answer`, `hangup`, `restart`
+//! (forces a fresh sidecar spawn - see `commands::sidecar_restart`),
 //! `hold`, `resume`, `mute:on`/`mute:off`,
 //! `blind_transfer:<uri>`, `attended_transfer:<uri>`,
 //! `complete_transfer`, `abort_transfer`,
@@ -36,7 +37,28 @@
 //! like `provisioning_apply` on an already-configured account without a
 //! GUI; added 2026-07-16 4R re-review to verify R4's "refuse to restart
 //! mid-call" check end to end, which needs an unlocked session on an
-//! already-configured account to even reach that check).
+//! already-configured account to even reach that check),
+//! `list_devices` (real-audio-devices fix - fires `core/PROTOCOL.md`'s
+//! `devices` command; the resulting `event:"devices"` line is captured by
+//! the normal sidecar-event log line, same as every other engine event -
+//! see `commands::sidecar_list_devices`'s doc for why this is
+//! fire-and-forget rather than something this step can return directly),
+//! `set_device:<input|output>:<name>` (admin-gated, needs
+//! `admin_set_password` first in the script - persists the device choice
+//! and best-effort applies it live via `set_device`, see
+//! `commands::save_audio_settings`; `<name>` is passed through verbatim,
+//! including any embedded `,` - it's expected to be a `devices` event's
+//! own `"<module>[,<device>]"` name, not user free text; each call only
+//! ever sets the ONE field named in `<input|output>`, leaving the other
+//! `SaveAudioInput` field `None` - since 2026-07-16's A3 fix that means
+//! "leave whatever's already saved for that direction untouched", not "clear
+//! it", so a `set_device:input:X` step followed later by `set_device:output:Y`
+//! composes correctly instead of the second call wiping the first's device;
+//! an empty `<name>` (`set_device:input:`) is a deliberate explicit clear
+//! back to the platform default, not a no-op - see
+//! `commands::merge_device_choice`'s doc for the exact three-way semantics,
+//! and `settings::validate_device_name` for the S1 rejection a `<name>`
+//! containing a raw newline would hit).
 //!
 //! Every step targets "the current call" (no `call_id`) - matching the
 //! frontend's own single-call-at-a-time UI; there's no scripted way here
@@ -90,6 +112,17 @@ pub fn maybe_run_e2e_script(app: &AppHandle) {
                     Ok(()) => log::info!("e2e: hangup -> ok"),
                     Err(e) => log::error!("e2e: hangup -> err: {e}"),
                 }
+            } else if step == "restart" {
+                // Forces a fresh spawn (config regenerated from scratch,
+                // same path `save_account_settings`/`save_favorites`/
+                // `provisioning_apply` already trigger) - added 2026-07-16
+                // 4R re-review to script the stale-device cross-check's own
+                // scenario end to end: persist a device, then force a
+                // respawn, and confirm `sidecar::resolve_device` degrades
+                // it using `Shared::known_devices`'s cache from the prior
+                // spawn's own "ready"-triggered devices query.
+                commands::sidecar_restart(sidecar);
+                log::info!("e2e: restart -> ok");
             } else if step == "hold" {
                 match commands::sidecar_hold(sidecar, None) {
                     Ok(()) => log::info!("e2e: hold -> ok"),
@@ -202,6 +235,26 @@ pub fn maybe_run_e2e_script(app: &AppHandle) {
                 match commands::admin_set_password(settings, admin, pw.to_string()) {
                     Ok(()) => log::info!("e2e: admin_set_password -> ok"),
                     Err(e) => log::info!("e2e: admin_set_password -> err: {e}"),
+                }
+            } else if step == "list_devices" {
+                match commands::sidecar_list_devices(sidecar) {
+                    Ok(()) => log::info!("e2e: list_devices -> ok (watch for event:\"devices\" on sidecar-event)"),
+                    Err(e) => log::error!("e2e: list_devices -> err: {e}"),
+                }
+            } else if let Some(rest) = step.strip_prefix("set_device:") {
+                let settings: tauri::State<std::sync::Arc<crate::settings::SettingsStore>> = app.state();
+                let admin: tauri::State<crate::settings::AdminSession> = app.state();
+                let Some((kind, name)) = rest.split_once(':') else {
+                    log::warn!("e2e: set_device step needs '<input|output>:<name>', got '{rest}'");
+                    continue;
+                };
+                let input = commands::SaveAudioInput {
+                    input_device: (kind == "input").then(|| name.to_string()),
+                    output_device: (kind == "output").then(|| name.to_string()),
+                };
+                match commands::save_audio_settings(settings, admin, sidecar, input) {
+                    Ok(()) => log::info!("e2e: set_device({kind}, {name}) -> ok"),
+                    Err(e) => log::error!("e2e: set_device({kind}, {name}) -> err: {e}"),
                 }
             } else {
                 log::warn!("e2e: unknown step '{step}'");
