@@ -50,11 +50,34 @@
 
     <div id="banner-slot"></div>
 
-    <!-- shown only when no SIP account has been configured yet -->
+    <!-- shown only when no SIP account has been configured yet. Auto-
+         provisioning (spec §5, provisioning.rs): paste a link here instead
+         of typing host/extension/secret by hand in Settings - modeled on
+         premium/design/mockups/onboarding.html's "Step 1 of 2 - Connect"
+         (a lighter, single-pane version of that mockup's two-pane branded
+         window - see shell/README.md "Design fidelity notes" for this
+         project's precedent of flagging exactly this kind of scope/
+         fidelity gap for creative-vigilia review rather than silently
+         shipping a divergence). -->
     <div class="setup-prompt" id="setup-prompt" hidden>
       <b>Connect your phone system</b>
-      <p>Add your extension in Settings to register with your phone system and start making calls.</p>
-      <button class="primary" id="setup-open-settings">Open Settings</button>
+      <p>Paste the provisioning link your installer sent you, or set it up by hand in Settings.</p>
+      <div class="prov-row">
+        <label class="prov">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.5 13.5a4 4 0 0 0 5.7 0l3-3a4 4 0 1 0-5.7-5.7l-1.2 1.2"/><path d="M13.5 10.5a4 4 0 0 0-5.7 0l-3 3a4 4 0 1 0 5.7 5.7l1.2-1.2"/></svg>
+          <!-- maxlength headroom above provisioning.rs's MAX_CONFIG_BYTES_ENCODED
+               (~21849 chars for the embedded centinelo://provision?config=...
+               form, the longest legitimate input this field ever needs to
+               hold) - a client-side backstop only, the real cap is
+               server-side in decode_embedded_config (2026-07-16 4R
+               re-review, B1). -->
+          <input type="text" id="prov-input" maxlength="22000" placeholder="Paste your provisioning link" aria-label="Provisioning link">
+        </label>
+        <button class="primary" id="prov-connect">Connect</button>
+      </div>
+      <p class="err" id="prov-error" hidden></p>
+      <p class="hint">A provisioning link contains your account. Treat it like a password.</p>
+      <button class="ghost" id="setup-open-settings" style="align-self:flex-start">Set up by hand in Settings</button>
     </div>
 
     <div id="configured-area" hidden>
@@ -354,6 +377,36 @@
         <button class="primary" id="btn-dial-confirm-call">Call</button>
         <button class="ghost" id="btn-dial-confirm-cancel">Not now</button>
       </div>
+    </div>
+  </div>
+
+  <!-- ================= provisioning confirmation ================= -->
+  <!-- Auto-provisioning "step 2" (provisioning.rs): shown after a paste
+       (Connect) or a centinelo://provision deep link resolves - shared
+       shape for both entry paths, see ui/js/app.js's
+       showProvisioningConfirm. Deliberately shows host/extension/
+       transport only, never the secret - matches
+       provisioning::ProvisioningPreviewView on the Rust side, which
+       doesn't carry the secret at all (see that struct's doc). Reuses
+       .lock-overlay/.lock-card like #dial-confirm-overlay, same z-index
+       precedent: a provisioning request can also arrive at any time
+       (deep link while the app is already open). -->
+  <div class="lock-overlay dial-confirm-overlay" id="provision-confirm-overlay" hidden>
+    <div class="lock-card">
+      <div class="lockhead">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.5 13.5a4 4 0 0 0 5.7 0l3-3a4 4 0 1 0-5.7-5.7l-1.2 1.2"/><path d="M13.5 10.5a4 4 0 0 0-5.7 0l-3 3a4 4 0 1 0 5.7 5.7l1.2-1.2"/></svg>
+        <b>Connect to this phone system?</b>
+      </div>
+      <p>Centinelo will register as:</p>
+      <div class="plate" id="prov-confirm-host" style="font-size:14px;color:var(--text-1);letter-spacing:.02em;text-transform:none">—</div>
+      <div class="plate" id="prov-confirm-ext" style="font-size:13px;color:var(--text-2);letter-spacing:.02em;text-transform:none">—</div>
+      <p class="hint" id="prov-confirm-transport"></p>
+      <p class="hint">The password is applied but never shown here.</p>
+      <div class="btnrow">
+        <button class="primary" id="btn-prov-confirm">Connect</button>
+        <button class="ghost" id="btn-prov-cancel">Cancel</button>
+      </div>
+      <p class="err" id="prov-confirm-error" hidden></p>
     </div>
   </div>
 

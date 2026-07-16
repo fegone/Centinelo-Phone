@@ -269,6 +269,47 @@ function closeDialConfirm() {
   $("dial-confirm-overlay").hidden = true;
 }
 
+// ---------------------------------------------------------------------------
+// auto-provisioning (spec §5) - see provisioning.rs for the Rust half.
+// Both the manual paste (#prov-connect) and a centinelo://provision deep
+// link (the "provisioning://preview" event, attached below) end up calling
+// showProvisioningConfirm with the same secret-free preview shape
+// (provisioning::ProvisioningPreviewView).
+// ---------------------------------------------------------------------------
+const PROV_TRANSPORT_LABEL = {
+  auto: "Auto — secure web, falls back to classic SIP",
+  wss: "Secure web (WSS)",
+  classic: "Classic SIP (UDP/TLS)",
+};
+
+async function provisioningResolveFromInput() {
+  const input = $("prov-input").value.trim();
+  $("prov-error").hidden = true;
+  if (!input) return;
+  const btn = $("prov-connect");
+  btn.disabled = true;
+  try {
+    const preview = await invoke("provisioning_resolve", { input });
+    showProvisioningConfirm(preview);
+  } catch (e) {
+    $("prov-error").textContent = String(e);
+    $("prov-error").hidden = false;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function showProvisioningConfirm(preview) {
+  if (!preview) return;
+  $("prov-confirm-host").textContent = preview.host;
+  const extLabel = preview.display_name ? `Extension ${preview.ext} — ${preview.display_name}` : `Extension ${preview.ext}`;
+  $("prov-confirm-ext").textContent = extLabel;
+  const transportLabel = PROV_TRANSPORT_LABEL[preview.transport_priority] || preview.transport_priority;
+  $("prov-confirm-transport").textContent = preview.has_tls_pin ? `${transportLabel} · TLS pin included` : transportLabel;
+  $("prov-confirm-error").hidden = true;
+  $("provision-confirm-overlay").hidden = false;
+}
+
 async function loadRecents() {
   try {
     const list = await invoke("get_recents");
@@ -1105,6 +1146,7 @@ function wireStaticHandlers() {
 
   document.addEventListener("keydown", (e) => {
     if (!$("dial-confirm-overlay").hidden) return; // handled by its own listener below
+    if (!$("provision-confirm-overlay").hidden) return; // handled by its own listener below
     if (!$("screen-settings").hidden) return;
     if (state.call) return;
     if (/^[0-9*#]$/.test(e.key)) appendDigit(e.key);
@@ -1123,6 +1165,48 @@ function wireStaticHandlers() {
     if ($("dial-confirm-overlay").hidden) return;
     if (e.key === "Enter") $("btn-dial-confirm-call").click();
     else if (e.key === "Escape") $("btn-dial-confirm-cancel").click();
+  });
+
+  // ---- auto-provisioning (spec §5, provisioning.rs) -----------------------
+  // Paste flow: #prov-input + Connect -> provisioning_resolve -> preview
+  // shown in #provision-confirm-overlay -> Connect there -> provisioning_apply.
+  // The deep-link entry path (a centinelo://provision link) skips straight
+  // to the same overlay via the "provisioning://preview" event - see
+  // attachTauriListeners below - so both paths share every handler here.
+  $("prov-connect").addEventListener("click", () => provisioningResolveFromInput());
+  $("prov-input").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") provisioningResolveFromInput();
+  });
+  $("btn-prov-confirm").addEventListener("click", async () => {
+    $("prov-confirm-error").hidden = true;
+    const btn = $("btn-prov-confirm");
+    btn.disabled = true;
+    try {
+      await invoke("provisioning_apply");
+      $("provision-confirm-overlay").hidden = true;
+      $("prov-input").value = "";
+      showBanner("Connected — registering with your phone system…", "info");
+      state.account = await invoke("get_account_settings");
+      renderIdentity();
+    } catch (e) {
+      $("prov-confirm-error").textContent = String(e);
+      $("prov-confirm-error").hidden = false;
+    } finally {
+      btn.disabled = false;
+    }
+  });
+  $("btn-prov-cancel").addEventListener("click", async () => {
+    $("provision-confirm-overlay").hidden = true;
+    try {
+      await invoke("provisioning_cancel");
+    } catch (e) {
+      console.error("provisioning_cancel failed", e);
+    }
+  });
+  document.addEventListener("keydown", (e) => {
+    if ($("provision-confirm-overlay").hidden) return;
+    if (e.key === "Enter") $("btn-prov-confirm").click();
+    else if (e.key === "Escape") $("btn-prov-cancel").click();
   });
 
   // ---- click-to-call bridge settings ---------------------------------
@@ -1204,6 +1288,14 @@ async function attachTauriListeners() {
   await listen("transcription://segment", (e) => handleTranscriptSegment(e.payload));
   await listen("transcription://done", (e) => handleTranscriptDone(e.payload));
   await listen("transcription://error", (e) => handleTranscriptError(e.payload));
+  // Auto-provisioning deep link (provisioning.rs handle_deep_link, wired
+  // from deeplink.rs) - same preview shape provisioning_resolve returns
+  // directly for the paste flow, so one confirmation screen serves both.
+  await listen("provisioning://preview", (e) => showProvisioningConfirm(e.payload));
+  await listen("provisioning://error", (e) => {
+    const message = e.payload && e.payload.message ? e.payload.message : String(e.payload);
+    showBanner(`Provisioning link: ${message}`, "err");
+  });
 }
 
 // Premium receptionist console entry point - hidden unless the license
@@ -1250,6 +1342,23 @@ async function boot() {
   renderAll();
   await loadRecents();
   await attachTauriListeners();
+  // Catches a provisioning preview whose "provisioning://preview" event
+  // already fired (and was lost - Tauri doesn't queue/replay events for
+  // listeners that attach late) before the listener above existed - the
+  // real scenario for a cold-start centinelo://provision?config=... deep
+  // link, which resolves synchronously in the Rust side's .setup(), well
+  // before this script has even loaded (2026-07-16 4R re-review, R3).
+  // Checked AFTER attachTauriListeners(), not before: together they cover
+  // every timing - anything that fires before this line lands here via
+  // the peek, anything after is caught live by the listener, no gap
+  // remains either way. Non-consuming (provisioning.rs `peek()`), so this
+  // can't race a real apply/cancel that happens to land at the same time.
+  try {
+    const pendingPreview = await invoke("provisioning_pending_preview");
+    if (pendingPreview) showProvisioningConfirm(pendingPreview);
+  } catch (e) {
+    console.error("provisioning_pending_preview failed", e);
+  }
   await applyPremiumUI();
   await applyTranscriptionUI();
   // Re-hydrate any transcript(s) still waiting to save from a previous

@@ -6,6 +6,7 @@ mod deeplink;
 mod e2e;
 mod hid;
 mod premium;
+mod provisioning;
 mod settings;
 mod sidecar;
 mod tray;
@@ -52,6 +53,14 @@ pub fn run() {
             let settings = Arc::new(SettingsStore::load(&app_data_dir)?);
             app.manage(settings.clone());
             app.manage(AdminSession::default());
+            // Managed before deeplink::setup() below - a `centinelo://
+            // provision` link handled during that call's own
+            // `get_current()` branch (app launched *by* the link) spawns
+            // a background thread that reaches for this state as soon as
+            // it resolves (provisioning.rs `handle_deep_link`); for the
+            // embedded (`config=`) form that resolution is instant, no
+            // network wait to cover the ordering gap.
+            app.manage(provisioning::ProvisioningPending::default());
 
             let sidecar = SidecarHandle::new(app.handle().clone(), settings.clone());
             app.manage(sidecar.clone());
@@ -157,6 +166,10 @@ pub fn run() {
             commands::transcription_model_status,
             commands::download_transcription_model,
             commands::reveal_in_file_manager,
+            commands::provisioning_resolve,
+            commands::provisioning_pending_preview,
+            commands::provisioning_apply,
+            commands::provisioning_cancel,
             hid::commands::hid_status,
             hid::commands::hid_list_devices,
             hid::commands::get_hid_settings,

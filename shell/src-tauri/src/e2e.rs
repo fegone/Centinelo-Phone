@@ -24,7 +24,19 @@
 //! roots - see `commands::reveal_in_file_manager`'s doc - the point of
 //! this step is confirming the command dispatches and rejects an
 //! out-of-scope path exactly like it would from the real UI, not that it
-//! succeeds without a real transcript on disk).
+//! succeeds without a real transcript on disk),
+//! `provisioning_resolve:<link>` (auto-provisioning, spec §5 - see
+//! provisioning.rs; `<link>` is passed through unencoded, so a
+//! `centinelo://provision?config=...` link's base64url payload is fine
+//! as-is, but avoid a link containing a literal `|` - this driver's own
+//! step separator), `provisioning_apply`, `provisioning_cancel`,
+//! `admin_set_password:<password>` (sets/changes the admin password and
+//! leaves the session unlocked on success, same as the real
+//! `admin_set_password` command - lets a script reach an admin-gated step
+//! like `provisioning_apply` on an already-configured account without a
+//! GUI; added 2026-07-16 4R re-review to verify R4's "refuse to restart
+//! mid-call" check end to end, which needs an unlocked session on an
+//! already-configured account to even reach that check).
 //!
 //! Every step targets "the current call" (no `call_id`) - matching the
 //! frontend's own single-call-at-a-time UI; there's no scripted way here
@@ -157,6 +169,32 @@ pub fn maybe_run_e2e_script(app: &AppHandle) {
                 match commands::reveal_in_file_manager(settings, path.to_string()) {
                     Ok(()) => log::info!("e2e: reveal_in_file_manager({path}) -> ok"),
                     Err(e) => log::info!("e2e: reveal_in_file_manager({path}) -> err: {e}"),
+                }
+            } else if let Some(link) = step.strip_prefix("provisioning_resolve:") {
+                let provisioning: tauri::State<crate::provisioning::ProvisioningPending> = app.state();
+                match commands::provisioning_resolve(provisioning, link.to_string()) {
+                    Ok(preview) => log::info!("e2e: provisioning_resolve -> ok, preview={preview:?}"),
+                    Err(e) => log::info!("e2e: provisioning_resolve -> err: {e}"),
+                }
+            } else if step == "provisioning_apply" {
+                let settings: tauri::State<std::sync::Arc<crate::settings::SettingsStore>> = app.state();
+                let admin: tauri::State<crate::settings::AdminSession> = app.state();
+                let sidecar: tauri::State<SidecarHandle> = app.state();
+                let provisioning: tauri::State<crate::provisioning::ProvisioningPending> = app.state();
+                match commands::provisioning_apply(settings, admin, sidecar, provisioning) {
+                    Ok(()) => log::info!("e2e: provisioning_apply -> ok"),
+                    Err(e) => log::info!("e2e: provisioning_apply -> err: {e}"),
+                }
+            } else if step == "provisioning_cancel" {
+                let provisioning: tauri::State<crate::provisioning::ProvisioningPending> = app.state();
+                commands::provisioning_cancel(provisioning);
+                log::info!("e2e: provisioning_cancel -> ok");
+            } else if let Some(pw) = step.strip_prefix("admin_set_password:") {
+                let settings: tauri::State<std::sync::Arc<crate::settings::SettingsStore>> = app.state();
+                let admin: tauri::State<crate::settings::AdminSession> = app.state();
+                match commands::admin_set_password(settings, admin, pw.to_string()) {
+                    Ok(()) => log::info!("e2e: admin_set_password -> ok"),
+                    Err(e) => log::info!("e2e: admin_set_password -> err: {e}"),
                 }
             } else {
                 log::warn!("e2e: unknown step '{step}'");

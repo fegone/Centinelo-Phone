@@ -112,6 +112,16 @@ fn handle_url(app: &AppHandle, settings: &Arc<SettingsStore>, url: &url::Url) {
     if scheme != TEL_SCHEME && scheme != CENTINELO_SCHEME {
         return; // not ours (shouldn't happen - the plugin only forwards configured schemes)
     }
+    // `centinelo://provision?...` is a distinct verb from the dial links
+    // this function otherwise handles (`centinelo://<number>`,
+    // `centinelo://dial?number=...`) - routed to provisioning.rs before
+    // any of the dial-target extraction below ever runs, same way this
+    // function already special-cases nothing else about `centinelo:`
+    // hosts today. See provisioning.rs's module doc for the full flow.
+    if crate::provisioning::is_provision_link(url) {
+        crate::provisioning::handle_deep_link(app.clone(), url.clone());
+        return;
+    }
     let snapshot = settings.snapshot();
     if scheme == TEL_SCHEME && !snapshot.bridge.register_tel_handler {
         log::info!("deep-link: ignoring a tel: link - \"Answer tel: links\" is off in Settings");

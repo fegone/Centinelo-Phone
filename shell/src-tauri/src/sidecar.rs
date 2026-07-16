@@ -177,6 +177,23 @@ impl SidecarHandle {
     }
 
     /// Coarse call/registration state for the click-to-call bridge's
+    /// Any call phase other than `None` (incoming/calling/in-call) -
+    /// backs `commands::provisioning_apply`'s pre-restart check (2026-07-16
+    /// 4R re-review, R4): applying a provisioning config restarts this
+    /// sidecar unconditionally, which drops whatever call is in progress
+    /// with no warning - a real risk specifically because a provisioning
+    /// request can arrive via a `centinelo://provision` deep link (email/
+    /// IM) at any time, not just from a deliberate "I'm between calls,
+    /// let's reconfigure" moment the way opening Settings usually is. A
+    /// fresh install (no account configured yet, the common first-run
+    /// case) can never be mid-call - the supervisor loop never even
+    /// starts before an account exists - so this is a safe, always-
+    /// accurate check to run unconditionally rather than only when
+    /// re-provisioning an already-configured install.
+    pub fn has_active_call(&self) -> bool {
+        !matches!(*self.0.call_phase.lock().expect("poisoned"), CallPhase::None)
+    }
+
     /// `/ping` (bridge.rs) - see `CallPhase`'s doc comment for the
     /// vocabulary and why `held` is deliberately absent.
     pub fn ping_state(&self) -> &'static str {
@@ -383,15 +400,26 @@ fn supervisor_loop(shared: Arc<Shared>) {
 
         shared.emit_status_from_thread(StatusPayload::Starting);
 
-        let mut child = match Command::new(&plan.binary)
-            .arg("-f")
+        // CENT_TLS_PIN: core/PROTOCOL.md's own documented env var ("one
+        // flat env var - single pin, checked for every TLS/WSS
+        // connection", see that file's TLS verification section) - only
+        // set when the account actually has one (provisioning.rs is the
+        // only writer today, see settings.rs AccountSettings doc). Built
+        // as a plain `Command` rather than one long builder chain so this
+        // one env var can be conditional without duplicating every other
+        // `.arg()`/`.env()`/`.stdio()` call across two branches.
+        let mut cmd = Command::new(&plan.binary);
+        cmd.arg("-f")
             .arg(&plan.scratch_dir)
             .env("CENT_WS_PATH", &plan.ws_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-        {
+            .stderr(Stdio::piped());
+        if let Some(pin) = account.tls_pin_sha256.as_deref().filter(|p| !p.is_empty()) {
+            cmd.env("CENT_TLS_PIN", pin);
+        }
+
+        let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
                 let _ = std::fs::remove_dir_all(&plan.scratch_dir);
@@ -725,6 +753,17 @@ fn write_accounts_file(
     transport: &str,
     port: u16,
 ) -> Result<(), String> {
+    // Defense at the sink (2026-07-16 4R re-review, A1): both callers that
+    // can produce an AccountSettings this function ends up spawning with
+    // (commands::save_account_settings, provisioning::validate) already
+    // run this same check before they persist - this second call is
+    // deliberate belt-and-suspenders, not redundant: it holds regardless
+    // of whether some future third caller remembers to validate before
+    // writing to `AccountSettings`, since this is the one place that
+    // actually builds the unescaped accounts-file line those characters
+    // could break out of.
+    crate::settings::validate_account_fields(&account.host, &account.ext, &account.secret, &account.display_name)?;
+
     // Mirrors run-spike.sh's ACCOUNT_URI/ACCOUNT_PARAMS exactly - see that
     // script for why each param is required (webrtc=yes on the endpoint
     // forces dtls_srtp/ice regardless of signaling transport; `outbound=`
