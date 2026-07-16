@@ -168,12 +168,17 @@ jobs:
   # The real official Pro build. DELIBERATELY GATED OFF (only runs when
   # dispatched with build_official_pro=true) and UNTESTED this pass - see
   # .claude/reports/release-ci-2026-07-16-windows-installer.md for exactly
-  # why. Three blockers, all outside release-ci's scope to resolve alone:
+  # why. Two blockers remain, both outside release-ci's scope to resolve
+  # alone (a third - core-win - closed 2026-07-16, see below):
   #
-  #   1. core-win (feature/windows-media-modules) is not merged - the
-  #      "Build core/ (Windows)" step below mirrors core-build.yml's
-  #      Windows job verbatim so it's ready the moment that lands, but has
-  #      never been run as part of *this* workflow.
+  #   1. [CLOSED 2026-07-16] core-win (feature/windows-media-modules,
+  #      ausine/aufile/ice/dtls_srtp/wasapi) merged to v2 at 47df112 -
+  #      the "Build core/ (Windows)" steps below now mirror the CURRENT
+  #      core-build.yml Windows job (including the wasapi module and the
+  #      fuller MODULES list), pulled in via merging origin/v2 into this
+  #      branch. Still never run as part of *this* workflow though - only
+  #      core-build.yml's own job has actually exercised these exact
+  #      commands on a real runner.
   #   2. PREMIUM_REPO_PAT does not exist as a repo secret yet. Needs a
   #      fine-grained PAT (or deploy key) scoped to READ-ONLY on
   #      fegone/centinelo-premium, created by Felix, added under this
@@ -257,6 +262,12 @@ jobs:
           cmake --install core/deps/re/build --config Release
 
       - name: Configure + build baresip + ctrl_json
+        # MODULES list kept identical to core-build.yml's own Windows job
+        # (as of 47df112, the windows-media-modules merge) - THIS IS A
+        # THIRD copy of that list (core-build.yml, package-official.sh's
+        # macOS branch, and here), same DRY problem package-official.sh's
+        # "Known gaps" already flags for the patch list; no shared source
+        # today, drift is manual-sync-only.
         shell: bash
         run: |
           set -o pipefail
@@ -266,7 +277,7 @@ jobs:
             -DRE_LIBRARY="$RE_INSTALL/lib/re-static.lib" \
             -DRE_INCLUDE_DIR="$(pwd -W)/core/deps/re/include" \
             -DOPENSSL_ROOT_DIR="$OPENSSL_ROOT_DIR" \
-            -DMODULES="account;g711;auconv;auresamp;menu" \
+            -DMODULES="account;g711;auconv;auresamp;ausine;aufile;ice;dtls_srtp;menu;wasapi" \
             -DAPP_MODULES="ctrl_json" \
             -DAPP_MODULES_DIR="$(pwd -W)/core/modules"
           cmake --build core/deps/baresip/build --config Release

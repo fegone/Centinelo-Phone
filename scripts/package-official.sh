@@ -15,7 +15,11 @@
 # dedicated symlink-fixture re-test (see "Known gaps" #1 below). Not yet run
 # against a *real* signed premium dylib (that requires Felix's offline
 # signing key, which never touches this repo or CI) or a *real* Windows core
-# build (feature/windows-media-modules not merged yet).
+# build via THIS script specifically — core-win (windows-media-modules,
+# ausine/aufile/ice/dtls_srtp/wasapi) merged to v2 at 47df112 and its own
+# core-build.yml job is green, but --target windows here still hard-fails
+# before reaching that build (see "Known gaps" #1) since porting the
+# re-install-prefix dance itself into this script wasn't done this pass.
 #
 # Windows target (added 2026-07-16, windows-installer pass): unlike macOS —
 # where the .app is just a directory, so copying files in after `tauri
@@ -439,13 +443,15 @@ cp "$CORE_BIN_PATH" "$CORE_ENGINE_DIR/"
 # target is a regular file now correctly matches `-type f`.
 #
 # Windows-only wrinkle (2026-07-16 windows-installer pass, read straight off
-# core-build.yml's Windows job comments — not exercised here, that job's
-# branch, feature/windows-media-modules, isn't merged yet): baresip on
-# Windows builds STATIC ("there is no ctrl_json.dll - the module is
-# compiled into the static baresip lib via the generated src/static.c
-# exports table"), so this `find` step will legitimately find zero module
-# files there - that is NOT a bug once core-win lands, unlike macOS where
-# finding zero .dylib files would mean something broke. (Searching
+# core-build.yml's Windows job comments — confirmed still true after
+# merging core-win, windows-media-modules @ 47df112, into this branch:
+# adding ausine/aufile/ice/dtls_srtp/wasapi to MODULES didn't change the
+# STATIC-vs-shared story): baresip on Windows builds STATIC ("there is no
+# ctrl_json.dll - the module is compiled into the static baresip lib via
+# the generated src/static.c exports table"), so this `find` step will
+# legitimately find zero module files there - that is NOT a bug, unlike
+# macOS where finding zero .dylib files would mean something broke.
+# (Searching
 # $CORE_BUILD_DIR itself, not the MSVC Release/ subdir CORE_BIN_PATH uses -
 # baresip's CMake symlinks modules flat into the build root per
 # core/BUILD.md step 4b; unverified for Windows specifically since this
