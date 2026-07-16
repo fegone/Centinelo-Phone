@@ -47,7 +47,17 @@
 //! and best-effort applies it live via `set_device`, see
 //! `commands::save_audio_settings`; `<name>` is passed through verbatim,
 //! including any embedded `,` - it's expected to be a `devices` event's
-//! own `"<module>[,<device>]"` name, not user free text).
+//! own `"<module>[,<device>]"` name, not user free text; each call only
+//! ever sets the ONE field named in `<input|output>`, leaving the other
+//! `SaveAudioInput` field `None` - since 2026-07-16's A3 fix that means
+//! "leave whatever's already saved for that direction untouched", not "clear
+//! it", so a `set_device:input:X` step followed later by `set_device:output:Y`
+//! composes correctly instead of the second call wiping the first's device;
+//! an empty `<name>` (`set_device:input:`) is a deliberate explicit clear
+//! back to the platform default, not a no-op - see
+//! `commands::merge_device_choice`'s doc for the exact three-way semantics,
+//! and `settings::validate_device_name` for the S1 rejection a `<name>`
+//! containing a raw newline would hit).
 //!
 //! Every step targets "the current call" (no `call_id`) - matching the
 //! frontend's own single-call-at-a-time UI; there's no scripted way here

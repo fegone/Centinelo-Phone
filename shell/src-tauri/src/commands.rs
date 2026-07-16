@@ -277,6 +277,14 @@ pub fn sidecar_list_devices(sidecar: State<SidecarHandle>) -> Result<(), String>
     sidecar.send_cmd(serde_json::json!({ "cmd": "devices" }))
 }
 
+/// `None`/omitted on a field = this save doesn't touch that field, keeping
+/// whatever's already persisted (2026-07-16 4R review, A3 - see
+/// `merge_device_choice`'s doc for why this matters: the old shape blindly
+/// replaced the *whole* `AudioSettings` struct, so an input-only save
+/// silently wiped a previously-saved output device). `Some("")` (or
+/// all-whitespace) on a field = an explicit clear back to the platform
+/// default. `Some(name)` = an explicit new device, validated via
+/// `settings::validate_device_name` (S1) before being accepted at all.
 #[derive(Deserialize)]
 pub struct SaveAudioInput {
     #[serde(default)]
@@ -285,16 +293,85 @@ pub struct SaveAudioInput {
     pub output_device: Option<String>,
 }
 
-/// Persists the operator's device choice (so the *next* sidecar spawn
-/// picks it up via `sidecar::audio_config_lines`) and, best-effort, applies
-/// it live to whatever's running right now via `core/PROTOCOL.md`'s
-/// `set_device` - which the protocol documents as hot-swapping a call in
-/// progress with no re-INVITE (`ctrl_json.c`'s `cmd_set_device()`). A
-/// `set_device` failure (e.g. no sidecar running yet - no account
-/// configured) is intentionally swallowed here rather than failing the
-/// whole save: the persisted choice still takes effect on the next spawn
-/// either way, matching `save_favorites`/`save_account_settings`'s own
-/// "persist first, best-effort live-apply second" shape.
+/// Resolves one field's (`input_device`/`output_device`) next persisted
+/// value from what this particular save actually touched (2026-07-16 4R
+/// review, A3 - see `SaveAudioInput`'s doc for the three-way semantics
+/// this implements: not-touched / explicit-clear / explicit-set). Also the
+/// S1 VETO's persist-side validation: an explicit set that fails
+/// `settings::validate_device_name` (e.g. an embedded newline - baresip
+/// config-line injection, see that function's doc) is rejected outright
+/// here, before it ever reaches `settings.update_audio` - the whole save
+/// fails with a clear message rather than silently dropping just the bad
+/// field.
+fn merge_device_choice(previous: Option<String>, input: Option<String>) -> Result<Option<String>, String> {
+    match input {
+        None => Ok(previous),
+        Some(s) if s.trim().is_empty() => Ok(None),
+        Some(s) => {
+            let trimmed = s.trim().to_string();
+            settings::validate_device_name(&trimmed)?;
+            Ok(Some(trimmed))
+        }
+    }
+}
+
+/// Pure decision half of `apply_live_device` (2026-07-16 4R review) -
+/// whether a live `set_device` needs to be sent for this save, and with
+/// what device name - factored out so it's unit-testable without a real
+/// `SidecarHandle`/`AppHandle` (this crate has no mock for either - see
+/// `live_device_command_tests`). `None` = nothing to send: either this
+/// save didn't actually change `kind` (`previous == updated` - a save
+/// that only touched the *other* direction must not re-send a redundant
+/// `set_device` for this one), or it's an explicit clear (`Some -> None`)
+/// on a platform with no real driver to revert to (`platform_default` is
+/// `None` - nothing sensible to send live either way).
+///
+/// The explicit-clear-needs-a-live-command-too case (A5, 2026-07-16 4R
+/// review) is the one this replaces a naive "only send when `updated` is
+/// `Some`" would have missed: clearing a previously-selected device back
+/// to "default" must still push `<driver>,default` live via
+/// `sidecar::platform_default_device_string`, or an active call keeps
+/// using the old device even though settings now say "default".
+fn live_device_command(
+    previous: &Option<String>,
+    updated: &Option<String>,
+    platform_default: Option<String>,
+) -> Option<String> {
+    if previous == updated {
+        return None;
+    }
+    match updated {
+        Some(n) => Some(n.clone()),
+        None => platform_default,
+    }
+}
+
+/// Best-effort live hot-swap of one direction (`"input"`/`"output"`) via
+/// `core/PROTOCOL.md`'s `set_device` - which the protocol documents as
+/// hot-swapping a call in progress with no re-INVITE (`ctrl_json.c`'s
+/// `cmd_set_device()`). See `live_device_command` for exactly when a
+/// command is sent at all. A `send_cmd` failure (e.g. sidecar not running
+/// right now - no account configured yet) is surfaced via
+/// `SidecarHandle::emit_notice` (a real, user-visible signal - see that
+/// method's doc, not just a log line) rather than swallowed silently; it
+/// still doesn't fail the *save* itself, since the persisted choice takes
+/// effect on the next spawn/call either way, matching
+/// `save_favorites`/`save_account_settings`'s own "persist first,
+/// best-effort live-apply second" shape.
+fn apply_live_device(sidecar: &SidecarHandle, kind: &str, previous: &Option<String>, updated: &Option<String>) {
+    let Some(name) = live_device_command(previous, updated, crate::sidecar::platform_default_device_string()) else {
+        return;
+    };
+    if let Err(e) = sidecar.send_cmd(serde_json::json!({"cmd": "set_device", "kind": kind, "name": name})) {
+        sidecar.emit_notice(&format!(
+            "couldn't apply the {kind} device change to the running call ({e}) - it will take effect on the next call or restart"
+        ));
+    }
+}
+
+/// Persists the operator's device choice, merged onto whatever was already
+/// saved (A3 - see `merge_device_choice`), and best-effort applies each
+/// *changed* direction live (A5 - see `apply_live_device`).
 #[tauri::command(rename_all = "snake_case")]
 pub fn save_audio_settings(
     settings: State<Arc<SettingsStore>>,
@@ -303,23 +380,85 @@ pub fn save_audio_settings(
     input: SaveAudioInput,
 ) -> Result<(), String> {
     require_unlocked(&admin)?;
-    let clean = |d: Option<String>| d.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let previous = settings.snapshot().audio;
     let updated = settings::AudioSettings {
-        input_device: clean(input.input_device),
-        output_device: clean(input.output_device),
+        input_device: merge_device_choice(previous.input_device.clone(), input.input_device)?,
+        output_device: merge_device_choice(previous.output_device.clone(), input.output_device)?,
     };
     settings.update_audio(updated.clone()).map_err(|e| e.to_string())?;
-    if let Some(name) = &updated.input_device {
-        if let Err(e) = sidecar.send_cmd(serde_json::json!({"cmd": "set_device", "kind": "input", "name": name})) {
-            log::info!("save_audio_settings: live set_device(input) skipped: {e}");
-        }
-    }
-    if let Some(name) = &updated.output_device {
-        if let Err(e) = sidecar.send_cmd(serde_json::json!({"cmd": "set_device", "kind": "output", "name": name})) {
-            log::info!("save_audio_settings: live set_device(output) skipped: {e}");
-        }
-    }
+    apply_live_device(&sidecar, "input", &previous.input_device, &updated.input_device);
+    apply_live_device(&sidecar, "output", &previous.output_device, &updated.output_device);
     Ok(())
+}
+
+#[cfg(test)]
+mod audio_settings_command_tests {
+    use super::*;
+
+    #[test]
+    fn untouched_field_keeps_the_previous_value() {
+        assert_eq!(
+            merge_device_choice(Some("coreaudio,Old Mic".to_string()), None).unwrap(),
+            Some("coreaudio,Old Mic".to_string())
+        );
+    }
+
+    #[test]
+    fn explicit_empty_string_clears_to_platform_default() {
+        assert_eq!(merge_device_choice(Some("coreaudio,Old Mic".to_string()), Some("".to_string())).unwrap(), None);
+        assert_eq!(merge_device_choice(Some("coreaudio,Old Mic".to_string()), Some("   ".to_string())).unwrap(), None);
+    }
+
+    #[test]
+    fn explicit_value_replaces_the_previous_one() {
+        assert_eq!(
+            merge_device_choice(Some("coreaudio,Old Mic".to_string()), Some("coreaudio,New Mic".to_string())).unwrap(),
+            Some("coreaudio,New Mic".to_string())
+        );
+    }
+
+    #[test]
+    fn injected_newline_is_rejected_not_silently_dropped() {
+        // S1 VETO (2026-07-16 4R review) - persist-side half of the dual
+        // defense; sidecar::resolve_device is the sink-side half.
+        let err = merge_device_choice(None, Some("coreaudio,Mic\nmodule cons.so".to_string())).unwrap_err();
+        assert!(err.contains("control"), "unexpected message: {err}");
+    }
+
+    // ---- A5 (2026-07-16 4R review): live_device_command ------------------
+
+    #[test]
+    fn unchanged_field_sends_nothing_live() {
+        let same = Some("coreaudio,Mic".to_string());
+        assert_eq!(live_device_command(&same, &same, Some("coreaudio,default".to_string())), None);
+        assert_eq!(live_device_command(&None, &None, Some("coreaudio,default".to_string())), None);
+    }
+
+    #[test]
+    fn explicit_new_device_sends_that_device_live() {
+        assert_eq!(
+            live_device_command(&None, &Some("coreaudio,New Mic".to_string()), Some("coreaudio,default".to_string())),
+            Some("coreaudio,New Mic".to_string())
+        );
+    }
+
+    #[test]
+    fn clearing_a_device_sends_the_platform_default_live_not_nothing() {
+        // The exact bug A5 fixes: without this, clearing a device back to
+        // "default" would leave an in-progress call on the old device
+        // even though settings now say "default".
+        let previous = Some("coreaudio,Old Mic".to_string());
+        assert_eq!(
+            live_device_command(&previous, &None, Some("coreaudio,default".to_string())),
+            Some("coreaudio,default".to_string())
+        );
+    }
+
+    #[test]
+    fn clearing_with_no_platform_driver_sends_nothing_theres_nothing_sensible_to_revert_to() {
+        let previous = Some("ausine,440".to_string());
+        assert_eq!(live_device_command(&previous, &None, None), None);
+    }
 }
 
 // ---- theme ------------------------------------------------------------
