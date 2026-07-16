@@ -1,4 +1,4 @@
-# core/ — ctrl_json wire protocol (v1.1)
+# core/ — ctrl_json wire protocol (v1.2)
 
 `ctrl_json` (`core/modules/ctrl_json/`) is a baresip "application" module
 that turns the running engine into a sidecar controllable over stdio:
@@ -26,6 +26,16 @@ below for the full v1.1 changelog. v0 (dial/answer/hangup/quit only,
 reg_state/call_state/error events, no call_id, no BLF/transfer/DTMF/
 hold/mute/stats) is superseded; see "Changes from v0" below for exactly
 what moved and why, if you're a consumer that was coded against v0.
+
+**v1.2 status: `tap_start`/`tap_stop` are implemented and e2e-verified
+against the real test PBX** — see `core/E2E-F1.md` "F4 audio tap". v1.2
+is **fully backward compatible with v1.1**: nothing about any existing
+command/event changed shape or behavior; v1.2 only *adds* the two new
+commands and the `tap_state` event (§"Commands"/"Events"), the
+foundation for local per-call transcription (F4/F5 - each direction is a
+separate WAV file by construction, i.e. free 2-speaker diarization, no
+speaker-separation model needed downstream). See "Changes from v1.1"
+below for the full v1.2 changelog.
 
 ## Framing
 
@@ -130,6 +140,8 @@ either, both, or neither.
 | `{"cmd":"blf_unsubscribe","ext":"510"}` | Cleanly unsubscribes (`Expires: 0`) and stops tracking `ext`. Errors if not currently subscribed. |
 | `{"cmd":"devices"}` | **New in v1.1.** Emit a `devices` event (see "Events") enumerating audio input/output devices and which is active. |
 | `{"cmd":"set_device","kind":"input","name":"..."}` | **New in v1.1.** Select an audio device for `kind` (`"input"` or `"output"`, required, case-insensitive). `name` (required) is a `devices` event's own `"name"` value, round-tripped verbatim — see "Events" `devices` row for its `"<module>[,<device>]"` shape. Persists as the default for calls started after this command (`conf_config()->audio.{src,play}_{mod,dev}`) **and** applies live to whatever call is active right now, if any, via baresip's `audio_set_source()`/`audio_set_player()` hot-swap API (investigated while building this: both genuinely stop and restart the running audio source/player against the same live call, no re-INVITE needed — see `ctrl_json.c` `cmd_set_device()`'s own comment). Scoped to "the current call" like every other no-`call_id` command in this file (see `resolve_call()`) — a concurrent second call (an attended-transfer consultation leg) is not touched. |
+| `{"cmd":"tap_start","dir":"/abs/path","call_id":"..."}` | **New in v1.2.** Starts tapping the resolved call's audio to two new mono 16-bit PCM WAV files under `dir` (required — an absolute, already-existing, writable directory; this command doesn't create it): `<dir>/<call_id>-rx.wav` (the remote party — decoded incoming audio) and `<dir>/<call_id>-tx.wav` (the local party — outgoing audio before encode). `call_id` is optional like every other call-scoped command (falls back to "the current call" — see `resolve_call()`); resolving to no call is an `error`, same as `hold`/`mute`/etc, **not** an "arm for the next call" — a tap always targets a call that already exists at the moment this command runs (see `core/E2E-F1.md` "F4 audio tap" for why the e2e sequence dials first, then taps). Errors (all `error` events, none of them crash the engine or the call): no current/resolvable call, the call has no audio yet, `dir` is missing/empty, a tap is already running for this call (stop it first), or the output file(s) couldn't be opened (bad `dir`, not writable, ...). Both files exist on disk (0 bytes) as soon as this command succeeds; each one's real WAV header is committed on that direction's first actual audio frame, not synchronously with this command (see `core/modules/ctrl_json/wav_writer.h`) — typically sub-20ms later on an already-flowing call. Sample rate is whatever the negotiated codec's audio path actually runs at, taken from each direction's real first frame, never guessed — this build's actual account (`audio_codecs=pcmu,pcma`, see `run-spike.sh`) runs at 8000 Hz mono; see `core/E2E-F1.md` "F4 audio tap" for the real numbers. Output is always mono — a source frame with more than one channel is downmixed (integer average) first, though this build's actual codec set never produces one (G.711 decodes to mono) — see `audiotap.c` `write_frame()`. |
+| `{"cmd":"tap_stop","call_id":"..."}` | **New in v1.2.** Stops a running tap on the resolved call, finalizing both WAV headers (correct final `RIFF`/`data` chunk sizes — a tap is also auto-finalized on call teardown even without this command, see "Events" `tap_state` row). Errors if the resolved call doesn't exist, has no audio, or has no tap currently running. |
 
 Unknown `cmd` values, a required field missing/wrong-typed (e.g. `dial`
 without `uri`, `mute` without a real boolean `on`, `set_device` with a
@@ -159,7 +171,8 @@ exactly what `ok:true`/`ok:false` do and don't promise about a command's
 | `{"event":"blf","ext":"...","state":"idle\|ringing\|busy\|offline"}` | New in v1, from `blf_subscribe`. `idle`: no active dialog for that extension (either no `<dialog>` element in the NOTIFY body, *or* one present with `<state>terminated</state>` — both occur in practice, see `core/E2E-F1.md` for the real captured body, which uses the second shape). `ringing`: `<state>` is `early`/`proceeding`/`trying`. `busy`: `<state>confirmed</state>`. `offline`: the subscription itself failed/was rejected/expired before a NOTIFY could be parsed, *or* a `<dialog>` element was present with no parseable `<state>` — the "can't currently tell" bucket. Parsing is pure, tiny, and unit-tested against both synthetic bodies and the real capture — see `core/modules/ctrl_json/dialog_info.c` and `test/test_main.c`. |
 | `{"event":"attended_transfer_started","source_call_id":"...","target_call_id":"..."}` | New in v1, from `attended_transfer`, right after the consultation call's dial succeeds. Lets a consumer correlate exactly which two `call_id`s a pending `complete_transfer`/`abort_transfer` will act on — there's no other way to learn `target_call_id` (it's a brand new call, not something the caller supplied). |
 | `{"event":"devices","input":[{"name":"...","active":true\|false},...],"output":[...]}` | **New in v1.1**, from `devices`. `name` is a `"<module>[,<device>]"` composite (matching baresip's own `audio_source`/`audio_player` config-file syntax) — pass it straight back as `set_device`'s own `"name"` field to select that device. This spike's actual module set (`ausine` input / `aufile` output only, see `core/BUILD.md` "Module selection" — no `coreaudio`/`alsa`/`wasapi`/...) has no real per-device enumeration, so today each of `input`/`output` always has exactly one entry — the driver module itself standing in for "the device" — rather than a genuinely empty or fake-populated list; a future real device-backend module plugs in with no protocol change (see `ctrl_json.c` `devices_add_driver()`'s own comment for exactly how the fallback works). |
-| `{"event":"result","id":"...","ok":true\|false,"error":"...?", ...}` | **New in v1.1**, from any command that carried an `id` (see "Commands") — a direct, correlated acknowledgment of that *specific* command's own synchronous dispatch. `ok:true` means the command was accepted and dispatched without a synchronous validation/API failure — it is **not** a promise about anything asynchronous: e.g. a `blind_transfer` that gets `result ok:true` can still fail far-end minutes later, surfaced the same way it always was, as a `BEVENT_CALL_TRANSFER_FAILED`-sourced `error` event — watch the normal `call_state`/`reg_state`/`stats`/`blf`/... events for that, same as always; `result` only ever reports the exact same synchronous success/failure an `id`-less send of the same command would have shown via a normal event (an `error` event on failure, nothing extra on success) — `id` doesn't change *what* happens, only whether you get a correlated acknowledgment of it. `error` is present (and identical to the text a plain `error` event would carry) only when `ok:false`. `quality_stats` and `devices` additionally merge their own "command-specific fields" (the same fields their own `stats`/`devices` event would carry) directly onto a successful `result`, so a correlated caller doesn't need to also match up a second event by hand just to read the data it asked for — every other command's `result` is just `{"event":"result","id":"...","ok":true}` on success. |
+| `{"event":"result","id":"...","ok":true\|false,"error":"...?", ...}` | **New in v1.1**, from any command that carried an `id` (see "Commands") — a direct, correlated acknowledgment of that *specific* command's own synchronous dispatch. `ok:true` means the command was accepted and dispatched without a synchronous validation/API failure — it is **not** a promise about anything asynchronous: e.g. a `blind_transfer` that gets `result ok:true` can still fail far-end minutes later, surfaced the same way it always was, as a `BEVENT_CALL_TRANSFER_FAILED`-sourced `error` event — watch the normal `call_state`/`reg_state`/`stats`/`blf`/... events for that, same as always; `result` only ever reports the exact same synchronous success/failure an `id`-less send of the same command would have shown via a normal event (an `error` event on failure, nothing extra on success) — `id` doesn't change *what* happens, only whether you get a correlated acknowledgment of it. `error` is present (and identical to the text a plain `error` event would carry) only when `ok:false`. `quality_stats` and `devices` additionally merge their own "command-specific fields" (the same fields their own `stats`/`devices` event would carry) directly onto a successful `result`, so a correlated caller doesn't need to also match up a second event by hand just to read the data it asked for — every other command's `result` is just `{"event":"result","id":"...","ok":true}` on success. `tap_start`/`tap_stop` are **not** in the merge list (like `hold`/`mute`/`blind_transfer`/...) — they're action commands, not query commands; their real data travels on the dedicated `tap_state` event below, the same way `hold`'s travels on `call_state`. |
+| `{"event":"tap_state","call_id":"...","state":"started"\|"stopped","rx_path":"...","tx_path":"...", ...}` | **New in v1.2**, from `tap_start` (`state:"started"`) and from `tap_stop` **or** call teardown (`state:"stopped"` either way — see `audiotap.h` `audiotap_call_closed()`: a tap that outlives its own `tap_stop`, e.g. the peer hangs up first, is auto-finalized so a WAV file is never left open/corrupt). `call_id` is always the resolved call's real id, regardless of whether the triggering command supplied one — same convention as `call_state`. `rx_path`/`tx_path` are present on both states (the same two paths `tap_start` chose, echoed back on `stopped` too so a consumer doesn't have to have kept them from the `started` event). `"stopped"` additionally carries `rx_bytes`/`tx_bytes` (PCM data bytes written, WAV header excluded) and `rx_duration_ms`/`tx_duration_ms` (derived from bytes/sample-rate/sample-size, integer math) — `"started"` never carries these fields at all (nothing's been written yet, not even a zero) — see `core/E2E-F1.md` "F4 audio tap" for real captured numbers. |
 
 ## Changes from v0
 
@@ -246,7 +259,69 @@ already relies on changed shape or behavior. Everything below is new:
   `0` against a real e2e run's captured stdout (`core/E2E-F1.md` "F3
   regression"), with and without `-s`.
 
-## Planned (still not in v1.1)
+## Changes from v1.1
+
+v1.2 is additive and fully backward compatible — nothing a v1.1 consumer
+already relies on changed shape or behavior. Everything below is new:
+
+- **`tap_start`/`tap_stop`** (see "Commands"/"Events") — per-call audio
+  tapping to two mono 16-bit PCM WAV files, the foundation for local
+  transcription (F4/F5): each direction (remote/decoded vs.
+  local/pre-encode) is a separate file by construction, so a future
+  transcription pipeline gets 2-speaker diarization for free, no
+  speaker-separation model needed on the consuming side.
+- Implemented as a baresip `aufilt` (`core/modules/ctrl_json/audiotap.c`
+  — adapted from baresip's own `modules/sndfile/sndfile.c` reference
+  module for the encode/decode-frame plumbing, hand-rolling its own
+  minimal WAV writer, `core/modules/ctrl_json/wav_writer.c`, instead of
+  a new external dependency like libsndfile — see both files' own
+  top-of-file comments for the full design reasoning, including why the
+  filter attaches to every call unconditionally but a separate registry
+  decides per-frame whether anything actually gets written) — both new
+  files compiled into the *existing* `ctrl_json` module target (see
+  `core/modules/ctrl_json/CMakeLists.txt`), not a new sibling
+  `APP_MODULE` — no CI/build-config wiring beyond that one file's `SRCS`
+  line, since `ctrl_json` was already built everywhere this engine is.
+- A tap always targets a call that already exists when `tap_start` runs
+  (`call_id` optional, falls back to "the current call" — same
+  `resolve_call()` convention, and the same "no call ⇒ `error`, never an
+  implicit arm-for-later" behavior, as every other call-scoped command
+  in this file) — see `core/E2E-F1.md` "F4 audio tap" for why its e2e
+  sequence dials, waits for the same ICE-settle window scenario (a)
+  already established, *then* taps, rather than tapping before dialing.
+- A tap is auto-finalized on call teardown (`BEVENT_CALL_CLOSED` →
+  `audiotap_call_closed()`, see `event_handler()`) even without an
+  explicit `tap_stop` — "never leave a corrupt WAV" holds on every path
+  a call can end on, not just the happy path. Also force-finalized for
+  any call still mid-tap at process shutdown (`ctrl_close()` →
+  `audiotap_close()`).
+- WAV headers are committed lazily, per direction, on that direction's
+  first real audio frame — its actual sample rate, never a
+  guessed/pre-negotiated value (see `wav_writer.h`) — same deliberate
+  choice `sndfile.c` already made. A tap that is stopped/finalized
+  having seen zero real frames in a direction (e.g. the call died
+  immediately) still gets a syntactically valid, silent WAV in that
+  direction rather than a headerless stub, using a documented fallback
+  sample rate (`AUDIOTAP_FALLBACK_SRATE` in `audiotap.c` — this build's
+  actual G.711 audio path, 8000 Hz).
+- Output is always mono, 16-bit PCM, regardless of the source frame's
+  own channel count or sample format (downmixed/converted first if
+  needed, via `re`/`rem`'s own `auconv_to_s16()` — already a link-time
+  dependency of this engine, not a new one) — this build's actual e2e
+  testing only ever exercises the already-mono-S16LE fast path (G.711
+  decodes to that natively); the conversion/downmix path is portability/
+  correctness code for a future different codec, not something
+  `core/E2E-F1.md` "F4 audio tap" itself exercises against the real PBX.
+- A tap-side write failure (e.g. disk full) never disrupts the call
+  itself: `encode()`/`decode()` always return success to baresip's own
+  audio pipeline regardless of the tap's own I/O outcome; a failing
+  writer logs exactly one `warning()` (not one per frame) via a sticky
+  `wav_writer` error flag, then silently stops attempting further writes
+  in that direction for the rest of the call — the WAV file, when
+  finalized, ends up correctly headered for whatever it did manage to
+  capture.
+
+## Planned (still not in v1.2)
 
 - `devices`'s device-name granularity is exactly baresip's own module
   set for this spike build (`ausine`/`aufile`, see `core/BUILD.md`
@@ -285,3 +360,28 @@ already relies on changed shape or behavior. Everything below is new:
   pin rotation via an array). Fine for this engine's actual one-PBX-host
   usage; a real multi-account/multi-host version would need more. See
   `core/patches/0002-re-tls-fingerprint-pin.patch`'s own comment.
+- **Tap consumption is out of scope for this version** — `tap_start`/
+  `tap_stop` only produce the two WAV files; nothing in this repo reads
+  them back yet. The intended next consumer is
+  `premium/crates/centinelo-transcribe` (whisper.cpp, per the workspace
+  spec's F4 phase) — it should be able to treat `-rx.wav`/`-tx.wav` as
+  two independent, already-speaker-separated mono streams and never need
+  its own diarization step; both files use a canonical, spec-plain PCM
+  WAV (see `wav_writer.c` — no `LIST`/`fact`/other optional chunks, no
+  RF64/extensible-format header), so any standard WAV reader (Python's
+  stdlib `wave` module, as used by `core/E2E-F1.md` "F4 audio tap"'s own
+  verification, included) should read them without special-casing.
+- The downmix-to-mono / non-S16LE-source conversion path in
+  `audiotap.c`'s `write_frame()` (see "Changes from v1.1") is not
+  exercised by this repo's e2e testing — this build's actual codec set
+  (G.711) only ever produces already-mono-S16LE frames. Worth a
+  synthetic/unit-level check (a fake multi-channel `struct auframe`) if
+  a future build adds a stereo device or non-PCM-native codec ahead of
+  it in the pipeline.
+- No maximum tap duration/size enforcement — a very long tap on a very
+  long call will eventually hit the ~4 GiB single-file ceiling any
+  canonical (non-RF64) WAV file has (~37h continuous at this build's
+  8kHz mono — see `wav_writer.c`'s own note on `data_bytes` wrapping).
+  Not a concern for any call length this repo's e2e testing (or a real
+  dental-office phone call) produces; would need an RF64/W64 header or a
+  rollover-to-a-new-file policy if that ever changed.

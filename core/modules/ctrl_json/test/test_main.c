@@ -19,11 +19,13 @@
  * Copyright (C) 2026 Neola Dental / Centinelo Phone
  */
 
+#include <errno.h>
 #include <re.h>
 #include <stdio.h>
 #include <string.h>
 #include "../cmd.h"
 #include "../dialog_info.h"
+#include "../wav_writer.h"
 
 
 static int failures = 0;
@@ -366,6 +368,275 @@ static void test_cmd_devices_and_set_device(void)
 }
 
 
+/*
+ * v1.2: "tap_start" (required "dir", optional call_id - like dial's
+ * required "uri") and "tap_stop" (call_id only, like hold/resume). See
+ * PROTOCOL.md "tap_start"/"tap_stop" and audiotap.h - the actual
+ * aufilt/WAV-writer mechanics this decode feeds are out of reach of this
+ * standalone test binary (baresip-dependent - see this file's own
+ * top-of-file comment), covered by core/E2E-F1.md "F4 audio tap"
+ * instead; this is purely the JSON -> struct cent_cmd field extraction.
+ */
+static void test_cmd_tap(void)
+{
+	struct cent_cmd cmd;
+	const char *err = NULL;
+
+	CHECK(CENT_CMD_TAP_START ==
+	      decode("{\"cmd\":\"tap_start\",\"dir\":\"/tmp/calls\"}",
+		     &cmd, &err), "tap_start: type");
+	CHECK_STREQ(cmd.dir, "/tmp/calls", "tap_start: dir value");
+	CHECK(!cmd.have_call_id, "tap_start: no call_id -> have_call_id false");
+
+	CHECK(CENT_CMD_TAP_START ==
+	      decode("{\"cmd\":\"tap_start\",\"dir\":\"/tmp/calls\","
+		     "\"call_id\":\"c1\"}", &cmd, &err),
+	      "tap_start+call_id: type");
+	CHECK_STREQ(cmd.dir, "/tmp/calls", "tap_start+call_id: dir value");
+	CHECK(cmd.have_call_id, "tap_start+call_id: have_call_id true");
+	CHECK_STREQ(cmd.call_id, "c1", "tap_start+call_id: call_id value");
+
+	CHECK(CENT_CMD_NONE == decode("{\"cmd\":\"tap_start\"}", &cmd, &err),
+	      "tap_start: missing dir -> NONE");
+	CHECK(err != NULL && strstr(err, "dir") != NULL,
+	      "tap_start: missing dir -> errmsg mentions 'dir'");
+
+	CHECK(CENT_CMD_NONE ==
+	      decode("{\"cmd\":\"tap_start\",\"dir\":\"\"}", &cmd, &err),
+	      "tap_start: empty dir -> NONE (require_str treats empty as"
+	      " missing, same as dial's uri)");
+
+	CHECK(CENT_CMD_TAP_STOP == decode("{\"cmd\":\"tap_stop\"}", &cmd, &err),
+	      "tap_stop: type");
+	CHECK(!cmd.have_call_id, "tap_stop: no call_id -> have_call_id false");
+
+	CHECK(CENT_CMD_TAP_STOP ==
+	      decode("{\"cmd\":\"tap_stop\",\"call_id\":\"c1\"}", &cmd, &err),
+	      "tap_stop+call_id: type");
+	CHECK(cmd.have_call_id, "tap_stop+call_id: have_call_id true");
+	CHECK_STREQ(cmd.call_id, "c1", "tap_stop+call_id: call_id value");
+}
+
+
+/*
+ * v1.2: wav_writer.c - see wav_writer.h's own top comment for why this
+ * is unit tested (pure C99 stdio, no baresip/re) unlike audiotap.c (the
+ * caller that actually feeds it real call audio - covered by
+ * core/E2E-F1.md "F4 audio tap" instead). These tests do real file I/O
+ * against the current working directory (wherever ctest/the binary runs
+ * from - core/BUILD.md's own build-dir convention), cleaning up after
+ * themselves with remove().
+ */
+
+static uint32_t get_u32le(const uint8_t *p)
+{
+	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+	       ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+
+static uint16_t get_u16le(const uint8_t *p)
+{
+	return (uint16_t)(p[0] | (p[1] << 8));
+}
+
+
+/* Re-opens `path` independently (plain fopen/fread, no wav_writer.h API
+ * at all) and checks the canonical 44-byte PCM header field-by-field,
+ * plus that the file is exactly 44 + `want_data_bytes` bytes long. This
+ * is deliberately an independent reader from wav_writer.c's own
+ * build_header() - checking wav_writer's *output* against the WAV
+ * spec's actual byte layout, not just against itself. */
+static void check_wav_header(const char *path, uint32_t want_srate,
+			      uint32_t want_data_bytes, const char *desc)
+{
+	uint8_t hdr[44];
+	FILE *fp;
+	long total;
+	char msg[192];
+
+	fp = fopen(path, "rb");
+	CHECK(fp != NULL, desc);
+	if (!fp)
+		return;
+
+	CHECK(fread(hdr, 1, sizeof(hdr), fp) == sizeof(hdr),
+	      "wav header: could read 44 bytes");
+
+	CHECK(0 == memcmp(hdr + 0, "RIFF", 4), "wav header: 'RIFF' magic");
+	CHECK(get_u32le(hdr + 4) == 36 + want_data_bytes,
+	      "wav header: RIFF chunk size == 36 + data_bytes");
+	CHECK(0 == memcmp(hdr + 8, "WAVE", 4), "wav header: 'WAVE' magic");
+	CHECK(0 == memcmp(hdr + 12, "fmt ", 4), "wav header: 'fmt ' magic");
+	CHECK(get_u32le(hdr + 16) == 16, "wav header: fmt chunk size == 16");
+	CHECK(get_u16le(hdr + 20) == 1, "wav header: audio format == 1 (PCM)");
+	CHECK(get_u16le(hdr + 22) == 1, "wav header: channels == 1 (mono)");
+	(void)re_snprintf(msg, sizeof(msg), "%s: srate", desc);
+	CHECK(get_u32le(hdr + 24) == want_srate, msg);
+	CHECK(get_u32le(hdr + 28) == want_srate * 1 * 2,
+	      "wav header: byte_rate == srate * channels * bytes/sample");
+	CHECK(get_u16le(hdr + 32) == 2,
+	      "wav header: block_align == channels * bytes/sample");
+	CHECK(get_u16le(hdr + 34) == 16, "wav header: bits_per_sample == 16");
+	CHECK(0 == memcmp(hdr + 36, "data", 4), "wav header: 'data' magic");
+	CHECK(get_u32le(hdr + 40) == want_data_bytes,
+	      "wav header: data chunk size == want_data_bytes");
+
+	if (fseek(fp, 0, SEEK_END) == 0) {
+		total = ftell(fp);
+		CHECK(total == (long)(44 + want_data_bytes),
+		      "wav header: total file size == 44 + data_bytes"
+		      " (no extra trailing bytes)");
+	}
+
+	(void)fclose(fp);
+}
+
+
+static void test_wav_writer_basic(void)
+{
+	static const char *path = "wav_writer_test_basic.wav";
+	static const int16_t samples[4] = { 100, -100, 32767, -32768 };
+	struct wav_writer w;
+	uint8_t raw[8];
+	FILE *fp;
+
+	CHECK(0 == wav_writer_create(&w, path), "wav_writer: create");
+	CHECK(0 == wav_writer_write(&w, 8000, samples, 4),
+	      "wav_writer: write 4 samples @ 8000Hz");
+	CHECK(wav_writer_bytes(&w) == 8,
+	      "wav_writer: bytes() == 8 (4 samples * 2 bytes) after write,"
+	      " before close");
+	CHECK(0 == wav_writer_close(&w, 8000), "wav_writer: close");
+	CHECK(wav_writer_bytes(&w) == 8,
+	      "wav_writer: bytes() still 8 after close");
+
+	check_wav_header(path, 8000, 8, "wav_writer basic: header");
+
+	/* Sample data itself, byte-exact - independent of build_header(),
+	 * this is checking wav_writer_write()'s own raw fwrite() path. */
+	fp = fopen(path, "rb");
+	CHECK(fp != NULL, "wav_writer basic: re-open for sample data check");
+	if (fp) {
+		CHECK(fseek(fp, 44, SEEK_SET) == 0,
+		      "wav_writer basic: seek past header");
+		CHECK(fread(raw, 1, sizeof(raw), fp) == sizeof(raw),
+		      "wav_writer basic: read 8 data bytes");
+		CHECK(get_u16le(raw + 0) == (uint16_t)100,
+		      "wav_writer basic: sample 0 == 100");
+		CHECK(get_u16le(raw + 2) == (uint16_t)-100,
+		      "wav_writer basic: sample 1 == -100 (two's complement)");
+		CHECK(get_u16le(raw + 4) == (uint16_t)32767,
+		      "wav_writer basic: sample 2 == 32767");
+		CHECK(get_u16le(raw + 6) == (uint16_t)-32768,
+		      "wav_writer basic: sample 3 == -32768");
+		(void)fclose(fp);
+	}
+
+	/* Idempotence: a second close() must not corrupt the already-
+	 * finalized file (see wav_writer.h's own "idempotent" contract). */
+	CHECK(0 == wav_writer_close(&w, 8000),
+	      "wav_writer: second close() is a safe no-op (returns 0)");
+	check_wav_header(path, 8000, 8,
+			 "wav_writer basic: header unchanged after 2nd close");
+
+	(void)remove(path);
+}
+
+
+static void test_wav_writer_multi_write(void)
+{
+	static const char *path = "wav_writer_test_multiwrite.wav";
+	static const int16_t chunk_a[2] = { 1, 2 };
+	static const int16_t chunk_b[3] = { 3, 4, 5 };
+	struct wav_writer w;
+
+	CHECK(0 == wav_writer_create(&w, path), "wav_writer multi: create");
+	CHECK(0 == wav_writer_write(&w, 16000, chunk_a, 2),
+	      "wav_writer multi: first write (commits header @ 16000Hz)");
+	CHECK(0 == wav_writer_write(&w, 16000, chunk_b, 3),
+	      "wav_writer multi: second write (header already committed -"
+	      " srate arg ignored)");
+	CHECK(wav_writer_bytes(&w) == 10,
+	      "wav_writer multi: bytes() == 10 ((2+3) samples * 2 bytes)");
+	CHECK(0 == wav_writer_close(&w, 16000), "wav_writer multi: close");
+
+	check_wav_header(path, 16000, 10, "wav_writer multi: header");
+
+	(void)remove(path);
+}
+
+
+/* The "zero frames ever written" edge case (F4 task design: "never leave
+ * a corrupt WAV") - create() then close() with no write() in between at
+ * all must still leave a syntactically valid, silent WAV using the
+ * fallback srate. */
+static void test_wav_writer_never_written(void)
+{
+	static const char *path = "wav_writer_test_neverwritten.wav";
+	struct wav_writer w;
+
+	CHECK(0 == wav_writer_create(&w, path),
+	      "wav_writer never-written: create");
+	CHECK(wav_writer_bytes(&w) == 0,
+	      "wav_writer never-written: bytes() == 0 before close");
+	CHECK(0 == wav_writer_close(&w, 8000),
+	      "wav_writer never-written: close (commits fallback header)");
+	CHECK(wav_writer_bytes(&w) == 0,
+	      "wav_writer never-written: bytes() still 0 after close");
+
+	check_wav_header(path, 8000, 0,
+			 "wav_writer never-written: fallback header, 0 data"
+			 " bytes, still a syntactically valid WAV");
+
+	(void)remove(path);
+}
+
+
+/* wav_writer_close()/wav_writer_bytes() on a writer that was never even
+ * create()'d (an all-zero struct, matching how a fresh struct
+ * audiotap_reg's rx_w/tx_w start out - see audiotap.c) must be safe
+ * no-ops, not a crash - belt-and-suspenders alongside
+ * test_wav_writer_basic()'s "close an already-closed writer" case. */
+static void test_wav_writer_uninitialized_close(void)
+{
+	struct wav_writer w;
+
+	memset(&w, 0, sizeof(w));
+
+	CHECK(0 == wav_writer_close(&w, 8000),
+	      "wav_writer: close() on a never-create()'d (all-zero) writer"
+	      " is a safe no-op");
+	CHECK(wav_writer_bytes(&w) == 0,
+	      "wav_writer: bytes() on a never-create()'d writer == 0");
+}
+
+
+/* wav_writer_create() itself must fail cleanly (not crash) for the
+ * obviously-invalid inputs cmd.c's own require_str() already screens
+ * "dir" for at the JSON layer (see test_cmd_tap()) - this is the
+ * defense-in-depth layer under that one, exercised directly. */
+static void test_wav_writer_create_errors(void)
+{
+	struct wav_writer w;
+
+	CHECK(EINVAL == wav_writer_create(&w, NULL),
+	      "wav_writer: create(NULL path) -> EINVAL");
+	CHECK(EINVAL == wav_writer_create(&w, ""),
+	      "wav_writer: create(\"\") -> EINVAL");
+	CHECK(EINVAL == wav_writer_create(NULL, "x.wav"),
+	      "wav_writer: create(NULL writer) -> EINVAL");
+
+	/* A directory that doesn't exist: fopen()'s own ENOENT, propagated
+	 * verbatim - confirms wav_writer_create() doesn't swallow/remap the
+	 * real errno (matters for audiotap.c's own "bad 'dir'?" error
+	 * message being accurate). */
+	CHECK(0 != wav_writer_create(&w, "/no/such/directory/x.wav"),
+	      "wav_writer: create() under a nonexistent directory fails"
+	      " (nonzero, not necessarily ENOENT on every OS/libc)");
+}
+
+
 static void test_dialog_info_idle(void)
 {
 	static const char idle[] =
@@ -536,6 +807,13 @@ int main(void)
 	test_cmd_unknown_and_malformed();
 	test_cmd_id_correlation();
 	test_cmd_devices_and_set_device();
+	test_cmd_tap();
+
+	test_wav_writer_basic();
+	test_wav_writer_multi_write();
+	test_wav_writer_never_written();
+	test_wav_writer_uninitialized_close();
+	test_wav_writer_create_errors();
 
 	test_dialog_info_idle();
 	test_dialog_info_ringing();

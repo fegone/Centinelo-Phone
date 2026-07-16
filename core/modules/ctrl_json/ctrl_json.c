@@ -70,6 +70,7 @@
 #include <errno.h>
 #include "cmd.h"
 #include "dialog_info.h"
+#include "audiotap.h"
 
 #ifndef _WIN32
 #include <unistd.h>
@@ -448,6 +449,47 @@ static void emit_blf(const char *ext, enum cent_blf_state state)
 	(void)odict_entry_add(od, "ext", ODICT_STRING, ext);
 	(void)odict_entry_add(od, "state", ODICT_STRING,
 			       cent_blf_state_name(state));
+
+	emit(od);
+	mem_deref(od);
+}
+
+
+/*
+ * v1.2 (see PROTOCOL.md "tap_start"/"tap_stop"): reports an audio tap's
+ * lifecycle. `state` is "started" (from tap_start - rx_path/tx_path
+ * only, byte/duration fields omitted, nothing's been written yet) or
+ * "stopped" (from tap_stop *or* BEVENT_CALL_CLOSED auto-finalizing a
+ * tap that outlived its tap_stop - see event_handler() - carries the
+ * final byte/duration counts too). call_id is always the resolved
+ * call's real id, regardless of whether the triggering command supplied
+ * one - same convention as emit_call_state().
+ */
+static void emit_tap_state(struct call *call, const char *state,
+			    const struct audiotap_result *res)
+{
+	struct odict *od = NULL;
+	const char *id = call ? call_id(call) : "";
+
+	if (odict_alloc(&od, 16))
+		return;
+
+	(void)odict_entry_add(od, "event", ODICT_STRING, "tap_state");
+	(void)odict_entry_add(od, "call_id", ODICT_STRING, id);
+	(void)odict_entry_add(od, "state", ODICT_STRING, state);
+	(void)odict_entry_add(od, "rx_path", ODICT_STRING, res->rx_path);
+	(void)odict_entry_add(od, "tx_path", ODICT_STRING, res->tx_path);
+
+	if (!str_casecmp(state, "stopped")) {
+		(void)odict_entry_add(od, "rx_bytes", ODICT_INT,
+				       (int64_t)res->rx_bytes);
+		(void)odict_entry_add(od, "tx_bytes", ODICT_INT,
+				       (int64_t)res->tx_bytes);
+		(void)odict_entry_add(od, "rx_duration_ms", ODICT_INT,
+				       (int64_t)res->rx_duration_ms);
+		(void)odict_entry_add(od, "tx_duration_ms", ODICT_INT,
+				       (int64_t)res->tx_duration_ms);
+	}
 
 	emit(od);
 	mem_deref(od);
@@ -1276,6 +1318,54 @@ static void cmd_set_device(const struct cent_cmd *cmd)
 }
 
 
+/*
+ * v1.2 "tap_start"/"tap_stop" (see PROTOCOL.md, audiotap.h). Same
+ * resolve_call()-then-act shape as every other call-scoped command in
+ * this file (cmd_hold()/cmd_mute()/... above) - the actual aufilt/WAV-
+ * writer mechanics live in audiotap.c, not here; this function's whole
+ * job is decoding a struct cent_cmd into a resolved call and turning
+ * audiotap_start()'s outcome into the right event.
+ */
+static void cmd_tap_start(const struct cent_cmd *cmd)
+{
+	struct call *call = resolve_call(cmd->have_call_id, cmd->call_id);
+	struct audiotap_result res;
+	const char *errmsg = NULL;
+
+	if (!call) {
+		emit_error("tap_start: call not found");
+		return;
+	}
+
+	if (audiotap_start(call, cmd->dir, &res, &errmsg)) {
+		emit_errorf("%s", errmsg ? errmsg : "tap_start failed");
+		return;
+	}
+
+	emit_tap_state(call, "started", &res);
+}
+
+
+static void cmd_tap_stop(const struct cent_cmd *cmd)
+{
+	struct call *call = resolve_call(cmd->have_call_id, cmd->call_id);
+	struct audiotap_result res;
+	const char *errmsg = NULL;
+
+	if (!call) {
+		emit_error("tap_stop: call not found");
+		return;
+	}
+
+	if (audiotap_stop(call, &res, &errmsg)) {
+		emit_errorf("%s", errmsg ? errmsg : "tap_stop failed");
+		return;
+	}
+
+	emit_tap_state(call, "stopped", &res);
+}
+
+
 /* ------------------------------------------------------------------- */
 /* Command dispatch                                                     */
 
@@ -1434,6 +1524,14 @@ static void process_line(const char *line, size_t len)
 		cmd_set_device(&cmd);
 		break;
 
+	case CENT_CMD_TAP_START:
+		cmd_tap_start(&cmd);
+		break;
+
+	case CENT_CMD_TAP_STOP:
+		cmd_tap_stop(&cmd);
+		break;
+
 	default:
 		emit_error("internal error: unhandled command type");
 		break;
@@ -1502,7 +1600,19 @@ static void event_handler(enum bevent_ev ev, struct bevent *event, void *arg)
 		emit_call_state(call, "established");
 		break;
 
-	case BEVENT_CALL_CLOSED:
+	case BEVENT_CALL_CLOSED: {
+		/* v1.2: auto-finalize an audio tap that outlived its
+		 * tap_stop (peer hangup, failed dial, ... - the "call-end"
+		 * trigger from PROTOCOL.md "tap_start"/audiotap.h's own doc
+		 * comment) - "never leave a corrupt WAV" needs this to run
+		 * on *every* path a call can end on, not just an explicit
+		 * tap_stop. No-op (false, nothing emitted) for the common
+		 * case of a call that was never tapped. */
+		struct audiotap_result tap_res;
+
+		if (audiotap_call_closed(call, &tap_res))
+			emit_tap_state(call, "stopped", &tap_res);
+
 		/* If either half of a pending attended transfer just
 		 * closed on its own (peer hangup, failed dial, ...) before
 		 * complete_transfer/abort_transfer ran, don't leave the
@@ -1516,6 +1626,7 @@ static void event_handler(enum bevent_ev ev, struct bevent *event, void *arg)
 		}
 		emit_call_state(call, "closed");
 		break;
+	}
 
 	case BEVENT_CALL_HOLD:
 		emit_call_state(call, "hold");
@@ -1879,6 +1990,19 @@ static int ctrl_init(void)
 		return err;
 	}
 
+	/* v1.2: registers the audio-tap filter globally (attaches to every
+	 * call from here on - see audiotap.h's own top comment for why
+	 * that doesn't mean every call gets tapped). Deliberately last,
+	 * after every fallible step above: aufilt_register() itself can't
+	 * fail, but this ordering means it's a no-op invariant that
+	 * audiotap_init() ran if and only if ctrl_init() is about to
+	 * return success - so ctrl_close() (only ever called by baresip's
+	 * module loader for a module that finished init()'ing successfully)
+	 * calling audiotap_close() is always a matched pair, never a leak
+	 * of a filter registration whose owning ctrl_init() call actually
+	 * failed further down. */
+	audiotap_init();
+
 	/* Signal the controlling process that commands can now be sent. */
 	emit_ready();
 
@@ -1889,6 +2013,7 @@ static int ctrl_init(void)
 static int ctrl_close(void)
 {
 	bevent_unregister(event_handler);
+	audiotap_close();
 	list_flush(&blf_subs);
 	xfer_reset();
 	ctrl = mem_deref(ctrl);

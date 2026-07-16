@@ -397,6 +397,204 @@ engine's actual usage — dead code, debug-gated-off, wrong protocol/no
 module loaded, or a WS-server-only accept path this outbound-only client
 never reaches).
 
+## F4 audio tap
+
+Re-verification against the same live test PBX for v1.2's new
+`tap_start`/`tap_stop` (`core/PROTOCOL.md` "Changes from v1.1") — the
+per-call audio-tap foundation for local transcription. Same harness
+methodology as (e)-(g) above (a small Python harness, not checked in —
+scratch tooling; background thread parsing `{`-prefixed lines,
+`wait_for()` with a hard timeout, read-only `asterisk -rx` PBX
+snapshots), plus a second, independent verification pass over the
+resulting WAV files themselves using nothing but Python's stdlib `wave`
+module (deliberately *not* reusing any of this engine's own WAV-writing
+code — see "(i)" below).
+
+Secret handling: the harness reads ext 1100's password from this
+machine's local Centinelo Phone `settings.json` (per this workspace's
+`CLAUDE.md`) straight into the child process's env dict, in Python
+memory only — never on a command line, never logged, never written
+anywhere this document (or the harness's own source) could leak it.
+
+### (h) register → dial \*43 → tap_start → ~12s capture → tap_stop → hangup
+
+**PASS**, run twice (two independent live calls, different `call_id`s —
+see "(j)" below for the second run's own numbers and why it exists).
+Full captured exchange, run 1 (`call_id` truncated to `2845d09c...` for
+readability):
+
+```
+<- {"event":"ready"}
+<- {"event":"reg_state","account":"sip:1100@100.119.230.80:8089","state":"registered","transport":"wss"}
+-> {"cmd":"dial","uri":"sip:*43@100.119.230.80","id":"d1"}
+<- {"event":"result","id":"d1","ok":true}
+<- {"event":"call_state","state":"established","peer":"sip:*43@100.119.230.80;transport=wss","id":"2845d09c...","call_id":"2845d09c..."}
+```
+
+1. `register` (startup, wss) → `reg_state registered` — unchanged from
+   scenario (a)/(e).
+2. `dial *43` → `established`.
+3. **Deliberate deviation from the F4 task's own prose ordering, called
+   out explicitly**: the task description that specified this feature
+   listed the e2e sequence as "register → tap_start → dial *43 → ...".
+   This harness instead dials *first*, waits for the call to exist and
+   settle, *then* taps — because `tap_start`'s own design (`call_id`
+   optional, falling back to "the current call" via the same
+   `resolve_call()` every other call-scoped command in this protocol
+   uses) has no "arm for a call that doesn't exist yet" mode, by
+   design: **every** call-scoped command in this protocol (`hold`,
+   `mute`, `dtmf`, `blind_transfer`, `quality_stats`, and now
+   `tap_start`/`tap_stop`) resolves to a real, already-existing call or
+   fails with a plain `error` event — there is no precedent anywhere
+   else in this protocol for a command that silently queues itself for
+   a future call, and inventing one just for `tap_start` would have
+   made it the one call-scoped command in the whole protocol that
+   behaves differently from every other one. Confirmed empirically
+   too, not just by design: sending `tap_start` before `dial` in an
+   early manual test produced the expected, unsurprising `{"event":
+   "error","message":"tap_start: call not found"}` — correct behavior,
+   not a bug, given the design above.
+4. Same ~15-20s ICE-settle window as scenario (a) — but **polled, not a
+   fixed sleep**, using scenario (a)'s own "Summary of findings" #1
+   recommendation for a future automated test ("drive it off
+   `quality_stats` first reading non-zero instead of a fixed sleep"):
+   the harness sent `quality_stats` every 3s and waited for both
+   `tx_packets` and `rx_packets` to read non-zero. Real captured
+   sequence, run 1 (three all-zero polls, ICE still settling, then real
+   traffic):
+   ```
+   <- {"event":"stats","call_id":"2845d09c...","tx_packets":0,"rx_packets":0,...}
+   <- {"event":"stats","call_id":"2845d09c...","tx_packets":0,"rx_packets":0,...}
+   <- {"event":"stats","call_id":"2845d09c...","tx_packets":0,"rx_packets":0,"codec":"PCMU",...}
+   <- {"event":"stats","call_id":"2845d09c...","tx_packets":172,"rx_packets":170,"codec":"PCMU",...}
+   ```
+   Settled at ~9s after `established` this run (three 3s polls) — inside
+   scenario (a)'s documented 15-20s range, on the earlier side of it.
+5. `{"cmd":"tap_start","dir":"<abs scratch dir>","call_id":"2845d09c...","id":"t1"}` →
+   ```
+   {"event":"tap_state","call_id":"2845d09c...","state":"started",
+    "rx_path":".../2845d09c...-rx.wav","tx_path":".../2845d09c...-tx.wav"}
+   {"event":"result","id":"t1","ok":true}
+   ```
+   Both paths exist on disk (confirmed via a separate `ls` right after
+   this event — 0 bytes each at this instant, before either direction's
+   first real frame commits a header — see `wav_writer.h`).
+6. Harness slept 12s (audio flowing: our own `ausine,440` tone going
+   out, the PBX's `*43` demo-echotest app's response coming back — see
+   "(i)" below for exactly what came back).
+7. `{"cmd":"tap_stop","call_id":"2845d09c...","id":"t2"}` →
+   ```
+   {"event":"tap_state","call_id":"2845d09c...","state":"stopped",
+    "rx_path":".../2845d09c...-rx.wav","tx_path":".../2845d09c...-tx.wav",
+    "rx_bytes":192000,"tx_bytes":192000,"rx_duration_ms":12000,"tx_duration_ms":12000}
+   {"event":"result","id":"t2","ok":true}
+   ```
+   `192000 bytes / (8000 Hz × 2 bytes/sample) = 12.000s` exactly, both
+   directions — matches the harness's own ~12s sleep almost exactly (see
+   "(i)" for independent confirmation straight from the files
+   themselves, not just this event's self-reported numbers).
+8. `{"cmd":"hangup",...}` → `call_state closed`, then `quit` → clean
+   process exit. No crash, no hang, no leftover PBX channel (confirmed —
+   see "(j)").
+
+### (i) WAV file verification (`python3` `wave` module)
+
+**PASS.** Deliberately re-parsed both output files with nothing but
+Python's stdlib `wave` module — not this engine's own `wav_writer.c`, so
+this is checking the *bytes on disk* against the WAV spec independently,
+not just that this engine agrees with itself:
+
+| File (run 1, `call_id` `2845d09c...`) | channels | sample width | frame rate | frames | duration | RMS | peak |
+|---|---|---|---|---|---|---|---|
+| `-rx.wav` (remote/decoded) | 1 (mono) | 2 (16-bit) | 8000 Hz | 96000 | 12.000s | **3327.0** | 28028 |
+| `-tx.wav` (local/pre-encode) | 1 (mono) | 2 (16-bit) | 8000 Hz | 96000 | 12.000s | **5791.9** | 8191 |
+
+Both files: `actual file size on disk == 44 + (frames × 2 bytes)` exactly
+(192044 bytes each) — confirms the header's own RIFF/data chunk-size
+fields, patched at `tap_stop`, are byte-accurate, not just
+plausible-looking. Duration from the *file itself* (`frames / 8000`)
+matches the `tap_state stopped` event's own self-reported
+`rx_duration_ms`/`tx_duration_ms` (12000ms both) exactly — the protocol
+event isn't fabricating numbers independent of what actually landed on
+disk.
+
+**Non-silence**: both RMS values are unambiguous — silence/comfort noise
+on this codec/path reads in the tens at most; thousands is real audio
+content in both directions, satisfying the F4 task's own "non-silence
+(RMS above a threshold)" requirement with a very wide margin either way.
+
+**Bonus check — single-frequency (Goertzel) scan, not required by the
+task but run anyway for extra confidence**: `-tx.wav` (sourced entirely
+from this engine's own `ausine,440` config, zero PBX involvement) shows
+an exact, dominant 440 Hz peak (magnitude 4095.5, next-nearest 20 Hz-step
+bin at less than a tenth of that) — byte-accurate proof the encode-side
+tap captures *exactly* the known source signal, not noise or silence
+dressed up with a valid header. `-rx.wav` (the PBX's actual response) is
+real, substantial audio (RMS 3327-3325 across both runs) but is
+*spectrally more complex* than a single clean tone (magnitude at exactly
+440 Hz: only 189.6, vs. a broader peak around 220 Hz) — most likely
+because Asterisk's `demo-echotest`/`app-echo-test-echo` application
+plays a spoken announcement/prompt rather than being a byte-for-byte RTP
+echo the whole time (this repo's own prior scenario (f) already
+identified the PBX-side app name; nothing here contradicts it — it's the
+same app). This is a PBX test-application-behavior characteristic, not a
+tap defect: the tap faithfully records whatever audio actually arrives
+on each side, and the *tx* side (where this engine controls the ground
+truth completely) proves that faithfulness byte-for-byte. Not re-run
+with a numpy/scipy proper FFT (unavailable in this environment) — the
+pure-Python Goertzel single-bin detector used here is exact for the one
+frequency it targets (440 Hz falls on an exact bin at this window
+size/sample rate, no spectral leakage), just not a full spectrum plot.
+
+### (j) PBX-side corroboration + repeatability (run 2)
+
+**PASS.** A second, independent full run (fresh call, `call_id`
+`1ad0c76b...`) both cross-checks repeatability and adds a live PBX-side
+channel snapshot taken *during* the tap window (same "independent
+confirmation the JSON events reflect real call state" methodology as
+scenario (f), read-only `asterisk -rx`, no PBX config touched):
+
+```
+PBX channels DURING tap: PJSIP/1100-0000088b!from-internal!*43!7!Up!BackGround!demo-echotest,,,app-echo-test-echo!1100!...
+```
+
+A real, live PBX channel exists, running the same `demo-echotest`/
+`app-echo-test-echo` application scenario (f) already identified,
+*while* the tap is actively capturing — independent confirmation this
+isn't a local-loopback artifact. Run 2's own file-level numbers (again
+independently re-parsed with `python3`'s `wave` module):
+
+| File (run 2, `call_id` `1ad0c76b...`) | frames | duration | RMS | peak |
+|---|---|---|---|---|
+| `-rx.wav` | 100640 | 12.580s | 3325.0 | 28028 |
+| `-tx.wav` | 100800 | 12.600s | 5791.9 | 8191 |
+
+Consistent with run 1 within run-to-run timing noise (this run's harness
+paused mid-capture to make the SSH corroboration call above, so the
+sleep window ran ~0.6s long — both `tap_state stopped`'s own
+`rx_duration_ms`/`tx_duration_ms` and the independently-reparsed file
+durations agree on that *same* slightly-longer window, not just with
+each other in the abstract). `tx.wav`'s RMS (5791.9) and peak (8191) are
+bit-for-bit identical between both runs — expected and reassuring, since
+`ausine,440` generates the exact same deterministic tone every time;
+`rx.wav`'s RMS is within 0.06% run to run (3327.0 vs 3325.0) — real
+network audio, not literally identical, but consistent. Also confirms
+this feature is repeatable, not a one-off — two independent live calls,
+two clean `tap_start`→capture→`tap_stop`→`hangup` cycles, zero crashes,
+zero hangs, zero corrupt files.
+
+**stdout purity regression check** (v1.1's own F3 acceptance test,
+re-run here since `tap_state` is a new event type that could in
+principle have introduced its own stray non-JSON output): both runs,
+every stdout line captured by the harness, `grep -cv '^{'`-equivalent:
+
+| Run | Total stdout lines | Non-JSON lines |
+|---|---|---|
+| (h)/(i) — run 1 | 19 | **0** |
+| (j) — run 2 | 19 | **0** |
+
+v1.2 does not regress v1.1's pure-NDJSON guarantee.
+
 ## Summary of findings (for future F-phases)
 
 1. ICE needs real settle time here (~15-20s) before relying on live RTP
@@ -445,3 +643,24 @@ never reaches).
    exercising `set_device` against an already-established call in a
    real e2e run with no disruption to that call (it continued normally
    through to a clean `hangup` afterward).
+9. **(F4)** A tap-scoped command with no "arm for a future call" mode is
+   the *consistent* design, not a limitation worth working around — see
+   "(h)" step 3 for the full reasoning. Worth remembering for any future
+   command in this protocol that might be tempted to special-case
+   "no call yet" into a queued/deferred behavior: nothing else here does
+   that, and there's real value (one predictable failure mode,
+   `resolve_call()` returning `NULL` → a plain `error`) in not being the
+   first.
+10. **(F4)** The PBX's `*43` demo-echotest app is *not* simply a
+    byte-for-byte RTP echo the whole call — see "(i)"'s Goertzel
+    single-frequency scan: this engine's own outgoing `ausine,440` tone
+    (`tx.wav`) comes back spectrally different on the incoming side
+    (`rx.wav`), most likely because the app plays a spoken announcement/
+    prompt at some point rather than echoing continuously from the
+    moment media starts. Both directions are still unambiguously
+    non-silent (RMS in the thousands), so this doesn't block using `*43`
+    as this repo's safe e2e audio target — but a *future* test that
+    specifically needs to assert "the received audio is exactly the sent
+    tone" (rather than just "real audio arrived") would need a different
+    target or a longer capture window past the announcement, not `*43`
+    used the way this document uses it.

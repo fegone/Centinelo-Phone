@@ -197,6 +197,17 @@ enum cent_cmd_type cent_cmd_decode(struct cent_cmd *out,
 
 		out->type = CENT_CMD_SET_DEVICE;
 	}
+	else if (!str_casecmp(cmd, "tap_start")) {
+		if (!require_str(od, "dir", out->dir, sizeof(out->dir),
+				  "tap_start", errmsg))
+			return CENT_CMD_NONE;
+		optional_call_id(od, out);
+		out->type = CENT_CMD_TAP_START;
+	}
+	else if (!str_casecmp(cmd, "tap_stop")) {
+		optional_call_id(od, out);
+		out->type = CENT_CMD_TAP_STOP;
+	}
 	else {
 		out->type = CENT_CMD_UNKNOWN;
 	}

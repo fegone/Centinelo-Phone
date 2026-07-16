@@ -373,15 +373,21 @@ CENT_SECRET="..." ./core/run-spike.sh
   see `core/PROTOCOL.md` "Planned" for what a multi-host version would
   need.
 
-## Unit tests (`cmd.c` / `dialog_info.c`)
+## Unit tests (`cmd.c` / `dialog_info.c` / `wav_writer.c`)
 
 `core/modules/ctrl_json/test/` is a **standalone** CMake project (own
 `project()`, not part of baresip's own build tree — see that directory's
-`CMakeLists.txt` for why), covering the two pieces of `ctrl_json` that
-are pure/parseable without a running engine: JSON-command decoding
-(`cmd.c`) and dialog-info+xml parsing for BLF (`dialog_info.c`). Requires
-`core/deps/re` already built (step 4a above — links that exact
-`libre.a`, patches included, so what's tested matches what ships).
+`CMakeLists.txt` for why), covering the three pieces of `ctrl_json` that
+are pure/parseable-or-stdio-only without a running engine: JSON-command
+decoding (`cmd.c`), dialog-info+xml parsing for BLF (`dialog_info.c`),
+and the streaming WAV writer used by the v1.2 audio-tap feature
+(`wav_writer.c`, added v1.2 — see `core/PROTOCOL.md` "Changes from
+v1.1"). `audiotap.c`, the other new v1.2 file, is **not** here — it's
+baresip-dependent throughout (aufilt registration, `struct call`/
+`audio`), covered by `core/E2E-F1.md` "F4 audio tap" instead, same split
+as `ctrl_json.c`'s own call-control commands. Requires `core/deps/re`
+already built (step 4a above — links that exact `libre.a`, patches
+included, so what's tested matches what ships).
 
 ```bash
 cmake -S core/modules/ctrl_json/test -B core/modules/ctrl_json/test/build \
@@ -399,20 +405,35 @@ support `detect_leaks` (LeakSanitizer isn't available on Darwin) —
 platform" rather than silently ignoring it; leak checking on macOS is
 done separately, see "Memory safety" below.
 
-96 checks across both files as of this version (63 pre-v1.1 + 33 new:
-`id` correlation surviving every decode outcome including
-CENT_CMD_NONE/CENT_CMD_UNKNOWN, and `devices`/`set_device` decoding
-including the "kind" validation and both required/missing-field error
-paths), including one fixture that's the *real* dialog-info+xml body
-captured from the test PBX (see `core/E2E-F1.md` scenario c) — not just
-synthetic ones. Two real bugs were caught by these tests before any e2e
-run: the dialog-info parser originally conflated "well-formed idle" with
-"unparseable garbage" (both returned `idle`; fixed to require a
-`<dialog-info` root element before concluding idle, garbage now
-correctly falls into the `offline`/"can't tell" bucket), and a
-use-after-free in the `CENT_CMD_UNKNOWN` error path
+203 checks across all three files as of this version (96 pre-v1.2 [63
+pre-v1.1 + 33 v1.1's own `id` correlation / `devices`/`set_device`
+tests] + 107 new in v1.2: 11 for `tap_start`/`tap_stop` decoding
+(required `dir`, optional `call_id`, same shape as `dial`'s `uri`/every
+other call-scoped command) + 96 for `wav_writer.c` — header field
+correctness re-derived independently per test rather than trusted from
+the writer's own output (magic bytes, chunk sizes, sample rate, and the
+actual PCM sample bytes, byte-exact, including negative/extreme int16
+values), close()-idempotence (both "close an already-finalized writer
+again" and "close a writer that was never even `create()`'d"), the
+"zero frames ever written" fallback-header path, and `create()`'s own
+clean-failure behavior for bad inputs), including one fixture that's the
+*real* dialog-info+xml body captured from the test PBX (see
+`core/E2E-F1.md` scenario c) — not just synthetic ones. Two real bugs
+were caught by these tests before any e2e run: the dialog-info parser
+originally conflated "well-formed idle" with "unparseable garbage" (both
+returned `idle`; fixed to require a `<dialog-info` root element before
+concluding idle, garbage now correctly falls into the `offline`/"can't
+tell" bucket), and a use-after-free in the `CENT_CMD_UNKNOWN` error path
 (read the just-freed decoded JSON object to build the error message —
-fixed by capturing the `cmd` string before freeing).
+fixed by capturing the `cmd` string before freeing). v1.2 itself
+introduced no new bugs caught this way — `wav_writer.c` passed its own
+tests on the first ASan-clean run (see "Memory safety" below); the one
+real mistake made while building v1.2 (a stray literal `*/` inside a
+block comment in `audiotap.c`, closing it early and turning the next
+line of prose into invalid C) was a *compile* error, not something this
+test suite would have caught either way — caught immediately by the
+real engine build (`cmake --build core/deps/baresip/build`), not by
+`ctrl_json_test`.
 
 ## Memory safety
 
@@ -435,6 +456,27 @@ signed with a `get-task-allow` entitlement), which limits it to
 read-only introspection and blocks a full allocation-site stack trace
 for that one block — the repeat-count comparison was the practical way
 to get confidence without that.
+
+**v1.2 addendum (audio tap)**: the unit-test-reachable half of this
+feature (`wav_writer.c`, plus `cmd.c`'s `tap_start`/`tap_stop` decoding)
+is covered by the same `ctrl_json_test` ASan run above — clean, 0
+findings (203/203 checks, up from 96 pre-v1.2, see "Unit tests" above).
+`audiotap.c` itself (the baresip-dependent half — aufilt registration,
+the per-call tap registry) was **not** separately re-run under `leaks`
+this pass; its memory ownership follows the exact same
+`mem_zalloc()`/destructor/`list_append()`/`list_flush()` refcounting
+shape as `blf_subs` above (already covered by the `leaks` run's own
+repeat-count methodology, structurally, if not by re-running it
+specifically for tap traffic) — see `audiotap.c`'s own top comment. What
+*was* verified live: two full real-world runs against the real test PBX
+(`core/E2E-F1.md` "F4 audio tap"), each a complete `tap_start` → ~12s
+capture → `tap_stop` → `hangup` → `quit` cycle, both exiting the child
+process cleanly (no crash, no hang, confirmed by the harness's own
+`proc.wait()` completing) — real evidence against a crash/hang in the
+live code path, just not a substitute for an actual `leaks`/ASan pass
+against the *live* engine specifically exercising tap traffic, which
+would be a reasonable next step before this feature carries production
+weight beyond its current F4-foundation role.
 
 ## Windows CI
 

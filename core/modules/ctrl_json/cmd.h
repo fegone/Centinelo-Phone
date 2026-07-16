@@ -45,6 +45,8 @@ enum cent_cmd_type {
 	CENT_CMD_BLF_UNSUBSCRIBE,
 	CENT_CMD_DEVICES,
 	CENT_CMD_SET_DEVICE,
+	CENT_CMD_TAP_START,    /**< v1.2 - see PROTOCOL.md "tap_start" */
+	CENT_CMD_TAP_STOP,     /**< v1.2 - see PROTOCOL.md "tap_stop" */
 };
 
 enum {
@@ -66,6 +68,11 @@ enum {
 					 *   baresip.h struct config_audio -
 					 *   16 + 1 + 128 with room to
 					 *   spare). */
+	CENT_DIR_SIZE  = 512,   /**< tap_start "dir": an absolute filesystem
+				  *  path - same size class as CENT_URI_SIZE
+				  *  (a directory path can legitimately be
+				  *  long; no protocol reason to cap it
+				  *  tighter). See PROTOCOL.md "tap_start". */
 };
 
 /**
@@ -107,6 +114,14 @@ struct cent_cmd {
 						    *  for the "<module>[,
 						    *  <device>]" shape
 						    *  ctrl_json.c parses. */
+
+	char dir[CENT_DIR_SIZE];   /**< tap_start: absolute directory the
+				     *   engine writes <call_id>-rx.wav /
+				     *   -tx.wav into - see PROTOCOL.md
+				     *   "tap_start". Required (unlike
+				     *   call_id) - a missing/empty dir is a
+				     *   CENT_CMD_NONE decode error, same
+				     *   treatment as dial's "uri". */
 };
 
 /**
