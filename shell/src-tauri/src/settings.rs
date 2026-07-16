@@ -512,7 +512,10 @@ mod transcription_settings_tests {
         // Simulates loading a pre-F4 settings.json - SettingsStore::load's
         // `unwrap_or_default()` path plus #[serde(default)] on the field
         // must produce a usable AppSettings, not an error.
-        let json = r#"{"account":{"host":"pbx.example.test","ext":"1100","secret":"x"}}"#;
+        // "9999" here, never the real test PBX extension (1100, see this
+        // workspace's CLAUDE.md) - this file is in a public repo
+        // (2026-07-16 review, finding B3).
+        let json = r#"{"account":{"host":"pbx.example.test","ext":"9999","secret":"x"}}"#;
         let app: AppSettings = serde_json::from_str(json).unwrap();
         assert_eq!(app.transcription.mode, TranscriptionMode::Off);
         assert_eq!(app.account.host, "pbx.example.test");

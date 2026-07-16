@@ -11,11 +11,11 @@
 //!
 //! # What this sprint does NOT build
 //!
-//! The live-updating transcript panel is ola 2 (a mockup is "en camino"
-//! per the task) - this module only ever emits Tauri events
-//! (`transcription://segment`/`done`/`error`/`model-download-*`) for a
-//! future frontend to subscribe to; nothing here renders UI. See the shell
-//! task report for the full list of what's plumbing today vs. ola 2 scope.
+//! The live-updating transcript panel is ola 2 (mockups landed
+//! 2026-07-16, see creative-vigilia's report) - this module only ever
+//! emits Tauri events (`transcription://segment`/`done`/`error`/
+//! `model-download-*`) for a future frontend to subscribe to; nothing
+//! here renders UI.
 //!
 //! # Where the license check happens
 //!
@@ -25,42 +25,65 @@
 //!
 //! # Contract with `centinelo-transcribe` (the sidecar binary)
 //!
-//! This module integrates against the CLI/event contract specified in the
-//! F4-cierre shell task (Mario, 2026-07-16), **not** the crate's current
-//! `centinelo-transcribe/src/main.rs` CLI (which predates this task and
-//! uses a different `Label=path` positional-args shape with no JSON
-//! event stream) - see this file's own report for the exact mismatch and
-//! why: the binary may not exist yet on this machine, so this shell talks
-//! to whatever `centinelo-transcribe run ...` becomes, and tests mock it
-//! with a small script (`tests/fixtures/mock-transcribe.sh`) that speaks
-//! the target contract. Reconciling the crate's real CLI with this
-//! contract is `transcribe-engine`'s side of the integration - flagged in
-//! the shell report as a cross-agent follow-up, not guessed at here.
+//! **Confirmed against transcribe-engine's real implementation**
+//! (`premium` repo, `feature/transcribe-e2e` @ `962754e`, read read-only -
+//! not this module's scope to edit) as of 2026-07-16, superseding this
+//! module's earlier guess at the contract (which used an `"event"` JSON
+//! key and `txt_path`/`json_path` done-event field names - the real
+//! binary uses `"type"` and `txt`/`json`; fixed here to match):
 //!
-//! Invocation: `centinelo-transcribe run --rx <path> --tx <path> --model
-//! <path> --lang <lang> --mode live|post --out-dir <dir> --meta <json>`.
-//! Stdout: one JSON object per line - `{"event":"segment","speaker":...,
-//! "t0_ms":...,"t1_ms":...,"text":...}`, `{"event":"done","txt_path":...,
-//! "json_path":...}`, `{"event":"error","message":...}`. Live mode: a
-//! `stop\n` line on stdin signals "wrap up now" (matching
-//! `core/PROTOCOL.md`'s own "the engine reads commands, not just runs to
-//! completion" shape, so this shell's spawn/pipe/read code below looks
-//! deliberately similar to `sidecar.rs`'s).
+//! ```text
+//! centinelo-transcribe run --rx <rx.wav> --tx <tx.wav> --model <path> \
+//!   --lang <lang> --mode live|post --out-dir <dir> [--meta <json-or-path>]
+//! ```
+//!
+//! Stdout, one JSON object per line: `{"type":"segment","speaker":"agent"|
+//! "caller","t0_ms":N,"t1_ms":N,"text":"..."}`, then exactly one
+//! `{"type":"done","txt":"...","json":"..."}` (or `{"type":"error",
+//! "message":"..."}` - no `done` follows an `error`). `--mode live` polls
+//! the still-growing WAVs until it reads a `stop` line on stdin (or EOF),
+//! flushes, then emits `done`. `rx` is always the **Caller** (remote
+//! RTP), `tx` is always the **Agent** (local mic) - this module passes
+//! `core/PROTOCOL.md`'s own `<call_id>-rx.wav`/`-tx.wav` straight through
+//! unmodified, so that pairing is inherited from `tap_start`'s own
+//! naming, never re-derived here.
+//!
+//! `--meta` accepts **inline JSON or a file path** (the binary tries
+//! parsing it as JSON first, then falls back to reading it as a path) -
+//! this module always passes a path (`write_meta_file`), never inline
+//! JSON, so call metadata (the caller's number, in particular) never
+//! appears in this process's own argv, visible to any other local user
+//! via `ps` - see `write_meta_file`'s doc (2026-07-16 review finding M5).
+//!
+//! A separate `centinelo-transcribe ensure-model --tier <tier> --models-dir
+//! <dir>` subcommand (not `run`) handles on-demand, checksum-verified
+//! model download - `{"type":"progress","asset":...,"downloaded":N,
+//! "total":N}` / `{"type":"ready","model":"...","vad_model":"..."}` /
+//! `{"type":"error","message":"..."}`. This module shells out to it
+//! (`ensure_model`) rather than re-implementing its own download+checksum
+//! logic (an earlier version of this file did exactly that, with no
+//! pinned checksum and no `Content-Length` validation - 2026-07-16 review
+//! finding M4) - transcribe-engine's copy is the one, real source of
+//! pinned SHA256s (pulled from HuggingFace's own LFS metadata), so
+//! shelling out to it is the actual "consolidate into one source" fix,
+//! not hand-copying their hashes into a second, driftable copy here.
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use chrono::{DateTime, Local};
 use serde::Serialize;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::premium::{CapabilityStatusView, PremiumHandle};
-use crate::settings::{ModelTier, SettingsStore, TranscriptionMode, TranscriptionSettings};
+use crate::settings::{
+    ModelTier, SettingsStore, TranscriptionActivation, TranscriptionMode, TranscriptionSettings,
+};
 use crate::sidecar::SidecarHandle;
 
 /// The [`centinelo_premium_abi::Capability::feature_name`] this whole
@@ -88,17 +111,69 @@ pub fn is_unlocked(premium: &PremiumHandle) -> bool {
 }
 
 // ---------------------------------------------------------------------
+// call_id validation (2026-07-16 review, S1 - RISK VETO)
+// ---------------------------------------------------------------------
+
+/// Longest `call_id` this shell will ever act on. Generous for any
+/// realistic engine-generated id (observed real ids are short hex
+/// strings - `core/E2E-F1.md`) while still bounding worst-case path
+/// component length.
+const MAX_CALL_ID_LEN: usize = 128;
+
+/// Validates a `call_id` **before it is ever used to build a filesystem
+/// path** - the tap directory, the WAV filenames, and the final
+/// transcript's base filename under `storage_dir`
+/// (`finalize_artifacts`'s `base`). See the 2026-07-16 4R review, finding
+/// S1 (RISK VETO): `call_id` reaches this module from two places - a
+/// Tauri command argument (`commands::transcription_manual_start`, which
+/// is **not** admin-gated, so any webview content can supply an
+/// arbitrary string) and the core engine's own `call_state`/`tap_state`
+/// events. Neither is trusted. A `call_id` of e.g. `"../../../etc/x"`
+/// reaching `format!("{call_id}-rx.wav")`/`.join(...)` unchecked would let
+/// an attacker write or read outside every directory this module ever
+/// touches (`std::path::Path::join` does not sandbox `..` or embedded
+/// `/`/`\` - the OS resolves them as real path separators the moment a
+/// `std::fs` call actually touches disk).
+///
+/// [`TranscriptionHandle::start_tap`] is the single choke point every
+/// `call_id` passes through before any path is built from it (both the
+/// automatic path from `on_call_state` and the manual path from
+/// `manual_start` call it) - see that function's own doc. Every other
+/// place a `call_id` is used in this module (`on_tap_started`/
+/// `on_tap_stopped`/`manual_stop`/`retry`) only ever looks it up as a
+/// `HashMap` key against `active`/`pending_retries`, whose keys are
+/// themselves only ever populated through `start_tap` - an
+/// attacker-supplied `call_id` that never passed validation simply never
+/// matches anything and those lookups no-op, so a second validation call
+/// at each of those sites would be redundant, not defense-in-depth.
+///
+/// Rejects: empty, longer than [`MAX_CALL_ID_LEN`], containing `/`, `\`,
+/// or the two-character sequence `..` anywhere, or any byte outside
+/// `[A-Za-z0-9._-]`.
+fn valid_call_id(call_id: &str) -> bool {
+    if call_id.is_empty() || call_id.len() > MAX_CALL_ID_LEN {
+        return false;
+    }
+    if call_id.contains("..") || call_id.contains('/') || call_id.contains('\\') {
+        return false;
+    }
+    call_id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+// ---------------------------------------------------------------------
 // Orchestration handle
 // ---------------------------------------------------------------------
 
 /// Per-call bookkeeping needed to finalize a tap once transcription
-/// finishes - captured once at tap-start time (see `FinalizeContext`'s own
-/// doc) so the reader/finalize thread never has to re-read settings or
-/// re-look-up the call, and a mid-call settings change (e.g. admin edits
-/// `storage_dir` while a call is in progress) can't produce inconsistent
-/// behavior partway through a single call's pipeline - matches how
-/// account-settings changes elsewhere in this crate only take effect on
-/// the *next* sidecar respawn, never retroactively.
+/// finishes - captured once at tap-start time so the reader/finalize
+/// thread never has to re-read settings or re-look-up the call, and a
+/// mid-call settings change (e.g. admin edits `storage_dir` while a call
+/// is in progress) can't produce inconsistent behavior partway through a
+/// single call's pipeline - matches how account-settings changes
+/// elsewhere in this crate only take effect on the *next* sidecar
+/// respawn, never retroactively.
 #[derive(Clone)]
 struct FinalizeContext {
     call_id: String,
@@ -110,21 +185,86 @@ struct FinalizeContext {
     settings: TranscriptionSettings,
 }
 
+/// Coordinates the `on_tap_started`/`on_tap_stopped` handshake for a
+/// `Live`-mode tap - split out from `ActiveEntry` specifically so this
+/// coordination logic is unit-testable under a bare struct, with no
+/// `Mutex`/`Inner`/`AppHandle`/thread-spawning involved (2026-07-16
+/// review, finding A2: "maquina de estados SIN tests").
+///
+/// # The race this closes
+///
+/// `tap_state:"started"` always precedes `tap_state:"stopped"` on the
+/// wire (a tap must exist before it can stop), but this shell's own
+/// reaction to each is asynchronous (`on_tap_started`/`on_tap_stopped`
+/// each spawn a fresh thread) - so it's possible for `on_tap_stopped`'s
+/// thread to finish running *before* `on_tap_started`'s thread has
+/// finished spawning the live `centinelo-transcribe` process on a very
+/// short call. Whichever of "the process is spawned" and "stop was
+/// requested" happens *second* is the one that must actually write the
+/// `stop` line - this struct's two `mark_*` methods each return whether
+/// **this call** is the second one, i.e. whether the caller should send
+/// stop right now.
+#[derive(Debug, Default)]
+struct TapCoordination {
+    live_spawned: bool,
+    stop_requested: bool,
+}
+
+impl TapCoordination {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Call once `on_tap_started` has a live child's stdin in hand.
+    /// Returns `true` if stop should be signaled immediately (a
+    /// `mark_stop_requested` call already landed first).
+    fn mark_live_spawned(&mut self) -> bool {
+        self.live_spawned = true;
+        self.stop_requested
+    }
+
+    /// Call from `on_tap_stopped`. Returns `true` if the live process is
+    /// already spawned (the caller should write `stop` to its stdin
+    /// right now) - `false` means `on_tap_started` hasn't finished
+    /// spawning yet, and `mark_live_spawned`'s return value above is what
+    /// will eventually signal it instead.
+    fn mark_stop_requested(&mut self) -> bool {
+        self.stop_requested = true;
+        self.live_spawned
+    }
+
+    fn stop_requested(&self) -> bool {
+        self.stop_requested
+    }
+}
+
 struct ActiveEntry {
     ctx: FinalizeContext,
     /// Only ever `Some` in `Live` mode, and only after the transcribe
-    /// process has actually spawned (`on_tap_started`) - used to deliver
-    /// the `stop\n` signal from `on_tap_stopped`. See those two methods'
-    /// docs for the started/stopped race this (plus `stop_requested`)
-    /// exists to close.
+    /// process has actually spawned (`on_tap_started`).
     live_stdin: Option<std::process::ChildStdin>,
-    /// Set by `on_tap_stopped` the moment it runs, *before* it knows
-    /// whether `live_stdin` is populated yet - `on_tap_started`, once it
-    /// finishes spawning, checks this and sends the stop signal itself if
-    /// it's already true, rather than losing it to a race on a very short
-    /// call (tap started and stopped before the transcribe process
-    /// finished spawning).
-    stop_requested: bool,
+    coordination: TapCoordination,
+    /// Set by `spawn_reader_and_finalize` if a `Live`-mode transcribe
+    /// process exits **before** this call's tap was ever told to stop
+    /// (`coordination.stop_requested()` was still `false` at exit) - i.e.
+    /// it crashed, or exited on its own, while the call may still be
+    /// active (2026-07-16 review, finding A3). When this is `true`,
+    /// `on_tap_stopped`'s real, eventual stop event falls back to running
+    /// a fresh **post-call** pass against the WAVs (which keep being
+    /// written by the still-running core tap regardless of what happened
+    /// to the transcribe process) instead of assuming a long-dead reader
+    /// thread still owns finalize.
+    live_died_early: bool,
+    /// Set by `on_tap_started` the moment it confirms this call's tap
+    /// really started (`tap_state:"started"` actually arrived) - read by
+    /// `arm_tap_start_watchdog` (2026-07-16 review, finding M1) to detect
+    /// a `tap_start` that silently never landed (e.g. the call already
+    /// ended before the fire-and-forget wire write reached the engine,
+    /// which then responds with a generic, uncorrelated `error` event
+    /// this module has no way to route back to this specific call - see
+    /// that function's own doc for why a timeout, not protocol
+    /// correlation, is this version's fix).
+    tap_confirmed: bool,
 }
 
 struct Inner {
@@ -177,39 +317,33 @@ impl TranscriptionHandle {
     /// this never risks delaying that same reader thread's delivery of
     /// this call's own upcoming `tap_state:"started"` event.
     pub fn on_call_state(&self, event: &Value) {
-        let Some(state) = event.get("state").and_then(Value::as_str) else {
-            return;
-        };
-        let Some(call_id) = event.get("call_id").and_then(Value::as_str) else {
+        let Some((state, call_id)) = event_state_and_call_id(event) else {
             return;
         };
         if state != "established" {
             return; // "closed" is handled entirely via tap_state:"stopped" - see on_tap_stopped's doc.
         }
-        if self.0.active.lock().expect("poisoned").contains_key(call_id) {
-            return; // already tapping (e.g. a manual start already armed it)
-        }
+        let already_active = self.0.active.lock().expect("poisoned").contains_key(call_id);
         let settings = self.0.settings.snapshot().transcription;
-        if settings.mode == TranscriptionMode::Off {
+        if !should_auto_tap(&settings, already_active) {
             return;
-        }
-        if settings.activation != crate::settings::TranscriptionActivation::AllCalls {
-            return; // Manual: only an explicit transcription_manual_start call arms a tap.
         }
         if !is_unlocked(&self.0.premium) {
             return;
         }
         let peer = event.get("peer").and_then(Value::as_str).unwrap_or("").to_string();
-        self.start_tap(call_id, &peer, settings);
+        // start_tap re-checks "already active" atomically (M2) and
+        // validates call_id (S1) - the checks above are a cheap
+        // fast-path, not the correctness guarantee.
+        if let Err(e) = self.start_tap(call_id, &peer, settings) {
+            log::debug!("transcription: auto-tap for {call_id} not started: {e}");
+        }
     }
 
     /// Called from `sidecar.rs`'s stdout-reader thread on every
     /// `tap_state` event (`core/PROTOCOL.md` v1.2).
     pub fn on_tap_state(&self, event: &Value) {
-        let Some(state) = event.get("state").and_then(Value::as_str) else {
-            return;
-        };
-        let Some(call_id) = event.get("call_id").and_then(Value::as_str) else {
+        let Some((state, call_id)) = event_state_and_call_id(event) else {
             return;
         };
         match state {
@@ -231,11 +365,7 @@ impl TranscriptionHandle {
         if settings.mode == TranscriptionMode::Off {
             return Err("Transcription is turned off in Settings.".to_string());
         }
-        if self.0.active.lock().expect("poisoned").contains_key(call_id) {
-            return Err("Already transcribing this call.".to_string());
-        }
-        self.start_tap(call_id, peer, settings);
-        Ok(())
+        self.start_tap(call_id, peer, settings)
     }
 
     /// Manual per-call stop - sends `tap_stop`; the rest of the pipeline
@@ -262,11 +392,13 @@ impl TranscriptionHandle {
 
     /// Re-runs the transcribe pass for a call whose finalize step failed
     /// earlier (NAS down, disk full, engine binary missing) - see
-    /// `Inner::pending_retries`'s doc. Always re-runs a full `post` pass
-    /// against the still-on-disk WAVs (simpler and just as correct as
-    /// trying to distinguish "only the move failed" from "transcription
-    /// itself never finished" - re-transcribing the same WAVs is
-    /// idempotent, see `finalize_artifacts`).
+    /// `Inner::pending_retries`'s doc. If the transcript itself already
+    /// exists (only the final move into `storage_dir` failed - e.g. a
+    /// transient NAS blip after the engine had already finished), this
+    /// just retries that move rather than re-running the whole engine
+    /// against the WAVs again (2026-07-16 review, finding B1: the earlier
+    /// version threw the already-known `txt_path`/`json_path` away on
+    /// every failure and always re-transcribed from scratch).
     pub fn retry(&self, call_id: &str) -> Result<(), String> {
         let retry = {
             let mut guard = self.0.pending_retries.lock().expect("poisoned");
@@ -274,15 +406,6 @@ impl TranscriptionHandle {
                 .remove(call_id)
                 .ok_or_else(|| "No pending retry for this call.".to_string())?
         };
-        if !retry.rx_path.is_file() && !retry.tx_path.is_file() {
-            let call_id_owned = retry.call_id.clone();
-            self.0
-                .pending_retries
-                .lock()
-                .expect("poisoned")
-                .insert(call_id_owned, retry);
-            return Err("The original audio for this call is no longer on disk - nothing to retry.".to_string());
-        }
         let ctx = FinalizeContext {
             call_id: retry.call_id.clone(),
             peer: retry.peer.clone(),
@@ -292,58 +415,63 @@ impl TranscriptionHandle {
             started_at: retry.started_at,
             settings: retry.settings.clone(),
         };
-        let bin = match resolve_transcribe_binary() {
-            Ok(b) => b,
-            Err(e) => {
-                let call_id_owned = retry.call_id.clone();
-                self.0
-                    .pending_retries
-                    .lock()
-                    .expect("poisoned")
-                    .insert(call_id_owned, retry);
-                return Err(e);
-            }
-        };
-        let model = model_path(&self.0.app, ctx.settings.model_tier);
-        let meta = call_meta_json(&ctx.call_id, &ctx.peer, "post");
-        let args = TranscribeArgs {
-            bin,
-            rx: ctx.rx_path.clone(),
-            tx: ctx.tx_path.clone(),
-            model,
-            lang: ctx.settings.language.clone(),
-            mode: "post",
-            out_dir: ctx.tap_dir.clone(),
-            meta_json: meta,
-        };
-        match spawn_transcribe(&args) {
-            Ok(child) => {
-                spawn_reader_and_finalize(self.0.clone(), ctx, child);
-                Ok(())
-            }
-            Err(e) => {
-                let call_id_owned = retry.call_id.clone();
-                self.0
-                    .pending_retries
-                    .lock()
-                    .expect("poisoned")
-                    .insert(call_id_owned, retry);
-                Err(e.to_string())
+
+        if let (Some(txt), Some(json)) = (&retry.txt_path, &retry.json_path) {
+            if txt.is_file() && json.is_file() {
+                return match finalize_artifacts(&ctx, txt, json) {
+                    Ok(result) => {
+                        let _ = self.0.app.emit(
+                            "transcription://done",
+                            serde_json::json!({
+                                "call_id": ctx.call_id,
+                                "txt_path": result.txt.display().to_string(),
+                                "json_path": result.json.display().to_string(),
+                                "audio_kept": result.audio_kept,
+                            }),
+                        );
+                        Ok(())
+                    }
+                    Err(e) => {
+                        stash_pending_retry(&self.0, &ctx, Some(txt.clone()), Some(json.clone()), e.clone());
+                        Err(e)
+                    }
+                };
             }
         }
+
+        if !retry.rx_path.is_file() && !retry.tx_path.is_file() {
+            let call_id_owned = retry.call_id.clone();
+            self.0.pending_retries.lock().expect("poisoned").insert(call_id_owned, retry);
+            return Err("The original audio for this call is no longer on disk - nothing to retry.".to_string());
+        }
+
+        let Some(child) = spawn_transcribe_for(&self.0, &ctx, "post") else {
+            // spawn_transcribe_for already logged, emitted
+            // transcription://error, and re-stashed a fresh
+            // pending_retries entry for this call_id with the new failure
+            // reason - nothing left for this fn to restore.
+            return Err("Retry failed to start - see the transcription://error event for why.".to_string());
+        };
+        spawn_reader_and_finalize(self.0.clone(), ctx, child);
+        Ok(())
     }
 
-    fn start_tap(&self, call_id: &str, peer: &str, settings: TranscriptionSettings) {
+    /// The single entry point every `call_id` this module acts on passes
+    /// through before any filesystem path is built from it - see
+    /// [`valid_call_id`]'s doc (S1) for why this specific function is
+    /// that choke point. Also the single place a tap is atomically
+    /// reserved in `active` (2026-07-16 review, finding M2: the earlier
+    /// version's separate `contains_key` check + later `insert` in two
+    /// different function calls left a TOCTOU window a double-click on
+    /// the not-admin-gated `transcription_manual_start` command could
+    /// hit).
+    fn start_tap(&self, call_id: &str, peer: &str, settings: TranscriptionSettings) -> Result<(), String> {
+        if !valid_call_id(call_id) {
+            log::warn!("transcription: refusing to tap call with an invalid call_id ({} bytes)", call_id.len());
+            return Err("Invalid call id.".to_string());
+        }
+
         let tap_dir = std::env::temp_dir().join(format!("centinelo-transcribe-tap.{call_id}"));
-        if let Err(e) = std::fs::create_dir_all(&tap_dir) {
-            log::warn!("transcription: could not create tap dir for {call_id}: {e}");
-            return;
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&tap_dir, std::fs::Permissions::from_mode(0o700));
-        }
         let rx_path = tap_dir.join(format!("{call_id}-rx.wav"));
         let tx_path = tap_dir.join(format!("{call_id}-tx.wav"));
         let ctx = FinalizeContext {
@@ -355,14 +483,40 @@ impl TranscriptionHandle {
             started_at: Local::now(),
             settings,
         };
-        self.0.active.lock().expect("poisoned").insert(
-            call_id.to_string(),
-            ActiveEntry {
-                ctx,
-                live_stdin: None,
-                stop_requested: false,
-            },
-        );
+
+        // Atomic check-and-reserve: a single lock acquisition via the
+        // Entry API, so two concurrent callers (e.g. a double-click on
+        // the manual-start button, which isn't admin-gated) can never
+        // both observe "not active yet" and both proceed - the second
+        // one's `Entry::Occupied` always wins the race, deterministically.
+        {
+            let mut active = self.0.active.lock().expect("poisoned");
+            match active.entry(call_id.to_string()) {
+                std::collections::hash_map::Entry::Occupied(_) => {
+                    return Err("Already transcribing this call.".to_string());
+                }
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert(ActiveEntry {
+                        ctx,
+                        live_stdin: None,
+                        coordination: TapCoordination::new(),
+                        live_died_early: false,
+                        tap_confirmed: false,
+                    });
+                }
+            }
+        }
+
+        if let Err(e) = std::fs::create_dir_all(&tap_dir) {
+            log::warn!("transcription: could not create tap dir for {call_id}: {e}");
+            self.0.active.lock().expect("poisoned").remove(call_id);
+            return Err(format!("Could not create a working directory for this call: {e}"));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&tap_dir, std::fs::Permissions::from_mode(0o700));
+        }
 
         let sidecar = self.0.sidecar.clone();
         let call_id_owned = call_id.to_string();
@@ -379,6 +533,52 @@ impl TranscriptionHandle {
                 log::warn!("transcription: tap_start({call_id_owned}) failed: {e}");
             }
         });
+
+        self.arm_tap_start_watchdog(call_id);
+        Ok(())
+    }
+
+    /// Cleans up an `active` entry (and its tap directory) whose
+    /// `tap_start` was never confirmed by a real `tap_state:"started"`
+    /// event within [`tap_start_confirm_timeout`] - see
+    /// `ActiveEntry::tap_confirmed`'s doc (2026-07-16 review, finding M1).
+    /// `core/PROTOCOL.md`'s `tap_start` can fail with a generic, call-id-
+    /// less `error` event (e.g. the call already ended before this
+    /// fire-and-forget command reached the engine) that this module has
+    /// no way to correlate back to the specific call that sent it -
+    /// full request/response correlation (the protocol's own `id`/
+    /// `result` mechanism, v1.1+) would close this properly but isn't
+    /// wired up anywhere in `sidecar.rs` yet for any command, and adding
+    /// it is a larger, shared-infrastructure change out of scope for this
+    /// fix - a bounded timeout is the pragmatic version-scoped fix: it
+    /// can't distinguish "the command genuinely failed" from "it's just
+    /// slow", but the failure mode of falsely cleaning up a real,
+    /// slow-to-confirm tap is `on_tap_started` finding nothing in
+    /// `active` and silently no-op'ing (never a crash, never a corrupted
+    /// tap) - see that function's own `None => return` arm.
+    fn arm_tap_start_watchdog(&self, call_id: &str) {
+        let inner = self.0.clone();
+        let call_id = call_id.to_string();
+        std::thread::spawn(move || {
+            std::thread::sleep(tap_start_confirm_timeout());
+            let mut active = inner.active.lock().expect("poisoned");
+            let Some(entry) = active.get(&call_id) else {
+                return; // already finished/cleaned up through the normal path
+            };
+            if entry.tap_confirmed {
+                return;
+            }
+            log::warn!(
+                "transcription: tap_start for call {call_id} was never confirmed (no \
+                 tap_state:\"started\" within {:?}) - the call likely ended before the tap \
+                 could attach; cleaning up the orphaned tap directory",
+                tap_start_confirm_timeout()
+            );
+            let tap_dir = entry.ctx.tap_dir.clone();
+            active.remove(&call_id);
+            drop(active);
+            let _ = std::fs::remove_dir_all(&tap_dir);
+        });
     }
 
     fn on_tap_started(&self, call_id: &str) {
@@ -386,75 +586,42 @@ impl TranscriptionHandle {
         let call_id = call_id.to_string();
         std::thread::spawn(move || {
             let ctx = {
-                let active = inner.active.lock().expect("poisoned");
-                match active.get(&call_id) {
-                    Some(e) => e.ctx.clone(),
-                    None => return, // not a call this handle armed
+                let mut active = inner.active.lock().expect("poisoned");
+                match active.get_mut(&call_id) {
+                    Some(e) => {
+                        e.tap_confirmed = true;
+                        e.ctx.clone()
+                    }
+                    None => return, // not a call this handle armed (or already cleaned up - M1)
                 }
             };
-            if ctx.settings.mode != TranscriptionMode::Live {
+            if !on_tap_started_should_spawn(ctx.settings.mode) {
                 return; // post-call mode starts its process at tap_stop, not tap_start
             }
-            let bin = match resolve_transcribe_binary() {
-                Ok(b) => b,
-                Err(e) => {
-                    log::warn!("transcription: {e}");
-                    let _ = inner.app.emit(
-                        "transcription://error",
-                        serde_json::json!({"call_id": ctx.call_id, "message": e}),
-                    );
-                    inner.active.lock().expect("poisoned").remove(&ctx.call_id);
-                    return;
-                }
+            let Some(mut child) = spawn_transcribe_for(&inner, &ctx, "live") else {
+                inner.active.lock().expect("poisoned").remove(&ctx.call_id);
+                return;
             };
-            let model = model_path(&inner.app, ctx.settings.model_tier);
-            let meta = call_meta_json(&ctx.call_id, &ctx.peer, "live");
-            let args = TranscribeArgs {
-                bin,
-                rx: ctx.rx_path.clone(),
-                tx: ctx.tx_path.clone(),
-                model,
-                lang: ctx.settings.language.clone(),
-                mode: "live",
-                out_dir: ctx.tap_dir.clone(),
-                meta_json: meta,
-            };
-            match spawn_transcribe(&args) {
-                Ok(mut child) => {
-                    let stdin = child.stdin.take();
-                    let mut send_stop_now = false;
-                    {
-                        let mut active = inner.active.lock().expect("poisoned");
-                        if let Some(entry) = active.get_mut(&call_id) {
-                            entry.live_stdin = stdin;
-                            if entry.stop_requested {
-                                send_stop_now = true;
-                            }
-                        }
-                    }
-                    if send_stop_now {
-                        // tap_state:"stopped" already raced ahead of this
-                        // spawn (a very short call) - see ActiveEntry's
-                        // `stop_requested` doc.
-                        let mut active = inner.active.lock().expect("poisoned");
-                        if let Some(entry) = active.get_mut(&call_id) {
-                            if let Some(stdin) = entry.live_stdin.as_mut() {
-                                let _ = writeln!(stdin, "stop");
-                            }
-                        }
-                    }
-                    spawn_reader_and_finalize(inner.clone(), ctx, child);
-                }
-                Err(e) => {
-                    log::warn!("transcription: failed to start live transcribe for {}: {e}", ctx.call_id);
-                    let _ = inner.app.emit(
-                        "transcription://error",
-                        serde_json::json!({"call_id": ctx.call_id, "message": e.to_string()}),
-                    );
-                    inner.active.lock().expect("poisoned").remove(&ctx.call_id);
-                    stash_pending_retry(&inner, &ctx, None, None, e.to_string());
+            let stdin = child.stdin.take();
+            let mut send_stop_now = false;
+            {
+                let mut active = inner.active.lock().expect("poisoned");
+                if let Some(entry) = active.get_mut(&call_id) {
+                    entry.live_stdin = stdin;
+                    send_stop_now = entry.coordination.mark_live_spawned();
                 }
             }
+            if send_stop_now {
+                // tap_state:"stopped" already raced ahead of this spawn (a
+                // very short call) - see TapCoordination's doc.
+                let mut active = inner.active.lock().expect("poisoned");
+                if let Some(entry) = active.get_mut(&call_id) {
+                    if let Some(stdin) = entry.live_stdin.as_mut() {
+                        let _ = writeln!(stdin, "stop");
+                    }
+                }
+            }
+            spawn_reader_and_finalize(inner.clone(), ctx, child);
         });
     }
 
@@ -464,72 +631,85 @@ impl TranscriptionHandle {
         let rx_bytes = event.get("rx_bytes").and_then(Value::as_u64);
         let tx_bytes = event.get("tx_bytes").and_then(Value::as_u64);
         std::thread::spawn(move || {
-            let is_live = {
+            let run_post_call_ctx: Option<FinalizeContext> = {
                 let mut active = inner.active.lock().expect("poisoned");
                 let Some(entry) = active.get_mut(&call_id) else {
-                    return; // not a call this handle armed (or already finalized)
+                    return; // not a call this handle armed
                 };
-                entry.stop_requested = true;
-                let is_live = entry.ctx.settings.mode == TranscriptionMode::Live;
-                if is_live {
-                    if let Some(stdin) = entry.live_stdin.as_mut() {
-                        let _ = writeln!(stdin, "stop");
+                let live_already_spawned = entry.coordination.mark_stop_requested();
+                if on_tap_stopped_should_run_post_call(entry.ctx.settings.mode, entry.live_died_early) {
+                    active.remove(&call_id).map(|e| e.ctx)
+                } else {
+                    if live_already_spawned {
+                        if let Some(stdin) = entry.live_stdin.as_mut() {
+                            let _ = writeln!(stdin, "stop");
+                        }
                     }
+                    None
                 }
-                is_live
             };
             log::info!("transcription: tap stopped for {call_id} (rx_bytes={rx_bytes:?} tx_bytes={tx_bytes:?})");
-            if is_live {
-                // The reader thread spawned from on_tap_started already
-                // owns this call's finalize step - nothing else to do.
+            let Some(ctx) = run_post_call_ctx else {
+                // Live process still spawning/running - its own reader
+                // thread (from on_tap_started) owns finalize, including
+                // the A3 fallback if it turns out to have already died.
                 return;
-            }
-            // Post-call: this IS the trigger to run the single transcribe
-            // pass, now that both WAVs are fully finalized on disk.
-            let ctx = {
-                let mut active = inner.active.lock().expect("poisoned");
-                match active.remove(&call_id) {
-                    Some(entry) => entry.ctx,
-                    None => return,
-                }
             };
-            let bin = match resolve_transcribe_binary() {
-                Ok(b) => b,
-                Err(e) => {
-                    log::warn!("transcription: {e}");
-                    let _ = inner.app.emit(
-                        "transcription://error",
-                        serde_json::json!({"call_id": ctx.call_id, "message": e}),
-                    );
-                    stash_pending_retry(&inner, &ctx, None, None, e);
-                    return;
-                }
+            let Some(child) = spawn_transcribe_for(&inner, &ctx, "post") else {
+                return;
             };
-            let model = model_path(&inner.app, ctx.settings.model_tier);
-            let meta = call_meta_json(&ctx.call_id, &ctx.peer, "post");
-            let args = TranscribeArgs {
-                bin,
-                rx: ctx.rx_path.clone(),
-                tx: ctx.tx_path.clone(),
-                model,
-                lang: ctx.settings.language.clone(),
-                mode: "post",
-                out_dir: ctx.tap_dir.clone(),
-                meta_json: meta,
-            };
-            match spawn_transcribe(&args) {
-                Ok(child) => spawn_reader_and_finalize(inner.clone(), ctx, child),
-                Err(e) => {
-                    log::warn!("transcription: failed to start post-call transcribe for {}: {e}", ctx.call_id);
-                    let _ = inner.app.emit(
-                        "transcription://error",
-                        serde_json::json!({"call_id": ctx.call_id, "message": e.to_string()}),
-                    );
-                    stash_pending_retry(&inner, &ctx, None, None, e.to_string());
-                }
-            }
+            spawn_reader_and_finalize(inner.clone(), ctx, child);
         });
     }
+}
+
+/// Pure extraction of `state`/`call_id` from a `call_state`/`tap_state`
+/// event `Value` - shared by `on_call_state`/`on_tap_state`, and
+/// unit-tested directly against malformed/partial event shapes without
+/// needing a `TranscriptionHandle` at all (2026-07-16 review, finding A2).
+fn event_state_and_call_id(event: &Value) -> Option<(&str, &str)> {
+    let state = event.get("state").and_then(Value::as_str)?;
+    let call_id = event.get("call_id").and_then(Value::as_str)?;
+    Some((state, call_id))
+}
+
+/// Pure decision: should `on_call_state`'s `"established"` transition
+/// start an automatic tap? Unit-tested directly (2026-07-16 review,
+/// finding A2) - `mode == Off` always suppresses it; `Manual` activation
+/// never auto-taps (only an explicit `transcription_manual_start` call
+/// does); `AllCalls` does, unless a tap is already active for this call.
+fn should_auto_tap(settings: &TranscriptionSettings, already_active: bool) -> bool {
+    if already_active || settings.mode == TranscriptionMode::Off {
+        return false;
+    }
+    settings.activation == TranscriptionActivation::AllCalls
+}
+
+/// Pure decision: does `on_tap_started` need to spawn a transcribe
+/// process right now? Only `Live` mode does - `PostCall` waits for
+/// `tap_state:"stopped"` (both WAVs finalized) before running its single
+/// pass. Unit-tested directly (2026-07-16 review, finding A2).
+fn on_tap_started_should_spawn(mode: TranscriptionMode) -> bool {
+    mode == TranscriptionMode::Live
+}
+
+/// Pure decision: does `on_tap_stopped` need to run (or re-run) a
+/// post-call transcribe pass right now? True for `PostCall` mode always
+/// (that's its only trigger), and true for `Live` mode **only** if its
+/// process already died early (`live_died_early` - see `ActiveEntry`'s
+/// doc, A3 fix) - an on-track `Live` tap's own reader thread owns
+/// finalize instead. Unit-tested directly (2026-07-16 review, finding
+/// A2).
+fn on_tap_stopped_should_run_post_call(mode: TranscriptionMode, live_died_early: bool) -> bool {
+    mode != TranscriptionMode::Live || live_died_early
+}
+
+fn tap_start_confirm_timeout() -> Duration {
+    std::env::var("CENTINELO_TAP_CONFIRM_TIMEOUT_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_secs(8))
 }
 
 #[derive(Clone)]
@@ -539,6 +719,12 @@ struct PendingRetry {
     tap_dir: PathBuf,
     rx_path: PathBuf,
     tx_path: PathBuf,
+    /// Present when the engine finished (`done` was seen) but the final
+    /// move into `storage_dir` failed - lets `retry` skip straight to
+    /// re-attempting the move instead of re-running the whole engine
+    /// (2026-07-16 review, finding B1).
+    txt_path: Option<PathBuf>,
+    json_path: Option<PathBuf>,
     started_at: DateTime<Local>,
     settings: TranscriptionSettings,
     last_error: String,
@@ -566,8 +752,8 @@ impl From<&PendingRetry> for PendingRetryView {
 fn stash_pending_retry(
     inner: &Arc<Inner>,
     ctx: &FinalizeContext,
-    _txt_path: Option<PathBuf>,
-    _json_path: Option<PathBuf>,
+    txt_path: Option<PathBuf>,
+    json_path: Option<PathBuf>,
     reason: String,
 ) {
     let retry = PendingRetry {
@@ -576,6 +762,8 @@ fn stash_pending_retry(
         tap_dir: ctx.tap_dir.clone(),
         rx_path: ctx.rx_path.clone(),
         tx_path: ctx.tx_path.clone(),
+        txt_path,
+        json_path,
         started_at: ctx.started_at,
         settings: ctx.settings.clone(),
         last_error: reason.clone(),
@@ -603,7 +791,9 @@ struct TranscribeArgs {
     lang: String,
     mode: &'static str, // "live" | "post"
     out_dir: PathBuf,
-    meta_json: String,
+    /// A filesystem path, never inline JSON - see `write_meta_file`'s doc
+    /// (2026-07-16 review, finding M5).
+    meta_path: PathBuf,
 }
 
 fn spawn_transcribe(args: &TranscribeArgs) -> std::io::Result<Child> {
@@ -622,41 +812,138 @@ fn spawn_transcribe(args: &TranscribeArgs) -> std::io::Result<Child> {
         .arg("--out-dir")
         .arg(&args.out_dir)
         .arg("--meta")
-        .arg(&args.meta_json)
+        .arg(&args.meta_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
 }
 
+/// Writes this call's metadata to `<tap_dir>/meta.json` and returns its
+/// path, to be passed as `--meta <path>` - **never** inline JSON on the
+/// command line. 2026-07-16 review, finding M5: an earlier version of
+/// this module passed `--meta '{"call_id":...,"peer":...}'` directly as
+/// an argv value, which (unlike the SIP secret, confirmed never exposed
+/// this way) put the *called/calling number* in argv - visible to any
+/// other local user via `ps`/`/proc` for as long as the process runs.
+/// `centinelo-transcribe run --meta` accepts a file path as a documented
+/// fallback (it tries JSON-parsing the value first, then treats it as a
+/// path) so this costs nothing on the receiving end. `tap_dir` is
+/// already mode `0700` (owner-only - see `start_tap`), so this is no
+/// less protected than the WAV files sitting right next to it.
+///
+/// Only `call_id`/`number`/`started_at` are populated - `extension`/
+/// `direction`/`transport` (also accepted by `centinelo-transcribe`'s
+/// `CallMeta`) aren't threaded through from `core/PROTOCOL.md`'s
+/// `call_state` event to this module yet; all fields are `Option` on
+/// their side so omitting them is a supported, not a degraded, shape.
+fn write_meta_file(ctx: &FinalizeContext) -> Result<PathBuf, String> {
+    let meta = serde_json::json!({
+        "call_id": ctx.call_id,
+        "number": ctx.peer,
+        "started_at": ctx.started_at.to_rfc3339(),
+    });
+    let path = ctx.tap_dir.join("meta.json");
+    std::fs::write(&path, meta.to_string()).map_err(|e| format!("could not write call metadata file: {e}"))?;
+    Ok(path)
+}
+
+/// Resolves the binary, builds args (including writing the meta file),
+/// and spawns the `run` process for `ctx` in `mode` (`"live"`/`"post"`).
+/// On **any** failure (binary not found, meta file couldn't be written,
+/// `spawn()` itself fails) this function itself logs, emits
+/// `transcription://error`, and stashes a pending retry before returning
+/// `None` - every caller only needs `let Some(child) = ... else { return
+/// };`, no separate failure-handling branch of their own.
+///
+/// Extracted from what used to be three near-identical ~35-line blocks
+/// (`on_tap_started`'s live spawn, `on_tap_stopped`'s post spawn,
+/// `retry`'s respawn) - the triplication is exactly what let one of the
+/// three (the live spawn's `resolve_transcribe_binary()` failure branch)
+/// skip `stash_pending_retry` while its two siblings didn't (2026-07-16
+/// review, finding A1 - caught independently by both the readability and
+/// reliability lenses). A single shared function makes that class of
+/// drift structurally impossible instead of a linting/review concern.
+fn spawn_transcribe_for(inner: &Arc<Inner>, ctx: &FinalizeContext, mode: &'static str) -> Option<Child> {
+    let bin = match resolve_transcribe_binary() {
+        Ok(b) => b,
+        Err(e) => {
+            log::warn!("transcription: {e}");
+            let _ = inner.app.emit(
+                "transcription://error",
+                serde_json::json!({"call_id": ctx.call_id, "message": e}),
+            );
+            stash_pending_retry(inner, ctx, None, None, e);
+            return None;
+        }
+    };
+    let meta_path = match write_meta_file(ctx) {
+        Ok(p) => p,
+        Err(e) => {
+            log::warn!("transcription: {e}");
+            let _ = inner.app.emit(
+                "transcription://error",
+                serde_json::json!({"call_id": ctx.call_id, "message": e}),
+            );
+            stash_pending_retry(inner, ctx, None, None, e);
+            return None;
+        }
+    };
+    let model = model_path(&inner.app, ctx.settings.model_tier);
+    let args = TranscribeArgs {
+        bin,
+        rx: ctx.rx_path.clone(),
+        tx: ctx.tx_path.clone(),
+        model,
+        lang: ctx.settings.language.clone(),
+        mode,
+        out_dir: ctx.tap_dir.clone(),
+        meta_path,
+    };
+    match spawn_transcribe(&args) {
+        Ok(child) => Some(child),
+        Err(e) => {
+            log::warn!("transcription: failed to start {mode} transcribe for {}: {e}", ctx.call_id);
+            let _ = inner.app.emit(
+                "transcription://error",
+                serde_json::json!({"call_id": ctx.call_id, "message": e.to_string()}),
+            );
+            stash_pending_retry(inner, ctx, None, None, e.to_string());
+            None
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum TranscribeLine {
-    Segment { speaker: String, t0_ms: u64, t1_ms: u64, text: String },
+    Segment { speaker: String, t0_ms: i64, t1_ms: i64, text: String },
     Done { txt_path: Option<String>, json_path: Option<String> },
     Error { message: String },
     Unknown,
 }
 
-/// Pure parser for one line of the sidecar's stdout - see this module's
-/// doc for the exact JSON shapes. Unit-tested without spawning any
-/// process (`mod tests` below).
+/// Pure parser for one line of `run`'s stdout - see this module's doc for
+/// the exact JSON shape (confirmed against transcribe-engine's real
+/// implementation, 2026-07-16: `"type"` discriminator, `done`'s fields
+/// are `txt`/`json`). Unit-tested without spawning any process (`mod
+/// tests` below).
 fn parse_transcribe_line(line: &str) -> Option<TranscribeLine> {
     let trimmed = line.trim();
     if trimmed.is_empty() || !trimmed.starts_with('{') {
         return None; // matches sidecar.rs's own "ignore non-JSON noise" convention
     }
     let v: Value = serde_json::from_str(trimmed).ok()?;
-    let event = v.get("event").and_then(Value::as_str)?;
-    Some(match event {
+    let ty = v.get("type").and_then(Value::as_str)?;
+    Some(match ty {
         "segment" => TranscribeLine::Segment {
             speaker: v.get("speaker").and_then(Value::as_str).unwrap_or("").to_string(),
-            t0_ms: v.get("t0_ms").and_then(Value::as_u64).unwrap_or(0),
-            t1_ms: v.get("t1_ms").and_then(Value::as_u64).unwrap_or(0),
+            t0_ms: v.get("t0_ms").and_then(Value::as_i64).unwrap_or(0),
+            t1_ms: v.get("t1_ms").and_then(Value::as_i64).unwrap_or(0),
             text: v.get("text").and_then(Value::as_str).unwrap_or("").to_string(),
         },
         "done" => TranscribeLine::Done {
-            txt_path: v.get("txt_path").and_then(Value::as_str).map(str::to_string),
-            json_path: v.get("json_path").and_then(Value::as_str).map(str::to_string),
+            txt_path: v.get("txt").and_then(Value::as_str).map(str::to_string),
+            json_path: v.get("json").and_then(Value::as_str).map(str::to_string),
         },
         "error" => TranscribeLine::Error {
             message: v.get("message").and_then(Value::as_str).unwrap_or("unknown error").to_string(),
@@ -667,9 +954,10 @@ fn parse_transcribe_line(line: &str) -> Option<TranscribeLine> {
 
 /// Reads `child`'s stdout to completion, classifying each line, emitting
 /// `transcription://segment`/`transcription://error` as they arrive, then
-/// (on EOF) waits the process and either finalizes (`done` was seen) or
-/// stashes a pending retry. Runs on its own thread - the only thing that
-/// blocks on this child's lifetime, matching `sidecar.rs`'s own
+/// (on EOF) waits the process and decides what happened - see the A3
+/// handling below for why "the process exited" isn't always "this call
+/// is done". Runs on its own thread - the only thing that blocks on this
+/// child's lifetime, matching `sidecar.rs`'s own
 /// stdout-reader-thread-per-process style.
 fn spawn_reader_and_finalize(inner: Arc<Inner>, ctx: FinalizeContext, mut child: Child) {
     std::thread::spawn(move || {
@@ -718,9 +1006,47 @@ fn spawn_reader_and_finalize(inner: Arc<Inner>, ctx: FinalizeContext, mut child:
             }
         }
         let _ = child.wait();
-        // The one place a tap's lifecycle in `active` actually ends - see
-        // `ActiveEntry`/`on_tap_started`/`on_tap_stopped` docs for why
-        // live-mode removal doesn't happen at tap_stop time.
+
+        // A3 (2026-07-16 review): distinguish "this exit is expected"
+        // (post-call: always expected - it only ever runs once, after
+        // tap_stop; live: only expected once tap_state:"stopped" told
+        // this call to stop) from "a live process died on its own while
+        // the call may still be active". An entry missing from `active`
+        // entirely only happens on the post-call path (on_tap_stopped
+        // already removed it before spawning this reader) - treat that
+        // as "yes, expected" so post-call finalize behaves exactly as an
+        // always-expected exit.
+        let stop_was_requested = {
+            let active = inner.active.lock().expect("poisoned");
+            active
+                .get(&ctx.call_id)
+                .map(|e| e.coordination.stop_requested())
+                .unwrap_or(true)
+        };
+
+        if !stop_was_requested {
+            log::warn!(
+                "transcription: live engine for call {} exited before the call ended - \
+                 will run a full pass once the call actually hangs up",
+                ctx.call_id
+            );
+            let mut active = inner.active.lock().expect("poisoned");
+            if let Some(entry) = active.get_mut(&ctx.call_id) {
+                entry.live_stdin = None;
+                entry.live_died_early = true;
+            }
+            drop(active);
+            let _ = inner.app.emit(
+                "transcription://error",
+                serde_json::json!({
+                    "call_id": ctx.call_id,
+                    "message": "Live transcription stopped unexpectedly; will retry once the call ends.",
+                    "retryable": false,
+                }),
+            );
+            return; // do NOT remove from active, do NOT stash a terminal retry
+        }
+
         inner.active.lock().expect("poisoned").remove(&ctx.call_id);
 
         match (done_txt, done_json) {
@@ -827,20 +1153,42 @@ fn dated_dest_dir(storage_dir: &Path, started_at: DateTime<Local>) -> PathBuf {
         .join(started_at.format("%d").to_string())
 }
 
+/// Appends `suffix` to a path's file name (not its extension - `.part`
+/// stays a literal suffix on the whole name, e.g. `foo.txt` ->
+/// `foo.txt.part`, never `foo.part`).
+fn append_to_filename(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(suffix);
+    path.with_file_name(name)
+}
+
 /// `rename()` fails across filesystems/mount points (temp dir on one
-/// volume, a mounted NAS share on another) - falls back to copy+remove.
+/// volume, a mounted NAS share on another) - falls back to copy+rename,
+/// **never copy-directly-to-`dest`** (2026-07-16 review, finding M3): the
+/// earlier version copied straight to the final `dest` path, which would
+/// leave a corrupt, indistinguishable-from-good file at that exact name
+/// if the copy was interrupted partway (NAS blip, disk full mid-write).
+/// Copies to `<dest>.part` in the same directory first, and only
+/// `rename()`s it to `dest` on full success - the same atomic-publish
+/// pattern `centinelo-transcribe`'s own `model_manager.rs` uses for
+/// model downloads, and `rename()` within one directory is atomic on
+/// every filesystem this shell targets.
 fn move_file(src: &Path, dest: &Path) -> Result<(), String> {
     if std::fs::rename(src, dest).is_ok() {
         return Ok(());
     }
-    std::fs::copy(src, dest).map_err(|e| format!("could not copy {} -> {}: {e}", src.display(), dest.display()))?;
+    let tmp_dest = append_to_filename(dest, ".part");
+    std::fs::copy(src, &tmp_dest).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp_dest);
+        format!("could not copy {} -> {}: {e}", src.display(), tmp_dest.display())
+    })?;
+    std::fs::rename(&tmp_dest, dest).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp_dest);
+        format!("copied but could not publish {} -> {}: {e}", tmp_dest.display(), dest.display())
+    })?;
     std::fs::remove_file(src)
-        .map_err(|e| format!("copied but could not remove source {}: {e}", src.display()))?;
+        .map_err(|e| format!("published but could not remove source {}: {e}", src.display()))?;
     Ok(())
-}
-
-fn call_meta_json(call_id: &str, peer: &str, mode: &str) -> String {
-    serde_json::json!({"call_id": call_id, "peer": peer, "mode": mode}).to_string()
 }
 
 /// Resolves the `centinelo-transcribe` binary: `CENTINELO_TRANSCRIBE_BIN`
@@ -849,8 +1197,7 @@ fn call_meta_json(call_id: &str, peer: &str, mode: &str) -> String {
 /// `resolve_core_binary`, minus that function's dev-convenience walk-up
 /// search (the transcribe crate lives in the private `premium/` repo, a
 /// sibling of `phone/` rather than nested under it, so there's no single
-/// relative path to walk up to across every dev machine's checkout - see
-/// this file's own module doc, "may not exist yet on this machine").
+/// relative path to walk up to across every dev machine's checkout).
 fn resolve_transcribe_binary() -> Result<PathBuf, String> {
     if let Ok(p) = std::env::var("CENTINELO_TRANSCRIBE_BIN") {
         let pb = PathBuf::from(&p);
@@ -879,13 +1226,14 @@ fn resolve_transcribe_binary() -> Result<PathBuf, String> {
 }
 
 // ---------------------------------------------------------------------
-// Model tiers + download (F4 item 5)
+// Model tiers + on-demand download (F4 item 5)
 // ---------------------------------------------------------------------
 
-/// ggml filename per tier - `transcribe` skill's model research
-/// (2026-07-16): large-v3-turbo-q5_0 default "accurate", small-q5_1
-/// "light" (medium is obsolete per that research; turbo is both more
-/// accurate and faster).
+/// ggml filename per tier - matches `centinelo-transcribe`'s own
+/// `model_manager::ModelTier::default_path` naming exactly (confirmed by
+/// reading that module, `premium` repo `feature/transcribe-e2e`,
+/// read-only), so `transcription_model_status`'s file-presence check
+/// looks at the same path `ensure_model`/`run --model` actually use.
 pub fn model_filename(tier: ModelTier) -> &'static str {
     match tier {
         ModelTier::Accurate => "ggml-large-v3-turbo-q5_0.bin",
@@ -893,27 +1241,14 @@ pub fn model_filename(tier: ModelTier) -> &'static str {
     }
 }
 
-fn model_download_url(tier: ModelTier) -> &'static str {
+/// The `--tier` value `centinelo-transcribe ensure-model` expects -
+/// distinct from [`model_filename`] (a `.bin` file name), confirmed
+/// against that binary's real `ModelTier::as_str`/`parse`.
+fn tier_cli_name(tier: ModelTier) -> &'static str {
     match tier {
-        ModelTier::Accurate => {
-            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin"
-        }
-        ModelTier::Light => "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small-q5_1.bin",
+        ModelTier::Accurate => "large-v3-turbo-q5_0",
+        ModelTier::Light => "small-q5_1",
     }
-}
-
-/// Pinned SHA256 of each tier's canonical file, when known. **Tech debt
-/// (2026-07-16, shell task report): both are `None` today** - this shell
-/// has no verified-safe way to obtain the real published checksums inside
-/// this sprint's environment, and shipping a *guessed* hash would be
-/// actively worse than none (a wrong pin fails every legitimate download
-/// closed, permanently, until someone notices). [`download_model`] always
-/// computes the real SHA256 of what it downloaded and logs it either way.
-/// Once Felix/`transcribe-engine` confirm the canonical values (e.g. from
-/// the model card on huggingface.co/ggerganov/whisper.cpp), pinning them
-/// here is a one-line change with no other code affected.
-fn model_expected_sha256(_tier: ModelTier) -> Option<&'static str> {
-    None
 }
 
 fn model_dir(app: &AppHandle) -> PathBuf {
@@ -930,90 +1265,146 @@ pub fn model_path(app: &AppHandle, tier: ModelTier) -> PathBuf {
     model_dir(app).join(model_filename(tier))
 }
 
-/// Downloads `tier`'s model file with progress + checksum, per task item
-/// 5. Blocking (`ureq`) - always called from a background thread (see
-/// `commands::download_transcription_model`), matching this crate's
-/// existing thread-per-blocking-operation style (`bridge.rs`'s HTTP
-/// server, `sidecar.rs`'s supervisor) rather than pulling in an async
-/// runtime for what's ultimately one big sequential download.
-///
-/// # Tech debt: lives here, not in `centinelo-transcribe`
-///
-/// Per the task spec: "la logica real de descarga vive en el crate
-/// transcribe si su API esta lista; si no, implementala en shell". As of
-/// this sprint the crate (`premium/crates/centinelo-transcribe`) has no
-/// download/model-manager API at all (checked directly - only
-/// `default_model_path()`, no HTTP/checksum code) - so this is the shell
-/// implementation, flagged for consolidation into the crate later so a
-/// future CLI-only/headless use of `centinelo-transcribe` doesn't need to
-/// reimplement it.
-pub fn download_model(app: &AppHandle, tier: ModelTier) -> Result<PathBuf, String> {
-    let dir = model_dir(app);
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let dest_path = dir.join(model_filename(tier));
-    let tmp_path = dir.join(format!("{}.part", model_filename(tier)));
-    let url = model_download_url(tier);
-
-    let resp = ureq::get(url).call().map_err(|e| format!("download failed: {e}"))?;
-    let total: Option<u64> = resp.header("Content-Length").and_then(|s| s.parse().ok());
-    let mut reader = resp.into_reader();
-    let mut file = std::fs::File::create(&tmp_path).map_err(|e| e.to_string())?;
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 64 * 1024];
-    let mut downloaded: u64 = 0;
-    let tier_name = model_filename(tier);
-    loop {
-        let n = reader.read(&mut buf).map_err(|e| format!("read failed: {e}"))?;
-        if n == 0 {
-            break;
-        }
-        file.write_all(&buf[..n]).map_err(|e| e.to_string())?;
-        hasher.update(&buf[..n]);
-        downloaded += n as u64;
-        let _ = app.emit(
-            "transcription://model-download-progress",
-            serde_json::json!({
-                "tier": tier_name,
-                "downloaded_bytes": downloaded,
-                "total_bytes": total,
-            }),
-        );
-    }
-    drop(file);
-
-    let digest = format!("{:x}", hasher.finalize());
-    if let Some(expected) = model_expected_sha256(tier) {
-        if !digest.eq_ignore_ascii_case(expected) {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(format!(
-                "checksum mismatch for {tier_name}: expected {expected}, got {digest} - download discarded"
-            ));
-        }
-    } else {
-        log::warn!(
-            "transcription: no pinned checksum for {tier_name} yet (see transcription.rs \
-             model_expected_sha256's doc) - downloaded sha256={digest}, not verified against a known-good value"
-        );
-    }
-    std::fs::rename(&tmp_path, &dest_path).map_err(|e| e.to_string())?;
-    Ok(dest_path)
+#[derive(Debug, Clone, PartialEq)]
+enum EnsureModelLine {
+    Progress { asset: String, downloaded: u64, total: u64 },
+    Ready { model: String },
+    Error { message: String },
+    Unknown,
 }
 
-/// Spawns [`download_model`] on its own thread and emits
+/// Pure parser for `ensure-model`'s stdout, mirroring
+/// [`parse_transcribe_line`] for `run` - same `"type"` discriminator
+/// convention, different variant set (confirmed against
+/// `centinelo-transcribe`'s real `main.rs`, `premium` repo
+/// `feature/transcribe-e2e`, read-only).
+fn parse_ensure_model_line(line: &str) -> Option<EnsureModelLine> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || !trimmed.starts_with('{') {
+        return None;
+    }
+    let v: Value = serde_json::from_str(trimmed).ok()?;
+    let ty = v.get("type").and_then(Value::as_str)?;
+    Some(match ty {
+        "progress" => EnsureModelLine::Progress {
+            asset: v.get("asset").and_then(Value::as_str).unwrap_or("").to_string(),
+            downloaded: v.get("downloaded").and_then(Value::as_u64).unwrap_or(0),
+            total: v.get("total").and_then(Value::as_u64).unwrap_or(0),
+        },
+        "ready" => EnsureModelLine::Ready {
+            model: v.get("model").and_then(Value::as_str).unwrap_or("").to_string(),
+        },
+        "error" => EnsureModelLine::Error {
+            message: v.get("message").and_then(Value::as_str).unwrap_or("unknown error").to_string(),
+        },
+        _ => EnsureModelLine::Unknown,
+    })
+}
+
+fn spawn_ensure_model(bin: &Path, tier: ModelTier, models_dir: &Path) -> std::io::Result<Child> {
+    Command::new(bin)
+        .arg("ensure-model")
+        .arg("--tier")
+        .arg(tier_cli_name(tier))
+        .arg("--models-dir")
+        .arg(models_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+}
+
+/// Ensures `tier`'s model (+ its VAD companion) is present and
+/// checksum-verified, by shelling out to `centinelo-transcribe
+/// ensure-model` and streaming its progress - per task item 5, "descarga
+/// con progreso + checksum".
+///
+/// # Consolidation, not reimplementation (2026-07-16 review, finding M4)
+///
+/// An earlier version of this function downloaded the model file
+/// directly (`ureq` + `sha2`, streamed to a `.part` file) with an
+/// **unpinned** checksum (`model_expected_sha256` always returned `None`,
+/// making the rejection branch unreachable in practice) and no
+/// validation that the full `Content-Length` was actually received
+/// before accepting the file. `centinelo-transcribe`'s own
+/// `model_manager.rs` already does this correctly (pinned SHA256s pulled
+/// from HuggingFace's own LFS metadata, `lfs.oid`, atomic
+/// `.part`-then-rename publish, no silent partial-download acceptance),
+/// so duplicating that logic here, even with real hashes copied in,
+/// would create a second copy that drifts the moment either side updates
+/// a pinned hash. Shelling out to the one real implementation, the way
+/// `run` already does for transcription itself, is what "consolidate
+/// into one source" actually means here.
+pub fn ensure_model(app: &AppHandle, tier: ModelTier) -> Result<PathBuf, String> {
+    let bin = resolve_transcribe_binary()?;
+    let models_dir = model_dir(app);
+    std::fs::create_dir_all(&models_dir).map_err(|e| e.to_string())?;
+
+    let mut child = spawn_ensure_model(&bin, tier, &models_dir).map_err(|e| e.to_string())?;
+    if let Some(stderr) = child.stderr.take() {
+        std::thread::spawn(move || {
+            let reader = BufReader::new(stderr);
+            for line in reader.lines().map_while(Result::ok) {
+                log::debug!("ensure-model: {line}");
+            }
+        });
+    }
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "ensure-model: no stdout pipe".to_string())?;
+    let reader = BufReader::new(stdout);
+    let mut ready_model: Option<PathBuf> = None;
+    let mut last_error: Option<String> = None;
+    let tier_name = tier_cli_name(tier);
+    for line in reader.lines().map_while(Result::ok) {
+        match parse_ensure_model_line(&line) {
+            Some(EnsureModelLine::Progress { asset, downloaded, total }) => {
+                let _ = app.emit(
+                    "transcription://model-download-progress",
+                    serde_json::json!({
+                        "tier": tier_name,
+                        "asset": asset,
+                        "downloaded_bytes": downloaded,
+                        "total_bytes": total,
+                    }),
+                );
+            }
+            Some(EnsureModelLine::Ready { model }) => {
+                ready_model = Some(PathBuf::from(model));
+            }
+            Some(EnsureModelLine::Error { message }) => {
+                last_error = Some(message);
+            }
+            Some(EnsureModelLine::Unknown) | None => {}
+        }
+    }
+    let status = child.wait().map_err(|e| e.to_string())?;
+    match ready_model {
+        Some(path) if status.success() => Ok(path),
+        _ => Err(last_error.unwrap_or_else(|| "ensure-model exited without a ready event".to_string())),
+    }
+}
+
+/// Spawns [`ensure_model`] on its own thread and emits
 /// `transcription://model-download-done`/`-error` when it finishes - see
-/// `commands::download_transcription_model`.
+/// `commands::download_transcription_model`. Blocking work
+/// (`ensure_model` waits on a whole child process) always happens off
+/// the Tauri command's own calling thread, matching this crate's
+/// existing thread-per-blocking-operation style (`bridge.rs`'s HTTP
+/// server, `sidecar.rs`'s supervisor).
 pub fn spawn_model_download(app: AppHandle, tier: ModelTier) {
-    std::thread::spawn(move || match download_model(&app, tier) {
+    std::thread::spawn(move || match ensure_model(&app, tier) {
         Ok(path) => {
             let _ = app.emit(
                 "transcription://model-download-done",
-                serde_json::json!({"tier": model_filename(tier), "path": path.display().to_string()}),
+                serde_json::json!({"tier": tier_cli_name(tier), "path": path.display().to_string()}),
             );
         }
         Err(e) => {
             let _ = app.emit(
                 "transcription://model-download-error",
-                serde_json::json!({"tier": model_filename(tier), "message": e}),
+                serde_json::json!({"tier": tier_cli_name(tier), "message": e}),
             );
         }
     });
@@ -1023,11 +1414,175 @@ pub fn spawn_model_download(app: AppHandle, tier: ModelTier) {
 mod tests {
     use super::*;
 
+    // ---- valid_call_id (S1) ----
+
+    #[test]
+    fn valid_call_id_accepts_realistic_engine_ids() {
+        assert!(valid_call_id("8832d603f43c4fd3"));
+        assert!(valid_call_id("2845d09c"));
+        assert!(valid_call_id("a-b_c.d123"));
+    }
+
+    #[test]
+    fn valid_call_id_rejects_path_traversal_attempts() {
+        assert!(!valid_call_id("../../../etc/passwd"));
+        assert!(!valid_call_id("..\\..\\windows"));
+        assert!(!valid_call_id(".."));
+        assert!(!valid_call_id("a/b"));
+        assert!(!valid_call_id("a\\b"));
+        assert!(!valid_call_id("foo/../bar"));
+    }
+
+    #[test]
+    fn valid_call_id_rejects_empty_and_oversized() {
+        assert!(!valid_call_id(""));
+        assert!(!valid_call_id(&"a".repeat(MAX_CALL_ID_LEN + 1)));
+        assert!(valid_call_id(&"a".repeat(MAX_CALL_ID_LEN)));
+    }
+
+    #[test]
+    fn valid_call_id_rejects_other_special_characters() {
+        assert!(!valid_call_id("a b")); // space
+        assert!(!valid_call_id("a;rm -rf /"));
+        assert!(!valid_call_id("a\0b")); // NUL
+        assert!(!valid_call_id("a\nb"));
+    }
+
+    // ---- event_state_and_call_id (A2) ----
+
+    #[test]
+    fn event_state_and_call_id_extracts_both_fields() {
+        let event = serde_json::json!({"event": "call_state", "state": "established", "call_id": "abc123"});
+        assert_eq!(event_state_and_call_id(&event), Some(("established", "abc123")));
+    }
+
+    #[test]
+    fn event_state_and_call_id_none_when_state_missing() {
+        let event = serde_json::json!({"call_id": "abc123"});
+        assert_eq!(event_state_and_call_id(&event), None);
+    }
+
+    #[test]
+    fn event_state_and_call_id_none_when_call_id_missing() {
+        let event = serde_json::json!({"state": "established"});
+        assert_eq!(event_state_and_call_id(&event), None);
+    }
+
+    // ---- should_auto_tap (A2) ----
+
+    fn settings_with(mode: TranscriptionMode, activation: TranscriptionActivation) -> TranscriptionSettings {
+        TranscriptionSettings {
+            mode,
+            activation,
+            storage_dir: "/tmp/whatever".to_string(),
+            ..TranscriptionSettings::default()
+        }
+    }
+
+    #[test]
+    fn should_auto_tap_false_when_mode_off_regardless_of_activation() {
+        assert!(!should_auto_tap(
+            &settings_with(TranscriptionMode::Off, TranscriptionActivation::AllCalls),
+            false
+        ));
+        assert!(!should_auto_tap(
+            &settings_with(TranscriptionMode::Off, TranscriptionActivation::Manual),
+            false
+        ));
+    }
+
+    #[test]
+    fn should_auto_tap_false_for_manual_activation_even_when_mode_on() {
+        assert!(!should_auto_tap(
+            &settings_with(TranscriptionMode::Live, TranscriptionActivation::Manual),
+            false
+        ));
+        assert!(!should_auto_tap(
+            &settings_with(TranscriptionMode::PostCall, TranscriptionActivation::Manual),
+            false
+        ));
+    }
+
+    #[test]
+    fn should_auto_tap_true_for_all_calls_activation_when_mode_on() {
+        assert!(should_auto_tap(
+            &settings_with(TranscriptionMode::Live, TranscriptionActivation::AllCalls),
+            false
+        ));
+        assert!(should_auto_tap(
+            &settings_with(TranscriptionMode::PostCall, TranscriptionActivation::AllCalls),
+            false
+        ));
+    }
+
+    #[test]
+    fn should_auto_tap_false_when_already_active() {
+        assert!(!should_auto_tap(
+            &settings_with(TranscriptionMode::Live, TranscriptionActivation::AllCalls),
+            true
+        ));
+    }
+
+    // ---- on_tap_started/on_tap_stopped decisions (A2) ----
+
+    #[test]
+    fn on_tap_started_spawns_only_for_live() {
+        assert!(on_tap_started_should_spawn(TranscriptionMode::Live));
+        assert!(!on_tap_started_should_spawn(TranscriptionMode::PostCall));
+        assert!(!on_tap_started_should_spawn(TranscriptionMode::Off));
+    }
+
+    #[test]
+    fn on_tap_stopped_runs_post_call_for_post_call_mode() {
+        assert!(on_tap_stopped_should_run_post_call(TranscriptionMode::PostCall, false));
+        assert!(on_tap_stopped_should_run_post_call(TranscriptionMode::PostCall, true));
+    }
+
+    #[test]
+    fn on_tap_stopped_defers_to_live_reader_when_still_alive() {
+        assert!(!on_tap_stopped_should_run_post_call(TranscriptionMode::Live, false));
+    }
+
+    #[test]
+    fn on_tap_stopped_falls_back_to_post_call_when_live_died_early() {
+        // A3 fix: a live process that already crashed before this stop
+        // event must still get a full pass once the call really ends.
+        assert!(on_tap_stopped_should_run_post_call(TranscriptionMode::Live, true));
+    }
+
+    // ---- TapCoordination race (A2) - both possible orderings ----
+
+    #[test]
+    fn coordination_started_then_stopped_signals_stop_on_the_stop_call() {
+        let mut coord = TapCoordination::new();
+        let send_stop_on_attach = coord.mark_live_spawned();
+        assert!(!send_stop_on_attach, "no stop requested yet - nothing to send immediately");
+        let live_already_spawned = coord.mark_stop_requested();
+        assert!(live_already_spawned, "live was already spawned - caller should write stop now");
+    }
+
+    #[test]
+    fn coordination_stopped_then_started_signals_stop_on_the_start_call() {
+        let mut coord = TapCoordination::new();
+        let live_already_spawned = coord.mark_stop_requested();
+        assert!(!live_already_spawned, "live not spawned yet - nothing to write to yet");
+        let send_stop_on_attach = coord.mark_live_spawned();
+        assert!(send_stop_on_attach, "stop was already requested - caller should send it now on attach");
+    }
+
+    #[test]
+    fn coordination_started_without_stop_never_signals() {
+        let mut coord = TapCoordination::new();
+        let send_stop_on_attach = coord.mark_live_spawned();
+        assert!(!send_stop_on_attach);
+        assert!(!coord.stop_requested());
+    }
+
     // ---- parse_transcribe_line ----
 
     #[test]
     fn parses_segment_line() {
-        let line = r#"{"event":"segment","speaker":"agent","t0_ms":100,"t1_ms":900,"text":"hola"}"#;
+        let line = r#"{"type":"segment","speaker":"agent","t0_ms":100,"t1_ms":900,"text":"hola"}"#;
         assert_eq!(
             parse_transcribe_line(line),
             Some(TranscribeLine::Segment {
@@ -1041,7 +1596,7 @@ mod tests {
 
     #[test]
     fn parses_done_line() {
-        let line = r#"{"event":"done","txt_path":"/tmp/a.txt","json_path":"/tmp/a.json"}"#;
+        let line = r#"{"type":"done","txt":"/tmp/a.txt","json":"/tmp/a.json"}"#;
         assert_eq!(
             parse_transcribe_line(line),
             Some(TranscribeLine::Done {
@@ -1053,7 +1608,7 @@ mod tests {
 
     #[test]
     fn parses_error_line() {
-        let line = r#"{"event":"error","message":"model not found"}"#;
+        let line = r#"{"type":"error","message":"model not found"}"#;
         assert_eq!(
             parse_transcribe_line(line),
             Some(TranscribeLine::Error { message: "model not found".to_string() })
@@ -1068,13 +1623,54 @@ mod tests {
     }
 
     #[test]
-    fn unknown_event_name_is_unknown_not_none() {
-        assert_eq!(parse_transcribe_line(r#"{"event":"progress","pct":50}"#), Some(TranscribeLine::Unknown));
+    fn unknown_type_is_unknown_not_none() {
+        assert_eq!(parse_transcribe_line(r#"{"type":"progress","pct":50}"#), Some(TranscribeLine::Unknown));
     }
 
     #[test]
     fn malformed_json_is_none() {
         assert_eq!(parse_transcribe_line("{not json"), None);
+    }
+
+    #[test]
+    fn old_event_key_is_no_longer_recognized() {
+        // Guards against silently regressing back to the earlier, wrong
+        // guessed contract (`"event"` key, `txt_path`/`json_path` fields)
+        // now that it's confirmed against the real binary.
+        assert_eq!(parse_transcribe_line(r#"{"event":"segment","speaker":"agent","t0_ms":0,"t1_ms":1,"text":"x"}"#), None);
+    }
+
+    // ---- parse_ensure_model_line ----
+
+    #[test]
+    fn parses_ensure_model_progress_line() {
+        let line = r#"{"type":"progress","asset":"ggml-large-v3-turbo-q5_0.bin","downloaded":1024,"total":574041195}"#;
+        assert_eq!(
+            parse_ensure_model_line(line),
+            Some(EnsureModelLine::Progress {
+                asset: "ggml-large-v3-turbo-q5_0.bin".to_string(),
+                downloaded: 1024,
+                total: 574041195,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_ensure_model_ready_line() {
+        let line = r#"{"type":"ready","model":"/models/ggml-large-v3-turbo-q5_0.bin","vad_model":"/models/ggml-silero-v5.1.2.bin"}"#;
+        assert_eq!(
+            parse_ensure_model_line(line),
+            Some(EnsureModelLine::Ready { model: "/models/ggml-large-v3-turbo-q5_0.bin".to_string() })
+        );
+    }
+
+    #[test]
+    fn parses_ensure_model_error_line() {
+        let line = r#"{"type":"error","message":"checksum mismatch"}"#;
+        assert_eq!(
+            parse_ensure_model_line(line),
+            Some(EnsureModelLine::Error { message: "checksum mismatch".to_string() })
+        );
     }
 
     // ---- dated_dest_dir ----
@@ -1085,6 +1681,49 @@ mod tests {
         let dt = Local.with_ymd_and_hms(2026, 7, 16, 14, 32, 10).unwrap();
         let dir = dated_dest_dir(Path::new("/storage"), dt);
         assert_eq!(dir, PathBuf::from("/storage/2026/07/16"));
+    }
+
+    // ---- append_to_filename / move_file atomicity (M3) ----
+
+    #[test]
+    fn append_to_filename_suffixes_whole_name() {
+        assert_eq!(append_to_filename(Path::new("/a/b/foo.txt"), ".part"), PathBuf::from("/a/b/foo.txt.part"));
+    }
+
+    #[test]
+    fn move_file_publishes_atomically_via_part_file() {
+        let dir = scratch_dir("move-file-atomic");
+        let src = dir.join("src.txt");
+        let dest_dir = dir.join("cross-device-sim");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        std::fs::write(&src, b"hello").unwrap();
+        let dest = dest_dir.join("dest.txt");
+
+        move_file(&src, &dest).unwrap();
+
+        assert!(dest.is_file());
+        assert!(!src.exists());
+        // No leftover .part file after a successful move.
+        assert!(!dest_dir.join("dest.txt.part").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn move_file_never_leaves_a_partial_file_at_the_final_name() {
+        // Simulate a copy failure (source path with no read permission is
+        // hard to construct portably in a test - instead point `dest` at
+        // a directory that doesn't exist and won't be created, so the
+        // copy step itself fails cleanly) and confirm nothing appears at
+        // the exact final `dest` path.
+        let dir = scratch_dir("move-file-failure");
+        let src = dir.join("src.txt");
+        std::fs::write(&src, b"hello").unwrap();
+        let dest = dir.join("does-not-exist").join("dest.txt");
+
+        let result = move_file(&src, &dest);
+        assert!(result.is_err());
+        assert!(!dest.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ---- resolve_transcribe_binary ----
@@ -1121,7 +1760,9 @@ mod tests {
         use chrono::TimeZone;
         FinalizeContext {
             call_id: "call-abc123".to_string(),
-            peer: "sip:1100@example.test".to_string(),
+            // Synthetic, never the real PBX test extension (repo is
+            // public - see the 2026-07-16 review, finding B3).
+            peer: "sip:9999@example.test".to_string(),
             tap_dir: tap_dir.to_path_buf(),
             rx_path: tap_dir.join("call-abc123-rx.wav"),
             tx_path: tap_dir.join("call-abc123-tx.wav"),
@@ -1230,6 +1871,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tap_dir);
     }
 
+    // ---- write_meta_file (M5) ----
+
+    #[test]
+    fn write_meta_file_writes_json_under_tap_dir_not_argv() {
+        let tap_dir = scratch_dir("meta-file");
+        let ctx = make_ctx(&tap_dir, Path::new("/tmp/storage"), false);
+        let path = write_meta_file(&ctx).expect("should write meta file");
+        assert_eq!(path, tap_dir.join("meta.json"));
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let v: Value = serde_json::from_str(&contents).unwrap();
+        assert_eq!(v["call_id"], "call-abc123");
+        assert_eq!(v["number"], "sip:9999@example.test");
+        assert!(v["started_at"].is_string());
+        let _ = std::fs::remove_dir_all(&tap_dir);
+    }
+
     // ---- model tiers ----
 
     #[test]
@@ -1238,13 +1895,13 @@ mod tests {
     }
 
     #[test]
-    fn model_expected_sha256_is_documented_tech_debt() {
-        // See model_expected_sha256's doc: intentionally None until a real
-        // checksum is confirmed - this test pins the *current* state so a
-        // future fill-in is a deliberate, reviewed change, not a silent
-        // drop of verification.
-        assert_eq!(model_expected_sha256(ModelTier::Accurate), None);
-        assert_eq!(model_expected_sha256(ModelTier::Light), None);
+    fn tier_cli_names_match_the_real_binarys_parse_function() {
+        // Confirmed against `centinelo-transcribe`'s real
+        // `ModelTier::as_str`/`parse` (premium repo, read-only) - this
+        // test pins the exact strings so a future drift is a loud test
+        // failure, not a silent "unknown --tier" error from the sidecar.
+        assert_eq!(tier_cli_name(ModelTier::Accurate), "large-v3-turbo-q5_0");
+        assert_eq!(tier_cli_name(ModelTier::Light), "small-q5_1");
     }
 
     // ---- mocked-sidecar process integration tests -----------------------
@@ -1254,11 +1911,9 @@ mod tests {
     // `parse_transcribe_line` code the live app uses - the "e2e scripted
     // flujo con sidecar mockeado" the task asked for, without needing a
     // running Tauri app (no AppHandle involved - only the process
-    // spawn/pipe/parse layer, which is exactly what's untested by the
-    // pure `finalize_artifacts`/`parse_transcribe_line` unit tests above).
-    // Unix-only: the fixture is a bash script (see its own header) and
-    // this repo's Windows CI is already best-effort/continue-on-error
-    // (shell/README.md "Known limitations").
+    // spawn/pipe/parse layer). Unix-only: the fixture is a bash script
+    // (see its own header) and this repo's Windows CI is already
+    // best-effort/continue-on-error (shell/README.md "Known limitations").
 
     #[cfg(unix)]
     fn mock_binary_path() -> PathBuf {
@@ -1266,9 +1921,17 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn write_test_meta(out_dir: &Path) -> PathBuf {
+        let path = out_dir.join("meta.json");
+        std::fs::write(&path, r#"{"call_id":"call-abc123","number":"sip:9999@example.test"}"#).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
     #[test]
     fn mock_binary_post_mode_emits_segments_then_done_with_real_files() {
         let out_dir = scratch_dir("mock-post");
+        let meta_path = write_test_meta(&out_dir);
         let args = TranscribeArgs {
             bin: mock_binary_path(),
             rx: out_dir.join("call-rx.wav"),
@@ -1277,7 +1940,7 @@ mod tests {
             lang: "es".to_string(),
             mode: "post",
             out_dir: out_dir.clone(),
-            meta_json: "{}".to_string(),
+            meta_path,
         };
         let mut child = spawn_transcribe(&args).expect("mock binary should spawn");
         let stdout = child.stdout.take().expect("piped");
@@ -1302,8 +1965,8 @@ mod tests {
         let TranscribeLine::Done { txt_path, json_path } = done.expect("mock binary should emit a done event") else {
             unreachable!()
         };
-        let txt_path = PathBuf::from(txt_path.expect("done event should carry txt_path"));
-        let json_path = PathBuf::from(json_path.expect("done event should carry json_path"));
+        let txt_path = PathBuf::from(txt_path.expect("done event should carry txt path"));
+        let json_path = PathBuf::from(json_path.expect("done event should carry json path"));
         assert!(txt_path.is_file(), "mock binary should have actually written the txt file");
         assert!(json_path.is_file(), "mock binary should have actually written the json file");
 
@@ -1325,6 +1988,7 @@ mod tests {
     #[test]
     fn mock_binary_live_mode_blocks_until_stop_then_emits_done() {
         let out_dir = scratch_dir("mock-live");
+        let meta_path = write_test_meta(&out_dir);
         let args = TranscribeArgs {
             bin: mock_binary_path(),
             rx: out_dir.join("call-rx.wav"),
@@ -1333,7 +1997,7 @@ mod tests {
             lang: "es".to_string(),
             mode: "live",
             out_dir: out_dir.clone(),
-            meta_json: "{}".to_string(),
+            meta_path,
         };
         let mut child = spawn_transcribe(&args).expect("mock binary should spawn");
         let mut stdin = child.stdin.take().expect("piped");
@@ -1356,5 +2020,33 @@ mod tests {
         assert!(status.success());
 
         let _ = std::fs::remove_dir_all(&out_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mock_binary_ensure_model_emits_progress_then_ready() {
+        let models_dir = scratch_dir("mock-ensure-model");
+        let mut child = spawn_ensure_model(&mock_binary_path(), ModelTier::Light, &models_dir)
+            .expect("mock binary should spawn for ensure-model");
+        let stdout = child.stdout.take().expect("piped");
+        let reader = BufReader::new(stdout);
+        let mut saw_progress = false;
+        let mut ready: Option<EnsureModelLine> = None;
+        for line in reader.lines().map_while(Result::ok) {
+            match parse_ensure_model_line(&line) {
+                Some(p @ EnsureModelLine::Progress { .. }) => {
+                    saw_progress = true;
+                    let _ = p;
+                }
+                Some(r @ EnsureModelLine::Ready { .. }) => ready = Some(r),
+                _ => {}
+            }
+        }
+        let status = child.wait().expect("mock binary should exit cleanly");
+        assert!(status.success());
+        assert!(saw_progress, "mock ensure-model should emit at least one progress event");
+        assert!(matches!(ready, Some(EnsureModelLine::Ready { .. })));
+
+        let _ = std::fs::remove_dir_all(&models_dir);
     }
 }
