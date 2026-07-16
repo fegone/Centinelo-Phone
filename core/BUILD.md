@@ -489,9 +489,15 @@ still uploaded as an artifact on every run (pass or fail) via
 things that only show up in the raw CMake/MSVC output.
 
 **Confirmed green run** (not "should work" — an actual passing run,
-checked): [`29459035249`](https://github.com/fegone/Centinelo-Phone/actions/runs/29459035249)
-(`5be8dbf`, `v2-winci` branch) — `macOS (supported)` in 38s, `Windows
-(experimental)` in 4m9s, both ✓.
+checked): [`29533068908`](https://github.com/fegone/Centinelo-Phone/actions/runs/29533068908)
+(`db5f7e6`, `v2-winci` branch, 2026-07-16) — `macOS (supported)` in 1m6s,
+`Windows (experimental)` in 4m34s, both ✓, with the full media module set
+below (`ausine;aufile;ice;dtls_srtp;wasapi`) compiled in — confirmed from
+the job's own log, not inferred: `MODULES_DETECTED=account;g711;auconv;
+auresamp;ausine;aufile;ice;dtls_srtp;menu;wasapi;ctrl_json`. Prior run
+([`29459035249`](https://github.com/fegone/Centinelo-Phone/actions/runs/29459035249),
+`5be8dbf`) confirmed only the smaller pre-fix module set — see "Windows
+media modules" below for what changed and why.
 
 ### What's actually different on Windows (read the workflow file, not this doc, for the literal commands — this section explains *why*)
 
