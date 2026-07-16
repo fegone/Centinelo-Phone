@@ -92,8 +92,8 @@ core/
 See `BUILD.md` for the full, from-clean-clone build. Once built:
 
 ```bash
-CENT_EXT=1100 \
-CENT_HOST=100.119.230.80 \
+CENT_EXT=1000 \
+CENT_HOST=<pbx host> \
 CENT_TRANSPORT=wss \
 CENT_SECRET="$(...)" \
 ./core/run-spike.sh

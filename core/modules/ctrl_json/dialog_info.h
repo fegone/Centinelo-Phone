@@ -21,7 +21,7 @@
  * core/E2E-F1.md ("F5") for real captured NOTIFY bodies and this engine's
  * actual real-PBX verification status for each state.
  *
- * Copyright (C) 2026 Neola Dental / Centinelo Phone
+ * Copyright (C) 2026 Centinelo Phone
  */
 
 #ifndef CENTINELO_CTRL_JSON_DIALOG_INFO_H

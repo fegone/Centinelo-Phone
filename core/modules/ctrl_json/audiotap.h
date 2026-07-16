@@ -32,7 +32,7 @@
  *      see audiotap.c's write_frame()), per the F4 task design ("writes
  *      TWO mono ... WAV files").
  *
- * Copyright (C) 2026 Neola Dental / Centinelo Phone
+ * Copyright (C) 2026 Centinelo Phone
  */
 
 #ifndef CENTINELO_CTRL_JSON_AUDIOTAP_H

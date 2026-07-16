@@ -6,7 +6,7 @@
  * core/modules/ctrl_json/test/test_main.c can exercise this without a
  * running baresip engine (same reasoning as cmd.c/dialog_info.c).
  *
- * Copyright (C) 2026 Neola Dental / Centinelo Phone
+ * Copyright (C) 2026 Centinelo Phone
  */
 
 #include <errno.h>

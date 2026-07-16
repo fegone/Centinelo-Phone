@@ -1,8 +1,8 @@
 # core/ — F1 end-to-end verification (+ F3 regression, v1.1)
 
 Real evidence, gathered by actually running the built engine against the
-live test PBX (FreePBX 17 / Asterisk 22, `100.119.230.80`, Tailscale-only,
-ext 1100 / secret from `~/Library/Application Support/Centinelo
+live test PBX (FreePBX 17 / Asterisk 22, `<pbx host>`, Tailscale-only,
+ext 1000 / secret from `~/Library/Application Support/Centinelo
 Phone/settings.json`, never printed/committed). PBX-side verification was
 SSH + read-only `asterisk -rx "... show ..."` commands only — no PBX
 configuration was changed at any point in this work. Scenarios (a)-(d) +
@@ -23,7 +23,7 @@ before/after each protocol action for independent confirmation.
 **PASS.**
 
 1. `register` (startup) → `{"event":"reg_state",...,"state":"registered","transport":"wss"}`.
-2. `{"cmd":"dial","uri":"sip:*43@100.119.230.80"}` → `call_state`
+2. `{"cmd":"dial","uri":"sip:*43@<pbx host>"}` → `call_state`
    `established`.
 3. **Finding — ICE settle time**: immediately after `established`,
    baresip's own periodic bitrate ticker (stderr) read `audio=0/0
@@ -32,8 +32,8 @@ before/after each protocol action for independent confirmation.
    the account has `medianat=ice;mediaenc=dtls_srtp` (required by the
    endpoint's `webrtc=yes`, see `BUILD.md` "Findings"), and this
    engine offers host ICE candidates across every local interface (LAN,
-   Tailscale, IPv6 — six candidates in the captured SDP: `192.168.100.224`,
-   two IPv6 ULAs, `192.168.100.225`, `100.93.223.113` (Tailscale), one
+   Tailscale, IPv6 — six candidates in the captured SDP: `192.168.1.10`,
+   two IPv6 ULAs, `192.168.1.11`, `<tailscale ip>` (Tailscale), one
    more IPv6). ICE connectivity checks across that many candidate pairs
    take real time to settle. Waiting ~15-20s after `established` before
    relying on live RTP resolved it consistently across every run in this
@@ -60,11 +60,11 @@ harness logs, not checked in, for the complete transcript):
 
 ```
 $ asterisk -rx 'pjsip show channelstats'      (t=18s, before hold)
-          1100-00000867      00:00:18 ulaw      773       0    0   0.000    774 ...
+          1000-00000867      00:00:18 ulaw      773       0    0   0.000    774 ...
 $ asterisk -rx 'pjsip show channelstats'      (t=22s, 3s into hold)
-          1100-00000867      00:00:22 ulaw      775       0    0   0.000    776 ...   <- +2 over 4s
+          1000-00000867      00:00:22 ulaw      775       0    0   0.000    776 ...   <- +2 over 4s
 $ asterisk -rx 'pjsip show channelstats'      (after resume)
-          1100-00000867      00:00:27 ulaw     1001       0    0   0.000   1002 ...   <- +226 total, media clearly resumed
+          1000-00000867      00:00:27 ulaw     1001       0    0   0.000   1002 ...   <- +226 total, media clearly resumed
 ```
 
 ## (b) blind_transfer
@@ -73,7 +73,7 @@ $ asterisk -rx 'pjsip show channelstats'      (after resume)
 
 ### First attempt (blocked, root-caused, not a code bug)
 
-`dial *43` → `{"cmd":"blind_transfer","uri":"sip:*97@100.119.230.80",...}`
+`dial *43` → `{"cmd":"blind_transfer","uri":"sip:*97@<pbx host>",...}`
 initially failed: REFER was sent correctly and **accepted by Asterisk
 (202 Accepted)**, but the implicit refer-progress subscription's next
 NOTIFY carried `Subscription-State: terminated;reason=noresource` with
@@ -85,11 +85,11 @@ code path is correct, something PBX-side rejected the actual transfer.
 Root-caused two ways:
 
 1. Read-only `asterisk -rx "dialplan show *97@from-internal"` +
-   `/var/log/asterisk/full` (read-only) showed ext 1100 has no
+   `/var/log/asterisk/full` (read-only) showed ext 1000 has no
    voicemail mailbox provisioned (`VMBOXEXISTSSTATUS=FAILED`,
-   `VMCONTEXT=novm`) — dialing `*97` directly from 1100 answers then
+   `VMCONTEXT=novm`) — dialing `*97` directly from 1000 answers then
    immediately hangs itself up. **PBX-config footnote, not an engine
-   issue**: 1100 = novm. No PBX config was changed to investigate or
+   issue**: 1000 = novm. No PBX config was changed to investigate or
    work around this.
 2. That alone didn't explain a *reverse*-direction failure
    (`*97`→`*43`, also `noresource`/400) or a same-target failure with
@@ -106,16 +106,16 @@ Root-caused two ways:
 
 ### Working verification (dual-contact self-bridge)
 
-`pjsip show aor 1100` confirmed `max_contacts: 2`. Two separate engine
-instances (A, B) registered simultaneously as ext 1100 (two distinct
-contacts, confirmed: `sip:1100@100.93.223.113:56994...` and
-`...:56995...`). A dialed `sip:1100@100.119.230.80` (its own extension —
+`pjsip show aor 1000` confirmed `max_contacts: 2`. Two separate engine
+instances (A, B) registered simultaneously as ext 1000 (two distinct
+contacts, confirmed: `sip:1000@<tailscale ip>:56994...` and
+`...:56995...`). A dialed `sip:1000@<pbx host>` (its own extension —
 the dialplan allowed this and rang the other contact); B received
 `call_state incoming` and answered. A and B reached `established` — a
 **genuine 2-party bridge**, confirmed by both PBX channels sharing one
 `BridgeID` in `core show channels verbose`.
 
-From A: `{"cmd":"blind_transfer","uri":"sip:*43@100.119.230.80",...}` →
+From A: `{"cmd":"blind_transfer","uri":"sip:*43@<pbx host>",...}` →
 A's own call closed cleanly (`call_state closed` — the expected shape
 for a *successful* transfer, since `call_replace_transfer`/
 `call_transfer` success collapses the transferor's own leg, same as a
@@ -125,11 +125,11 @@ after:
 
 ```
 $ asterisk -rx 'core show channels verbose'      (before transfer)
-PJSIP/1100-00000870   from-internal                       1  Up  AppDial  (Outgoing Line)             BridgeID 9df79407-...
-PJSIP/1100-0000086f   dialOne-with-exten   1100            2  Up  Dial     PJSIP/1100/sip:1100@100.9  BridgeID 9df79407-...
+PJSIP/1000-00000870   from-internal                       1  Up  AppDial  (Outgoing Line)             BridgeID 9df79407-...
+PJSIP/1000-0000086f   dialOne-with-exten   1000            2  Up  Dial     PJSIP/1000/sip:1000@<ip>  BridgeID 9df79407-...
 
 $ asterisk -rx 'core show channels verbose'      (after blind_transfer to *43)
-PJSIP/1100-00000870   from-internal-xfer   *43             7  Up  BackGround   demo-echotest,,,app-echo-...
+PJSIP/1000-00000870   from-internal-xfer   *43             7  Up  BackGround   demo-echotest,,,app-echo-...
 ```
 
 The surviving channel visibly moved into `from-internal-xfer` context,
@@ -142,14 +142,14 @@ alternate target (`*43`) once a genuine bridge existed.
 **PASS.**
 
 `{"cmd":"blf_subscribe","ext":"510"}` → SUBSCRIBE `Event: dialog`,
-`Accept: application/dialog-info+xml` sent to `sip:510@100.119.230.80`
+`Accept: application/dialog-info+xml` sent to `sip:510@<pbx host>`
 (digest-authenticated, 401→200 in trace). Initial NOTIFY received and
 correctly parsed:
 
 ```
 $ (raw NOTIFY body, captured via -s SIP trace, ext 510 idle/unregistered)
 <?xml version="1.0" encoding="UTF-8"?>
-<dialog-info xmlns="urn:ietf:params:xml:ns:dialog-info" version="0" state="full" entity="sip:510@100.119.230.80">
+<dialog-info xmlns="urn:ietf:params:xml:ns:dialog-info" version="0" state="full" entity="sip:510@<pbx host>">
  <dialog id="510">
   <state>terminated</state>
  </dialog>
@@ -219,7 +219,7 @@ against the same live PBX:
   the outgoing tx path — see `PROTOCOL.md`).
 - **`attended_transfer` + `complete_transfer`**: verified for real using
   the same dual-contact bridge as scenario (b). A+B bridged (as above);
-  from A, `{"cmd":"attended_transfer","uri":"sip:*60@100.119.230.80",...}`
+  from A, `{"cmd":"attended_transfer","uri":"sip:*60@<pbx host>",...}`
   → source held (`call_state hold`) → `attended_transfer_started` fired
   with correct `source_call_id`/`target_call_id` → consultation call to
   `*60` established. PBX showed 3 channels at that point (the held A-B
@@ -285,15 +285,15 @@ before/during/after.
 **PASS.**
 
 ```
--> {"cmd": "dial", "uri": "sip:*43@100.119.230.80", "id": "d1"}
-<- {"event":"reg_state","account":"sip:1100@100.119.230.80:8089","state":"registered","transport":"wss"}
+-> {"cmd": "dial", "uri": "sip:*43@<pbx host>", "id": "d1"}
+<- {"event":"reg_state","account":"sip:1000@<pbx host>:8089","state":"registered","transport":"wss"}
 <- {"event":"result","id":"d1","ok":true}
-<- {"event":"call_state","state":"established","peer":"sip:*43@100.119.230.80;transport=wss","id":"8832d603f43c4fd3","call_id":"8832d603f43c4fd3"}
+<- {"event":"call_state","state":"established","peer":"sip:*43@<pbx host>;transport=wss","id":"8832d603f43c4fd3","call_id":"8832d603f43c4fd3"}
 ```
 
 1. `register` (startup, wss) → `reg_state registered` — unchanged from
    scenario (a).
-2. `{"cmd":"dial","uri":"sip:*43@100.119.230.80","id":"d1"}` → both a
+2. `{"cmd":"dial","uri":"sip:*43@<pbx host>","id":"d1"}` → both a
    correlated `result` (`id:"d1"`, `ok:true`) **and** the normal
    `call_state established` arrived (order between the two is not
    guaranteed by the protocol and wasn't fixed run to run — the harness
@@ -349,7 +349,7 @@ self-reported events:
 
 ```
 PBX channels BEFORE:        []
-PBX channels DURING call:   ['PJSIP/1100-0000087b!from-internal!*43!7!Up!BackGround!demo-echotest,,,app-echo-test-echo!1100!!!3!3!!1784157785.3767']
+PBX channels DURING call:   ['PJSIP/1000-0000087b!from-internal!*43!7!Up!BackGround!demo-echotest,,,app-echo-test-echo!1000!!!3!3!!1784157785.3767']
 PBX channels AFTER hangup:  []
 ```
 
@@ -382,8 +382,8 @@ that gap between them is itself a real finding (see below): the first
 round (`core/patches/0003-*` only — the baresip-side banner/log/
 SIP-trace fix) brought a scenario-(e)-shaped run down from the v1
 baseline to **3** non-JSON lines (`"websock: connecting to
-'wss://100.119.230.80:8089/ws'"`, `"<...> WSS websock established to
-100.119.230.80:8089"`, `"--> send"`) — all from unconditional
+'wss://<pbx host>:8089/ws'"`, `"<...> WSS websock established to
+<pbx host>:8089"`, `"--> send"`) — all from unconditional
 `re_printf()`s in `core/deps/re`'s own SIP-over-WS transport code
 (`src/sip/transp.c`), a different submodule than 0003 touched, only
 found by actually capturing and grepping a live run's stdout, not by
@@ -410,7 +410,7 @@ resulting WAV files themselves using nothing but Python's stdlib `wave`
 module (deliberately *not* reusing any of this engine's own WAV-writing
 code — see "(i)" below).
 
-Secret handling: the harness reads ext 1100's password from this
+Secret handling: the harness reads ext 1000's password from this
 machine's local Centinelo Phone `settings.json` (per this workspace's
 `CLAUDE.md`) straight into the child process's env dict, in Python
 memory only — never on a command line, never logged, never written
@@ -425,10 +425,10 @@ readability):
 
 ```
 <- {"event":"ready"}
-<- {"event":"reg_state","account":"sip:1100@100.119.230.80:8089","state":"registered","transport":"wss"}
--> {"cmd":"dial","uri":"sip:*43@100.119.230.80","id":"d1"}
+<- {"event":"reg_state","account":"sip:1000@<pbx host>:8089","state":"registered","transport":"wss"}
+-> {"cmd":"dial","uri":"sip:*43@<pbx host>","id":"d1"}
 <- {"event":"result","id":"d1","ok":true}
-<- {"event":"call_state","state":"established","peer":"sip:*43@100.119.230.80;transport=wss","id":"2845d09c...","call_id":"2845d09c..."}
+<- {"event":"call_state","state":"established","peer":"sip:*43@<pbx host>;transport=wss","id":"2845d09c...","call_id":"2845d09c..."}
 ```
 
 1. `register` (startup, wss) → `reg_state registered` — unchanged from
@@ -555,7 +555,7 @@ confirmation the JSON events reflect real call state" methodology as
 scenario (f), read-only `asterisk -rx`, no PBX config touched):
 
 ```
-PBX channels DURING tap: PJSIP/1100-0000088b!from-internal!*43!7!Up!BackGround!demo-echotest,,,app-echo-test-echo!1100!...
+PBX channels DURING tap: PJSIP/1000-0000088b!from-internal!*43!7!Up!BackGround!demo-echotest,,,app-echo-test-echo!1000!...
 ```
 
 A real, live PBX channel exists, running the same `demo-echotest`/
@@ -599,14 +599,14 @@ v1.2 does not regress v1.1's pure-NDJSON guarantee.
 
 Methodology: same as F3/F4 — a small Python harness (not checked in,
 scratch tooling), NDJSON over two `run-spike.sh` child processes (both
-registered as ext 1100, dual-contact trick, `max_contacts: 2`), a
+registered as ext 1000, dual-contact trick, `max_contacts: 2`), a
 `wait_for(predicate, timeout)` primitive, PBX-side snapshots via
 read-only `asterisk -rx "... show ..."` before/after each action. No PBX
 configuration was changed at any point.
 
 ### answer with explicit call_id
 
-**PASS.** Engine A dials `sip:1100@<pbx host>` (own extension, dual
+**PASS.** Engine A dials `sip:1000@<pbx host>` (own extension, dual
 contact); engine B (the other registered contact) receives
 `call_state incoming` and captures its own `call_id`. B sends
 `{"cmd":"answer","call_id":"<that id>","id":"ans1"}` → `result` `ok:true`
@@ -618,10 +618,10 @@ call (verified by asserting on the exact `call_id` match, not just that
 ### held (presence_override)
 
 **Parser correct to spec; real PBX does not emit the signal.** Engine A
-`blf_subscribe`s ext `1100` (its own watched extension, dual-contact —
+`blf_subscribe`s ext `1000` (its own watched extension, dual-contact —
 watching-yourself is odd but exercises the exact same NOTIFY-parsing
 path a receptionist console watching *any* other extension would).
-Engine A then dials `1100`; B answers (genuine 2-party bridge, same
+Engine A then dials `1000`; B answers (genuine 2-party bridge, same
 dual-contact-bridge shape as scenario (b)). Media confirmed flowing
 (`audio=63957/63957 (bit/s)` on B's own stderr bitrate ticker) before
 attempting anything hold-related — same ICE/dialog settle discipline as
@@ -634,8 +634,8 @@ one stale capture), and all three are byte-for-byte:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
-<dialog-info xmlns="urn:ietf:params:xml:ns:dialog-info" version="2" state="full" entity="sip:1100@<pbx host>">
- <dialog id="1100">
+<dialog-info xmlns="urn:ietf:params:xml:ns:dialog-info" version="2" state="full" entity="sip:1000@<pbx host>">
+ <dialog id="1000">
   <state>confirmed</state>
  </dialog>
 </dialog-info>
@@ -655,7 +655,7 @@ synthetic fixtures built strictly to the RFC-documented shape (see
 `test_dialog_info_held()`) — this is a real PBX-side gap, not a parser
 bug, and the real captured "still busy" body above is now a permanent
 regression-guard fixture
-(`test_dialog_info_real_capture_1100_confirmed_no_hold_signal()`)
+(`test_dialog_info_real_capture_ext1000_confirmed_no_hold_signal()`)
 proving the parser correctly reads what this PBX actually sends rather
 than what RFC 4235 merely *permits* a compliant implementation to send.
 
@@ -664,7 +664,7 @@ than what RFC 4235 merely *permits* a compliant implementation to send.
 **Not attempted against the live PBX.** Testing it would require
 toggling DND on the test extension via a feature code (e.g. FreePBX's
 conventional `*78`/`*79`) that is outside this task's pre-authorized
-safe-target list (`*43`, `*60`, dual-contact 1100, BLF to 510) — not
+safe-target list (`*43`, `*60`, dual-contact 1000, BLF to 510) — not
 dialed. Independently, this version's `held` finding above (this PBX's
 own chan_pjsip dialog-info doesn't add non-standard signaling beyond the
 base RFC 4235 `<state>` value) makes it plausible DND wouldn't be
@@ -773,7 +773,7 @@ function `audiotap.c` calls, not a re-implementation.
    `<dialog>` element — both are handled, but only the real capture
    proves which one this PBX actually sends. Added as a permanent
    regression fixture.
-4. Ext 1100 has no voicemail mailbox (`VMCONTEXT=novm`) — PBX-config
+4. Ext 1000 has no voicemail mailbox (`VMCONTEXT=novm`) — PBX-config
    footnote for whoever sets up test extensions next, not an engine
    defect. No PBX config was touched to work around this.
 5. Blind/attended transfer of a single-party `Background()`/`Answer()`

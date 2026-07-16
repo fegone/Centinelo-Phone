@@ -10,9 +10,9 @@
 # deleted with the rest of the scratch dir).
 #
 # Required env vars:
-#   CENT_EXT      SIP extension / username, e.g. 1100
+#   CENT_EXT      SIP extension / username, e.g. 1000
 #   CENT_SECRET   SIP auth password for that extension
-#   CENT_HOST     PBX host/IP, e.g. 100.119.230.80
+#   CENT_HOST     PBX host/IP, e.g. 192.0.2.10
 #
 # Optional env vars:
 #   CENT_TRANSPORT      wss (default) | udp | tcp | tls
@@ -77,7 +77,7 @@
 #            including everything CENT_JSON_STDOUT diverted off stdout).
 #
 # Example:
-#   CENT_EXT=1100 CENT_HOST=100.119.230.80 CENT_TRANSPORT=wss \
+#   CENT_EXT=1000 CENT_HOST=192.0.2.10 CENT_TRANSPORT=wss \
 #     CENT_SECRET="$(...)" ./core/run-spike.sh
 
 set -euo pipefail
@@ -135,7 +135,7 @@ mkdir -p "$SCRATCH_DIR"
 # the request-URI fresh and defaulting to the wss/tls well-known port
 # (443), which nothing is listening on here. Found by running the spike:
 # without `outbound`, dialing *43 over wss silently tried to connect to
-# 100.119.230.80:443 and failed. See BUILD.md "Findings".
+# 192.0.2.10:443 and failed. See BUILD.md "Findings".
 umask 077   # accounts contains auth_pass - keep the scratch dir private
 ACCOUNT_URI="<sip:${CENT_EXT}@${CENT_HOST}:${CENT_PORT};transport=${CENT_TRANSPORT}>"
 ACCOUNT_PARAMS=";auth_pass=${CENT_SECRET};mediaenc=dtls_srtp;medianat=ice;rtcp_mux=yes;audio_codecs=pcmu,pcma;regint=120"
