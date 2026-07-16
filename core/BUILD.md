@@ -534,19 +534,10 @@ media modules" below for what changed and why.
    `git submodule update`).
 
 3. **`MODULES` set on Windows now matches macOS's media set, plus the
-   Windows-native audio backend** (fixed 2026-07-16, see "Windows media
-   modules" below): `account;g711;auconv;auresamp;ausine;aufile;ice;
-   dtls_srtp;menu;wasapi`. Previously (`account;g711;auconv;auresamp;
-   menu`) the Windows build compiled and linked but had **no path to real
-   media at all** — no ICE/DTLS-SRTP (mandatory for this endpoint's
-   `webrtc=yes`, see "Findings" above, independent of signaling
-   transport) and no audio device module (so no microphone/speaker even
-   if media had worked). A green Windows run today proves the engine +
-   `ctrl_json` **link and produce a runnable `baresip.exe` with every
-   module a real WSS/ICE/DTLS-SRTP call needs compiled in** — see
-   "Sanity" below for exactly what is (and still is not) verified this
-   way, and "Windows media modules" for what's still needed beyond CI to
-   prove an actual call works on real Windows hardware.
+   Windows-native audio backend**: `account;g711;auconv;auresamp;ausine;
+   aufile;ice;dtls_srtp;menu;wasapi`. See "Windows media modules" below
+   for the full rationale (what was missing before 2026-07-16, why, and
+   what a green run does/doesn't prove) — not repeated here.
 
 4. **No runtime smoke test** — the Windows job only checks the artifacts
    exist (`test -x .../Release/baresip.exe`, `test -f
@@ -567,7 +558,11 @@ media modules" below for what changed and why.
    is the mechanism that would have caught the pre-2026-07-16 state (or
    any future module silently dropping out via an early `return()` in its
    own `CMakeLists.txt`, e.g. an unsatisfied optional dependency) as a
-   hard CI failure instead of a silently-smaller green build.
+   hard CI failure instead of a silently-smaller green build. The check
+   is a token-exact match against the `;`-separated list (wraps both
+   sides in `;` and matches `;name;`), not a plain substring check — a
+   substring check would wrongly pass a module whose name is contained
+   inside another present module's name.
 
 ### Windows media modules (fixed 2026-07-16)
 
@@ -636,9 +631,8 @@ module).
   platform-conditional (`wasapi,default` and an analogous mac path — no
   `coreaudio` module is enabled on macOS either, same file, same gap) to
   actually select it as `audio_source`/`audio_player`. Flagged to
-  shell-tauri, not fixed here (out of `phone/core/` scope) — see this
-  session's report,
-  `.claude/reports/core-engine-2026-07-16-windows-media.md`.
+  shell-tauri, not fixed here — out of `phone/core/` scope, and
+  `shell/src-tauri/` isn't touched by this file or workflow.
 
 **F1 status** (`ctrl_json.c`'s stdin path, still accurate, unchanged by
 the above): the previously-flagged Windows blocker (`unistd.h`/`read()`/

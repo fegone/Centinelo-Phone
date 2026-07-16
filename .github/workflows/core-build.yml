@@ -165,16 +165,10 @@ jobs:
         # job resolves via FindRE.cmake); RE_LIBRARY at the just-installed
         # static archive re-static.lib (OUTPUT_NAME re-static on MSVC).
         #
-        # MODULES now mirrors macOS's media set (ausine/aufile/ice/dtls_srtp)
-        # plus `wasapi`, the Windows-native audio backend (WASAPI, guarded
-        # `if(NOT WIN32) return()` in its own CMakeLists.txt, so it's a no-op
-        # everywhere else) - see core/BUILD.md "Windows CI" for why the
-        # previous, smaller list (`account;g711;auconv;auresamp;menu`) was a
-        # real functional gap: without ice/dtls_srtp this engine cannot
-        # produce real media on a `webrtc=yes` endpoint (mandatory
-        # DTLS-SRTP+ICE regardless of signaling transport, see BUILD.md
-        # "Findings"), and without a native audio module there is no
-        # microphone/speaker path at all on Windows.
+        # MODULES (2026-07-16): added ausine/aufile/ice/dtls_srtp/wasapi -
+        # see core/BUILD.md "Windows CI" > "Windows media modules" for the
+        # full rationale (why the previous, smaller list was a real
+        # functional gap, not just a smaller compile).
         shell: bash
         run: |
           set -o pipefail
@@ -219,9 +213,17 @@ jobs:
             echo "error: MODULES_DETECTED line not found in baresip-configure.log" >&2
             exit 1
           fi
+          # Token-exact match, not substring: CMake's own list separator is
+          # `;` (see MODULES_DETECTED's own `list(APPEND ...)` calls), so
+          # wrap both the haystack and each needle in `;` and match
+          # `;name;` - a plain `*"$mod"*` substring check would wrongly pass
+          # a module whose name is a substring of another present module
+          # (none collide today, but the check should not depend on that
+          # staying true).
+          detected_tokens=";${detected_line#MODULES_DETECTED=};"
           for mod in ausine aufile ice dtls_srtp wasapi; do
-            case "$detected_line" in
-              *"$mod"*) ;;
+            case "$detected_tokens" in
+              *";$mod;"*) ;;
               *)
                 echo "error: module '$mod' missing from MODULES_DETECTED - it was requested but silently dropped (check its CMakeLists.txt for an early return())" >&2
                 exit 1
