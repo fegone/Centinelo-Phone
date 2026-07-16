@@ -24,14 +24,52 @@
 //   segments: [{ speaker: "agent"|"caller", t0Ms, t1Ms, text }],
 //   done: null | { txtPath, jsonPath, audioKept, channelsFailed: string[] },
 //   error: null | { message, retryable, localTxtPath, localJsonPath },
+//   // Other calls' unresolved save failures (2026-07-16 4R re-review,
+//   // M2) - never dropped just because a new call started tracking here.
+//   otherPendingRetries: [{ callId, peer, lastError }],
 // }
 
 const SPEAKER_TAG = { agent: "You", caller: "Caller" };
 
+// Bounds how many turns the LIVE tape actually renders (2026-07-16 4R
+// re-review, M4): every new segment used to trigger a full re-render of
+// the ENTIRE tape so far, which is O(n) work n times over a call = O(n^2)
+// total - visibly janky on a long call center call with hundreds of
+// segments. Capping the live view to the most recent N turns bounds each
+// render to O(N), independent of how long the call has run; the `done`
+// phase always renders every segment (that render only ever happens
+// once, and is the authoritative saved transcript).
+const LIVE_TAPE_MAX_TURNS = 50;
+
+// Manual replacement, not the `div.textContent = s; d.innerHTML` trick
+// this module used to use - functionally identical for text-node content
+// (the WHATWG HTML serialization algorithm escapes exactly these three
+// characters in text content: an ambiguous `&`, `<`, and `>`) but doesn't
+// require a live `document`, which is what let this module's pure string
+// helpers (`tapeHtml`, `plainTextTranscript`, everything in
+// `__testables`) gain real `node:test` coverage (2026-07-16 4R re-review,
+// T1) without a jsdom-style dependency this project has otherwise never
+// needed.
 function escapeHtml(s) {
-  const d = document.createElement("div");
-  d.textContent = s ?? "";
-  return d.innerHTML;
+  return String(s ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+/// `escapeHtml` is only safe for TEXT node content - `"`/`'` don't need
+/// escaping there, but DO when the same string is interpolated inside an
+/// HTML attribute value (2026-07-16 4R re-review, M1: the find input's
+/// `value="${escapeHtml(query)}"` let a query containing a literal `"`
+/// break out of the attribute and inject arbitrary markup/handlers on a
+/// re-render). Use this instead for any string placed inside an
+/// attribute; prefer setting the DOM property directly
+/// (`el.value = query`) over interpolating into markup at all wherever
+/// that's an option (see `renderTranscriptBody`'s find input, which does
+/// exactly that now) - this helper covers the remaining cases (`data-*`
+/// attributes) where the value has to be part of the initial HTML string.
+function escapeAttr(s) {
+  return escapeHtml(s).replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
 
 function fmtClock(ms) {
@@ -93,10 +131,19 @@ function turnHtml(seg, query) {
 }
 
 function tapeHtml(model, opts = {}) {
-  const { query = "", trailingListening = false } = opts;
-  const segs = sortedSegments(model.segments);
+  const { query = "", trailingListening = false, capLive = false } = opts;
+  let segs = sortedSegments(model.segments);
+  let truncated = false;
+  if (capLive && segs.length > LIVE_TAPE_MAX_TURNS) {
+    segs = segs.slice(segs.length - LIVE_TAPE_MAX_TURNS);
+    truncated = true;
+  }
   const parts = [];
-  if (model.startedAt) {
+  if (truncated) {
+    parts.push(
+      `<p class="tr-truncated-note">Showing the most recent ${LIVE_TAPE_MAX_TURNS} turns while the call is live — the saved transcript will have all of it.</p>`
+    );
+  } else if (model.startedAt) {
     parts.push(`<div class="tmark"><span>Call began · ${fmtClock(model.startedAt)}</span></div>`);
   }
   for (const seg of segs) parts.push(turnHtml(seg, query));
@@ -135,18 +182,20 @@ function renderLive(model) {
   return `
     <div class="tr-live">
       <div class="tr-toprow"><span class="workchip"><i aria-hidden="true"></i>Live</span></div>
-      <div class="tape" id="tr-tape">${tapeHtml(model, { trailingListening: true })}</div>
+      <div class="tape" id="tr-tape">${tapeHtml(model, { trailingListening: true, capLive: true })}</div>
       <p class="trail">Runs a few seconds behind the conversation — turns land whole, already attributed. No word-by-word churn.</p>
-    </div>`;
+    </div>
+    ${pendingRetryRowsHtml(model.otherPendingRetries)}`;
 }
 
-function renderWriting() {
+function renderWriting(model) {
   return `
     <div class="writing">
       ${ICON.scribe}
       <b>Writing the transcript</b>
       <span class="sub">This can take a few minutes on this computer. You can keep taking calls.</span>
-    </div>`;
+    </div>
+    ${pendingRetryRowsHtml(model.otherPendingRetries)}`;
 }
 
 function factsHtml(model) {
@@ -168,6 +217,33 @@ function channelsFailedNotice(channelsFailed) {
   return `<div class="tr-partial" role="status">
     <span>${ICON.folderDown}</span>
     <p>Part of this call wasn't transcribed — ${escapeHtml(who)} audio couldn't be read. What follows is what was captured, not the full call.</p>
+  </div>`;
+}
+
+/// Rows for calls OTHER than the one currently displayed whose save is
+/// still pending (2026-07-16 4R re-review, M2) - shown regardless of
+/// `model.phase`, since a save failure on a previous call can be pending
+/// while a brand new call is already `live`. `retries` entries only need
+/// `callId`/`peer`/`lastError` here - the fuller shape
+/// (`local*Path`/`channelsFailed`) is for the currently-displayed one via
+/// `model.error`, not this list.
+function pendingRetryRowsHtml(retries) {
+  const items = retries || [];
+  if (!items.length) return "";
+  const rows = items
+    .map(
+      (r) => `<div class="tr-pending-row">
+        <div class="bx">
+          <b>${escapeHtml(r.peer || "Unknown caller")}</b>
+          <p>${escapeHtml(r.lastError || "Couldn't save.")}</p>
+        </div>
+        <button class="ghostbtn tr-pending-retry-btn" data-call-id="${escapeAttr(r.callId)}">Retry now</button>
+      </div>`
+    )
+    .join("");
+  return `<div class="tr-pending-list" aria-label="Other calls waiting to save">
+    <p class="tr-pending-title">Other calls waiting to save</p>
+    ${rows}
   </div>`;
 }
 
@@ -193,7 +269,7 @@ function renderDone(model, opts) {
     <div class="findrow">
       <label class="find">
         ${ICON.search}
-        <input type="text" id="tr-find-input" placeholder="Find in transcript" aria-label="Find in transcript" value="${escapeHtml(query)}">
+        <input type="text" id="tr-find-input" placeholder="Find in transcript" aria-label="Find in transcript">
       </label>
       <span class="hits" id="tr-find-hits"></span>
     </div>
@@ -207,7 +283,8 @@ function renderDone(model, opts) {
            </div>`
         : ""
     }
-    <div class="tfoot">${ICON.shield}Transcribed on this computer · audio never left it</div>`;
+    <div class="tfoot">${ICON.shield}Transcribed on this computer · audio never left it</div>
+    ${pendingRetryRowsHtml(model.otherPendingRetries)}`;
 }
 
 function renderError(model) {
@@ -228,20 +305,21 @@ function renderError(model) {
       </div>
     </div>
     ${channelsFailedNotice(err.channelsFailed)}
-    <div class="tape" id="tr-tape">${tapeHtml(model)}</div>`;
+    <div class="tape" id="tr-tape">${tapeHtml(model)}</div>
+    ${pendingRetryRowsHtml(model.otherPendingRetries)}`;
 }
 
 /// Renders `model` into `container` (the `.transcript-body` element),
 /// re-wiring the phase-specific handlers passed in `handlers` (all
 /// optional — the mock harness typically passes none):
 /// { onCopy(text), onShowFolder(path), onRetry(callId),
-///   onShowLocal(path), onFindInput(query) }
+///   onShowLocal(path), onFindInput(query), onRetryOther(callId) }
 export function renderTranscriptBody(container, model, handlers = {}) {
   if (!container || !model) return;
   const query = container.dataset.trQuery || "";
   let html;
   if (model.phase === "live") html = renderLive(model);
-  else if (model.phase === "writing") html = renderWriting();
+  else if (model.phase === "writing") html = renderWriting(model);
   else if (model.phase === "error") html = renderError(model);
   else html = renderDone(model, { query });
 
@@ -267,8 +345,23 @@ export function renderTranscriptBody(container, model, handlers = {}) {
     const path = model.error.localTxtPath || model.error.localJsonPath;
     if (path) localBtn.addEventListener("click", () => handlers.onShowLocal(path));
   }
+  container.querySelectorAll(".tr-pending-retry-btn").forEach((btn) => {
+    if (handlers.onRetryOther) {
+      btn.addEventListener("click", () => handlers.onRetryOther(btn.dataset.callId));
+    }
+  });
   const findInput = $("tr-find-input");
   if (findInput) {
+    // Set the DOM property directly rather than interpolating `query`
+    // into the markup as a `value="..."` attribute (2026-07-16 4R
+    // re-review, M1 - RISK): a query containing `"` would otherwise
+    // break out of the attribute on the very next re-render (any
+    // segment arriving mid-typing rebuilds this container's innerHTML)
+    // and inject arbitrary markup/event handlers. This is airtight
+    // against that class of bug entirely, not just escaped harder - the
+    // browser's own attribute parser never sees `query` as markup text
+    // at all.
+    findInput.value = query;
     findInput.addEventListener("input", () => {
       container.dataset.trQuery = findInput.value;
       // Re-render the tape FIRST so the <mark> count below reflects the
@@ -278,18 +371,66 @@ export function renderTranscriptBody(container, model, handlers = {}) {
       if (tape) tape.innerHTML = tapeHtml(model, { query: findInput.value });
       const hits = container.querySelectorAll("mark").length;
       const hitsEl = $("tr-find-hits");
-      if (hitsEl) hitsEl.textContent = findInput.value.trim() ? `${hits} OF ${hits}` : "";
+      // "N matches", not "N OF N" - there's no current-match cursor to
+      // navigate between (no next/prev affordance exists), so a fraction
+      // implying one would be misleading (2026-07-16 4R re-review, B1).
+      if (hitsEl) hitsEl.textContent = findInput.value.trim() ? `${hits} match${hits === 1 ? "" : "es"}` : "";
       if (handlers.onFindInput) handlers.onFindInput(findInput.value);
     });
   }
 }
 
+/// Renders just the "other calls waiting to save" list as the *primary*
+/// content of `container` - used when there is no current/live call to
+/// show (`state.transcript === null`) but one or more earlier calls still
+/// have an unresolved save failure (2026-07-16 4R re-review, M2: this is
+/// what keeps those reachable after `beginTranscript` moves on to a new
+/// call, or after an app restart re-hydrates `transcription_pending_retries`
+/// with nothing currently `live`).
+export function renderPendingRetriesOnly(container, retries, handlers = {}) {
+  if (!container) return;
+  const items = retries || [];
+  if (!items.length) {
+    container.innerHTML = "";
+    return;
+  }
+  container.innerHTML = `
+    <div class="tr-foldercard">
+      <div class="tr-fc-body">
+        ${ICON.folderDown}
+        <div class="bx">
+          <b>Transcripts waiting to save.</b>
+          <p>These are safe on this computer and will move over once the issue is fixed.</p>
+        </div>
+      </div>
+    </div>
+    ${pendingRetryRowsHtml(items)}`;
+  container.querySelectorAll(".tr-pending-retry-btn").forEach((btn) => {
+    if (handlers.onRetryOther) {
+      btn.addEventListener("click", () => handlers.onRetryOther(btn.dataset.callId));
+    }
+  });
+}
+
 /// Plain-text export for the "Copy" action - `HH:MM  You: ...` per line,
 /// chronologically interleaved (same ordering the tape itself uses).
+/// Always the FULL segment list, never the live tape's capped view
+/// (`LIVE_TAPE_MAX_TURNS`) - Copy is only offered on the `done` phase,
+/// where the complete transcript is already available.
 export function plainTextTranscript(model) {
   return sortedSegments(model.segments)
     .map((seg) => `[${fmtTurnClock(seg.t0Ms || 0)}] ${speakerLabel(seg.speaker)}: ${seg.text || ""}`)
     .join("\n");
 }
 
-export const __testables = { sortedSegments, speakerLabel, fmtDuration, fmtTurnClock, highlightQuery };
+export const __testables = {
+  sortedSegments,
+  speakerLabel,
+  fmtDuration,
+  fmtTurnClock,
+  highlightQuery,
+  escapeHtml,
+  escapeAttr,
+  tapeHtml,
+  LIVE_TAPE_MAX_TURNS,
+};

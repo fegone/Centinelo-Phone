@@ -4,9 +4,9 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Centinelo — transcript panel dev harness</title>
-<link rel="stylesheet" href="../css/tokens.css">
-<link rel="stylesheet" href="../css/app.css">
-<link rel="stylesheet" href="../css/transcript.css">
+<link rel="stylesheet" href="../ui/css/tokens.css">
+<link rel="stylesheet" href="../ui/css/app.css">
+<link rel="stylesheet" href="../ui/css/transcript.css">
 <style>
   /* Harness-only chrome (never shipped/loaded by the real app - this file
      is not referenced from index.html). Puts the real .transcript-screen
@@ -32,6 +32,8 @@
   <button data-scenario="done-partial">04 Done (channel failed)</button>
   <button data-scenario="done-audio">05 Done (audio kept)</button>
   <button data-scenario="error">06 Error (folder down)</button>
+  <button data-scenario="live-with-other-pending">07 Live + other pending (M2)</button>
+  <button data-scenario="pending-only">08 Pending only, no current (M2)</button>
   <h2>Theme</h2>
   <button data-theme="auto" class="on">Auto</button>
   <button data-theme="light">Light</button>
@@ -54,7 +56,7 @@
 </div>
 
 <script type="module">
-import { renderTranscriptBody } from "../js/transcript-panel.js";
+import { renderTranscriptBody, renderPendingRetriesOnly } from "../ui/js/transcript-panel.js";
 
 const STARTED = Date.now() - 8 * 60_000 - 42_000; // 8m42s ago, like the mockup's own "lasted 08:42"
 
@@ -108,20 +110,45 @@ const SCENARIOS = {
       endedAt: STARTED + 8 * 60_000 + 42_000,
       error: { message: "could not write to storage_dir: No such file or directory", retryable: true, localTxtPath: "/tmp/centinelo-transcribe-tap.call-abc/transcript.txt", localJsonPath: null, channelsFailed: [] },
     }),
+  // M2 (2026-07-16 4R re-review): a NEW call is live while an EARLIER
+  // call's save is still pending - proves beginTranscript no longer
+  // silently drops the earlier one.
+  "live-with-other-pending": () =>
+    baseModel({
+      phase: "live",
+      otherPendingRetries: [
+        { callId: "call-earlier-1", peer: "+1 (352) 555-0199", lastError: "could not write to storage_dir: No such file or directory" },
+      ],
+    }),
+  // M2: nothing currently live/writing/done - only pending saves from a
+  // previous session (app restart re-hydration case).
+  "pending-only": () => null,
 };
 
 const TRANSCRIPT_STATE_LABEL = { live: "Live", writing: "Writing…", done: "Saved", error: "Couldn't save" };
+const PENDING_ONLY_RETRIES = [
+  { callId: "call-earlier-1", peer: "+1 (352) 555-0199", lastError: "could not write to storage_dir: No such file or directory" },
+  { callId: "call-earlier-2", peer: "Front desk transfer", lastError: "disk full" },
+];
 
 function render(scenarioKey) {
   const model = SCENARIOS[scenarioKey]();
-  document.getElementById("tr-peer-name").textContent = model.peerName || "Transcript";
-  document.getElementById("tr-state-label").textContent = TRANSCRIPT_STATE_LABEL[model.phase] || "";
-  renderTranscriptBody(document.getElementById("transcript-body"), model, {
+  const handlers = {
     onCopy: (text) => console.log("copy:", text),
     onShowFolder: (path) => console.log("show in folder:", path),
     onShowLocal: (path) => console.log("show local copy:", path),
     onRetry: () => console.log("retry"),
-  });
+    onRetryOther: (callId) => console.log("retry other:", callId),
+  };
+  if (!model) {
+    document.getElementById("tr-peer-name").textContent = "Transcript";
+    document.getElementById("tr-state-label").textContent = "Couldn't save";
+    renderPendingRetriesOnly(document.getElementById("transcript-body"), PENDING_ONLY_RETRIES, handlers);
+    return;
+  }
+  document.getElementById("tr-peer-name").textContent = model.peerName || "Transcript";
+  document.getElementById("tr-state-label").textContent = TRANSCRIPT_STATE_LABEL[model.phase] || "";
+  renderTranscriptBody(document.getElementById("transcript-body"), model, handlers);
 }
 
 document.querySelectorAll(".controls button[data-scenario]").forEach((btn) => {

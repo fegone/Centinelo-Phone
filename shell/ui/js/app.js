@@ -5,7 +5,7 @@
 // app.withGlobalTauri = true) — never touches the sidecar process or the
 // settings file directly.
 
-import { renderTranscriptBody } from "./transcript-panel.js";
+import { renderTranscriptBody, renderPendingRetriesOnly } from "./transcript-panel.js";
 
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
@@ -37,6 +37,12 @@ const state = {
   // or manual activation never started for this call). See
   // ui/js/transcript-panel.js's header comment for the full shape.
   transcript: null,
+  // Every call (any call, not just state.transcript's own) whose save is
+  // still pending backend-side - independent of which one is "current"
+  // client-side, so switching calls never loses visibility into an
+  // earlier one's unresolved failure (2026-07-16 4R re-review, M2).
+  // [{callId, peer, startedAt, lastError, channelsFailed, localTxtPath, localJsonPath}]
+  pendingRetries: [],
 };
 
 const $ = (id) => document.getElementById(id);
@@ -442,8 +448,30 @@ async function applyTranscriptionUI() {
   renderManualTranscribeButton();
 }
 
+/// Reveals a transcript-owned path (a finished save, or the local copy
+/// kept during a pending retry) in the OS file manager - the one place
+/// `reveal_in_file_manager` is ever invoked from, shared by "Show in
+/// folder" (done phase) and "Show local copy" (error phase), which used
+/// to be two byte-identical closures (2026-07-16 4R re-review, B2).
+function revealInFileManager(path) {
+  invoke("reveal_in_file_manager", { path }).catch((e) => showBanner(String(e), "err"));
+}
+
+/// Re-runs a save for `callId` and refreshes the pending-retries list
+/// afterward either way (success removes it backend-side; failure
+/// re-stashes it with a - possibly different - reason) so the UI never
+/// shows a stale entry.
+function retryTranscript(callId) {
+  invoke("transcription_retry", { call_id: callId })
+    .then(refreshPendingRetriesList)
+    .catch((e) => {
+      showBanner(String(e), "err");
+      refreshPendingRetriesList();
+    });
+}
+
 function renderTranscriptButton() {
-  $("btn-transcript").hidden = !state.transcript;
+  $("btn-transcript").hidden = !(state.transcript || state.pendingRetries.length);
 }
 
 /// Starts tracking a transcript the moment the backend is expected to
@@ -462,8 +490,24 @@ function maybeAutoStartTranscript(callId, peer, direction) {
   beginTranscript(callId, peer, direction);
 }
 
+/// `callId`/`peer`/`direction` are always caller-supplied values, never
+/// read from `state.call` here - see the `btn-transcribe-manual` click
+/// handler's own comment (2026-07-16 4R re-review, A1) for why: `state.call`
+/// can already be null (a `closed` event raced an in-flight
+/// `transcription_manual_start`) by the time this runs.
 function beginTranscript(callId, peer, direction) {
   if (state.transcript && state.transcript.callId === callId) return; // already tracking (re-entrant established)
+  if (state.transcript && state.transcript.phase === "error") {
+    // Don't silently drop an unresolved save failure for the PREVIOUS
+    // call just because a new one started (2026-07-16 4R re-review, M2)
+    // - transcription_pending_retries already tracks it backend-side
+    // independent of state.transcript; refresh state.pendingRetries from
+    // it before this call's own info is overwritten, so "Retry now" for
+    // the earlier call stays reachable (rendered as part of the new
+    // model's own otherPendingRetries, or via the titlebar button's
+    // fallback view once nothing is "live").
+    refreshPendingRetriesList();
+  }
   state.transcript = {
     callId,
     peer: peer || "",
@@ -492,8 +536,8 @@ function maybeTranscriptCallEnded(callId) {
 }
 
 function openTranscriptScreen() {
-  if (!state.transcript) return;
-  $("tr-peer-name").textContent = extractUser(state.transcript.peer) || "Transcript";
+  if (!state.transcript && !state.pendingRetries.length) return;
+  $("tr-peer-name").textContent = state.transcript ? extractUser(state.transcript.peer) || "Transcript" : "Transcript";
   renderTranscriptScreenBody();
   $("screen-transcript").hidden = false;
 }
@@ -503,28 +547,35 @@ function closeTranscriptScreen() {
 }
 
 function renderTranscriptScreenBody() {
-  if (!state.transcript) return;
-  $("tr-state-label").textContent = TRANSCRIPT_STATE_LABEL[state.transcript.phase] || "";
-  renderTranscriptBody($("transcript-body"), state.transcript, {
-    onCopy: async (text) => {
-      try {
-        await navigator.clipboard.writeText(text);
-        showBanner("Transcript copied.", "info");
-      } catch (e) {
-        console.error("clipboard write failed", e);
-      }
-    },
-    onShowFolder: (path) => {
-      invoke("reveal_in_file_manager", { path }).catch((e) => showBanner(String(e), "err"));
-    },
-    onShowLocal: (path) => {
-      invoke("reveal_in_file_manager", { path }).catch((e) => showBanner(String(e), "err"));
-    },
-    onRetry: () => {
-      if (!state.transcript) return;
-      invoke("transcription_retry", { call_id: state.transcript.callId }).catch((e) => showBanner(String(e), "err"));
-    },
-  });
+  if (state.transcript) {
+    $("tr-state-label").textContent = TRANSCRIPT_STATE_LABEL[state.transcript.phase] || "";
+    const model = {
+      ...state.transcript,
+      otherPendingRetries: state.pendingRetries.filter((r) => r.callId !== state.transcript.callId),
+    };
+    renderTranscriptBody($("transcript-body"), model, {
+      onCopy: async (text) => {
+        try {
+          await navigator.clipboard.writeText(text);
+          showBanner("Transcript copied.", "info");
+        } catch (e) {
+          console.error("clipboard write failed", e);
+        }
+      },
+      onShowFolder: revealInFileManager,
+      onShowLocal: revealInFileManager,
+      onRetry: () => {
+        if (state.transcript) retryTranscript(state.transcript.callId);
+      },
+      onRetryOther: retryTranscript,
+    });
+  } else if (state.pendingRetries.length) {
+    $("tr-state-label").textContent = "Couldn't save";
+    renderPendingRetriesOnly($("transcript-body"), state.pendingRetries, { onRetryOther: retryTranscript });
+  } else {
+    $("tr-state-label").textContent = "";
+    $("transcript-body").innerHTML = "";
+  }
 }
 
 function handleTranscriptSegment(payload) {
@@ -549,6 +600,11 @@ function handleTranscriptDone(payload) {
   } else {
     showBanner(`Transcript ready — ${extractUser(state.transcript.peer) || "call"}.`, "info");
   }
+  // This call may have just resolved an entry in the pending list (e.g.
+  // it had errored once, then a live-process-died-early retry - A3 in
+  // transcription.rs - quietly succeeded on its own) - keep the list
+  // honest either way.
+  refreshPendingRetriesList();
 }
 
 function handleTranscriptError(payload) {
@@ -572,28 +628,51 @@ function handleTranscriptError(payload) {
   renderTranscriptButton();
   if ($("screen-transcript").hidden) openTranscriptScreen();
   else renderTranscriptScreenBody();
-  refreshTranscriptRetryInfo(payload.call_id);
+  // `transcription://error` only carries {call_id, message, retryable} -
+  // the local-copy paths and any channels_failed the engine already knew
+  // about live in the backend's pending_retries map instead
+  // (PendingRetryView, commands::transcription_pending_retries).
+  // refreshPendingRetriesList both populates state.transcript.error with
+  // those extra fields (when its callId matches) AND keeps
+  // state.pendingRetries - the list every OTHER call's unresolved
+  // failure lives in - in sync (M2).
+  refreshPendingRetriesList();
 }
 
-/// `transcription://error` only carries `{call_id, message, retryable}` -
-/// the local-copy paths (`local_txt_path`/`local_json_path`) and any
-/// `channels_failed` the engine already knew about live in the backend's
-/// `pending_retries` map instead (`PendingRetryView`,
-/// `commands::transcription_pending_retries`). Fetched right after the
-/// error event so "Show local copy" has a real path to open, without
-/// bloating the event payload itself.
-async function refreshTranscriptRetryInfo(callId) {
+/// Fetches the backend's full pending-retries list (every call whose
+/// transcript couldn't be moved into storage_dir yet, not just the
+/// currently-displayed one) and reconciles `state.pendingRetries` +
+/// `state.transcript.error` (when it's one of the entries) from it.
+/// Called at boot (so an app restart doesn't lose visibility into a
+/// retry that was pending when it last quit - 2026-07-16 4R re-review,
+/// M2), and after any event that could change the set (a new retryable
+/// error, a done that might have resolved one, a retry attempt either
+/// way).
+async function refreshPendingRetriesList() {
   try {
     const list = await invoke("transcription_pending_retries");
-    const entry = (list || []).find((r) => r.call_id === callId);
-    if (!entry || !state.transcript || state.transcript.callId !== callId) return;
-    state.transcript.error = {
-      message: entry.last_error,
-      retryable: true,
-      localTxtPath: entry.local_txt_path || null,
-      localJsonPath: entry.local_json_path || null,
-      channelsFailed: entry.channels_failed || [],
-    };
+    state.pendingRetries = (list || []).map((r) => ({
+      callId: r.call_id,
+      peer: r.peer,
+      startedAt: r.started_at,
+      lastError: r.last_error,
+      channelsFailed: r.channels_failed || [],
+      localTxtPath: r.local_txt_path || null,
+      localJsonPath: r.local_json_path || null,
+    }));
+    if (state.transcript) {
+      const mine = state.pendingRetries.find((r) => r.callId === state.transcript.callId);
+      if (mine) {
+        state.transcript.error = {
+          message: mine.lastError,
+          retryable: true,
+          localTxtPath: mine.localTxtPath,
+          localJsonPath: mine.localJsonPath,
+          channelsFailed: mine.channelsFailed,
+        };
+      }
+    }
+    renderTranscriptButton();
     if (!$("screen-transcript").hidden) renderTranscriptScreenBody();
   } catch (e) {
     console.error("transcription_pending_retries failed", e);
@@ -916,10 +995,25 @@ function wireStaticHandlers() {
   $("btn-transcribe-manual").addEventListener("click", async () => {
     if (!state.call || !state.call.callId) return;
     const btn = $("btn-transcribe-manual");
+    // Capture everything BEFORE the await (4R re-review 2026-07-16, A1):
+    // a call_state:"closed" can land while this invoke is still in
+    // flight, and its handler sets state.call = null synchronously
+    // (finalizeClosedCall). Reading state.call.* again after the await
+    // would then throw (crashing this handler as an uncaught rejection,
+    // shown to the operator as a raw JS error banner) AND skip
+    // beginTranscript entirely - even though the backend already
+    // accepted the tap and will transcribe the call regardless, so every
+    // transcription:// event for it would be silently dropped
+    // (handleTranscriptSegment/Done/Error all require a live
+    // state.transcript.callId match). beginTranscript itself never reads
+    // state.call - only these captured values do.
+    const callId = state.call.callId;
+    const peer = state.call.peer || "";
+    const direction = state.call.direction;
     btn.disabled = true;
     try {
-      await invoke("transcription_manual_start", { call_id: state.call.callId, peer: state.call.peer || "" });
-      beginTranscript(state.call.callId, state.call.peer, state.call.direction);
+      await invoke("transcription_manual_start", { call_id: callId, peer });
+      beginTranscript(callId, peer, direction);
     } catch (e) {
       showBanner(String(e), "err");
     } finally {
@@ -1158,6 +1252,11 @@ async function boot() {
   await attachTauriListeners();
   await applyPremiumUI();
   await applyTranscriptionUI();
+  // Re-hydrate any transcript(s) still waiting to save from a previous
+  // run (2026-07-16 4R re-review, M2) - transcription_pending_retries is
+  // backend-tracked independent of this window's own lifetime, so a
+  // restart while a NAS was down, say, shouldn't lose visibility into it.
+  if (state.transcription.unlocked) await refreshPendingRetriesList();
 }
 
 boot();

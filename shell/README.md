@@ -24,14 +24,16 @@ shell/
       console.rs   premium console window (F4, see "Premium console window")
       transcription.rs  local transcription orchestration (F4, tap->transcribe->save)
       e2e.rs       debug-only scripted e2e driver (see "e2e verification")
-  ui/            static frontend, served directly as `frontendDist`
+  ui/            static frontend, served directly as `frontendDist` (bundled into every build - see "dev/" below for why the mock harness deliberately lives OUTSIDE this directory)
     index.html     single-page app: main window + settings + call overlay + transcript panel
     css/tokens.css   verbatim copy of the Vigilia design tokens
     css/app.css      component styles ported from the design mockups
     css/transcript.css  transcript panel styles (F4 ola 2, see "Transcript panel")
     js/app.js        all frontend logic (Tauri invoke/event wiring)
     js/transcript-panel.js  transcript panel rendering (pure - no Tauri dependency)
-    dev/transcript-mock.html  standalone harness for screenshot verification (not shipped/loaded by the app)
+    js/transcript-panel.test.js  node:test coverage for the above (`npm test`)
+  dev/           dev-only tooling, NEVER under ui/ so `frontendDist` never bundles it
+    transcript-mock.html  standalone harness for screenshot verification (see "Transcript panel")
 ```
 
 ## Architecture: shell <-> sidecar
@@ -261,7 +263,7 @@ check, not the UI code.
   it exports pure `renderTranscriptBody(container, model, handlers)` /
   `plainTextTranscript(model)` functions operating on a plain state object;
   `app.js` owns all `invoke`/`listen` wiring and hands the module a `model`
-  built from real events. This is what let `ui/dev/transcript-mock.html`
+  built from real events. This is what let `dev/transcript-mock.html`
   (a harness, not referenced by `index.html`, never shipped/loaded by the
   real app) verify all five phases × both themes via a headless Browser
   pane instead of desktop GUI automation — see `E2E.md` "Transcript panel
@@ -293,6 +295,79 @@ check, not the UI code.
   it as a calm, non-alarming notice ("Part of this call wasn't
   transcribed...") above the tape, never a full-looking transcript that's
   silently missing a channel.
+
+### 4R fix pass (2026-07-16, same day)
+
+The first 4R review on this panel FAILED all four lenses. Every finding
+was closed in the same branch before merge - summarized here since it
+changed real architecture, not just polish:
+
+- **A previously-in-flight `state.call` could vanish before an `await`
+  resolved** (`btn-transcribe-manual`'s click handler) - a `call_state:
+  "closed"` racing `transcription_manual_start`'s own round trip nulled
+  `state.call` synchronously mid-`await`, so resuming afterward threw
+  reading `state.call.callId` (crashing as a raw JS error banner) *and*
+  skipped `beginTranscript` - even though the backend had already
+  accepted the tap and would transcribe the call regardless, silently
+  orphaning every `transcription://` event for it. Fixed by capturing
+  `callId`/`peer`/`direction` before the `await`, never re-reading
+  `state.call` after it.
+- **The find input's `value="${escapeHtml(query)}"` was an attribute-
+  injection bug** - `escapeHtml` only ever escaped `&`/`<`/`>` (correct
+  for text-node content, where this module also uses it), not `"`/`'`,
+  which a re-render (any live segment arriving mid-typing) then
+  interpolated straight into a `value="..."` attribute. Fixed by setting
+  the DOM `value` property directly instead of ever building that
+  attribute from user input as a string; added `escapeAttr` for the
+  handful of remaining `data-*` attribute interpolations (the
+  otherwise-safe `call_id`s in the pending-retries list, defense in
+  depth since those are already whitelist-validated server-side).
+- **A pending retry (NAS down, say) on call A used to vanish from the UI
+  the instant call B started** - `beginTranscript` unconditionally
+  overwrote `state.transcript`. Fixed with a real
+  `state.pendingRetries` list, independent of whichever call is
+  "current" - hydrated at `boot()` (so an app restart doesn't lose
+  visibility either), refreshed after every relevant event, and rendered
+  as an "other calls waiting to save" section (or, with nothing current
+  at all, as the panel's own primary content -
+  `renderPendingRetriesOnly`).
+- **`reveal_in_file_manager` on Windows silently opened Explorer with
+  nothing selected** for a `storage_dir` on a NAS share - `canonicalize()`
+  returns the `\\?\UNC\...` extended-length form there, which
+  `explorer /select,` doesn't resolve. Fixed with a pure, unit-tested
+  `strip_windows_extended_prefix`. Its own path-validation logic
+  (`reveal_path_is_allowed`) was extracted out of the `#[tauri::command]`
+  for testability at the same time - its test suite caught a **second,
+  real bug** in the process: the temp-tap-dir check compared an
+  unresolved `std::env::temp_dir()` against an already-`canonicalize()`d
+  candidate path, which never matched on macOS (`/var` -> `/private/var`)
+  - meaning "Show local copy" would have silently failed on every
+  developer's own Mac. Also added a symlink-escape test (a link inside
+  `storage_dir` pointing outside it) proving `canonicalize()`-before-check
+  closes that path.
+- **A live call's tape re-rendered its ENTIRE history on every single new
+  segment** - O(n) work n times over a call is O(n²) total, visibly janky
+  on a long call-center call. Fixed by capping the *live* view to the most
+  recent `LIVE_TAPE_MAX_TURNS` (50) turns (with a quiet note that it's
+  truncated) - the `done`/`error` phases still always render every
+  segment, since that render only ever happens once and is the
+  authoritative saved transcript.
+- **Zero automated test coverage** on `transcript-panel.js` despite
+  exporting `__testables` for exactly that purpose, and zero coverage on
+  `reveal_in_file_manager`'s entire security boundary. Closed with
+  `ui/js/transcript-panel.test.js` (`node:test`, no new dependency -
+  `escapeHtml` was rewritten to not need a live `document` so the whole
+  module's pure half is testable in plain Node) and the
+  `reveal_in_file_manager_tests` module in `commands.rs` (see above -
+  this is also what caught the macOS temp-dir bug).
+- **Readability**: the find-hit counter always read `N OF N` with no
+  actual prev/next cursor to navigate between, implying a feature that
+  doesn't exist - simplified to `N matches`. `onShowFolder`/`onShowLocal`
+  were byte-identical closures - both are now the same
+  `revealInFileManager` reference. The mock harness moved from `ui/dev/`
+  to a sibling `shell/dev/` - `ui/` is bundled verbatim into every build
+  via `frontendDist`, so anything under it ships in the release
+  regardless of whether `index.html` links to it.
 
 ## Design fidelity notes
 
@@ -376,6 +451,7 @@ cmake --build core/deps/baresip/build -j"$(sysctl -n hw.ncpu)"
 cd shell
 npm install
 npm run dev        # = tauri dev - builds Rust + launches the app
+npm test           # node:test coverage for ui/js/*.test.js (frontend pure logic)
 ```
 
 First launch: the main window shows "Connect your phone system" until you
