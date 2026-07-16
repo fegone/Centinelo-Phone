@@ -14,7 +14,7 @@
 //! delete-on-stop scratch `accounts` file - the same sanctioned exception
 //! `run-spike.sh` itself documents - never anywhere else.
 
-use crate::settings::{AccountSettings, SettingsStore, TransportPriority};
+use crate::settings::{AccountSettings, AudioSettings, SettingsStore, TransportPriority};
 use crate::transcription::TranscriptionHandle;
 use serde::Serialize;
 use serde_json::Value;
@@ -888,7 +888,7 @@ impl SpawnPlan {
         let ws_path = "/ws".to_string();
 
         write_accounts_file(&scratch_dir, account, transport, port)?;
-        write_config_file(&scratch_dir, &module_path, transport)?;
+        write_config_file(&scratch_dir, &module_path, transport, &settings.snapshot().audio)?;
 
         Ok(Self {
             binary,
@@ -946,27 +946,243 @@ fn write_accounts_file(
     write_private_file(&scratch_dir.join("accounts"), contents.as_bytes())
 }
 
-fn write_config_file(scratch_dir: &Path, module_path: &Path, transport: &str) -> Result<(), String> {
+/// Env var that forces the synthetic `ausine`/`aufile` audio pair
+/// regardless of platform or persisted `AudioSettings` - `qa-e2e`'s
+/// scripted driver depends on deterministic, headless-safe audio (no mic/
+/// speaker permission prompt, no dependency on what's actually plugged
+/// into the test machine) and must never be silently switched to a real
+/// device. Checked with a plain string-equality (not case-insensitive on
+/// purpose) so this stays an explicit, deliberate opt-in - see
+/// `e2e_synthetic_audio`'s call site in `SpawnPlan::build`/`write_config_file`.
+const E2E_AUDIO_ENV: &str = "CENTINELO_E2E_AUDIO";
+
+fn e2e_synthetic_audio() -> bool {
+    std::env::var(E2E_AUDIO_ENV).as_deref() == Ok("synthetic")
+}
+
+/// This platform's real baresip audio-device module, if this build's
+/// `MODULES` list is expected to carry one - `coreaudio` on macOS,
+/// `wasapi` on Windows (both confirmed to honor a `,default` device
+/// suffix by reading their own sources, `core/deps/baresip/modules/
+/// {coreaudio/{recorder,player}.c,wasapi/{src,play}.c}` - `str_isset(device)`
+/// false or literally `"default"` both resolve to the OS default device).
+/// `None` on any other target (e.g. a Linux dev machine - this repo has
+/// no `alsa`/`pulse` in its `MODULES` list, see core/BUILD.md "Module
+/// selection") - `audio_config_lines` degrades to the synthetic pair in
+/// that case, loudly logged, not silently.
+///
+/// Deliberately does **not** check whether the module is actually present
+/// in the linked core binary's `MODULES_DETECTED` (no way to introspect
+/// that from here without spawning the process first) - a binary built
+/// without this module for its own platform is a build-config bug in
+/// `core/`, not something this function can route around. See this
+/// change's own report for the known macOS gap (mac CI's `MODULES` list
+/// doesn't carry `coreaudio` yet, unlike Windows CI's `wasapi` - flagged
+/// to core-engine, not fixed here, out of shell-tauri's ambit).
+fn platform_audio_driver() -> Option<&'static str> {
+    if cfg!(target_os = "macos") {
+        Some("coreaudio")
+    } else if cfg!(target_os = "windows") {
+        Some("wasapi")
+    } else {
+        None
+    }
+}
+
+/// Picks which baresip audio module(s) to load and the exact
+/// `audio_source`/`audio_player`/`audio_alert` config values, given the
+/// operator's persisted device choice (if any), whether e2e's synthetic
+/// override is active, and this platform's real driver. Pure/free function
+/// (like `apply_call_state_transition` above) so every branch is
+/// unit-testable without a scratch dir, a running sidecar, or actually
+/// being compiled for a given `target_os` - see `audio_config_lines_tests`.
+///
+/// Precedence:
+/// 1. `synthetic` (`CENTINELO_E2E_AUDIO=synthetic`, see
+///    `e2e_synthetic_audio`) - always `ausine`/`aufile`, unconditionally,
+///    regardless of `audio`/`driver` - what this app shipped with before
+///    this fix, still exactly what qa-e2e depends on.
+/// 2. An explicit `set_device`-selected device on `audio.input_device`/
+///    `audio.output_device` (`core/PROTOCOL.md`'s `"<module>[,<device>]"`
+///    shape, round-tripped verbatim - see `commands::save_audio_settings`)
+///    - the operator picked something specific; honored even if it names
+///      a module other than `driver` (e.g. reverting to `ausine` by hand
+///      via a `devices` response) since it's an explicit choice, not a
+///      guess.
+/// 3. `driver` (this platform's real audio module) at its own `default`
+///    pseudo-device - the production default this whole fix exists for:
+///    a fresh install with zero settings changes still gets real audio.
+/// 4. `driver` is `None` (no real driver known for this platform/build) -
+///    degrades to the same synthetic pair as branch 1, but logged as a
+///    warning by the caller (this function has no logger access, stays
+///    pure) since it means production calls on that platform have no
+///    real mic/speaker at all, not a case any shipped build should hit.
+fn audio_config_lines(
+    audio: &AudioSettings,
+    synthetic: bool,
+    driver: Option<&str>,
+    scratch_dir_display: &str,
+) -> (Vec<&'static str>, String, String, String) {
+    if synthetic || driver.is_none() {
+        let rx_wav = format!("aufile,{scratch_dir_display}/rx.wav");
+        return (vec!["ausine.so", "aufile.so"], "ausine,440".to_string(), rx_wav.clone(), rx_wav);
+    }
+    let driver = driver.expect("checked is_none above");
+    let module_line: &'static str = match driver {
+        "coreaudio" => "coreaudio.so",
+        "wasapi" => "wasapi.so",
+        _ => "coreaudio.so", // unreachable given platform_audio_driver()'s own match, kept exhaustive rather than panicking
+    };
+    let source = audio
+        .input_device
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{driver},default"));
+    let player = audio
+        .output_device
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{driver},default"));
+    // Ring tone through the same real output device as the call audio -
+    // `aufile` (silently writing the alert to a scratch WAV nobody looks
+    // at) would mean an incoming call never actually rings audibly, same
+    // bug class this whole fix addresses for mic/speaker.
+    let alert = player.clone();
+    (vec![module_line], source, player, alert)
+}
+
+#[cfg(test)]
+mod audio_config_lines_tests {
+    use super::*;
+
+    #[test]
+    fn synthetic_flag_wins_even_with_a_real_driver_and_persisted_device() {
+        let audio = AudioSettings {
+            input_device: Some("coreaudio,Some Mic".to_string()),
+            output_device: Some("coreaudio,Some Speaker".to_string()),
+        };
+        let (modules, source, player, alert) = audio_config_lines(&audio, true, Some("coreaudio"), "/tmp/x");
+        assert_eq!(modules, vec!["ausine.so", "aufile.so"]);
+        assert_eq!(source, "ausine,440");
+        assert_eq!(player, "aufile,/tmp/x/rx.wav");
+        assert_eq!(alert, "aufile,/tmp/x/rx.wav");
+    }
+
+    #[test]
+    fn macos_default_with_no_persisted_device_uses_coreaudio_default() {
+        let audio = AudioSettings::default();
+        let (modules, source, player, alert) = audio_config_lines(&audio, false, Some("coreaudio"), "/tmp/x");
+        assert_eq!(modules, vec!["coreaudio.so"]);
+        assert_eq!(source, "coreaudio,default");
+        assert_eq!(player, "coreaudio,default");
+        assert_eq!(alert, "coreaudio,default");
+    }
+
+    #[test]
+    fn windows_default_with_no_persisted_device_uses_wasapi_default() {
+        let audio = AudioSettings::default();
+        let (modules, source, player, alert) = audio_config_lines(&audio, false, Some("wasapi"), "/tmp/x");
+        assert_eq!(modules, vec!["wasapi.so"]);
+        assert_eq!(source, "wasapi,default");
+        assert_eq!(player, "wasapi,default");
+        assert_eq!(alert, "wasapi,default");
+    }
+
+    #[test]
+    fn explicit_persisted_device_overrides_the_platform_default() {
+        let audio = AudioSettings {
+            input_device: Some("coreaudio,MacBook Pro Microphone".to_string()),
+            output_device: Some("coreaudio,MacBook Pro Speakers".to_string()),
+        };
+        let (modules, source, player, alert) = audio_config_lines(&audio, false, Some("coreaudio"), "/tmp/x");
+        assert_eq!(modules, vec!["coreaudio.so"]);
+        assert_eq!(source, "coreaudio,MacBook Pro Microphone");
+        assert_eq!(player, "coreaudio,MacBook Pro Speakers");
+        assert_eq!(alert, "coreaudio,MacBook Pro Speakers");
+    }
+
+    #[test]
+    fn only_input_selected_output_still_defaults() {
+        let audio = AudioSettings {
+            input_device: Some("coreaudio,USB Mic".to_string()),
+            output_device: None,
+        };
+        let (_, source, player, _) = audio_config_lines(&audio, false, Some("coreaudio"), "/tmp/x");
+        assert_eq!(source, "coreaudio,USB Mic");
+        assert_eq!(player, "coreaudio,default");
+    }
+
+    #[test]
+    fn blank_persisted_device_is_treated_as_unset() {
+        // Defensive: an empty-string value (shouldn't normally get
+        // persisted - see commands::save_audio_settings - but a
+        // hand-edited settings.json could carry one) falls back to the
+        // platform default rather than sending baresip a bare "coreaudio,"
+        // device string.
+        let audio = AudioSettings { input_device: Some("  ".to_string()), output_device: None };
+        let (_, source, _, _) = audio_config_lines(&audio, false, Some("coreaudio"), "/tmp/x");
+        assert_eq!(source, "coreaudio,default");
+    }
+
+    #[test]
+    fn no_real_driver_for_this_platform_degrades_to_synthetic() {
+        // e.g. a Linux dev machine - this repo's MODULES list has no
+        // alsa/pulse module (core/BUILD.md "Module selection") - falling
+        // back to ausine/aufile keeps `cargo tauri dev` usable there
+        // rather than failing to spawn at all.
+        let audio = AudioSettings::default();
+        let (modules, source, player, alert) = audio_config_lines(&audio, false, None, "/tmp/x");
+        assert_eq!(modules, vec!["ausine.so", "aufile.so"]);
+        assert_eq!(source, "ausine,440");
+        assert_eq!(player, "aufile,/tmp/x/rx.wav");
+        assert_eq!(alert, "aufile,/tmp/x/rx.wav");
+    }
+}
+
+fn write_config_file(
+    scratch_dir: &Path,
+    module_path: &Path,
+    transport: &str,
+    audio: &AudioSettings,
+) -> Result<(), String> {
     let _ = transport; // media requirements are unconditional, see run-spike.sh
     let module_path_str = module_path.display();
-    let scratch_str = scratch_dir.display();
+    let scratch_str = scratch_dir.display().to_string();
+
+    let synthetic = e2e_synthetic_audio();
+    if synthetic {
+        log::info!("sidecar: {E2E_AUDIO_ENV}=synthetic - using ausine/aufile, not real audio devices");
+    }
+    let driver = platform_audio_driver();
+    if driver.is_none() && !synthetic {
+        log::warn!(
+            "sidecar: no real audio driver known for this platform - falling back to synthetic ausine/aufile. A shipped Centinelo build should always have coreaudio (macOS) or wasapi (Windows) available."
+        );
+    }
+    let (audio_modules, audio_source, audio_player, audio_alert) =
+        audio_config_lines(audio, synthetic, driver, &scratch_str);
+    let audio_module_lines: String = audio_modules.iter().map(|m| format!("module\t\t\t{m}\n")).collect();
+
     let contents = format!(
         "# Generated by Centinelo Phone shell - do not edit by hand, do not commit.\n\n\
 module_path\t\t{module_path_str}\n\n\
 module\t\t\tg711.so\n\
 module\t\t\tauconv.so\n\
 module\t\t\tauresamp.so\n\
-module\t\t\tausine.so\n\
-module\t\t\taufile.so\n\
+{audio_module_lines}\
 module\t\t\tice.so\n\
 module\t\t\tdtls_srtp.so\n\
 module\t\t\tmenu.so\n\
 module\t\t\taccount.so\n\
 module_app\t\tctrl_json.so\n\n\
 sip_verify_server\tno\n\n\
-audio_source\t\tausine,440\n\
-audio_player\t\taufile,{scratch_str}/rx.wav\n\
-audio_alert\t\taufile,{scratch_str}/rx.wav\n\n\
+audio_source\t\t{audio_source}\n\
+audio_player\t\t{audio_player}\n\
+audio_alert\t\t{audio_alert}\n\n\
 rtp_timeout\t\t0\n"
     );
     std::fs::write(scratch_dir.join("config"), contents).map_err(|e| e.to_string())

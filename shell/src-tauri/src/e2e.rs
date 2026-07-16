@@ -36,7 +36,18 @@
 //! like `provisioning_apply` on an already-configured account without a
 //! GUI; added 2026-07-16 4R re-review to verify R4's "refuse to restart
 //! mid-call" check end to end, which needs an unlocked session on an
-//! already-configured account to even reach that check).
+//! already-configured account to even reach that check),
+//! `list_devices` (real-audio-devices fix - fires `core/PROTOCOL.md`'s
+//! `devices` command; the resulting `event:"devices"` line is captured by
+//! the normal sidecar-event log line, same as every other engine event -
+//! see `commands::sidecar_list_devices`'s doc for why this is
+//! fire-and-forget rather than something this step can return directly),
+//! `set_device:<input|output>:<name>` (admin-gated, needs
+//! `admin_set_password` first in the script - persists the device choice
+//! and best-effort applies it live via `set_device`, see
+//! `commands::save_audio_settings`; `<name>` is passed through verbatim,
+//! including any embedded `,` - it's expected to be a `devices` event's
+//! own `"<module>[,<device>]"` name, not user free text).
 //!
 //! Every step targets "the current call" (no `call_id`) - matching the
 //! frontend's own single-call-at-a-time UI; there's no scripted way here
@@ -202,6 +213,26 @@ pub fn maybe_run_e2e_script(app: &AppHandle) {
                 match commands::admin_set_password(settings, admin, pw.to_string()) {
                     Ok(()) => log::info!("e2e: admin_set_password -> ok"),
                     Err(e) => log::info!("e2e: admin_set_password -> err: {e}"),
+                }
+            } else if step == "list_devices" {
+                match commands::sidecar_list_devices(sidecar) {
+                    Ok(()) => log::info!("e2e: list_devices -> ok (watch for event:\"devices\" on sidecar-event)"),
+                    Err(e) => log::error!("e2e: list_devices -> err: {e}"),
+                }
+            } else if let Some(rest) = step.strip_prefix("set_device:") {
+                let settings: tauri::State<std::sync::Arc<crate::settings::SettingsStore>> = app.state();
+                let admin: tauri::State<crate::settings::AdminSession> = app.state();
+                let Some((kind, name)) = rest.split_once(':') else {
+                    log::warn!("e2e: set_device step needs '<input|output>:<name>', got '{rest}'");
+                    continue;
+                };
+                let input = commands::SaveAudioInput {
+                    input_device: (kind == "input").then(|| name.to_string()),
+                    output_device: (kind == "output").then(|| name.to_string()),
+                };
+                match commands::save_audio_settings(settings, admin, sidecar, input) {
+                    Ok(()) => log::info!("e2e: set_device({kind}, {name}) -> ok"),
+                    Err(e) => log::error!("e2e: set_device({kind}, {name}) -> err: {e}"),
                 }
             } else {
                 log::warn!("e2e: unknown step '{step}'");

@@ -376,6 +376,36 @@ impl Default for HidSettings {
     }
 }
 
+// ---- audio devices (real-audio-devices fix) ------------------------------
+//
+// Selects which real input/output device `sidecar.rs`'s `write_config_file`
+// wires up for the engine (`coreaudio` on macOS, `wasapi` on Windows - see
+// `sidecar::platform_audio_driver`), instead of the `ausine`/`aufile`
+// synthetic pair the config generator hardcoded unconditionally before this
+// fix. `None` on either field = that platform's driver at its own `default`
+// pseudo-device, which is what a fresh install gets with zero settings
+// changes - the whole point of this feature (a beta tester who never opens
+// Settings still hears/is heard). Admin-gated
+// (`commands::save_audio_settings`), same rationale as `HidSettings`: an
+// agent shouldn't be able to silently repoint the app at a different mic/
+// speaker than the one an admin verified.
+//
+// A `CENTINELO_E2E_AUDIO=synthetic` env var overrides both fields at spawn
+// time regardless of what's persisted here - qa-e2e's driver depends on
+// deterministic synthetic audio and must never be silently switched to a
+// real device by whatever happens to be persisted in a given test profile's
+// `settings.json`. See `sidecar::audio_config_lines`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AudioSettings {
+    /// `"<module>[,<device>]"` - `core/PROTOCOL.md`'s own `devices` event
+    /// "name" shape, round-tripped verbatim from that event via
+    /// `commands::save_audio_settings`. Never hand-typed by a human.
+    #[serde(default)]
+    pub input_device: Option<String>,
+    #[serde(default)]
+    pub output_device: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AdminSettings {
     /// Argon2 PHC hash string, e.g. "$argon2id$v=19$...". `None` until the
@@ -438,6 +468,8 @@ pub struct AppSettings {
     pub transcription: TranscriptionSettings,
     #[serde(default)]
     pub hid: HidSettings,
+    #[serde(default)]
+    pub audio: AudioSettings,
 }
 
 fn default_favorites() -> Vec<FavoriteSlot> {
@@ -579,6 +611,12 @@ impl SettingsStore {
     pub fn update_hid(&self, hid: HidSettings) -> std::io::Result<()> {
         let mut guard = self.inner.lock().expect("settings mutex poisoned");
         guard.hid = hid;
+        self.persist(&guard)
+    }
+
+    pub fn update_audio(&self, audio: AudioSettings) -> std::io::Result<()> {
+        let mut guard = self.inner.lock().expect("settings mutex poisoned");
+        guard.audio = audio;
         self.persist(&guard)
     }
 
@@ -924,5 +962,42 @@ mod locale_pref_tests {
         assert!(json.contains(r#""locale":"pt-BR""#), "expected a literal pt-BR in the wire JSON, got: {json}");
         let back: AppSettings = serde_json::from_str(&json).unwrap();
         assert_eq!(back.locale, LocalePref::PtBr);
+    }
+}
+
+#[cfg(test)]
+mod audio_settings_tests {
+    use super::*;
+
+    #[test]
+    fn defaults_to_no_explicit_device_either_side() {
+        // No settings.json entry yet (fresh install) = the platform's real
+        // driver default device, per sidecar::audio_config_lines - nothing
+        // persisted here forces that, it's just "no override".
+        let audio = AudioSettings::default();
+        assert_eq!(audio.input_device, None);
+        assert_eq!(audio.output_device, None);
+    }
+
+    #[test]
+    fn app_settings_without_audio_key_defaults_gracefully() {
+        // Pre-this-feature settings.json (or hand-edited, missing the key)
+        // must still load - same #[serde(default)] discipline as every
+        // other AppSettings field (transcription/hid above).
+        let json = r#"{"account":{"host":"pbx.example.test","ext":"9999","secret":"x"}}"#;
+        let app: AppSettings = serde_json::from_str(json).unwrap();
+        assert_eq!(app.audio.input_device, None);
+        assert_eq!(app.audio.output_device, None);
+    }
+
+    #[test]
+    fn selected_devices_round_trip_through_json() {
+        let audio = AudioSettings {
+            input_device: Some("coreaudio,MacBook Pro Microphone".to_string()),
+            output_device: Some("coreaudio,MacBook Pro Speakers".to_string()),
+        };
+        let json = serde_json::to_string(&audio).unwrap();
+        let back: AudioSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(audio, back);
     }
 }

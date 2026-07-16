@@ -245,6 +245,83 @@ pub fn save_favorites(
     Ok(settings.snapshot().favorites)
 }
 
+// ---- audio devices (real-audio-devices fix) --------------------------
+//
+// Free-tier readable (mic/speaker choice isn't sensitive the way the SIP
+// account or a call-center's favorites roster is), but only admin-unlocked
+// callers can change it - same rationale as HidSettings just below and
+// favorites above: an agent shouldn't be able to silently repoint the app
+// at a different device than the one an admin verified works against the
+// test PBX. See settings.rs `AudioSettings`'s doc for the persisted shape
+// and sidecar.rs `audio_config_lines` for exactly how these values (or
+// their absence) become the engine's `audio_source`/`audio_player`/
+// `audio_alert` config lines.
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn get_audio_settings(settings: State<Arc<SettingsStore>>) -> settings::AudioSettings {
+    settings.snapshot().audio
+}
+
+/// Fires `core/PROTOCOL.md`'s `devices` command - fire-and-forget, like
+/// every other `sidecar_*` control command in this file (`sidecar_hold`,
+/// `sidecar_mute`, ...): the sidecar has no request/response correlation
+/// wired up here (v1.2's `id`/`result` exists in the protocol but this app
+/// doesn't use it yet - see that file's "Commands" table), so the actual
+/// `{"event":"devices","input":[...],"output":[...]}` payload arrives on
+/// the same `sidecar-event` stream every other engine event already rides
+/// (sidecar.rs `EVENT_LINE`) - a caller (frontend, or `e2e.rs`'s
+/// `list_devices` step) listens for `event === "devices"` there, same
+/// pattern already used for `blf`/`call_state`/... .
+#[tauri::command(rename_all = "snake_case")]
+pub fn sidecar_list_devices(sidecar: State<SidecarHandle>) -> Result<(), String> {
+    sidecar.send_cmd(serde_json::json!({ "cmd": "devices" }))
+}
+
+#[derive(Deserialize)]
+pub struct SaveAudioInput {
+    #[serde(default)]
+    pub input_device: Option<String>,
+    #[serde(default)]
+    pub output_device: Option<String>,
+}
+
+/// Persists the operator's device choice (so the *next* sidecar spawn
+/// picks it up via `sidecar::audio_config_lines`) and, best-effort, applies
+/// it live to whatever's running right now via `core/PROTOCOL.md`'s
+/// `set_device` - which the protocol documents as hot-swapping a call in
+/// progress with no re-INVITE (`ctrl_json.c`'s `cmd_set_device()`). A
+/// `set_device` failure (e.g. no sidecar running yet - no account
+/// configured) is intentionally swallowed here rather than failing the
+/// whole save: the persisted choice still takes effect on the next spawn
+/// either way, matching `save_favorites`/`save_account_settings`'s own
+/// "persist first, best-effort live-apply second" shape.
+#[tauri::command(rename_all = "snake_case")]
+pub fn save_audio_settings(
+    settings: State<Arc<SettingsStore>>,
+    admin: State<AdminSession>,
+    sidecar: State<SidecarHandle>,
+    input: SaveAudioInput,
+) -> Result<(), String> {
+    require_unlocked(&admin)?;
+    let clean = |d: Option<String>| d.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let updated = settings::AudioSettings {
+        input_device: clean(input.input_device),
+        output_device: clean(input.output_device),
+    };
+    settings.update_audio(updated.clone()).map_err(|e| e.to_string())?;
+    if let Some(name) = &updated.input_device {
+        if let Err(e) = sidecar.send_cmd(serde_json::json!({"cmd": "set_device", "kind": "input", "name": name})) {
+            log::info!("save_audio_settings: live set_device(input) skipped: {e}");
+        }
+    }
+    if let Some(name) = &updated.output_device {
+        if let Err(e) = sidecar.send_cmd(serde_json::json!({"cmd": "set_device", "kind": "output", "name": name})) {
+            log::info!("save_audio_settings: live set_device(output) skipped: {e}");
+        }
+    }
+    Ok(())
+}
+
 // ---- theme ------------------------------------------------------------
 
 #[tauri::command(rename_all = "snake_case")]
