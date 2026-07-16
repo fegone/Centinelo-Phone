@@ -502,6 +502,18 @@ auresamp;ausine;aufile;ice;dtls_srtp;menu;wasapi;ctrl_json`. Prior run
 `5be8dbf`) confirmed only the smaller pre-fix module set — see "Windows
 media modules" below for what changed and why.
 
+**Confirmed green run with `coreaudio`** (macOS side, 2026-07-16):
+[`29535201032`](https://github.com/fegone/Centinelo-Phone/actions/runs/29535201032)
+(`0ec279a`, PR #1 against `v2`, opened only to trigger this workflow's
+`pull_request` check — not merged) — `macOS (supported)` in 43s,
+`Windows (experimental)` in 4m58s, both ✓. `macOS (supported)`'s own log
+confirms `MODULES_DETECTED=account;g711;auconv;auresamp;ausine;aufile;
+ice;dtls_srtp;menu;coreaudio;ctrl_json`, a `Building C object modules/
+coreaudio/...` / `Linking C shared module coreaudio.so` build, and the
+sanity step printing `OK: re + baresip(+ctrl_json, +ausine, +aufile,
++ice, +dtls_srtp, +coreaudio) built on macOS`. See "macOS media modules"
+below for what changed and why.
+
 ### What's actually different on Windows (read the workflow file, not this doc, for the literal commands — this section explains *why*)
 
 1. **OpenSSL via Chocolatey, not brew**, and its install path is
