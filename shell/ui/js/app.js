@@ -6,6 +6,8 @@
 // settings file directly.
 
 import { renderTranscriptBody, renderPendingRetriesOnly } from "./transcript-panel.js";
+import { t, setLocale, localeTag, applyStaticI18n } from "./i18n.js";
+import { escapeHtml, escapeAttr } from "./dom-utils.js";
 
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
@@ -29,6 +31,7 @@ const state = {
   adminConfigured: false,
   adminUnlocked: false,
   theme: "auto",
+  localePref: "auto", // "auto" | "en" | "pt-BR" | "es" - see i18n.js setLocale
   callTimerHandle: null,
   pendingDialNumber: null, // set while #dial-confirm-overlay is showing
   // ---- transcription (F4 ola 2) ------------------------------------------
@@ -43,6 +46,10 @@ const state = {
   // earlier one's unresolved failure (2026-07-16 4R re-review, M2).
   // [{callId, peer, startedAt, lastError, channelsFailed, localTxtPath, localJsonPath}]
   pendingRetries: [],
+  // Last list rendered into #recents-list - cached purely so a live
+  // language switch (see refreshAllUiText) can re-render it in the new
+  // locale's date/duration formatting without an extra round-trip.
+  recents: [],
 };
 
 const $ = (id) => document.getElementById(id);
@@ -89,7 +96,7 @@ function fmtDuration(totalSeconds) {
 }
 
 function fmtClock(ms) {
-  return new Date(ms).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  return new Date(ms).toLocaleTimeString(localeTag(), { hour: "numeric", minute: "2-digit" });
 }
 
 function fmtWhen(ms) {
@@ -98,8 +105,8 @@ function fmtWhen(ms) {
   if (d.toDateString() === now.toDateString()) return fmtClock(ms);
   const yesterday = new Date(now);
   yesterday.setDate(now.getDate() - 1);
-  if (d.toDateString() === yesterday.toDateString()) return "Yesterday";
-  return d.toLocaleDateString([], { month: "short", day: "numeric" });
+  if (d.toDateString() === yesterday.toDateString()) return t("main.yesterday");
+  return d.toLocaleDateString(localeTag(), { month: "short", day: "numeric" });
 }
 
 function extractUser(uri) {
@@ -134,51 +141,51 @@ function renderRegPill() {
     pill.classList.add("reg-registered");
   } else if (state.regState === "registering") {
     pill.classList.add("reg-registering");
-    detail = "CONNECTING";
+    detail = t("regPill.connecting");
   } else if (state.regState === "failed") {
     pill.classList.add("reg-failed");
-    detail = "RETRYING";
+    detail = t("regPill.retrying");
   } else {
-    detail = "OFFLINE";
+    detail = t("regPill.offline");
   }
   $("reg-pill-detail").textContent = detail;
   pill.title =
     state.regState === "registered"
-      ? `Registered — ${transportText} transport`
+      ? t("regPill.registeredTitle", { transport: transportText })
       : state.regState === "failed"
-        ? "Can't reach your phone system — retrying automatically."
-        : "Not registered yet.";
+        ? t("regPill.failedTitle")
+        : t("regPill.notRegisteredTitle");
 }
 
 function renderTitlebarState() {
   const el = $("titlebar-state");
   const s = state.sidecarStatus;
   if (!state.account || !state.account.host) {
-    el.textContent = "Not set up";
+    el.textContent = t("titlebarState.notSetUp");
   } else if (state.call) {
-    const who = extractUser(state.call.peer) || "call";
-    if (state.call.state === "established") el.textContent = `On a call — ${who}`;
-    else if (state.call.state === "ringing") el.textContent = `Ringing — ${who}`;
-    else if (state.call.state === "incoming") el.textContent = `Incoming — ${who}`;
-    else el.textContent = `Calling ${who}…`;
+    const who = extractUser(state.call.peer) || t("transcript.callWord");
+    if (state.call.state === "established") el.textContent = t("titlebarState.onCallWith", { who });
+    else if (state.call.state === "ringing") el.textContent = t("titlebarState.ringingWith", { who });
+    else if (state.call.state === "incoming") el.textContent = t("titlebarState.incomingWith", { who });
+    else el.textContent = t("titlebarState.callingWith", { who });
   } else if (s.status === "idle") {
-    el.textContent = "Not set up";
+    el.textContent = t("titlebarState.notSetUp");
   } else if (s.status === "starting") {
-    el.textContent = "Starting…";
+    el.textContent = t("titlebarState.starting");
   } else if (s.status === "restarting") {
-    el.textContent = `Reconnecting the phone engine… (${s.attempt}/${s.max_attempts})`;
+    el.textContent = t("titlebarState.reconnecting", { attempt: s.attempt, max: s.max_attempts });
   } else if (s.status === "stopped") {
-    el.textContent = "Phone engine stopped";
+    el.textContent = t("titlebarState.stopped");
   } else if (s.status === "failed") {
-    el.textContent = "Phone engine crashed — see Settings";
+    el.textContent = t("titlebarState.crashed");
   } else if (state.regState === "registering") {
-    el.textContent = "Connecting…";
+    el.textContent = t("titlebarState.connecting");
   } else if (state.regState === "failed") {
-    el.textContent = "Can't reach your phone system — retrying";
+    el.textContent = t("titlebarState.cantReachRetrying");
   } else if (state.regState === "registered") {
-    el.textContent = "Ready";
+    el.textContent = t("titlebarState.ready");
   } else {
-    el.textContent = "Ready";
+    el.textContent = t("titlebarState.ready");
   }
 }
 
@@ -196,14 +203,21 @@ function renderIdentity() {
   $("setup-prompt").hidden = configured;
   $("configured-area").hidden = !configured;
   if (!configured) return;
-  const name = state.account.display_name || `Extension ${state.account.ext}`;
+  const name = state.account.display_name || t("provisioning.extensionOnly", { ext: state.account.ext });
   $("me-name").textContent = name;
   $("me-plate").textContent = `EXT ${state.account.ext}`;
   $("me-medal").textContent = initials(name);
 }
 
 function renderDial() {
-  $("dial-num").textContent = state.dial;
+  const el = $("dial-num");
+  el.textContent = state.dial;
+  // The empty-state placeholder is a CSS `content: attr(...)` pseudo-
+  // element (app.css `.display .num:empty::before`), not text this
+  // element ever actually contains - keeping it in sync with the active
+  // locale here too (cheap: renderDial() already runs on every digit
+  // press and on refreshAllUiText's language-switch pass).
+  el.setAttribute("data-empty-placeholder", t("main.dialPlaceholder"));
 }
 
 // idle=soft/jade lamp, ringing=amber (ringing OWNS amber - the one-glow
@@ -212,7 +226,7 @@ function renderDial() {
 // mockups/main.html's .fav.idle|.ring|.busy|.off (see app.css) - shape
 // (lamp-edge bar + pulse ring on .ring only) + color + word, never color
 // alone, per the design law's "never color alone" rule.
-const BLF_LABEL = { idle: "Available", ringing: "Ringing", busy: "On a call", offline: "Offline" };
+const BLF_LABEL_KEY = { idle: "favorites.available", ringing: "favorites.ringing", busy: "favorites.onCall", offline: "favorites.offline" };
 const BLF_CSS_STATE = { idle: "idle", ringing: "ring", busy: "busy", offline: "off" };
 
 function renderFavorites() {
@@ -225,25 +239,20 @@ function renderFavorites() {
     const hasExt = !!ext;
     const blfState = hasExt ? state.blf[ext] : null;
     const cssState = hasExt ? BLF_CSS_STATE[blfState] || "off" : "off";
-    const label = !hasExt ? "Empty" : blfState ? BLF_LABEL[blfState] || "Offline" : "Not tracked yet";
+    const label = !hasExt ? t("favorites.empty") : blfState ? t(BLF_LABEL_KEY[blfState] || "favorites.offline") : t("favorites.notTrackedYet");
+    const extFallback = t("favorites.extFallback", { ext });
     btn.className = `fav ${cssState}`;
     btn.disabled = !hasExt;
-    btn.innerHTML = `<b>${escapeHtml(slot.label || (hasExt ? `Ext ${ext}` : "Not set up"))}</b>
+    btn.innerHTML = `<b>${escapeHtml(slot.label || (hasExt ? extFallback : t("favorites.notSetUp")))}</b>
       <span class="sub"><span class="plate">${hasExt ? "EXT " + escapeHtml(ext) : "—"}</span><span class="st">${label}</span></span>`;
     if (hasExt) {
       // Favorites in a real clinic are real people - always confirm, never
       // dial straight from a click (see shell task spec).
-      const name = slot.label && slot.label.trim() ? slot.label.trim() : `Ext ${ext}`;
-      btn.addEventListener("click", () => confirmAndDial(ext, `Calling ${name}.`));
+      const name = slot.label && slot.label.trim() ? slot.label.trim() : extFallback;
+      btn.addEventListener("click", () => confirmAndDial(ext, t("favorites.callingName", { name })));
     }
     grid.appendChild(btn);
   }
-}
-
-function escapeHtml(s) {
-  const d = document.createElement("div");
-  d.textContent = s ?? "";
-  return d.innerHTML;
 }
 
 // ---------------------------------------------------------------------------
@@ -255,7 +264,7 @@ function escapeHtml(s) {
 // ---------------------------------------------------------------------------
 function confirmAndDial(number, sourceText) {
   if (state.call) {
-    showBanner(`Can't call ${number} — you're already on a call.`, "err");
+    showBanner(t("call.cantCallBusy", { number }), "err");
     return;
   }
   state.pendingDialNumber = number;
@@ -276,10 +285,10 @@ function closeDialConfirm() {
 // showProvisioningConfirm with the same secret-free preview shape
 // (provisioning::ProvisioningPreviewView).
 // ---------------------------------------------------------------------------
-const PROV_TRANSPORT_LABEL = {
-  auto: "Auto — secure web, falls back to classic SIP",
-  wss: "Secure web (WSS)",
-  classic: "Classic SIP (UDP/TLS)",
+const PROV_TRANSPORT_LABEL_KEY = {
+  auto: "provisioning.transportAuto",
+  wss: "provisioning.transportWss",
+  classic: "provisioning.transportClassic",
 };
 
 async function provisioningResolveFromInput() {
@@ -302,10 +311,12 @@ async function provisioningResolveFromInput() {
 function showProvisioningConfirm(preview) {
   if (!preview) return;
   $("prov-confirm-host").textContent = preview.host;
-  const extLabel = preview.display_name ? `Extension ${preview.ext} — ${preview.display_name}` : `Extension ${preview.ext}`;
+  const extLabel = preview.display_name
+    ? t("provisioning.extensionNamed", { ext: preview.ext, name: preview.display_name })
+    : t("provisioning.extensionOnly", { ext: preview.ext });
   $("prov-confirm-ext").textContent = extLabel;
-  const transportLabel = PROV_TRANSPORT_LABEL[preview.transport_priority] || preview.transport_priority;
-  $("prov-confirm-transport").textContent = preview.has_tls_pin ? `${transportLabel} · TLS pin included` : transportLabel;
+  const transportLabel = PROV_TRANSPORT_LABEL_KEY[preview.transport_priority] ? t(PROV_TRANSPORT_LABEL_KEY[preview.transport_priority]) : preview.transport_priority;
+  $("prov-confirm-transport").textContent = preview.has_tls_pin ? t("provisioning.tlsPinIncluded", { transport: transportLabel }) : transportLabel;
   $("prov-confirm-error").hidden = true;
   $("provision-confirm-overlay").hidden = false;
 }
@@ -320,12 +331,13 @@ async function loadRecents() {
 }
 
 function renderRecents(list) {
+  state.recents = list || [];
   const el = $("recents-list");
   el.innerHTML = "";
   if (!list || list.length === 0) {
     const empty = document.createElement("div");
     empty.className = "empty";
-    empty.textContent = "Calls you make and take will show up here.";
+    empty.textContent = t("main.recentsEmpty");
     el.appendChild(empty);
     return;
   }
@@ -337,11 +349,12 @@ function renderRecents(list) {
     const arrow = outbound
       ? `<path d="M7 17L17 7"/><path d="M9 7h8v8"/>`
       : `<path d="M17 7L7 17"/><path d="M7 9v8h8"/>`;
-    const metaTop = missed ? `<span class="miss">Missed</span>` : fmtDuration(item.duration_secs);
+    const metaTop = missed ? `<span class="miss">${escapeHtml(t("main.callMissed"))}</span>` : fmtDuration(item.duration_secs);
+    const directionLabel = outbound ? t("main.callOutgoing") : missed ? t("main.callMissedCall") : t("main.callIncoming");
     row.innerHTML = `
       <span class="ic ${missed ? "missed" : ""}" aria-hidden="true"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${arrow}</svg></span>
-      <span class="who"><b class="mono">${escapeHtml(item.peer)}</b><i>${outbound ? "Outgoing" : missed ? "Missed call" : "Incoming"}</i></span>
-      <span class="meta">${fmtWhen(item.started_at)}<br>${metaTop}</span>`;
+      <span class="who"><b class="mono">${escapeHtml(item.peer)}</b><i>${escapeHtml(directionLabel)}</i></span>
+      <span class="meta">${escapeHtml(fmtWhen(item.started_at))}<br>${metaTop}</span>`;
     row.addEventListener("click", () => dialUri(item.peer));
     el.appendChild(row);
   }
@@ -364,7 +377,7 @@ async function dialUri(digitsOrExt) {
   const digits = String(digitsOrExt || "").trim();
   if (!digits) return;
   if (!state.account || !state.account.host) {
-    showBanner("Add your phone system in Settings first.", "err");
+    showBanner(t("call.addAccountFirst"), "err");
     return;
   }
   const uri = `sip:${digits}@${state.account.host}`;
@@ -391,8 +404,8 @@ function renderCallOverlay() {
   overlay.hidden = false;
   const who = extractUser(state.call.peer) || state.call.peer;
   $("call-peer-name").textContent = who;
-  $("call-peer-uri").textContent = state.call.direction === "inbound" ? "Incoming call" : "";
-  $("call-via").textContent = state.call.direction === "inbound" ? "Main line" : "Calling…";
+  $("call-peer-uri").textContent = state.call.direction === "inbound" ? t("call.incomingCallLabel") : "";
+  $("call-via").textContent = state.call.direction === "inbound" ? t("call.mainLine") : t("call.callingEllipsis");
   $("call-medal").firstChild.textContent = initials(who);
   $("call-lamp").classList.toggle("live", state.call.state === "established");
 
@@ -402,7 +415,7 @@ function renderCallOverlay() {
 
   const ringing = state.call.state === "ringing" || state.call.state === "dialing";
   $("ringing-label").hidden = !ringing;
-  $("ringing-label-text").textContent = state.call.state === "dialing" ? "Calling…" : "Ringing…";
+  $("ringing-label-text").textContent = state.call.state === "dialing" ? t("call.callingEllipsis") : t("call.ringingEllipsis");
 
   const established = state.call.state === "established";
   $("call-timer").hidden = !established;
@@ -467,7 +480,11 @@ async function finalizeClosedCall() {
 // built this sprint). See premium/design/mockups/transcript-panel.html
 // specimen 04 and creative-vigilia's 2026-07-16 report.
 // ---------------------------------------------------------------------------
-const TRANSCRIPT_STATE_LABEL = { live: "Live", writing: "Writing…", done: "Saved", error: "Couldn't save" };
+const TRANSCRIPT_STATE_LABEL_KEY = { live: "transcript.live", writing: "transcript.writing", done: "transcript.saved", error: "transcript.couldntSave" };
+function transcriptStateLabel(phase) {
+  const key = TRANSCRIPT_STATE_LABEL_KEY[phase];
+  return key ? t(key) : "";
+}
 
 async function applyTranscriptionUI() {
   try {
@@ -578,7 +595,7 @@ function maybeTranscriptCallEnded(callId) {
 
 function openTranscriptScreen() {
   if (!state.transcript && !state.pendingRetries.length) return;
-  $("tr-peer-name").textContent = state.transcript ? extractUser(state.transcript.peer) || "Transcript" : "Transcript";
+  $("tr-peer-name").textContent = state.transcript ? extractUser(state.transcript.peer) || t("transcript.defaultTitle") : t("transcript.defaultTitle");
   renderTranscriptScreenBody();
   $("screen-transcript").hidden = false;
 }
@@ -589,7 +606,7 @@ function closeTranscriptScreen() {
 
 function renderTranscriptScreenBody() {
   if (state.transcript) {
-    $("tr-state-label").textContent = TRANSCRIPT_STATE_LABEL[state.transcript.phase] || "";
+    $("tr-state-label").textContent = transcriptStateLabel(state.transcript.phase);
     const model = {
       ...state.transcript,
       otherPendingRetries: state.pendingRetries.filter((r) => r.callId !== state.transcript.callId),
@@ -598,7 +615,7 @@ function renderTranscriptScreenBody() {
       onCopy: async (text) => {
         try {
           await navigator.clipboard.writeText(text);
-          showBanner("Transcript copied.", "info");
+          showBanner(t("transcript.copiedToClipboard"), "info");
         } catch (e) {
           console.error("clipboard write failed", e);
         }
@@ -611,7 +628,7 @@ function renderTranscriptScreenBody() {
       onRetryOther: retryTranscript,
     });
   } else if (state.pendingRetries.length) {
-    $("tr-state-label").textContent = "Couldn't save";
+    $("tr-state-label").textContent = t("transcript.couldntSave");
     renderPendingRetriesOnly($("transcript-body"), state.pendingRetries, { onRetryOther: retryTranscript });
   } else {
     $("tr-state-label").textContent = "";
@@ -639,7 +656,7 @@ function handleTranscriptDone(payload) {
   if (!$("screen-transcript").hidden) {
     renderTranscriptScreenBody();
   } else {
-    showBanner(`Transcript ready — ${extractUser(state.transcript.peer) || "call"}.`, "info");
+    showBanner(t("transcript.readyFor", { who: extractUser(state.transcript.peer) || t("transcript.callWord") }), "info");
   }
   // This call may have just resolved an entry in the pending list (e.g.
   // it had errored once, then a live-process-died-early retry - A3 in
@@ -655,7 +672,7 @@ function handleTranscriptError(payload) {
     // will run a full post-call pass once the call actually ends). The
     // pipeline resolves itself via a later done/error; nothing to change
     // about the visible phase yet.
-    showBanner(payload.message || "Transcription had a hiccup — it will keep trying.", "info");
+    showBanner(payload.message || t("transcript.hiccup"), "info");
     return;
   }
   state.transcript.phase = "error";
@@ -745,7 +762,7 @@ function renderManualTranscribeButton() {
 function handleSidecarStatus(payload) {
   state.sidecarStatus = payload;
   if (payload.status === "failed") {
-    showBanner(payload.message || "The phone engine stopped working.", "err", 0);
+    showBanner(payload.message || t("sidecar.engineStopped"), "err", 0);
   }
   if (payload.status === "idle" || payload.status === "stopped") {
     state.regState = "unregistered";
@@ -782,7 +799,7 @@ function handleSidecarEvent(evt) {
       handleBlfEvent(evt);
       break;
     case "error":
-      showBanner(evt.message || "Something went wrong.", "err");
+      showBanner(evt.message || t("sidecar.somethingWrong"), "err");
       break;
     default:
       break;
@@ -888,12 +905,12 @@ function renderFavoritesFields(favorites) {
     row.className = "field-row";
     row.innerHTML = `
       <div class="field">
-        <label for="fav-label-${i}">Label</label>
-        <input id="fav-label-${i}" type="text" placeholder="Front desk" maxlength="40" style="font-family:var(--font-ui)">
+        <label for="fav-label-${i}">${escapeHtml(t("settings.favLabelLabel"))}</label>
+        <input id="fav-label-${i}" type="text" placeholder="${escapeAttr(t("settings.favLabelPlaceholder"))}" maxlength="40" style="font-family:var(--font-ui)">
       </div>
       <div class="field">
-        <label for="fav-ext-${i}">Extension</label>
-        <input id="fav-ext-${i}" type="text" placeholder="Empty" maxlength="20">
+        <label for="fav-ext-${i}">${escapeHtml(t("settings.favExtLabel"))}</label>
+        <input id="fav-ext-${i}" type="text" placeholder="${escapeAttr(t("settings.favExtPlaceholder"))}" maxlength="20">
       </div>`;
     container.appendChild(row);
     $(`fav-label-${i}`).value = slot.label || "";
@@ -944,12 +961,13 @@ async function openSettings() {
     $("in-host").value = account.host || "";
     $("in-ext").value = account.ext || "";
     $("in-secret").value = "";
-    $("secret-hint").textContent = account.secret_set
-      ? "Currently set — leave blank to keep it unchanged."
-      : "Not set yet.";
+    $("secret-hint").textContent = account.secret_set ? t("settings.secretCurrentlySet") : t("settings.secretNotSet");
     $("in-core-path").value = corePath || "";
     setTransportUI(account.transport_priority || "auto");
     setThemeUI(theme || "auto");
+    document.querySelectorAll("#locale-row button").forEach((b) => {
+      b.classList.toggle("on", b.dataset.localeChoice === state.localePref);
+    });
     renderFavoritesFields(favorites);
     renderBridgeFields(bridge);
     $("save-status").textContent = "";
@@ -980,10 +998,73 @@ function applyTheme(theme) {
   else root.setAttribute("data-theme", theme);
 }
 
+// ---------------------------------------------------------------------------
+// language (i18n) - "auto" follows this computer's OS language (see
+// i18n.js's detectSystemLocale), same "auto" semantic theme already uses
+// (CSS prefers-color-scheme there; navigator.language here) rather than
+// writing a resolved value back to settings on first boot. Sits under the
+// same admin-lock overlay as every other #settings-body control (task
+// brief: "setting bajo admin lock") - no extra plumbing needed, the
+// overlay already covers the whole card (see index.html's #locale-row
+// comment).
+// ---------------------------------------------------------------------------
+function setLocaleUI(pref) {
+  state.localePref = pref;
+  const resolved = setLocale(pref);
+  document.querySelectorAll("#locale-row button").forEach((b) => {
+    b.classList.toggle("on", b.dataset.localeChoice === pref);
+  });
+  refreshAllUiText();
+  return resolved;
+}
+
+/// Re-applies every translated string currently on screen after a live
+/// language switch - static [data-i18n*] markup plus the handful of
+/// screens whose text is computed from state rather than sitting still in
+/// the DOM (titlebar/reg-pill/favorites/call-overlay/recents/settings
+/// hints/the transcript panel, if open). Confirmation overlays
+/// (dial-confirm/provision-confirm) are NOT re-rendered here - they're
+/// short-lived and already build their text with t() at the moment they
+/// open, so the next time one opens it's correct in the new language;
+/// re-rendering one that happens to be open mid-switch is an accepted
+/// edge case, same class as other races this codebase documents rather
+/// than fully closes (see e.g. transcription.rs's own comments).
+function refreshAllUiText() {
+  applyStaticI18n();
+  renderAll();
+  renderIdentity();
+  renderDial();
+  renderFavorites();
+  renderCallOverlay();
+  renderRecents(state.recents);
+  if (state.account) {
+    $("secret-hint").textContent = state.account.secret_set ? t("settings.secretCurrentlySet") : t("settings.secretNotSet");
+  }
+  // Favorites card inside Settings (4R re-review 2026-07-16, A1): its
+  // "Label"/"Extension" field labels + placeholders are built in JS via
+  // t() (renderFavoritesFields), not sitting in static [data-i18n*]
+  // markup, so a language switch with Settings open left them stale until
+  // Settings was closed/reopened. Re-render it here too - but seeded from
+  // whatever's CURRENTLY TYPED in the fields (collectFavoritesFields),
+  // never from state.favorites (the main dial screen's own copy, which
+  // can already differ from an in-progress, unsaved edit here): a naive
+  // renderFavoritesFields(state.favorites) would silently discard
+  // whatever the admin was mid-typing the moment they picked a language -
+  // trading one staleness bug for a data-loss one. Only when Settings is
+  // actually open - closed, #favorites-fields has nothing to relabel.
+  if (!$("screen-settings").hidden) {
+    renderFavoritesFields(collectFavoritesFields());
+  }
+  if (!$("screen-transcript").hidden) {
+    $("tr-peer-name").textContent = state.transcript ? extractUser(state.transcript.peer) || t("transcript.defaultTitle") : t("transcript.defaultTitle");
+    renderTranscriptScreenBody();
+  }
+}
+
 async function saveAccountSettings() {
   const statusEl = $("save-status");
   statusEl.className = "status";
-  statusEl.textContent = "Saving…";
+  statusEl.textContent = t("settings.saving");
   const host = $("in-host").value.trim();
   const ext = $("in-ext").value.trim();
   const secret = $("in-secret").value;
@@ -1003,15 +1084,13 @@ async function saveAccountSettings() {
     const favorites = await invoke("save_favorites", { favorites: collectFavoritesFields() });
     state.favorites = favorites;
     renderFavorites();
-    statusEl.textContent = "Saved — reconnecting…";
+    statusEl.textContent = t("settings.savedReconnecting");
     statusEl.className = "status ok";
     const account = await invoke("get_account_settings");
     state.account = account;
     renderIdentity();
     $("in-secret").value = "";
-    $("secret-hint").textContent = account.secret_set
-      ? "Currently set — leave blank to keep it unchanged."
-      : "Not set yet.";
+    $("secret-hint").textContent = account.secret_set ? t("settings.secretCurrentlySet") : t("settings.secretNotSet");
   } catch (e) {
     statusEl.textContent = String(e);
     statusEl.className = "status err";
@@ -1087,11 +1166,21 @@ function wireStaticHandlers() {
       }
     });
   });
+  document.querySelectorAll("#locale-row button").forEach((b) => {
+    b.addEventListener("click", async () => {
+      setLocaleUI(b.dataset.localeChoice);
+      try {
+        await invoke("set_locale", { locale: b.dataset.localeChoice });
+      } catch (e) {
+        console.error("set_locale failed", e);
+      }
+    });
+  });
 
   $("btn-save-settings").addEventListener("click", saveAccountSettings);
   $("btn-restart-engine").addEventListener("click", () => {
     invoke("sidecar_restart");
-    showBanner("Restarting the phone engine…", "info");
+    showBanner(t("settings.restarting"), "info");
   });
 
   $("btn-unlock").addEventListener("click", async () => {
@@ -1101,7 +1190,7 @@ function wireStaticHandlers() {
       state.adminUnlocked = true;
       applyLockUI();
     } else {
-      $("unlock-error").textContent = "Incorrect password.";
+      $("unlock-error").textContent = t("settings.incorrectPassword");
     }
   });
   $("unlock-password").addEventListener("keydown", (e) => {
@@ -1112,7 +1201,7 @@ function wireStaticHandlers() {
   $("btn-firstrun-set").addEventListener("click", async () => {
     const pw = $("firstrun-password").value;
     if (pw.length < 8) {
-      $("firstrun-error").textContent = "Use at least 8 characters.";
+      $("firstrun-error").textContent = t("settings.useAtLeast8");
       return;
     }
     try {
@@ -1129,14 +1218,14 @@ function wireStaticHandlers() {
     const pw = $("in-admin-new").value;
     const statusEl = $("admin-password-status");
     if (pw.length < 8) {
-      statusEl.textContent = "Use at least 8 characters.";
+      statusEl.textContent = t("settings.useAtLeast8");
       statusEl.className = "hint err";
       return;
     }
     try {
       await invoke("admin_set_password", { new_password: pw });
       $("in-admin-new").value = "";
-      statusEl.textContent = "Password updated.";
+      statusEl.textContent = t("settings.passwordUpdated");
       statusEl.className = "hint ok";
     } catch (e) {
       statusEl.textContent = String(e);
@@ -1185,7 +1274,7 @@ function wireStaticHandlers() {
       await invoke("provisioning_apply");
       $("provision-confirm-overlay").hidden = true;
       $("prov-input").value = "";
-      showBanner("Connected — registering with your phone system…", "info");
+      showBanner(t("provisioning.connectedRegistering"), "info");
       state.account = await invoke("get_account_settings");
       renderIdentity();
     } catch (e) {
@@ -1223,7 +1312,7 @@ function wireStaticHandlers() {
       document.execCommand("copy");
       input.setAttribute("readonly", "");
     }
-    statusEl.textContent = "Copied.";
+    statusEl.textContent = t("settings.copied");
     statusEl.className = "hint ok";
     setTimeout(() => {
       statusEl.textContent = "";
@@ -1260,25 +1349,25 @@ function wireStaticHandlers() {
 // here it's the click-to-call bridge (bridge.rs) and centinelo:// or tel:
 // deep links (deeplink.rs), unified into one "click-to-call" event so the
 // UI only needs one confirmation flow (see confirmAndDial above).
-const CLICK_TO_CALL_SOURCE_LABEL = {
-  bridge: "your browser",
-  tel: "a tel: link",
-  centinelo: "a centinelo: link",
+const CLICK_TO_CALL_SOURCE_KEY = {
+  bridge: "clickToCallSource.bridge",
+  tel: "clickToCallSource.tel",
+  centinelo: "clickToCallSource.centinelo",
 };
 
 function handleClickToCall(payload) {
   if (!payload || !payload.number) return;
-  const sourceLabel = CLICK_TO_CALL_SOURCE_LABEL[payload.source] || "outside the app";
+  const sourceLabel = CLICK_TO_CALL_SOURCE_KEY[payload.source] ? t(CLICK_TO_CALL_SOURCE_KEY[payload.source]) : t("clickToCallSource.fallback");
   if (state.call) {
-    showBanner(`Can't dial ${payload.number} — you're already on a call.`, "err");
+    showBanner(t("call.cantDialBusy", { number: payload.number }), "err");
     return;
   }
   if (payload.auto_dial) {
-    showBanner(`Dialing ${payload.number} from ${sourceLabel}.`, "info");
+    showBanner(t("call.dialingFrom", { number: payload.number, source: sourceLabel }), "info");
     dialUri(payload.number);
     return;
   }
-  confirmAndDial(payload.number, `From ${sourceLabel}.`);
+  confirmAndDial(payload.number, t("dialConfirm.fromSource", { source: sourceLabel }));
 }
 
 async function attachTauriListeners() {
@@ -1294,7 +1383,7 @@ async function attachTauriListeners() {
   await listen("provisioning://preview", (e) => showProvisioningConfirm(e.payload));
   await listen("provisioning://error", (e) => {
     const message = e.payload && e.payload.message ? e.payload.message : String(e.payload);
-    showBanner(`Provisioning link: ${message}`, "err");
+    showBanner(t("provisioning.linkError", { message }), "err");
   });
 }
 
@@ -1318,6 +1407,22 @@ async function applyPremiumUI() {
 async function boot() {
   document.documentElement.dataset.os = detectOS();
   wireStaticHandlers();
+
+  // Locale first, before any other render below reads t() - "auto" (the
+  // default, matching an unconfigured settings.json) resolves against this
+  // computer's OS language (see i18n.js detectSystemLocale); an explicit
+  // saved choice always wins. Applying [data-i18n*] markup here means the
+  // very first real paint (post pre-JS-load flash of index.html's English
+  // fallback text) is already in the right language.
+  try {
+    const localePref = await invoke("get_locale");
+    state.localePref = localePref || "auto";
+    setLocale(state.localePref);
+  } catch (e) {
+    console.error("get_locale failed", e);
+    setLocale("auto");
+  }
+  applyStaticI18n();
 
   try {
     const [account, favorites, theme, sidecarStatus, blfStates] = await Promise.all([

@@ -68,7 +68,7 @@ cmake --build core/deps/re/build -j"$(sysctl -n hw.ncpu 2>/dev/null || nproc)"
 # 4b. baresip - minimal, explicit module set (see "Module selection")
 cmake -S core/deps/baresip -B core/deps/baresip/build \
   -DCMAKE_BUILD_TYPE=Release \
-  -DMODULES="account;g711;auconv;auresamp;ausine;aufile;ice;dtls_srtp;menu" \
+  -DMODULES="account;g711;auconv;auresamp;ausine;aufile;ice;dtls_srtp;menu;coreaudio" \
   -DAPP_MODULES="ctrl_json" \
   -DAPP_MODULES_DIR="$PWD/core/modules"
 cmake --build core/deps/baresip/build -j"$(sysctl -n hw.ncpu 2>/dev/null || nproc)"
@@ -125,13 +125,16 @@ instead of relying on that default-everything list:
 | `ice`, `dtls_srtp` | **required**, not optional — see "webrtc=yes" finding below |
 | `menu` | owns the `dial`/`accept`/`hangup` long-form commands (`modules/menu/static_menu.c`); `ctrl_json` drives these via `cmd_process_long()`, the same mechanism baresip's stock `ctrl_tcp` module uses, rather than reimplementing UA/call selection |
 | `account` | loads the accounts file. **Must load after** `g711`/`ice`/`dtls_srtp`/`menu` in the config's module list — see "Findings" |
+| `coreaudio` | macOS's real audio backend (input/output device access via CoreAudio/AudioToolbox) — see "macOS media modules" below |
 | `ctrl_json` (app module) | this repo's control channel, see `PROTOCOL.md` |
 
 Explicitly *not* loaded: `stdio` (its keyboard/tty UI would fight
 `ctrl_json` for stdin) and anything with an external media/GUI dependency
-(`opus`, `gst`, `sdl`, `portaudio`, `coreaudio`, ...) — none of it is
-needed for this spike, and leaving it out keeps the build free of brew/
-system audio-library dependencies, which matters for Windows CI parity.
+(`opus`, `gst`, `sdl`, `portaudio`, ...) — none of it is needed for this
+spike, and leaving it out keeps the build free of brew/system
+audio-library dependencies, which matters for Windows CI parity.
+`coreaudio` **is** now loaded on macOS (added 2026-07-16, matching the
+Windows job's `wasapi`) — see "macOS media modules" below for why.
 
 ## Findings
 
@@ -499,6 +502,18 @@ auresamp;ausine;aufile;ice;dtls_srtp;menu;wasapi;ctrl_json`. Prior run
 `5be8dbf`) confirmed only the smaller pre-fix module set — see "Windows
 media modules" below for what changed and why.
 
+**Confirmed green run with `coreaudio`** (macOS side, 2026-07-16):
+[`29535201032`](https://github.com/fegone/Centinelo-Phone/actions/runs/29535201032)
+(`0ec279a`, PR #1 against `v2`, opened only to trigger this workflow's
+`pull_request` check — not merged) — `macOS (supported)` in 43s,
+`Windows (experimental)` in 4m58s, both ✓. `macOS (supported)`'s own log
+confirms `MODULES_DETECTED=account;g711;auconv;auresamp;ausine;aufile;
+ice;dtls_srtp;menu;coreaudio;ctrl_json`, a `Building C object modules/
+coreaudio/...` / `Linking C shared module coreaudio.so` build, and the
+sanity step printing `OK: re + baresip(+ctrl_json, +ausine, +aufile,
++ice, +dtls_srtp, +coreaudio) built on macOS`. See "macOS media modules"
+below for what changed and why.
+
 ### What's actually different on Windows (read the workflow file, not this doc, for the literal commands — this section explains *why*)
 
 1. **OpenSSL via Chocolatey, not brew**, and its install path is
@@ -621,18 +636,67 @@ module).
   constraint as "F1 status" below) — this is a CI-only, link-level
   verification, stated explicitly rather than implied.
 - **Separate, real gap this does *not* close (shell-tauri's scope, not
-  core-engine's)**: `shell/src-tauri/src/sidecar.rs`'s
-  `write_config_file()` hardcodes `audio_source ausine,440` /
-  `audio_player aufile,<scratch>/rx.wav` unconditionally, on **every**
-  platform including macOS — i.e. the shell's real, shipped config never
-  actually selects a real microphone/speaker device today, on any OS.
-  Compiling `wasapi` in on Windows makes the module available; it does
-  nothing by itself until `write_config_file()` is made
-  platform-conditional (`wasapi,default` and an analogous mac path — no
-  `coreaudio` module is enabled on macOS either, same file, same gap) to
-  actually select it as `audio_source`/`audio_player`. Flagged to
-  shell-tauri, not fixed here — out of `phone/core/` scope, and
-  `shell/src-tauri/` isn't touched by this file or workflow.
+  core-engine's)**: as of `v2`'s current HEAD,
+  `shell/src-tauri/src/sidecar.rs`'s `write_config_file()` still hardcodes
+  `audio_source ausine,440` / `audio_player aufile,<scratch>/rx.wav`
+  unconditionally, on every platform. Compiling `wasapi`/`coreaudio` in
+  makes each module *available* to the built binary; selecting it as the
+  real `audio_source`/`audio_player` is a separate, shell-side config
+  change. (Not fixed here — out of `phone/core/` scope, and
+  `shell/src-tauri/` isn't touched by this file or workflow. That wiring
+  is in progress on a separate branch, `feature/real-audio-devices` —
+  this CI change is its prerequisite: that branch's own code comment
+  already flagged this exact gap, "CI's `wasapi` ... doesn't carry
+  `coreaudio` yet".)
+
+### macOS media modules (fixed 2026-07-16)
+
+Same gap as "Windows media modules" above, mac side: before this date the
+macOS CI `MODULES` list was `account;g711;auconv;auresamp;ausine;aufile;
+ice;dtls_srtp;menu` — no macOS-native audio backend, so the *shell's*
+official macOS binary (once `feature/real-audio-devices` lands and
+selects `coreaudio,default` as `audio_source`/`audio_player` on macOS,
+matching what it already does for `wasapi` on Windows) would ship without
+the module it needs, and fail to load a real microphone/speaker at
+runtime. Fixed by adding `coreaudio` (now `account;g711;auconv;auresamp;
+ausine;aufile;ice;dtls_srtp;menu;coreaudio`).
+
+- **`coreaudio`**: baresip v4.9.0's `modules/coreaudio/` (`coreaudio.c`,
+  `player.c`, `recorder.c`) is gated `if(NOT ${CMAKE_SYSTEM_NAME} MATCHES
+  "Darwin") return()` in its own `CMakeLists.txt` — the mac-only
+  counterpart to `wasapi`'s `if(NOT WIN32) return()` — so it is a genuine
+  no-op if ever requested on Linux/Windows, and this addition is safe:
+  `macos-latest` always satisfies the guard. No extra `-DMODULES=`
+  dependency flags were needed: its `CMakeLists.txt` links
+  `"-framework CoreFoundation" "-framework CoreAudio" "-framework
+  AudioToolbox"` itself, and all three ship with every macOS SDK — no
+  brew package, no `Install toolchain` step change required (confirmed:
+  the `brew install cmake openssl` step was not touched).
+- **Confirmed for real, not just requested**: a full local build on this
+  machine (macOS 26.5, AppleClang 21, CMake 4.4.0, Homebrew OpenSSL
+  3.6.3 — the same toolchain the CI job description at the top of this
+  file cites) produced `MODULES_DETECTED=account;g711;auconv;auresamp;
+  ausine;aufile;ice;dtls_srtp;menu;coreaudio;ctrl_json` and a built
+  `core/deps/baresip/build/coreaudio.so`, plus a clean `baresip -h`
+  sanity check and a green `ctrl_json_test` (ASan) run — see "Confirmed
+  green run" above for the CI-side confirmation of the same thing.
+- **Sanity check extended the same way as Windows's**: the macOS job's
+  "Configure + build baresip + ctrl_json" step now tees its configure
+  output to `baresip-configure.log`, and the "Sanity" step greps it for
+  the `MODULES_DETECTED=` line and asserts (token-exact, `;name;` match,
+  same reasoning as the Windows job's own assertion) that `ausine`,
+  `aufile`, `ice`, `dtls_srtp`, and `coreaudio` are all present — not just
+  requested. It also directly `test -e`s
+  `core/deps/baresip/build/coreaudio.so` alongside the existing
+  `ctrl_json.so` check, since the macOS job (unlike Windows) builds
+  baresip as a dynamic module set with real per-module `.so` files, not a
+  static link.
+- **What this does *not* yet prove**: same caveat as `wasapi` — CI (and
+  this session's local build) only proves `coreaudio` compiles, links,
+  and that `baresip -h` still runs; neither confirms `coreaudio,default`
+  actually opens a real microphone/speaker end-to-end on a live call
+  (would need `feature/real-audio-devices` merged plus a real e2e run
+  against the test PBX with real audio — qa-e2e's scope, not this one).
 
 **F1 status** (`ctrl_json.c`'s stdin path, still accurate, unchanged by
 the above): the previously-flagged Windows blocker (`unistd.h`/`read()`/
