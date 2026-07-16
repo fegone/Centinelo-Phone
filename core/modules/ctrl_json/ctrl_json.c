@@ -59,7 +59,7 @@
  *
  * See core/PROTOCOL.md for the wire protocol (v1.1).
  *
- * Copyright (C) 2026 Neola Dental / Centinelo Phone
+ * Copyright (C) 2026 Centinelo Phone
  */
 
 #include <re.h>

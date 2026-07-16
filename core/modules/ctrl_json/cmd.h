@@ -12,7 +12,7 @@
  *
  * See core/PROTOCOL.md for the wire protocol these map to.
  *
- * Copyright (C) 2026 Neola Dental / Centinelo Phone
+ * Copyright (C) 2026 Centinelo Phone
  */
 
 #ifndef CENTINELO_CTRL_JSON_CMD_H

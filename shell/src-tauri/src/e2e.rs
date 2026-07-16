@@ -9,7 +9,7 @@
 //! `cargo tauri dev` / bundled app is unaffected.
 //!
 //! Script grammar: `|`-separated steps, e.g.
-//!   "wait:5|dial:sip:*43@100.119.230.80|wait:8|hangup|wait:2"
+//!   "wait:5|dial:sip:*43@192.0.2.10|wait:8|hangup|wait:2"
 //! Steps: `wait:<secs>`, `dial:<uri>`, `answer`, `hangup`,
 //! `hold`, `resume`, `mute:on`/`mute:off`,
 //! `blind_transfer:<uri>`, `attended_transfer:<uri>`,

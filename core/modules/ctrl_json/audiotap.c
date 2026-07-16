@@ -43,7 +43,7 @@
  * handful of concurrent calls, see PROTOCOL.md's attended-transfer
  * scenario for the realistic ceiling).
  *
- * Copyright (C) 2026 Neola Dental / Centinelo Phone
+ * Copyright (C) 2026 Centinelo Phone
  */
 
 #include <re.h>

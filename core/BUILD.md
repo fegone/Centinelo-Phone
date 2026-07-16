@@ -97,7 +97,7 @@ fixups outside these commands were needed.
 ## 5. Run
 
 ```bash
-CENT_EXT=1100 CENT_HOST=100.119.230.80 CENT_TRANSPORT=wss \
+CENT_EXT=1000 CENT_HOST=<pbx host> CENT_TRANSPORT=wss \
 CENT_SECRET="$(python3 -c "import json;print(json.load(open('$HOME/Library/Application Support/Centinelo Phone/settings.json'))['password'])")" \
 ./core/run-spike.sh
 ```
@@ -118,7 +118,7 @@ instead of relying on that default-everything list:
 
 | Module | Why |
 |---|---|
-| `g711` | codec — matches the test endpoint's `allow=(opus\|ulaw)` (`asterisk -rx "pjsip show endpoint 1100"`), zero external deps |
+| `g711` | codec — matches the test endpoint's `allow=(opus\|ulaw)` (`asterisk -rx "pjsip show endpoint 1000"`), zero external deps |
 | `auconv`, `auresamp` | audio format/rate glue baresip's own default config always loads |
 | `ausine` | sine-wave audio **source** (`ausrc`) — no microphone / OS audio-permission needed, ideal for a headless/CI spike |
 | `aufile` | writes received audio to a `.wav` as audio **player** (`auplay`) — no speaker needed |
@@ -136,12 +136,12 @@ system audio-library dependencies, which matters for Windows CI parity.
 ## Findings
 
 These were all discovered by actually running the spike end-to-end
-against the target PBX (FreePBX 17 / Asterisk 22 at `100.119.230.80`),
+against the target PBX (FreePBX 17 / Asterisk 22 at `<pbx host>`),
 not from reading docs — each one blocked a real run until fixed.
 
 ### `webrtc=yes` forces DTLS-SRTP + ICE, independent of SIP transport
 
-`asterisk -rx "pjsip show endpoint 1100"` (read-only) shows
+`asterisk -rx "pjsip show endpoint 1000"` (read-only) shows
 `webrtc: yes`, which in turn forces `media_encryption: dtls`,
 `ice_support: true`, `use_avpf: true`, `rtcp_mux: true` **at the endpoint
 level** — this applies to calls placed on that endpoint regardless of
@@ -182,7 +182,7 @@ temp, add config */` comment acknowledging the gap. Confirmed independent
 of baresip with a raw probe:
 
 ```bash
-$ printf 'GET / HTTP/1.1\r\nHost: 100.119.230.80:8089\r\n...' | openssl s_client -connect 100.119.230.80:8089 -quiet
+$ printf 'GET / HTTP/1.1\r\nHost: <pbx host>:8089\r\n...' | openssl s_client -connect <pbx host>:8089 -quiet
 HTTP/1.1 404 Not Found
 Server: Asterisk/22.8.2
 ```
@@ -196,7 +196,7 @@ Enabled URI's:
 ```
 Asterisk's `res_http_websocket` mounts at `/ws`, not `/`. TLS itself is
 fine (raw `openssl s_client` completes the handshake and shows a normal,
-if self-signed, cert from `Neola Internal CA` — see "TLS leaf-certificate
+if self-signed, cert from an internal CA — see "TLS leaf-certificate
 pinning (CENT_TLS_PIN)" below, implemented in F1); the 404 is purely an
 HTTP-routing mismatch, and it is not
 something `sip_verify_server`/account params can route around, since the
@@ -215,12 +215,12 @@ final report / repo issue.
 
 ### outbound calls need an explicit route back to the registered transport
 
-Even after the path fix, `dial sip:*43@100.119.230.80` (exactly the form
+Even after the path fix, `dial sip:*43@<pbx host>` (exactly the form
 in this task's spec — no `;transport=` or `:port`) initially still failed:
 ```
-websock: connecting to 'wss://100.119.230.80:8089/ws'   <- REGISTER, OK
+websock: connecting to 'wss://<pbx host>:8089/ws'   <- REGISTER, OK
 ...
-websock: connecting to 'wss://100.119.230.80:443/ws'    <- the dial, wrong port
+websock: connecting to 'wss://<pbx host>:443/ws'    <- the dial, wrong port
 sip: websock connection closed (Protocol error [100])
 ```
 Resolving a bare request-URI with no transport/port hint falls back to
@@ -233,7 +233,7 @@ also sets `outbound="sip:<host>:<port>;transport=<transport>"` (see
 `run-spike.sh`), which pins an explicit proxy/route so a same-process
 `dial sip:ext@host` — no transport params required, matching
 `PROTOCOL.md`'s v0 command shape — routes over whichever transport is
-under test. Confirmed fixed: dialing the bare `*43@100.119.230.80` after
+under test. Confirmed fixed: dialing the bare `*43@<pbx host>` after
 this reached `established` on both wss and udp.
 
 ### `lg.enable_stdout` defaults to `true` (v1) → pure JSON stdout (v1.1)
@@ -325,7 +325,7 @@ one pair of patches:
 `sip_verify_server no` (config key, `run-spike.sh` sets it via
 `CENT_VERIFY_SERVER`, default `no`) is required for this PBX's WSS
 listener, which serves a self-signed cert issued by an internal CA
-("Neola Internal CA" / CN `neola-pbx.tail0fc359.ts.net`). Confirmed via
+(CN `<pbx host>`). Confirmed via
 `uag.c`: this key drives `tls_disable_verify_server()` on the dedicated
 WSS TLS context (`uag.wss_tls`), independent of the plain-TLS-transport
 context.
@@ -341,7 +341,7 @@ i.e. handshake done, cert chain check already run):
 
 ```bash
 CENT_TLS_PIN="$(python3 -c "import json;print(json.load(open('$HOME/Library/Application Support/Centinelo Phone/settings.json'))['pinnedCertSha256'][0])")" \
-CENT_EXT=1100 CENT_HOST=100.119.230.80 CENT_TRANSPORT=wss \
+CENT_EXT=1000 CENT_HOST=<pbx host> CENT_TRANSPORT=wss \
 CENT_SECRET="..." ./core/run-spike.sh
 ```
 

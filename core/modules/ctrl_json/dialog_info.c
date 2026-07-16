@@ -10,7 +10,7 @@
  * NOTIFY body actually takes - a real XML parser would be considerably
  * more code for no behavioural difference here.
  *
- * Copyright (C) 2026 Neola Dental / Centinelo Phone
+ * Copyright (C) 2026 Centinelo Phone
  */
 
 #include <re.h>

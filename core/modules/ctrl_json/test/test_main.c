@@ -16,7 +16,7 @@
  * Run via ctest (see test/CMakeLists.txt) or directly:
  *   ./ctrl_json_test
  *
- * Copyright (C) 2026 Neola Dental / Centinelo Phone
+ * Copyright (C) 2026 Centinelo Phone
  */
 
 #include <errno.h>
@@ -1156,7 +1156,7 @@ static void test_dialog_info_real_capture_ext510_idle(void)
 		"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n"
 		"<dialog-info xmlns=\"urn:ietf:params:xml:ns:dialog-info\""
 		" version=\"0\" state=\"full\""
-		" entity=\"sip:510@100.119.230.80\">\r\n"
+		" entity=\"sip:510@192.0.2.10\">\r\n"
 		" <dialog id=\"510\">\r\n"
 		"  <state>terminated</state>\r\n"
 		" </dialog>\r\n"
@@ -1173,7 +1173,7 @@ static void test_dialog_info_real_capture_ext510_idle(void)
  * v1.3 presence_override - real capture, mid-hold (see core/E2E-F1.md
  * "F5 presence_override" and dialog_info.h's own header comment on
  * CENT_BLF_HELD for the full story). Captured via SIP trace (-s) while
- * ext 1100 (this engine's own test account, dual-contact trick) had a
+ * ext 1000 (this engine's own test account, dual-contact trick) had a
  * live bridged call on local hold (this engine's own `hold` command) -
  * this exact body (only `version=` differs across the 3 NOTIFYs actually
  * captured spanning the hold window - all byte-identical otherwise) is
@@ -1185,21 +1185,21 @@ static void test_dialog_info_real_capture_ext510_idle(void)
  * (busy, not a false "held") rather than what RFC 4235 merely allows a
  * compliant implementation to send.
  */
-static void test_dialog_info_real_capture_1100_confirmed_no_hold_signal(void)
+static void test_dialog_info_real_capture_ext1000_confirmed_no_hold_signal(void)
 {
 	static const char real_body[] =
 		"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n"
 		"<dialog-info xmlns=\"urn:ietf:params:xml:ns:dialog-info\""
 		" version=\"2\" state=\"full\""
-		" entity=\"sip:1100@192.0.2.10\">\r\n"
-		" <dialog id=\"1100\">\r\n"
+		" entity=\"sip:1000@192.0.2.10\">\r\n"
+		" <dialog id=\"1000\">\r\n"
 		"  <state>confirmed</state>\r\n"
 		" </dialog>\r\n"
 		"</dialog-info>\r\n";
 
 	CHECK(CENT_BLF_BUSY ==
 	      dialog_info_parse(real_body, str_len(real_body)),
-	      "dialog_info: real ext-1100 capture, mid-hold (state=full,"
+	      "dialog_info: real ext-1000 capture, mid-hold (state=full,"
 	      " dialog state=confirmed, NO rendering param) -> busy, NOT"
 	      " held - this real PBX doesn't signal hold via dialog-info"
 	      " (see dialog_info.h's CENT_BLF_HELD comment)");
@@ -1379,7 +1379,7 @@ int main(void)
 	test_dialog_info_terminated_and_unknown();
 	test_dialog_info_real_capture_ext510_idle();
 	test_dialog_info_held();
-	test_dialog_info_real_capture_1100_confirmed_no_hold_signal();
+	test_dialog_info_real_capture_ext1000_confirmed_no_hold_signal();
 	test_dialog_info_dnd();
 	test_blf_state_name();
 

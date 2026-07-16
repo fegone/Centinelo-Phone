@@ -41,7 +41,7 @@
  * only once, at wav_writer_close() - per the F4 task design ("buffer
  * writes, don't fsync per frame").
  *
- * Copyright (C) 2026 Neola Dental / Centinelo Phone
+ * Copyright (C) 2026 Centinelo Phone
  */
 
 #ifndef CENTINELO_CTRL_JSON_WAV_WRITER_H
