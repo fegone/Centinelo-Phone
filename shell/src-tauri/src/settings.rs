@@ -123,6 +123,121 @@ impl AccountSettings {
     }
 }
 
+// ---- shared account-field validation (2026-07-16 4R re-review, A1) -------
+//
+// `sidecar.rs`'s `write_accounts_file` interpolates `host`/`ext`/`secret`
+// unquoted, unescaped, straight into a single-line baresip accounts entry
+// (`<sip:{ext}@{host}:{port};transport=...>` + `;auth_pass={secret};...`)
+// - a `;` inside `secret` would prematurely close `auth_pass=` and let the
+// rest of the string inject arbitrary account params; a newline anywhere
+// would inject an entirely separate account line.
+//
+// The first version of this check lived only in `provisioning.rs`
+// (provisioning-sourced accounts are more exposed - a URL merely pasted,
+// or a link someone else sent). That left the *other* writer of
+// `AccountSettings`, `commands::save_account_settings` (manual entry in
+// Settings), checking only for empty host/ext - still reachable by the
+// same injection, just gated behind admin-unlock instead of being
+// impossible. This function is now the single source of truth, called
+// from BOTH callers before they persist, **and** defensively again inside
+// `write_accounts_file` itself right before it builds the line - so the
+// check holds even if some future third caller forgets to call it.
+pub const MAX_HOST_LEN: usize = 253; // RFC 1035 full-name limit
+pub const MAX_EXT_LEN: usize = 64;
+pub const MAX_SECRET_LEN: usize = 256;
+pub const MAX_DISPLAY_NAME_LEN: usize = 128;
+
+/// Character/length safety for the four fields that flow into that one
+/// accounts-file line. Deliberately does **not** enforce "non-empty" -
+/// that's each caller's own business rule: provisioning requires all
+/// three (see `provisioning::validate`); manual Settings entry already
+/// enforces host/ext non-empty separately (`commands::save_account_settings`)
+/// and allows an unspecified secret to mean "keep the existing one".
+pub fn validate_account_fields(host: &str, ext: &str, secret: &str, display_name: &str) -> Result<(), String> {
+    if host.chars().count() > MAX_HOST_LEN {
+        return Err("\"host\" is too long.".to_string());
+    }
+    if !host.is_empty()
+        && !host.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']'))
+    {
+        return Err("\"host\" contains characters that aren't allowed in a hostname or IP address.".to_string());
+    }
+
+    if ext.chars().count() > MAX_EXT_LEN {
+        return Err("\"ext\" is too long.".to_string());
+    }
+    if !ext.is_empty()
+        && !ext.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '*' | '#' | '+'))
+    {
+        return Err("\"ext\" contains characters that aren't allowed in an extension.".to_string());
+    }
+
+    if secret.chars().count() > MAX_SECRET_LEN {
+        return Err("\"secret\" is too long.".to_string());
+    }
+    if secret.chars().any(|c| c.is_control() || c == ';') {
+        return Err(
+            "\"secret\" contains characters that aren't allowed (control characters or \";\").".to_string(),
+        );
+    }
+
+    if display_name.chars().count() > MAX_DISPLAY_NAME_LEN {
+        return Err("\"display_name\" is too long.".to_string());
+    }
+    if display_name.chars().any(|c| c.is_control()) {
+        return Err("\"display_name\" contains control characters.".to_string());
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod validate_account_fields_tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_values_pass() {
+        assert!(validate_account_fields("pbx.example.test", "9999", "s3cret", "Front Desk").is_ok());
+    }
+
+    #[test]
+    fn empty_values_pass_requiredness_is_the_callers_job() {
+        assert!(validate_account_fields("", "", "", "").is_ok());
+    }
+
+    #[test]
+    fn secret_semicolon_rejected_account_line_injection() {
+        let err =
+            validate_account_fields("h", "1", "x;outbound=\"sip:evil.example.test\"", "").unwrap_err();
+        assert!(err.contains("secret"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn secret_newline_rejected_account_line_injection() {
+        assert!(validate_account_fields("h", "1", "x\n<sip:evil@evil.example.test>;auth_pass=y", "").is_err());
+    }
+
+    #[test]
+    fn host_semicolon_rejected() {
+        assert!(validate_account_fields("pbx.example.test;evilparam=1", "1", "x", "").is_err());
+    }
+
+    #[test]
+    fn ext_at_sign_rejected() {
+        assert!(validate_account_fields("h", "1001@evil.example.test", "x", "").is_err());
+    }
+
+    #[test]
+    fn host_too_long_rejected() {
+        assert!(validate_account_fields(&"a".repeat(MAX_HOST_LEN + 1), "1", "x", "").is_err());
+    }
+
+    #[test]
+    fn display_name_control_char_rejected() {
+        assert!(validate_account_fields("h", "1", "x", "Front\nDesk").is_err());
+    }
+}
+
 // ---- transcription (F4) --------------------------------------------------
 //
 // All fields here are admin-gated, same as account/favorites - see
@@ -314,10 +429,28 @@ impl SettingsStore {
         write_private_file(&self.path, json.as_bytes())
     }
 
+    /// Rolls the in-memory copy back to `account`'s previous value if
+    /// `persist()` fails (disk full, NAS-mounted app-data dir gone, ...) -
+    /// every sibling `update_*` method below has the same
+    /// mutate-then-persist shape and the same latent memory/disk
+    /// divergence on a failed write; `update_account` gets the fix here
+    /// because `provisioning_apply` (commands.rs) depends on it directly
+    /// (2026-07-16 4R re-review, R1) - a failed provisioning apply should
+    /// leave the account exactly as it was, not silently switch the
+    /// *in-memory* account to the new (never-persisted, and therefore
+    /// never what the next sidecar spawn's scratch `accounts` file - or
+    /// the next successful `snapshot()` - actually reflects) one. The
+    /// other `update_*` methods sharing this shape are pre-existing and
+    /// out of this diff's scope; flagged as a follow-up.
     pub fn update_account(&self, account: AccountSettings) -> std::io::Result<()> {
         let mut guard = self.inner.lock().expect("settings mutex poisoned");
+        let previous = guard.account.clone();
         guard.account = account;
-        self.persist(&guard)
+        if let Err(e) = self.persist(&guard) {
+            guard.account = previous;
+            return Err(e);
+        }
+        Ok(())
     }
 
     pub fn update_core_binary_path(&self, path: Option<String>) -> std::io::Result<()> {
@@ -372,22 +505,50 @@ impl SettingsStore {
     }
 }
 
+/// `path.tmp.<pid>` in the same directory as `path` - same directory so
+/// the final `fs::rename` below is a same-filesystem rename (atomic on
+/// every OS this app targets), and pid-suffixed so two processes racing
+/// to write the same settings file (shouldn't happen in practice - one
+/// `SettingsStore` per running app - but cheap to make impossible rather
+/// than merely unlikely) can't clobber each other's temp file mid-write.
+fn tmp_sibling_path(path: &Path) -> PathBuf {
+    let file_name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "settings".to_string());
+    path.with_file_name(format!("{file_name}.tmp.{}", std::process::id()))
+}
+
+/// Write-then-rename instead of truncate-in-place (2026-07-16 4R
+/// re-review, R2): the previous `OpenOptions::truncate(true)` + one
+/// `write_all` left a real window where a crash or a full disk mid-write
+/// truncated `settings.json` to a partial/invalid file - `SettingsStore::load`'s
+/// `unwrap_or_default()` on a parse failure would then silently reset
+/// *every* setting (account, admin password hash, bridge token,
+/// favorites) on the next launch. `fs::rename` within one directory is
+/// atomic on macOS/Linux/Windows - the file at `path` is always either
+/// the old complete contents or the new complete contents, never a
+/// partial write, regardless of when a crash/power-loss happens.
 #[cfg(unix)]
 fn write_private_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
-    let mut f = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    use std::io::Write;
-    f.write_all(contents)
+    let tmp_path = tmp_sibling_path(path);
+    {
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp_path)?;
+        use std::io::Write;
+        f.write_all(contents)?;
+        f.sync_all()?; // durable on disk before the rename makes it visible
+    }
+    fs::rename(&tmp_path, path)
 }
 
 #[cfg(not(unix))]
 fn write_private_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    fs::write(path, contents)
+    let tmp_path = tmp_sibling_path(path);
+    fs::write(&tmp_path, contents)?;
+    fs::rename(&tmp_path, path)
 }
 
 /// Session-only admin unlock flag. Deliberately NOT persisted - a fresh app

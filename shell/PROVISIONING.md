@@ -139,25 +139,93 @@ the same admin-lock rule *except* for one carve-out:
   to change the account than typing it in by hand - see
   `commands::provisioning_apply`'s doc comment for the exact check
   (`settings.snapshot().account.is_configured()`).
+- **A call in progress blocks the apply regardless of admin state**
+  (2026-07-16 4R re-review, R4): applying restarts the sidecar
+  unconditionally, which would otherwise drop whatever call is in
+  progress with no warning - a real risk specifically because a
+  `centinelo://provision` deep link can arrive via email/IM at any
+  moment, not just from a deliberate "I'm between calls" trip to
+  Settings. `commands::provisioning_apply` refuses with "You're on a
+  call..." (surfaced in `#prov-confirm-error`, same slot every other
+  apply-time error uses) whenever `SidecarHandle::has_active_call()` is
+  true - incoming/calling/in-call, not just an established call. A fresh
+  install can never be mid-call (the sidecar never even starts before an
+  account exists), so this check runs unconditionally rather than only on
+  the re-provision path.
 
 ## Security notes
 
 - **Account-line injection**: `sidecar.rs`'s `write_accounts_file`
   interpolates `host`/`ext`/`secret` unquoted into a single-line baresip
-  accounts entry. `validate()` rejects `;` and control characters (including
-  newlines) in `secret`, and a restrictive character allowlist for `host`/
-  `ext` - specifically closing off breaking out of `auth_pass=...;` or
-  injecting an extra accounts-file line. Covered by
-  `provisioning.rs`'s `secret_with_semicolon_rejected_account_line_injection`/
+  accounts entry. The character/length validation that closes this
+  (`;`/control chars rejected in `secret`, restrictive allowlists for
+  `host`/`ext`) lives in **`settings::validate_account_fields`**, not in
+  this module - it's the single source of truth, called from every writer
+  of an `AccountSettings` the sidecar will eventually spawn with:
+  `commands::save_account_settings` (manual Settings entry),
+  `provisioning::validate` (this module), **and** defensively again
+  inside `write_accounts_file` itself right before it builds the line
+  (2026-07-16 4R re-review, A1 - the first version of this check lived
+  only in `provisioning.rs`, leaving the manual-entry path checking
+  nothing but emptiness). Covered by `settings::validate_account_fields_tests`
+  (the shared checks) and `provisioning::tests::secret_with_semicolon_rejected_account_line_injection`/
   `secret_with_newline_rejected_account_line_injection`/`host_with_semicolon_rejected`/
-  `ext_with_at_sign_rejected` tests.
-- **https-only**, no redirect following, 16 KiB response cap, 8s timeout -
-  see "The link forms" above.
+  `ext_with_at_sign_rejected` (provisioning's own required-field wrapping
+  of them).
+- **https-only**, no redirect following, 16 KiB response cap (checked on
+  the *encoded* length before ever decoding the `config=` form - 2026-07-16
+  4R re-review, B1), 8s timeout - see "The link forms" above.
+- **SSRF/DNS-rebinding hardening on the fetch** (2026-07-16 4R re-review,
+  M1): the `url=`/bare-https fetch uses a custom `ureq::Resolver`
+  (`provisioning::ssrf_safe_resolve`) that resolves the host once and
+  drops loopback/link-local (including the 169.254.169.254 cloud-metadata
+  endpoint)/unspecified/multicast addresses from the result *before*
+  `ureq` ever connects - there's no second, independent resolution
+  afterward for a rebinding attacker to redirect, which is what actually
+  defeats the attack (a "resolve, check, then let the client re-resolve
+  and connect" sequence has a gap; this doesn't). **Deliberately does
+  NOT block RFC 1918 private ranges or the RFC 6598 CGNAT range
+  (100.64.0.0/10)** - blocking those would break this feature's primary
+  use case, not just close an edge case: a real on-prem PBX or a
+  Tailscale-hosted provisioning page legitimately lives there (this
+  workspace's own test PBX is a CGNAT/Tailscale address). See
+  `provisioning.rs`'s `ipv4_should_be_blocked` doc for the full reasoning
+  - this is a deliberately scoped subset of "block everything private",
+  chosen to close the vectors with zero legitimate use (metadata
+  endpoints, loopback) while preserving the product's real deployment
+  model. A stricter policy (full RFC1918/ULA block, or an installer-domain
+  allowlist) is a product decision, not a purely technical one - flagged
+  for Mario/Felix if the threat model should be tightened further.
+- **A TLS pin doesn't survive a host change** (2026-07-16 4R re-review,
+  M2): `commands::resolved_tls_pin` clears `tls_pin_sha256` whenever a
+  manual Settings save changes the host - a pin is a fingerprint of ONE
+  host's certificate, and silently carrying PBX A's pin over to PBX B
+  would fail that connection for a reason invisible in this UI (no field
+  here shows/clears the pin directly).
 - **No file-path fields** in the config at all - see "Not supported yet".
-- The secret is validated, applied to `settings.json` (mode 600, same as
-  every other account write), and handed to the sidecar as a scratch
-  `accounts` file (mode 0700 dir) - never logged, never returned to the
-  frontend, never included in a preview.
+- The secret is validated, applied to `settings.json` (mode 600, written
+  atomically via write-to-temp-then-rename - 2026-07-16 4R re-review, R2,
+  see settings.rs `write_private_file`'s doc for why a crash/full-disk
+  mid-write used to be able to reset every setting on next launch) and
+  handed to the sidecar as a scratch `accounts` file (mode 0700 dir) -
+  never logged, never returned to the frontend, never included in a
+  preview.
+- **A failed apply doesn't lose the pending config** (2026-07-16 4R
+  re-review, R1): `provisioning_apply` peeks at the pending config and
+  only clears it once `update_account` has actually succeeded - if the
+  disk write fails (NAS-mounted app-data dir gone, disk full), the
+  operator sees the real error and can just hit Connect again instead of
+  a confusing "Nothing pending" forcing a re-paste.
+- **A cold-start deep link's confirmation screen can't get lost**
+  (2026-07-16 4R re-review, R3): a `centinelo://provision?config=...`
+  link resolves synchronously during Rust-side startup, well before the
+  frontend has loaded and attached its `provisioning://preview` listener
+  - Tauri doesn't queue/replay events for late listeners, so without a
+  fix that preview (and the confirmation it should have shown) would
+  simply vanish. `ui/js/app.js`'s `boot()` calls the non-consuming
+  `provisioning_pending_preview` command once, right after attaching
+  listeners - between "listeners attached" and "checked once", no timing
+  gap remains where a preview could go unseen.
 
 ## QR
 
@@ -185,6 +253,10 @@ picker/webcam loop can't be driven by the scripted e2e driver either).
   preview or the error.
 - `provisioning_apply` - applies whatever's currently pending.
 - `provisioning_cancel` - discards whatever's currently pending.
+- `admin_set_password:<password>` - sets/changes the admin password and
+  leaves the session unlocked (added 2026-07-16 4R re-review, to reach
+  `provisioning_apply` on an already-configured account from a script,
+  without a GUI to click through the unlock screen).
 
 Fully offline, deterministic example (no PBX/network needed - the embedded
 `config=` form):
@@ -199,11 +271,29 @@ the same placeholder host/extension convention `settings.rs`'s own test
 fixtures already use in this public repo, never this workspace's real test
 PBX address, which never appears under `phone/`.)
 
-To exercise the real `https://` fetch path end to end, stand up any static
-file server serving a valid config JSON over https (a throwaway self-signed
-cert works fine against a real client, same as this repo's PBX box) and
-point a `provisioning_resolve:https://...` step at it - not automated here
-since it needs a live server, but the code path is identical to the
-embedded case past `fetch_remote()`'s network call (see
-`provisioning.rs`'s `read_capped_body` unit tests for the byte-cap logic
-that call exercises, tested without a live server).
+Real requests/responses (status handling, the size-capped body read
+against a real streamed response, JSON parsing) are covered by
+`provisioning::tests::fetch_via_agent_*` against a loopback `tiny_http`
+server, not just the pure-parsing tests above - `fetch_via_agent` is
+split out from `fetch_remote` specifically so it's testable that way
+without a valid TLS certificate (see that function's doc, 2026-07-16 4R
+re-review B3). The `https`-only enforcement and the SSRF-safe resolver
+both live in `fetch_remote`/`build_agent`, one layer up, deliberately
+outside of what those loopback tests exercise.
+
+**R4 (a call in progress blocks `provisioning_apply`) - verification
+note**: verified by code inspection (the same `CallPhase`/`match` pattern
+`SidecarHandle::ping_state` already uses, and the check runs before any
+mutation in `provisioning_apply`) plus e2e evidence for the *negative*
+case (idle - no active call - correctly allows apply, run against a
+throwaway clean-install fixture). The *positive* case (dial a real call,
+then confirm `provisioning_apply` is refused mid-call) was attempted
+against this workspace's real test PBX during the 2026-07-16 4R
+re-review fix pass but not completed with clean evidence - the dial
+itself didn't settle within the attempt's wait window, and continuing to
+iterate against the shared real `settings.json` (which a *successful*
+`provisioning_apply` overwrites) carried more risk than the remaining
+verification gap justified once the account had already been restored
+once from backup. Flagged here rather than silently claimed as fully
+e2e-verified; qa-e2e or a follow-up session can complete it against the
+real PBX with more time budget for the dial to settle.

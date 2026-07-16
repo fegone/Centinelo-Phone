@@ -105,28 +105,83 @@ pub fn save_account_settings(
     if input.host.trim().is_empty() || input.ext.trim().is_empty() {
         return Err("Host and extension are required.".to_string());
     }
+    let host = input.host.trim().to_string();
+    let ext = input.ext.trim().to_string();
+    let display_name = input.display_name.trim().to_string();
     // Pulls the *whole* previous account, not just the secret (was
     // `previous_secret` only, pre-provisioning) - `..previous` below
     // preserves `tls_pin_sha256` across a manual Settings save instead of
     // silently dropping it, since there's no manual-entry field for that
     // one yet (see settings.rs AccountSettings doc) - a provisioned pin
-    // shouldn't vanish the next time someone edits the host in Settings.
+    // shouldn't vanish the next time someone edits, say, the display name
+    // in Settings.
     let previous = settings.snapshot().account;
     let secret = match input.secret {
         Some(s) if !s.is_empty() => s,
         _ => previous.secret.clone(),
     };
+    let tls_pin_sha256 = resolved_tls_pin(&host, &previous.host, previous.tls_pin_sha256.clone());
+    crate::settings::validate_account_fields(&host, &ext, &secret, &display_name)?;
     let account = AccountSettings {
-        host: input.host.trim().to_string(),
-        ext: input.ext.trim().to_string(),
+        host,
+        ext,
         secret,
-        display_name: input.display_name.trim().to_string(),
+        display_name,
         transport_priority: input.transport_priority,
-        ..previous
+        tls_pin_sha256,
     };
     settings.update_account(account).map_err(|e| e.to_string())?;
     sidecar.restart_now();
     Ok(())
+}
+
+/// A TLS pin is a fingerprint of ONE host's certificate - carrying it over
+/// when the host itself changes would silently apply PBX A's pin as
+/// `CENT_TLS_PIN` against PBX B, failing that connection for a reason
+/// invisible in this UI (no field here shows/clears the pin - see
+/// settings.rs `AccountSettings` doc). Extracted as a pure function
+/// (2026-07-16 4R re-review, M2) so this rule is unit-testable without a
+/// full Tauri `State`/`AppHandle` - see `resolved_tls_pin_tests` below,
+/// same pattern `reveal_path_is_allowed` already established in this file
+/// for the same reason.
+fn resolved_tls_pin(new_host: &str, previous_host: &str, previous_pin: Option<String>) -> Option<String> {
+    if new_host == previous_host {
+        previous_pin
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod resolved_tls_pin_tests {
+    use super::*;
+
+    #[test]
+    fn same_host_keeps_the_pin() {
+        assert_eq!(
+            resolved_tls_pin("pbx.example.test", "pbx.example.test", Some("AA".repeat(32))),
+            Some("AA".repeat(32))
+        );
+    }
+
+    #[test]
+    fn changed_host_clears_the_pin() {
+        assert_eq!(resolved_tls_pin("pbx-b.example.test", "pbx-a.example.test", Some("AA".repeat(32))), None);
+    }
+
+    #[test]
+    fn no_previous_pin_stays_none_regardless_of_host_change() {
+        assert_eq!(resolved_tls_pin("pbx-b.example.test", "pbx-a.example.test", None), None);
+        assert_eq!(resolved_tls_pin("pbx.example.test", "pbx.example.test", None), None);
+    }
+
+    #[test]
+    fn first_time_setting_a_host_from_empty_clears_any_stale_pin() {
+        // previous_host == "" only happens on a fresh/never-configured
+        // account - any pin present there would be leftover/impossible
+        // state, not a real "same host" case.
+        assert_eq!(resolved_tls_pin("pbx.example.test", "", Some("AA".repeat(32))), None);
+    }
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -357,6 +412,28 @@ pub fn provisioning_resolve(
     Ok(preview)
 }
 
+/// Non-consuming read of whatever's currently pending, if anything - used
+/// by the frontend once at `boot()` to catch a preview that was already
+/// resolved (and its `provisioning://preview` event already fired) before
+/// `attachTauriListeners()` had a chance to register a listener for it
+/// (2026-07-16 4R re-review, R3). This is the scenario a cold-start
+/// `centinelo://provision?config=...` deep link hits every time: the
+/// `config=` embedded form resolves synchronously (no network wait to
+/// cover the gap), inside `.setup()`, well before the webview has even
+/// loaded `index.html`, let alone run `boot()` - Tauri's `emit` doesn't
+/// queue/replay for listeners that attach after the fact, so without this
+/// command that preview (and the confirmation screen it should have
+/// shown) is simply lost, silently, from the operator's point of view
+/// ("I clicked the link and nothing happened"). See `ui/js/app.js`
+/// `boot()`: listeners attach first, then this is checked once - between
+/// the two, no window remains where a preview could go unseen.
+#[tauri::command(rename_all = "snake_case")]
+pub fn provisioning_pending_preview(
+    provisioning: State<crate::provisioning::ProvisioningPending>,
+) -> Option<crate::provisioning::ProvisioningPreviewView> {
+    provisioning.peek().as_ref().map(crate::provisioning::ProvisioningPreviewView::from)
+}
+
 /// Admin-gated *unless* this is the very first provisioning on a clean
 /// install (no account configured yet) - matches the task spec's explicit
 /// carve-out ("salvo el primer provisioning en instalación limpia, que es
@@ -380,10 +457,29 @@ pub fn provisioning_apply(
     if already_configured {
         require_unlocked(&admin)?;
     }
+    // A provisioning request can arrive via a centinelo://provision deep
+    // link at any moment - unlike opening Settings by hand, it's not
+    // necessarily "I'm between calls and ready to reconfigure". Refuse
+    // rather than silently dropping whatever call is in progress when
+    // sidecar.restart_now() below runs (2026-07-16 4R re-review, R4) -
+    // the frontend's existing #prov-confirm-error slot surfaces this
+    // message directly, same as any other error from this command.
+    if sidecar.has_active_call() {
+        return Err("You're on a call — finish or hang up before connecting to a new phone system.".to_string());
+    }
+    // peek(), not take() (2026-07-16 4R re-review, R1): if update_account
+    // below fails (disk full, NAS-mounted app-data dir gone), the pending
+    // config must still be there for a retry - consuming it up front and
+    // only then discovering the persist failed left "Connect" looking
+    // like it had silently forgotten the link (a bewildering "Nothing
+    // pending" on retry) instead of surfacing the real, and often
+    // transient, disk-write error. Only cleared below once update_account
+    // has actually succeeded.
     let config = provisioning
-        .take()
+        .peek()
         .ok_or_else(|| "Nothing pending - paste a provisioning link first.".to_string())?;
     settings.update_account(config.into()).map_err(|e| e.to_string())?;
+    provisioning.clear();
     sidecar.restart_now();
     Ok(())
 }

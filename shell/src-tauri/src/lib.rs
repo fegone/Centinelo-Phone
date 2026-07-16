@@ -157,6 +157,7 @@ pub fn run() {
             commands::download_transcription_model,
             commands::reveal_in_file_manager,
             commands::provisioning_resolve,
+            commands::provisioning_pending_preview,
             commands::provisioning_apply,
             commands::provisioning_cancel,
         ])

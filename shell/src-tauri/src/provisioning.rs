@@ -88,12 +88,15 @@ const PROVISION_HOST: &str = "provision";
 /// stingy enough that a misbehaving/malicious server streaming an
 /// unbounded response can't grow this process's memory unbounded either.
 const MAX_CONFIG_BYTES: usize = 16 * 1024;
+/// `MAX_CONFIG_BYTES` bytes of raw JSON, base64-encoded (no padding)
+/// expands by ~4/3 - `decode_embedded_config` checks the *encoded*
+/// string's length against this before ever calling `.decode()` (2026-07-16
+/// 4R re-review, B1: decoding first and only checking the decoded length
+/// afterward let an attacker-sized base64 string allocate an unbounded
+/// buffer before this module ever got to say no). `+ 4` is slack for
+/// base64's block-rounding.
+const MAX_CONFIG_BYTES_ENCODED: usize = MAX_CONFIG_BYTES * 4 / 3 + 4;
 const FETCH_TIMEOUT: Duration = Duration::from_secs(8);
-
-const MAX_HOST_LEN: usize = 253; // RFC 1035 full-name limit
-const MAX_EXT_LEN: usize = 64;
-const MAX_SECRET_LEN: usize = 256;
-const MAX_DISPLAY_NAME_LEN: usize = 128;
 
 // ---------------------------------------------------------------------------
 // Config shape
@@ -178,18 +181,36 @@ pub struct ProvisioningPending {
 }
 
 impl ProvisioningPending {
-    pub fn set(&self, config: ProvisioningConfig) {
-        *self.inner.lock().expect("provisioning-pending mutex poisoned") = Some(config);
+    /// This session-only cache holds nothing more sensitive than what a
+    /// pending confirmation screen is about to show (still including the
+    /// secret internally, only *displayed* fields are filtered - see
+    /// `ProvisioningPreviewView`), and a poisoned mutex here only ever
+    /// means some unrelated panic happened elsewhere while a lock was
+    /// held - `.unwrap_or_else(|e| e.into_inner())` recovers the
+    /// last-known value and carries on instead of cascading that
+    /// unrelated panic into losing (or crashing on) a pending provisioning
+    /// confirmation (2026-07-16 4R re-review, B2 - was `.expect(...)` on
+    /// all three methods).
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<ProvisioningConfig>> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Consumes the pending config (used by `provisioning_apply` - a
-    /// config is applied at most once, then it's gone).
-    pub fn take(&self) -> Option<ProvisioningConfig> {
-        self.inner.lock().expect("provisioning-pending mutex poisoned").take()
+    pub fn set(&self, config: ProvisioningConfig) {
+        *self.lock() = Some(config);
+    }
+
+    /// Non-consuming read - see `commands::provisioning_pending_preview`
+    /// (R3: lets the frontend catch a preview whose event fired before
+    /// any listener attached) and `commands::provisioning_apply` (R1:
+    /// peek, only `clear()` once the apply has actually succeeded, so a
+    /// failed apply leaves the config available to retry instead of
+    /// forcing a re-paste).
+    pub fn peek(&self) -> Option<ProvisioningConfig> {
+        self.lock().clone()
     }
 
     pub fn clear(&self) {
-        *self.inner.lock().expect("provisioning-pending mutex poisoned") = None;
+        *self.lock() = None;
     }
 }
 
@@ -260,12 +281,21 @@ fn parse_centinelo_provision(url: &url::Url) -> Result<ProvisioningSource, Strin
 
 fn decode_embedded_config(encoded: &str) -> Result<ProvisioningConfig, String> {
     use base64::Engine;
+    // Reject on the ENCODED length first (2026-07-16 4R re-review, B1) -
+    // see MAX_CONFIG_BYTES_ENCODED's doc for why checking only the
+    // decoded length (the original version of this function) isn't
+    // enough on its own.
+    if encoded.len() > MAX_CONFIG_BYTES_ENCODED {
+        return Err("The embedded provisioning data is too large.".to_string());
+    }
     // URL_SAFE_NO_PAD: the config travels inside a URL query parameter
     // (already itself percent-decoded by `query_pairs()` above) - standard
     // base64's `+`/`/`/`=` would need re-escaping there for no benefit.
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(encoded)
         .map_err(|_| "The embedded provisioning data is corrupted (bad base64).".to_string())?;
+    // Kept as defense-in-depth even though the encoded-length check above
+    // already makes this unreachable in practice (base64 only shrinks).
     if bytes.len() > MAX_CONFIG_BYTES {
         return Err("The embedded provisioning data is too large.".to_string());
     }
@@ -294,15 +324,78 @@ fn read_capped_body(mut reader: impl Read, cap: usize) -> Result<Vec<u8>, String
     Ok(buf)
 }
 
-fn fetch_remote(url: &url::Url) -> Result<ProvisioningConfig, String> {
-    if url.scheme() != "https" {
-        // Defense in depth - every caller into this function has already
-        // enforced https at parse time (parse_input/parse_centinelo_provision),
-        // but this function isn't otherwise `pub(self)`-locked to that
-        // invariant holding forever.
-        return Err("Provisioning links must use https.".to_string());
+/// IPv4 ranges with no legitimate reason for a PBX provisioning server to
+/// ever resolve to them - loopback (any local service on the operator's
+/// own machine), link-local/169.254.0.0/16 (includes the 169.254.169.254
+/// cloud-metadata endpoint, the textbook SSRF target), unspecified, and
+/// multicast/reserved (`>= 224`, covers 255.255.255.255 broadcast too).
+/// Deliberately does **not** block RFC 1918 private ranges (10/8,
+/// 172.16/12, 192.168/16) or the RFC 6598 CGNAT range (100.64.0.0/10) -
+/// both are exactly where a *real* on-prem PBX or a Tailscale-hosted
+/// provisioning page legitimately lives (this workspace's own test PBX
+/// is a CGNAT/Tailscale address); blocking them would break this
+/// feature's primary use case, not just close an edge case. See
+/// PROVISIONING.md "Security notes" for the full reasoning and an
+/// explicit note that this is a deliberately scoped subset of "block
+/// everything private", not a full SSRF-hardened fetch.
+fn ipv4_should_be_blocked(ip: std::net::Ipv4Addr) -> bool {
+    let o = ip.octets();
+    o[0] == 127 // loopback
+        || o[0] == 0 // unspecified / "this network"
+        || (o[0] == 169 && o[1] == 254) // link-local, incl. cloud metadata
+        || o[0] >= 224 // multicast (224/4) + reserved (240/4) + broadcast
+}
+
+/// IPv6 equivalent of [`ipv4_should_be_blocked`] - loopback (`::1`),
+/// unspecified (`::`), link-local (`fe80::/10`), multicast (`ff00::/8`),
+/// and an IPv4-mapped address (`::ffff:a.b.c.d`) checked against the same
+/// IPv4 rules. ULA (`fc00::/7`, IPv6's RFC1918-equivalent) is deliberately
+/// NOT blocked, matching the IPv4 function's own RFC1918 carve-out.
+fn ipv6_should_be_blocked(ip: std::net::Ipv6Addr) -> bool {
+    if ip.is_loopback() || ip.is_unspecified() {
+        return true;
     }
-    let agent = ureq::AgentBuilder::new()
+    if let Some(v4) = ip.to_ipv4_mapped() {
+        return ipv4_should_be_blocked(v4);
+    }
+    let seg0 = ip.segments()[0];
+    (seg0 & 0xffc0) == 0xfe80 // link-local fe80::/10
+        || (seg0 & 0xff00) == 0xff00 // multicast ff00::/8
+}
+
+fn ip_should_be_blocked(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => ipv4_should_be_blocked(v4),
+        std::net::IpAddr::V6(v6) => ipv6_should_be_blocked(v6),
+    }
+}
+
+/// A [`ureq::Resolver`] that resolves normally (`ToSocketAddrs`, the same
+/// stdlib resolution `ureq`'s default resolver uses) but drops any
+/// resulting address in [`ip_should_be_blocked`]'s set before handing the
+/// list back - and ureq connects to one of exactly *these* addresses, no
+/// second resolution afterward. That "resolve once, connect to what you
+/// resolved" property is what actually defeats DNS rebinding (2026-07-16
+/// 4R re-review, M1): a naive "resolve, check, then let the HTTP client
+/// connect by hostname" sequence has a gap where the client's own,
+/// independent resolution (its second DNS lookup, for the real
+/// connection) can return a different, attacker-flipped answer than the
+/// one that was checked. Here there is no second lookup - the checked
+/// list *is* what gets connected to.
+fn ssrf_safe_resolve(netloc: &str) -> std::io::Result<Vec<std::net::SocketAddr>> {
+    use std::net::ToSocketAddrs;
+    let resolved: Vec<std::net::SocketAddr> = netloc.to_socket_addrs()?.collect();
+    let allowed: Vec<std::net::SocketAddr> = resolved.into_iter().filter(|addr| !ip_should_be_blocked(addr.ip())).collect();
+    if allowed.is_empty() {
+        return Err(std::io::Error::other(
+            "every address this host resolved to is a loopback/link-local/multicast address, which a provisioning fetch never legitimately needs",
+        ));
+    }
+    Ok(allowed)
+}
+
+fn build_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(5))
         .timeout(FETCH_TIMEOUT)
         // No automatic redirect following: a redirect to an unexpected
@@ -310,9 +403,22 @@ fn fetch_remote(url: &url::Url) -> Result<ProvisioningConfig, String> {
         // (re-paste the final link), not a silent extra hop this shell
         // decided on their behalf.
         .redirects(0)
-        .build();
+        // SSRF/DNS-rebinding hardening - see ssrf_safe_resolve's doc.
+        .resolver(ssrf_safe_resolve as fn(&str) -> std::io::Result<Vec<std::net::SocketAddr>>)
+        .build()
+}
 
-    let response = match agent.get(url.as_str()).call() {
+/// The actual GET + response handling, over whatever [`ureq::Agent`] the
+/// caller supplies - split out from [`fetch_remote`] so this half (status
+/// codes, the size-capped body read, JSON parsing) is unit-testable
+/// against a real loopback HTTP server (`tests::fetch_via_agent_tests`
+/// below) without needing a valid TLS certificate, which the `https`-only
+/// enforcement + [`build_agent`]'s SSRF-safe resolver both deliberately
+/// stay outside of (2026-07-16 4R re-review, B3 - this was previously
+/// exercised only by unrelated pure-parsing tests, never a real request/
+/// response round trip).
+fn fetch_via_agent(agent: &ureq::Agent, url: &str) -> Result<ProvisioningConfig, String> {
+    let response = match agent.get(url).call() {
         Ok(r) => r,
         Err(ureq::Error::Status(code, _)) => {
             return Err(format!("The provisioning server returned HTTP {code}."));
@@ -327,72 +433,47 @@ fn fetch_remote(url: &url::Url) -> Result<ProvisioningConfig, String> {
     serde_json::from_str(&text).map_err(|e| format!("The provisioning response isn't a valid config: {e}"))
 }
 
+fn fetch_remote(url: &url::Url) -> Result<ProvisioningConfig, String> {
+    if url.scheme() != "https" {
+        // Defense in depth - every caller into this function has already
+        // enforced https at parse time (parse_input/parse_centinelo_provision),
+        // but this function isn't otherwise `pub(self)`-locked to that
+        // invariant holding forever.
+        return Err("Provisioning links must use https.".to_string());
+    }
+    fetch_via_agent(&build_agent(), url.as_str())
+}
+
 // ---------------------------------------------------------------------------
 // Validation
 // ---------------------------------------------------------------------------
 
-/// The injection-relevant boundary: `sidecar.rs`'s `write_accounts_file`
-/// interpolates `host`/`ext`/`secret` unquoted, unescaped, straight into a
-/// single-line baresip accounts entry (`<sip:{ext}@{host}:{port};...>` +
-/// `;auth_pass={secret};...`) - a `;` inside `secret` would prematurely
-/// close `auth_pass=` and let the rest of the string inject arbitrary
-/// account params; a newline anywhere would inject an entirely separate
-/// account line. This validation exists specifically because provisioning
-/// config is more exposed than the existing manual Settings form: it can
-/// come from a URL an operator merely pasted (or, for the `url=` deep-link
-/// form, a link someone else sent them) rather than something they typed
-/// themselves field-by-field.
+/// The injection-relevant character/length checks (host/ext/secret/
+/// display_name) live in `settings::validate_account_fields` now, not
+/// here - it's the single source of truth called from every writer of an
+/// `AccountSettings` the sidecar will eventually spawn with, not just this
+/// provisioning path (2026-07-16 4R re-review, A1: the first version of
+/// this function had its own copy of those checks, which meant
+/// `commands::save_account_settings` - manual entry in Settings - wasn't
+/// covered by them at all). What's left here is provisioning-specific:
+/// which of the three required fields are actually required (a manual
+/// Settings save allows an empty secret to mean "keep the existing one";
+/// a provisioning config without one is simply useless) and the
+/// `tls_pin_sha256` format, which only this schema has.
 fn validate(config: &ProvisioningConfig) -> Result<(), String> {
     let host = config.host.trim();
     if host.is_empty() {
         return Err("The provisioning config is missing \"host\".".to_string());
     }
-    if host.chars().count() > MAX_HOST_LEN {
-        return Err("\"host\" in the provisioning config is too long.".to_string());
-    }
-    if !host
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']'))
-    {
-        return Err(
-            "\"host\" in the provisioning config contains characters that aren't allowed in a hostname or IP address."
-                .to_string(),
-        );
-    }
-
     let ext = config.ext.trim();
     if ext.is_empty() {
         return Err("The provisioning config is missing \"ext\".".to_string());
     }
-    if ext.chars().count() > MAX_EXT_LEN {
-        return Err("\"ext\" in the provisioning config is too long.".to_string());
-    }
-    if !ext
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '*' | '#' | '+'))
-    {
-        return Err("\"ext\" in the provisioning config contains characters that aren't allowed in an extension.".to_string());
-    }
-
     if config.secret.is_empty() {
         return Err("The provisioning config is missing \"secret\".".to_string());
     }
-    if config.secret.chars().count() > MAX_SECRET_LEN {
-        return Err("\"secret\" in the provisioning config is too long.".to_string());
-    }
-    if config.secret.chars().any(|c| c.is_control() || c == ';') {
-        return Err(
-            "\"secret\" in the provisioning config contains characters that aren't allowed (control characters or \";\")."
-                .to_string(),
-        );
-    }
-
-    if config.display_name.chars().count() > MAX_DISPLAY_NAME_LEN {
-        return Err("\"display_name\" in the provisioning config is too long.".to_string());
-    }
-    if config.display_name.chars().any(|c| c.is_control()) {
-        return Err("\"display_name\" in the provisioning config contains control characters.".to_string());
-    }
+    crate::settings::validate_account_fields(host, ext, &config.secret, &config.display_name)
+        .map_err(|e| format!("The provisioning config is invalid: {e}"))?;
 
     if let Some(pin) = &config.tls_pin_sha256 {
         let cleaned: String = pin.chars().filter(|c| *c != ':').collect();
@@ -660,7 +741,7 @@ mod tests {
     #[test]
     fn host_too_long_rejected() {
         let mut c = valid_config();
-        c.host = "a".repeat(MAX_HOST_LEN + 1);
+        c.host = "a".repeat(crate::settings::MAX_HOST_LEN + 1);
         assert!(validate(&c).is_err());
     }
 
@@ -742,11 +823,12 @@ mod tests {
     // ---- ProvisioningPending ---------------------------------------------
 
     #[test]
-    fn pending_set_then_take_returns_config_once() {
+    fn pending_set_then_peek_then_clear_leaves_it_empty() {
         let pending = ProvisioningPending::default();
         pending.set(valid_config());
-        assert_eq!(pending.take(), Some(valid_config()));
-        assert_eq!(pending.take(), None); // consumed
+        assert_eq!(pending.peek(), Some(valid_config()));
+        pending.clear();
+        assert_eq!(pending.peek(), None);
     }
 
     #[test]
@@ -754,7 +836,7 @@ mod tests {
         let pending = ProvisioningPending::default();
         pending.set(valid_config());
         pending.clear();
-        assert_eq!(pending.take(), None);
+        assert_eq!(pending.peek(), None);
     }
 
     #[test]
@@ -764,7 +846,21 @@ mod tests {
         let mut second = valid_config();
         second.ext = "2002".to_string();
         pending.set(second.clone());
-        assert_eq!(pending.take(), Some(second));
+        assert_eq!(pending.peek(), Some(second));
+    }
+
+    #[test]
+    fn pending_peek_does_not_consume() {
+        // R1/R3's whole point: peek() must be side-effect-free so
+        // provisioning_apply can look before it leaps, and boot()'s
+        // provisioning_pending_preview can check without racing a real
+        // apply/cancel.
+        let pending = ProvisioningPending::default();
+        pending.set(valid_config());
+        assert_eq!(pending.peek(), Some(valid_config()));
+        assert_eq!(pending.peek(), Some(valid_config())); // still there
+        pending.clear();
+        assert_eq!(pending.peek(), None);
     }
 
     // ---- is_provision_link -------------------------------------------
@@ -774,5 +870,204 @@ mod tests {
         assert!(is_provision_link(&url::Url::parse("centinelo://provision?url=x").unwrap()));
         assert!(!is_provision_link(&url::Url::parse("centinelo://501").unwrap()));
         assert!(!is_provision_link(&url::Url::parse("https://provision").unwrap()));
+    }
+
+    // ---- SSRF/DNS-rebinding hardening (2026-07-16 4R re-review, M1) -----
+
+    #[test]
+    fn loopback_v4_is_blocked() {
+        assert!(ipv4_should_be_blocked("127.0.0.1".parse().unwrap()));
+        assert!(ipv4_should_be_blocked("127.53.1.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn cloud_metadata_link_local_v4_is_blocked() {
+        // 169.254.169.254 - the textbook SSRF target (AWS/GCP/Azure
+        // instance-metadata endpoints all live here).
+        assert!(ipv4_should_be_blocked("169.254.169.254".parse().unwrap()));
+        assert!(ipv4_should_be_blocked("169.254.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn unspecified_and_multicast_v4_blocked() {
+        assert!(ipv4_should_be_blocked("0.0.0.0".parse().unwrap()));
+        assert!(ipv4_should_be_blocked("224.0.0.1".parse().unwrap()));
+        assert!(ipv4_should_be_blocked("255.255.255.255".parse().unwrap()));
+    }
+
+    #[test]
+    fn rfc1918_and_cgnat_v4_are_deliberately_allowed() {
+        // NOT blocked on purpose - see ipv4_should_be_blocked's doc: this
+        // product's real deployments (including this workspace's own test
+        // PBX, a Tailscale/CGNAT address) live in exactly these ranges.
+        assert!(!ipv4_should_be_blocked("192.168.1.50".parse().unwrap()));
+        assert!(!ipv4_should_be_blocked("10.0.0.5".parse().unwrap()));
+        assert!(!ipv4_should_be_blocked("172.16.0.5".parse().unwrap()));
+        assert!(!ipv4_should_be_blocked("100.100.1.1".parse().unwrap())); // CGNAT/Tailscale
+    }
+
+    #[test]
+    fn public_v4_is_allowed() {
+        assert!(!ipv4_should_be_blocked("93.184.216.34".parse().unwrap()));
+    }
+
+    #[test]
+    fn loopback_and_unspecified_v6_blocked() {
+        assert!(ipv6_should_be_blocked("::1".parse().unwrap()));
+        assert!(ipv6_should_be_blocked("::".parse().unwrap()));
+    }
+
+    #[test]
+    fn link_local_and_multicast_v6_blocked() {
+        assert!(ipv6_should_be_blocked("fe80::1".parse().unwrap()));
+        assert!(ipv6_should_be_blocked("ff02::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn ula_v6_deliberately_allowed() {
+        assert!(!ipv6_should_be_blocked("fc00::1".parse().unwrap()));
+        assert!(!ipv6_should_be_blocked("fd12:3456:789a::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn ipv4_mapped_v6_defers_to_the_v4_rules() {
+        // ::ffff:127.0.0.1 - a rebinding trick specifically aimed at
+        // resolvers that check the "obvious" v4/v6 cases but forget the
+        // mapped form.
+        assert!(ipv6_should_be_blocked("::ffff:127.0.0.1".parse().unwrap()));
+        assert!(!ipv6_should_be_blocked("::ffff:93.184.216.34".parse().unwrap()));
+    }
+
+    #[test]
+    fn public_v6_is_allowed() {
+        assert!(!ipv6_should_be_blocked("2606:2800:220:1:248:1893:25c8:1946".parse().unwrap()));
+    }
+
+    #[test]
+    fn ssrf_safe_resolve_rejects_when_every_address_is_blocked() {
+        // "localhost" resolves only to loopback addresses on every
+        // platform this app targets.
+        let err = ssrf_safe_resolve("localhost:443").unwrap_err();
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[test]
+    fn ssrf_safe_resolve_passes_through_a_public_looking_literal() {
+        // A bare IP literal:port resolves synchronously, no real DNS
+        // needed - keeps this test hermetic (no network access required
+        // to run `cargo test`).
+        let addrs = ssrf_safe_resolve("93.184.216.34:443").unwrap();
+        assert_eq!(addrs, vec!["93.184.216.34:443".parse().unwrap()]);
+    }
+
+    #[test]
+    fn ssrf_safe_resolve_rejects_a_loopback_literal() {
+        assert!(ssrf_safe_resolve("127.0.0.1:8080").is_err());
+    }
+
+    // ---- decode_embedded_config: pre-decode length cap (B1) --------------
+
+    #[test]
+    fn embedded_config_oversized_encoded_string_rejected_before_decoding() {
+        // Not valid base64 at all (repeated '!') - if this were rejected
+        // via the OLD "decode first, check length after" order it would
+        // fail with the "corrupted (bad base64)" message instead; getting
+        // "too large" here proves the length check runs first and never
+        // reaches .decode() at all (2026-07-16 4R re-review, B1).
+        let huge_garbage = "!".repeat(MAX_CONFIG_BYTES_ENCODED + 1);
+        let err = decode_embedded_config(&huge_garbage).unwrap_err();
+        assert!(err.contains("too large"), "unexpected message: {err}");
+    }
+
+    // ---- fetch_via_agent: real request/response round trip (B3) ---------
+    // A loopback tiny_http server (already a project dependency, see
+    // bridge.rs) standing in for a provisioning server - exercises the
+    // parts build_agent()'s https-only/SSRF-resolver wrapping deliberately
+    // stays outside of: status handling, the size cap against a REAL
+    // streamed response (not an in-memory Cursor), and JSON parsing.
+
+    fn test_agent() -> ureq::Agent {
+        ureq::AgentBuilder::new()
+            .timeout(std::time::Duration::from_secs(5))
+            .redirects(0)
+            .build()
+    }
+
+    #[test]
+    fn fetch_via_agent_happy_path() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr();
+        let handle = std::thread::spawn(move || {
+            let request = server.recv().unwrap();
+            let body = r#"{"host":"pbx.example.test","ext":"9999","secret":"x"}"#;
+            let response = tiny_http::Response::from_string(body);
+            request.respond(response).unwrap();
+        });
+        let url = format!("http://{addr}/config.json");
+        let config = fetch_via_agent(&test_agent(), &url).unwrap();
+        assert_eq!(config.host, "pbx.example.test");
+        assert_eq!(config.ext, "9999");
+        assert_eq!(config.secret, "x");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn fetch_via_agent_non_2xx_status_surfaces_as_error() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr();
+        let handle = std::thread::spawn(move || {
+            let request = server.recv().unwrap();
+            let response = tiny_http::Response::from_string("not found").with_status_code(404);
+            request.respond(response).unwrap();
+        });
+        let url = format!("http://{addr}/missing.json");
+        let err = fetch_via_agent(&test_agent(), &url).unwrap_err();
+        assert!(err.contains("404"), "unexpected message: {err}");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn fetch_via_agent_malformed_json_surfaces_as_error() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr();
+        let handle = std::thread::spawn(move || {
+            let request = server.recv().unwrap();
+            let response = tiny_http::Response::from_string("not json at all");
+            request.respond(response).unwrap();
+        });
+        let url = format!("http://{addr}/bad.json");
+        assert!(fetch_via_agent(&test_agent(), &url).is_err());
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn fetch_via_agent_oversized_body_rejected() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr();
+        let handle = std::thread::spawn(move || {
+            let request = server.recv().unwrap();
+            let huge = "x".repeat(MAX_CONFIG_BYTES + 1);
+            let response = tiny_http::Response::from_string(huge);
+            request.respond(response).unwrap();
+        });
+        let url = format!("http://{addr}/huge.json");
+        let err = fetch_via_agent(&test_agent(), &url).unwrap_err();
+        assert!(err.contains("too large"), "unexpected message: {err}");
+        handle.join().unwrap();
+    }
+
+    // ---- JSON with required fields genuinely ABSENT, not empty (B3) -----
+
+    #[test]
+    fn json_missing_required_fields_entirely_rejected_by_deserialization() {
+        // Different code path from empty_host_rejected/empty_ext_rejected/
+        // empty_secret_rejected above (those go through validate() on an
+        // already-constructed Rust struct with a `""` value) - this
+        // exercises real JSON deserialization failing because the key is
+        // ABSENT, not present-but-empty, since host/ext/secret have no
+        // #[serde(default)] (2026-07-16 4R re-review, B3).
+        assert!(serde_json::from_str::<ProvisioningConfig>(r#"{"ext":"9999","secret":"x"}"#).is_err());
+        assert!(serde_json::from_str::<ProvisioningConfig>(r#"{"host":"pbx.example.test","secret":"x"}"#).is_err());
+        assert!(serde_json::from_str::<ProvisioningConfig>(r#"{"host":"pbx.example.test","ext":"9999"}"#).is_err());
     }
 }

@@ -1342,6 +1342,23 @@ async function boot() {
   renderAll();
   await loadRecents();
   await attachTauriListeners();
+  // Catches a provisioning preview whose "provisioning://preview" event
+  // already fired (and was lost - Tauri doesn't queue/replay events for
+  // listeners that attach late) before the listener above existed - the
+  // real scenario for a cold-start centinelo://provision?config=... deep
+  // link, which resolves synchronously in the Rust side's .setup(), well
+  // before this script has even loaded (2026-07-16 4R re-review, R3).
+  // Checked AFTER attachTauriListeners(), not before: together they cover
+  // every timing - anything that fires before this line lands here via
+  // the peek, anything after is caught live by the listener, no gap
+  // remains either way. Non-consuming (provisioning.rs `peek()`), so this
+  // can't race a real apply/cancel that happens to land at the same time.
+  try {
+    const pendingPreview = await invoke("provisioning_pending_preview");
+    if (pendingPreview) showProvisioningConfirm(pendingPreview);
+  } catch (e) {
+    console.error("provisioning_pending_preview failed", e);
+  }
   await applyPremiumUI();
   await applyTranscriptionUI();
   // Re-hydrate any transcript(s) still waiting to save from a previous

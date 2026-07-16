@@ -65,7 +65,13 @@
       <div class="prov-row">
         <label class="prov">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.5 13.5a4 4 0 0 0 5.7 0l3-3a4 4 0 1 0-5.7-5.7l-1.2 1.2"/><path d="M13.5 10.5a4 4 0 0 0-5.7 0l-3 3a4 4 0 1 0 5.7 5.7l1.2-1.2"/></svg>
-          <input type="text" id="prov-input" placeholder="Paste your provisioning link" aria-label="Provisioning link">
+          <!-- maxlength headroom above provisioning.rs's MAX_CONFIG_BYTES_ENCODED
+               (~21849 chars for the embedded centinelo://provision?config=...
+               form, the longest legitimate input this field ever needs to
+               hold) - a client-side backstop only, the real cap is
+               server-side in decode_embedded_config (2026-07-16 4R
+               re-review, B1). -->
+          <input type="text" id="prov-input" maxlength="22000" placeholder="Paste your provisioning link" aria-label="Provisioning link">
         </label>
         <button class="primary" id="prov-connect">Connect</button>
       </div>
