@@ -47,6 +47,7 @@ enum cent_cmd_type {
 	CENT_CMD_SET_DEVICE,
 	CENT_CMD_TAP_START,    /**< v1.2 - see PROTOCOL.md "tap_start" */
 	CENT_CMD_TAP_STOP,     /**< v1.2 - see PROTOCOL.md "tap_stop" */
+	CENT_CMD_PARK,         /**< v1.3 - see PROTOCOL.md "park" */
 };
 
 enum {
@@ -88,9 +89,21 @@ struct cent_cmd {
 				     *   that carries it - this says whether
 				     *   the caller supplied one or the
 				     *   engine should fall back to "the
-				     *   current call". */
+				     *   current call". v1.3: now also decoded
+				     *   for "answer" (see PROTOCOL.md
+				     *   "answer") - retrocompatible, an
+				     *   answer with no call_id keeps
+				     *   targeting "the current incoming
+				     *   call", same as v1/v1.1/v1.2. */
 	char digits[CENT_DTMF_SIZE];
-	char ext[CENT_EXT_SIZE];
+	char ext[CENT_EXT_SIZE];   /**< blf_subscribe/blf_unsubscribe's
+				     *   watched extension, and (v1.3) park's
+				     *   target parking-lot pilot extension -
+				     *   same "bare extension on the account's
+				     *   own PBX host" shape in both cases, so
+				     *   this field is shared rather than
+				     *   growing a second one - see
+				     *   PROTOCOL.md "park". */
 	bool mute_on;
 
 	/** v1.1 request/response correlation (see PROTOCOL.md) - unlike

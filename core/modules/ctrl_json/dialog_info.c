@@ -24,6 +24,8 @@ const char *cent_blf_state_name(enum cent_blf_state state)
 	case CENT_BLF_IDLE:    return "idle";
 	case CENT_BLF_RINGING: return "ringing";
 	case CENT_BLF_BUSY:    return "busy";
+	case CENT_BLF_HELD:    return "held";
+	case CENT_BLF_DND:     return "dnd";
 	case CENT_BLF_OFFLINE: return "offline";
 	default:               return "offline";
 	}
@@ -54,6 +56,19 @@ enum cent_blf_state dialog_info_parse(const char *body, size_t len)
 		return cent_blf_state_for_close();
 
 	/*
+	 * v1.3 presence_override - DND (see dialog_info.h's header comment
+	 * for the full rationale/verification status - non-standard,
+	 * best-effort, no real Asterisk capture has ever produced either
+	 * pattern against this engine's test PBX). Checked before the "no
+	 * <dialog> element -> idle" fallback right below, since an
+	 * idle-but-DND'd extension has zero <dialog> elements either way -
+	 * without this check first, it would silently fall into idle.
+	 */
+	if (!re_regex(body, len, "<dnd>true</dnd>", NULL) ||
+	    !re_regex(body, len, "dnd=\"true\"", NULL))
+		return CENT_BLF_DND;
+
+	/*
 	 * Does a "<dialog" *element* (as opposed to the "<dialog-info
 	 * ...>" root element just confirmed above) appear at all? The
 	 * required single delimiter character after "dialog" - one of
@@ -79,8 +94,44 @@ enum cent_blf_state dialog_info_parse(const char *body, size_t len)
 		return cent_blf_state_for_close();
 	}
 
-	if (!pl_strcasecmp(&state, "confirmed"))
+	if (!pl_strcasecmp(&state, "confirmed")) {
+		/*
+		 * v1.3 presence_override - HELD: the RFC 4235/RFC 3840
+		 * standard hold indication, a <target> "+sip.rendering"
+		 * param with pvalue="no" (see dialog_info.h's header
+		 * comment). Deliberately not scoped to the single
+		 * <dialog>...</dialog> block just matched above - this was
+		 * never a real XML parser (see this file's top-of-file
+		 * comment) and every real capture so far carries exactly one
+		 * <dialog> per NOTIFY anyway (see core/E2E-F1.md), so a
+		 * whole-body search is equivalent in practice and keeps this
+		 * consistent with how the <state> extraction above already
+		 * works (first match anywhere in the body).
+		 *
+		 * Two independent substring checks, not one combined
+		 * pattern: re_regex (see this file's top-of-file comment on
+		 * it being a small hand-rolled matcher, not a real regex
+		 * engine) has no backtracking, so a single pattern like
+		 * "+sip.rendering\"[^>]*pvalue=\"no\"" fails in practice -
+		 * "[^>]*" greedily consumes right through "pvalue=\"no\""
+		 * itself (nothing stops it before the *next* real '>', which
+		 * is well past it), leaving nothing left for the literal
+		 * "pvalue=\"no\"" that follows in the pattern to match
+		 * against - caught by this file's own unit tests (see
+		 * test/test_main.c test_dialog_info_held()) before this ever
+		 * reached e2e. "+sip.rendering" and "pvalue=\"no\"" both
+		 * appearing anywhere in the body is a strong enough signal on
+		 * its own for the simple, single-dialog bodies this parser
+		 * actually sees (see core/E2E-F1.md) - no real dialog-info
+		 * body has any other reason to contain literal
+		 * "pvalue=\"no\"" text.
+		 */
+		if (!re_regex(body, len, "+sip.rendering", NULL) &&
+		    !re_regex(body, len, "pvalue=\"no\"", NULL))
+			return CENT_BLF_HELD;
+
 		return CENT_BLF_BUSY;
+	}
 
 	if (!pl_strcasecmp(&state, "early") ||
 	    !pl_strcasecmp(&state, "proceeding") ||

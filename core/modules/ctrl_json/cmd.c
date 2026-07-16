@@ -97,6 +97,12 @@ enum cent_cmd_type cent_cmd_decode(struct cent_cmd *out,
 		out->type = CENT_CMD_DIAL;
 	}
 	else if (!str_casecmp(cmd, "answer")) {
+		/* v1.3: optional call_id (see PROTOCOL.md "answer") - a
+		 * queue-aware caller with more than one incoming call can
+		 * now say exactly which one to answer; omitting it keeps
+		 * the v1/v1.1/v1.2 behavior of answering "the" incoming
+		 * call. */
+		optional_call_id(od, out);
 		out->type = CENT_CMD_ANSWER;
 	}
 	else if (!str_casecmp(cmd, "hangup")) {
@@ -207,6 +213,20 @@ enum cent_cmd_type cent_cmd_decode(struct cent_cmd *out,
 	else if (!str_casecmp(cmd, "tap_stop")) {
 		optional_call_id(od, out);
 		out->type = CENT_CMD_TAP_STOP;
+	}
+	else if (!str_casecmp(cmd, "park")) {
+		/* v1.3 - see PROTOCOL.md "park". `ext` (required, same
+		 * shape/field as blf_subscribe's) is the parking lot's pilot
+		 * extension - required, not defaulted, since a parking
+		 * lot's pilot extension is per-PBX configuration this
+		 * engine has no business guessing (see PROTOCOL.md "park"
+		 * for why - this engine's own test PBX uses "70", but that's
+		 * this deployment's config, not a protocol constant). */
+		if (!require_str(od, "ext", out->ext, sizeof(out->ext),
+				  "park", errmsg))
+			return CENT_CMD_NONE;
+		optional_call_id(od, out);
+		out->type = CENT_CMD_PARK;
 	}
 	else {
 		out->type = CENT_CMD_UNKNOWN;

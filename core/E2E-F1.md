@@ -595,6 +595,195 @@ every stdout line captured by the harness, `grep -cv '^{'`-equivalent:
 
 v1.2 does not regress v1.1's pure-NDJSON guarantee.
 
+## F5 presence_override / park (v1.3, F4-cierre protocol gaps)
+
+Methodology: same as F3/F4 — a small Python harness (not checked in,
+scratch tooling), NDJSON over two `run-spike.sh` child processes (both
+registered as ext 1100, dual-contact trick, `max_contacts: 2`), a
+`wait_for(predicate, timeout)` primitive, PBX-side snapshots via
+read-only `asterisk -rx "... show ..."` before/after each action. No PBX
+configuration was changed at any point.
+
+### answer with explicit call_id
+
+**PASS.** Engine A dials `sip:1100@100.119.230.80` (own extension, dual
+contact); engine B (the other registered contact) receives
+`call_state incoming` and captures its own `call_id`. B sends
+`{"cmd":"answer","call_id":"<that id>","id":"ans1"}` → `result` `ok:true`
+→ `call_state` `established`, same `call_id`. Confirms the explicit-id
+path resolves and answers the *correct* call, not just "the" incoming
+call (verified by asserting on the exact `call_id` match, not just that
+*some* call became established).
+
+### held (presence_override)
+
+**Parser correct to spec; real PBX does not emit the signal.** Engine A
+`blf_subscribe`s ext `1100` (its own watched extension, dual-contact —
+watching-yourself is odd but exercises the exact same NOTIFY-parsing
+path a receptionist console watching *any* other extension would).
+Engine A then dials `1100`; B answers (genuine 2-party bridge, same
+dual-contact-bridge shape as scenario (b)). Media confirmed flowing
+(`audio=63957/63957 (bit/s)` on B's own stderr bitrate ticker) before
+attempting anything hold-related — same ICE/dialog settle discipline as
+scenario (a). B sends `{"cmd":"hold","call_id":...}` → `call_state`
+`hold` on B's own side, as expected (unchanged v1 behavior). Watched via
+A's `-s` SIP trace across the *entire* hold window: **three separate
+dialog-info NOTIFYs arrived during hold** (the body's own
+`version="1"`/`"2"`/`"3"` attribute proves they're distinct NOTIFYs, not
+one stale capture), and all three are byte-for-byte:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<dialog-info xmlns="urn:ietf:params:xml:ns:dialog-info" version="2" state="full" entity="sip:1100@100.119.230.80">
+ <dialog id="1100">
+  <state>confirmed</state>
+ </dialog>
+</dialog-info>
+```
+
+No `<local>`/`<remote>`/`<target>` element, no `+sip.rendering` param —
+identical in shape to the plain pre-hold "busy" NOTIFY. `A`'s own `blf`
+event stream confirms the observable consequence: `busy` before hold,
+`busy` again after hold (never `held`), for the entire window, across
+two independent full runs (same result both times — not a one-off
+flake). Root-caused, not just observed: this is FreePBX 17.0.30/
+Asterisk 22.8.2's own chan_pjsip hint dialog-info implementation choice
+— it doesn't add the RFC 4235/RFC 3840 hold-indication target param for
+a locally-held call. `dialog_info.c`'s `CENT_BLF_HELD` parsing rule
+itself was verified independently, before this real-PBX finding, against
+synthetic fixtures built strictly to the RFC-documented shape (see
+`test_dialog_info_held()`) — this is a real PBX-side gap, not a parser
+bug, and the real captured "still busy" body above is now a permanent
+regression-guard fixture
+(`test_dialog_info_real_capture_1100_confirmed_no_hold_signal()`)
+proving the parser correctly reads what this PBX actually sends rather
+than what RFC 4235 merely *permits* a compliant implementation to send.
+
+### dnd (presence_override)
+
+**Not attempted against the live PBX.** Testing it would require
+toggling DND on the test extension via a feature code (e.g. FreePBX's
+conventional `*78`/`*79`) that is outside this task's pre-authorized
+safe-target list (`*43`, `*60`, dual-contact 1100, BLF to 510) — not
+dialed. Independently, this version's `held` finding above (this PBX's
+own chan_pjsip dialog-info doesn't add non-standard signaling beyond the
+base RFC 4235 `<state>` value) makes it plausible DND wouldn't be
+observable via `Event: dialog` on this PBX either, even if tested — an
+idle-but-DND'd extension has zero active dialogs regardless, the same
+shape as plain idle, without something extra in the XML this repo has
+never observed Asterisk send. `dialog_info.c`'s `CENT_BLF_DND` hook is
+implemented and unit-tested against synthetic fixtures only.
+
+### park
+
+**Command/protocol layer confirmed; end-to-end parking not yet
+confirmed — a real, reproducible finding, not a PBX-config gap.**
+
+First, read-only PBX verification of the actual parking-lot pilot
+extension/feature code (task asked to confirm this rather than assume
+`*70`/`71` from memory):
+
+```
+$ asterisk -rx "features show"            # Park Call: no *code configured
+$ asterisk -rx "dialplan show 70@from-internal"
+[ Included context 'parkedcalls' created by 'res_parking/default' ]
+  '70' =>           1. Park()                                     [res_parking]
+$ asterisk -rx "parking show default"
+Parking Lot: default
+  Parking Extension   :  70
+  Parking Context     :  parkedcalls
+  Parking Spaces      :  71-78
+```
+
+Confirms: this PBX's parking pilot is the **bare extension `70`** (not a
+`*`-prefixed feature code — `features show`'s built-in "Park Call" row
+has no code assigned; parking here is reached by dialing the lot's own
+pilot extension, which is unrelated to that DTMF-during-call feature),
+reachable from ext 1100's own dialplan context (`from-internal` →
+`from-internal-xfer`/`-noxfer` → includes `parkedcalls`), auto-assigning
+a free slot from `71`-`78`.
+
+Bridge setup identical to the `held` scenario above (dual-contact,
+confirmed media flowing, ~18s settle before acting — ruled out as an
+ICE-timing artifact by re-running with both a 5s and an 18s settle
+window, same result both times). B sends
+`{"cmd":"park","ext":"70","call_id":...,"id":"park1"}` →
+`{"event":"park","call_id":...,"ext":"70"}` then
+`{"event":"result","id":"park1","ok":true}` — the command layer works
+exactly as designed: decode, call resolution, URI construction (reusing
+`build_pbx_ext_uri()`, the same helper `blf_subscribe` uses,
+independently proven correct by that command's own passing e2e in the
+`held` scenario above), and the synchronous confirmation events, all
+correct.
+
+But B's own stderr (SIP trace) shows the REFER itself never actually
+reaches the wire:
+
+```
+transferring call to sip:70@100.119.230.80
+call: subscription closed: Destination address required [39]
+```
+
+No `REFER sip:...` request line appears anywhere in the full SIP trace
+capture (confirmed by grepping the entire trace) — `errno` 39 on macOS
+is `EDESTADDRREQ`, a **local** socket/transport-layer error, not a SIP
+response code; the PBX never sent anything back (no 4xx/5xx), and
+read-only PBX verification immediately after confirmed the original
+call was left completely undisturbed — still a normal 2-party bridge,
+not parked, not dropped:
+
+```
+$ asterisk -rx "parking show default"
+Parked Calls
+------------
+  (none)
+$ asterisk -rx "core show channels"
+PJSIP/1100-00000010   (None)                       Up  AppDial((Outgoing Line))
+PJSIP/1100-0000000f   1100@dialOne-with-exten:2     Up  Dial(PJSIP/1100/sip:1100@100.9...
+2 active channels, 1 active call
+```
+
+Reproduced twice (independent runs, both with the longer 18s settle
+window) — same error, same "call left untouched" outcome both times, not
+a flake. Root-causing attempted: `call_transfer()` (`src/call.c`) calls
+`sipevent_drefer()`, which reuses the *existing call dialog*
+(`sipsess_dialog(call->sess)`) for the REFER's own destination
+resolution — confirmed by reading `sipevent_drefer()`/`sipsub_alloc()`
+in `core/deps/re/src/sipevent/subscribe.c` — so the Refer-To URI's own
+content (`sip:70@100.119.230.80`, built via the same `build_pbx_ext_uri()`
+helper `blf_subscribe` already proved correct) should never itself be
+consulted for *where* the REFER request is sent; it's carried in the
+`Refer-To:` header value only. `sipsub_close_handler()` in `src/call.c`
+is what logs the "subscription closed" line, when the closing error
+(`err`) is non-zero — meaning some part of `re`'s own sipevent-subscribe
+machinery hit `EDESTADDRREQ` internally, before or instead of ever
+transmitting the REFER, specifically when this engine's own code path
+targets Asterisk's `Park()` app (the *identical* mechanism worked
+correctly for a `Background()`/echo-app target in scenario (b)). Not
+resolved within this task's scope — flagged as a real, open gap (see
+`PROTOCOL.md` "Planned"), not glossed over.
+
+### pathsafe regression (security fix verification)
+
+**PASS** — confirms the v1.3 `call_id`-sanitization security fix (see
+`PROTOCOL.md` "Changes from v1.2") didn't break a normal (non-malicious)
+`tap_start`. Same dual-contact bridge; B's own real call_id (a UUID,
+e.g. `9ed494c9-8217-4ea6-953d-c4ec0224d010` — only characters already in
+`pathsafe_component()`'s whitelist) is used for
+`{"cmd":"tap_start","dir":"/tmp/cent-e2e-tapdir",...}` →
+`{"event":"tap_state","state":"started","rx_path":"/tmp/cent-e2e-tapdir/9ed494c9-8217-4ea6-953d-c4ec0224d010-rx.wav",...}`
+— filename byte-for-byte unchanged from the pre-fix behavior (a real
+UUID's hyphens are in the whitelist), files created on disk exactly
+where expected (`ls` confirmed both `-rx.wav`/`-tx.wav` present, correct
+names, inside the target directory). Malicious-input coverage (`../`,
+bare `..`, shell metacharacters, truncation, NULL/edge cases) is unit
+tested (`test_pathsafe_component()`, 16 checks, ASan-clean) rather than
+fired at the real PBX — this repo has no way to make a real SIP peer
+send a crafted `Call-ID` header without a second, modified engine build
+specifically for that purpose, which was judged out of scope for this
+task; the unit tests exercise the exact same `pathsafe_component()`
+function `audiotap.c` calls, not a re-implementation.
+
 ## Summary of findings (for future F-phases)
 
 1. ICE needs real settle time here (~15-20s) before relying on live RTP
@@ -664,3 +853,56 @@ v1.2 does not regress v1.1's pure-NDJSON guarantee.
     tone" (rather than just "real audio arrived") would need a different
     target or a longer capture window past the announcement, not `*43`
     used the way this document uses it.
+11. **(F5)** `re_regex()` (`core/deps/re/src/fmt/regex.c`) has **no
+    backtracking** — a greedy `[^X]*` run, once it starts consuming,
+    never gives back characters to let a later literal in the same
+    pattern match. A combined pattern like
+    `"+sip.rendering\"[^>]*pvalue=\"no\""` looks reasonable by
+    inspection (matches this file's own existing `"<state[^>]*>..."`
+    style) but silently fails whenever the skipped text itself contains
+    the literal string the pattern is looking for further along (`[^>]*`
+    greedily eats straight through `pvalue="no"` itself, since nothing
+    in that substring is `>`) — caught immediately by this session's own
+    unit tests (`test_dialog_info_held()`), before it ever reached e2e.
+    Fixed by splitting into two independent whole-body substring checks
+    instead of one combined pattern — correct here because both
+    substrings appearing anywhere in a real dialog-info body is already
+    a strong enough signal for the simple, single-dialog bodies this
+    parser actually sees (see `dialog_info.c`'s own comment on the fix).
+    Worth remembering for any *future* `re_regex()` pattern in this
+    codebase that tries to "skip past unrelated content, then match a
+    literal" — write it as two checks, or make the skipped char-class
+    exclude enough to force an early stop, not a single greedy pattern.
+12. **(F5)** Asterisk's real chan_pjsip dialog-info hint NOTIFY, at
+    least on this PBX (FreePBX 17.0.30 / Asterisk 22.8.2), carries
+    *less* state than RFC 4235/3840 allow a compliant implementation to
+    send — no hold-indication target param, and (by inference, not
+    directly tested — see "dnd" above) plausibly no DND indication
+    either. A protocol/parser designed purely from the RFC text, without
+    a real capture, would have shipped a `held`/`dnd` feature that
+    silently never fires against this engine's actual real-world target
+    — exactly why this task's real-PBX e2e pass (not just unit tests
+    against synthetic RFC-shaped fixtures) was worth doing before
+    calling either "done".
+13. **(F5)** A REFER that dispatches successfully at every layer this
+    engine's own code touches (`call_transfer()` returns `0`, `result
+    ok:true`, a confirmation event fires) is **not** sufficient evidence
+    the REFER request actually reached the wire — always independently
+    confirm via SIP trace (`grep` for the actual `REFER sip:...` request
+    line) and/or PBX-side state (here: `parking show`/`core show
+    channels` showing the call was never actually parked) before
+    treating a command as e2e-`PASS`, matching this repo's own "evidence
+    real o no pasó" rule. The `park` finding above would have been
+    reported as a false positive without this cross-check.
+14. **(F5)** Blind-transferring into Asterisk's `Park()` application
+    behaves differently, at the `re`/baresip transport layer, than
+    blind-transferring into a `Background()`/echo-app target (scenario
+    (b), which works cleanly) — both use the exact same `call_transfer()`
+    call site and the exact same dialog-reusing `sipevent_drefer()`
+    mechanism underneath, so whatever's different is specific to how
+    `Park()`'s own SIP-level response/re-INVITE behavior interacts with
+    `re`'s REFER-progress-subscription bookkeeping, not this engine's own
+    command-dispatch code (which is identical for both targets). A
+    genuinely open interop question, not yet root-caused past this
+    point — see `PROTOCOL.md` "Planned" `park` entry for the suggested
+    next debugging step.

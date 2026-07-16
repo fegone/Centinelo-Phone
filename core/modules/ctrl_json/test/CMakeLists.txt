@@ -1,13 +1,13 @@
 # core/modules/ctrl_json/test/CMakeLists.txt
 #
 # Standalone CMake project for ctrl_json's unit tests (cmd.c +
-# dialog_info.c + wav_writer.c - see ../cmd.h / ../dialog_info.h /
-# ../wav_writer.h for why these three files are pure/parseable-or-stdio-only
-# and testable without a running baresip engine. audiotap.c, v1.2's other
-# new file, is NOT here - it's baresip-dependent throughout (aufilt
-# registration, struct call/audio) - see core/E2E-F1.md "F4 audio tap" for
-# its coverage instead, same split as ctrl_json.c's own call-control
-# commands).
+# dialog_info.c + wav_writer.c + pathsafe.c [v1.3] - see ../cmd.h /
+# ../dialog_info.h / ../wav_writer.h / ../pathsafe.h for why these four
+# files are pure/parseable-or-stdio-only and testable without a running
+# baresip engine. audiotap.c, v1.2's other new file, is NOT here - it's
+# baresip-dependent throughout (aufilt registration, struct call/audio) -
+# see core/E2E-F1.md "F4 audio tap" for its coverage instead, same split
+# as ctrl_json.c's own call-control commands).
 #
 # Deliberately NOT folded into the ctrl_json module's own CMakeLists.txt
 # (the one baresip's build processes via APP_MODULES/add_subdirectory,
@@ -56,7 +56,8 @@ add_executable(ctrl_json_test
 	test_main.c
 	../cmd.c
 	../dialog_info.c
-	../wav_writer.c)
+	../wav_writer.c
+	../pathsafe.c)
 
 target_include_directories(ctrl_json_test PRIVATE "${RE_ROOT}/include")
 

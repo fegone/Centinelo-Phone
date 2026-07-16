@@ -56,6 +56,11 @@
 #include "audiotap.h"
 #include "cmd.h"          /* CENT_ID_SIZE - reuse the same call_id sizing
 			    * the rest of this protocol already uses */
+#include "pathsafe.h"     /* v1.3 security fix - see that file's own
+			    * top comment: call_id(call) is caller-
+			    * controlled (SIP Call-ID header) for an
+			    * incoming call, not engine-generated - must
+			    * never reach path_build() unsanitized. */
 #include "wav_writer.h"
 
 
@@ -506,7 +511,24 @@ int audiotap_start(struct call *call, const char *dir,
 
 	r->au = au;
 	cid = call_id(call);
-	str_ncpy(r->call_id, cid ? cid : "", sizeof(r->call_id));
+
+	/*
+	 * v1.3 security fix (see pathsafe.h's top comment for the full
+	 * story): call_id(call) is the SIP Call-ID header verbatim for an
+	 * incoming call - caller-controlled, not engine-generated - and
+	 * RFC 3261's own `word` grammar legally allows '/' in it. Route it
+	 * through pathsafe_component() before it ever reaches path_build()
+	 * below, which otherwise interpolates it directly into a
+	 * filesystem path - an unsanitized Call-ID containing "../" is a
+	 * real path-traversal vector into an attacker-chosen location
+	 * outside the caller-supplied `dir`, not merely a theoretical one.
+	 * r->call_id (used below for path_build() and echoed back
+	 * nowhere else - the `call_id` field on tap_state/other JSON
+	 * events always comes from call_id(call) directly, see
+	 * ctrl_json.c - a JSON string handles arbitrary bytes safely,
+	 * unlike a filesystem path) is now always the *sanitized* form.
+	 */
+	pathsafe_component(cid, r->call_id, sizeof(r->call_id));
 
 	path_build(r->rx_path, sizeof(r->rx_path), dir, r->call_id, "rx");
 	path_build(r->tx_path, sizeof(r->tx_path), dir, r->call_id, "tx");

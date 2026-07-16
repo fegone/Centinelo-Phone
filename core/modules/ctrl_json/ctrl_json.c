@@ -516,6 +516,36 @@ static void emit_attended_transfer_started(struct call *source,
 }
 
 
+/*
+ * v1.3 (see PROTOCOL.md "park"): confirms a park request's own
+ * *synchronous* dispatch (the REFER was accepted and sent) - same
+ * "ok:true is not a promise about the async outcome" caveat as
+ * blind_transfer's own call_state "closed"/error story (see
+ * cmd_blind_transfer()'s comment): the far end's own eventual REFER
+ * NOTIFY outcome, and which specific parking-lot slot Asterisk's
+ * Park() app actually auto-assigns, are not observable over plain SIP
+ * signaling this engine's call leg is party to - see PROTOCOL.md
+ * "park" for the full explanation of why `ext` here is the pilot
+ * extension the park request targeted, not a specific auto-assigned
+ * slot number.
+ */
+static void emit_park(struct call *call, const char *ext)
+{
+	struct odict *od = NULL;
+	const char *id = call ? call_id(call) : "";
+
+	if (odict_alloc(&od, 8))
+		return;
+
+	(void)odict_entry_add(od, "event", ODICT_STRING, "park");
+	(void)odict_entry_add(od, "call_id", ODICT_STRING, id);
+	(void)odict_entry_add(od, "ext", ODICT_STRING, ext);
+
+	emit(od);
+	mem_deref(od);
+}
+
+
 /* ------------------------------------------------------------------- */
 /* Devices (v1.1 - see PROTOCOL.md "devices"/"set_device")             */
 
@@ -674,6 +704,39 @@ static struct call *resolve_call(bool have_call_id, const char *call_id)
 		return uag_call_find(call_id);
 
 	return ua_call(primary_ua());
+}
+
+
+/*
+ * v1.3: builds "sip:<ext>@<host>" against the same PBX host/port `ua`'s
+ * account registered against - shared by blf_subscribe() (watches ext's
+ * dialog state) and cmd_park() (blind-transfers to the parking lot's
+ * pilot ext) since both need exactly the same "bare extension on this
+ * account's own PBX" address shape (see PROTOCOL.md "blf_subscribe" and
+ * "park") - factored out here rather than duplicated a second time.
+ *
+ * @return 0 on success (`uri` filled in), an error code otherwise. Never
+ *         emits its own error event - callers add their own
+ *         command-specific message (see call sites).
+ */
+static int build_pbx_ext_uri(struct ua *ua, const char *ext,
+			      char *uri, size_t uri_size)
+{
+	struct account *acc;
+	struct uri *aor;
+
+	if (!ua)
+		return ENOENT;
+
+	acc = ua_account(ua);
+	aor = account_luri(acc);
+	if (!aor)
+		return ENOENT;
+
+	if (re_snprintf(uri, uri_size, "sip:%s@%r", ext, &aor->host) < 0)
+		return EOVERFLOW;
+
+	return 0;
 }
 
 
@@ -841,7 +904,6 @@ static void blf_subscribe(const char *ext)
 {
 	struct ua *ua = primary_ua();
 	struct account *acc;
-	struct uri *aor;
 	struct blf_sub *b;
 	const char *routev[1];
 	char uri[256];
@@ -859,18 +921,18 @@ static void blf_subscribe(const char *ext)
 	}
 
 	acc = ua_account(ua);
-	aor = account_luri(acc);
-	if (!aor) {
-		emit_error("blf_subscribe: could not resolve PBX host from"
-			   " the account");
-		return;
-	}
 
 	/* Target: same PBX host/port this account registered against,
 	 * different user part - matches how run-spike.sh builds the
 	 * account URI itself (CENT_EXT@CENT_HOST). */
-	if (re_snprintf(uri, sizeof(uri), "sip:%s@%r", ext, &aor->host) < 0) {
+	err = build_pbx_ext_uri(ua, ext, uri, sizeof(uri));
+	if (err == EOVERFLOW) {
 		emit_error("blf_subscribe: uri too long");
+		return;
+	}
+	else if (err) {
+		emit_error("blf_subscribe: could not resolve PBX host from"
+			   " the account");
 		return;
 	}
 
@@ -1219,6 +1281,62 @@ static void cmd_blind_transfer(const struct cent_cmd *cmd)
 
 
 /*
+ * v1.3 "park" (see PROTOCOL.md "park"): parks a call by blind-transferring
+ * it (REFER, same call_transfer() mechanism as cmd_blind_transfer() right
+ * above - park IS a blind transfer, just to a specific kind of PBX
+ * resource) to `cmd->ext` - the target parking lot's *pilot* extension
+ * (e.g. this engine's own test PBX's "70", confirmed read-only via
+ * `asterisk -rx "parking show"`/`"dialplan show 70@from-internal"` to run
+ * `Park()` - see core/E2E-F1.md "F5 park" for the exact commands/output).
+ * `ext` is required (see cmd.c) rather than defaulted to any particular
+ * value - a parking lot's pilot extension is per-PBX configuration, not
+ * a protocol constant this engine should guess at (this repo is public;
+ * baking in this deployment's own "70" would also embed one test PBX's
+ * config into shipped code for no protocol reason - see PROTOCOL.md
+ * "park" for the full explanation, including why the resulting
+ * confirmation event's `ext` field is the *pilot* extension the park
+ * request targeted, not a specific auto-assigned parking slot number -
+ * that's genuinely not observable over plain SIP signaling this engine's
+ * call leg is party to, confirmed by reading how Asterisk's REFER
+ * handling and Park() app interact here, not guessed).
+ */
+static void cmd_park(const struct cent_cmd *cmd)
+{
+	struct call *call = resolve_call(cmd->have_call_id, cmd->call_id);
+	char uri[256];
+	int err;
+
+	if (!call) {
+		emit_error("park: call not found");
+		return;
+	}
+
+	err = build_pbx_ext_uri(primary_ua(), cmd->ext, uri, sizeof(uri));
+	if (err == EOVERFLOW) {
+		emit_error("park: uri too long");
+		return;
+	}
+	else if (err) {
+		emit_error("park: could not resolve PBX host from the"
+			   " account");
+		return;
+	}
+
+	err = call_transfer(call, uri);
+	if (err) {
+		emit_errorf("park failed (%m)", err);
+		return;
+	}
+
+	/* Confirms the REFER was dispatched, not the eventual parked
+	 * outcome - see emit_park()'s own comment. Async failure, same as
+	 * blind_transfer, surfaces as BEVENT_CALL_TRANSFER_FAILED -> a
+	 * plain error event, see event_handler(). */
+	emit_park(call, cmd->ext);
+}
+
+
+/*
  * v1.1 "set_device" (see PROTOCOL.md "devices"/"set_device"). Splits
  * cmd->device_name back into module/device the same way
  * devices_add_driver() built it (see that function's header comment) -
@@ -1446,11 +1564,31 @@ static void process_line(const char *line, size_t len)
 	case CENT_CMD_QUIT: {
 		struct mbuf *resp = mbuf_alloc(256);
 		struct re_printf pf = {print_handler, resp};
-		const char *buf = (type == CENT_CMD_ANSWER) ? "accept" : "quit";
+		char buf[16 + CENT_ID_SIZE];
 		int err;
 
 		if (!resp)
 			break;
+
+		/*
+		 * v1.3: an explicit call_id (see PROTOCOL.md "answer") rides
+		 * as baresip's own "accept <call-id>" long-command parameter
+		 * - modules/menu/static_menu.c's cmd_answer() already
+		 * resolves that exact shape via uag_call_find() (confirmed
+		 * by reading it, not assumed - see core/BUILD.md's own
+		 * "read the source, don't guess" precedent), so this needed
+		 * no new resolve-call path here, just building the right
+		 * string. No call_id keeps the plain "accept"/"quit" this
+		 * case has always sent - byte-for-byte unchanged for a
+		 * caller that never sends call_id, and CENT_CMD_QUIT never
+		 * decodes one (see cmd.c) so it's unaffected either way.
+		 */
+		if (type == CENT_CMD_ANSWER && cmd.have_call_id)
+			(void)re_snprintf(buf, sizeof(buf), "accept %s",
+					   cmd.call_id);
+		else
+			str_ncpy(buf, (type == CENT_CMD_ANSWER) ? "accept" :
+				 "quit", sizeof(buf));
 
 		err = cmd_process_long(baresip_commands(), buf, str_len(buf),
 					&pf, NULL);
@@ -1530,6 +1668,10 @@ static void process_line(const char *line, size_t len)
 
 	case CENT_CMD_TAP_STOP:
 		cmd_tap_stop(&cmd);
+		break;
+
+	case CENT_CMD_PARK:
+		cmd_park(&cmd);
 		break;
 
 	default:
