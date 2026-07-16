@@ -22,6 +22,13 @@
     </div>
     <span class="state" id="titlebar-state">Starting…</span>
     <div class="winbtns">
+      <!-- Premium receptionist console - hidden until premium_capability_status
+           says the license gate cleared (see ui/js/app.js boot(), console.rs
+           is_unlocked). Absent by default, not merely disabled: matches the
+           tray menu's own "entry absent" gating (tray.rs). -->
+      <button class="wbtn" id="btn-console" aria-label="Console" title="Open the receptionist console" hidden>
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="4" y="4" width="7" height="7" rx="1.6"/><rect x="13" y="4" width="7" height="7" rx="1.6"/><rect x="4" y="13" width="7" height="7" rx="1.6"/><rect x="13" y="13" width="7" height="7" rx="1.6"/></svg>
+      </button>
       <button class="wbtn" id="btn-settings" aria-label="Settings">
         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M4 7h10M18 7h2M4 12h4M12 12h8M4 17h13"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="19" cy="17" r="2"/></svg>
       </button>

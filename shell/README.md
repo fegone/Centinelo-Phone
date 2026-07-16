@@ -9,14 +9,19 @@ framework.
 ```
 shell/
   src-tauri/     Rust backend (Tauri app)
+    centinelo-premium-abi/  vendored verbatim from the private premium repo
+                             (see "Premium module loader" below) - the C ABI
+                             contract only, no secrets, no feature logic
     src/
       lib.rs       app wiring: state, commands, tray, lifecycle, plugins
       sidecar.rs   sidecar process supervisor (spawn/pipe/restart/backoff)
       settings.rs  settings.json persistence + argon2 admin-password hashing
       commands.rs  #[tauri::command]s exposed to the frontend
-      tray.rs      system tray (Show/Quit, close-to-tray)
+      tray.rs      system tray (Show/Quit, close-to-tray, gated Console…)
       bridge.rs    click-to-call localhost HTTP bridge (F3)
       deeplink.rs  centinelo:// / tel: deep-link handling (F3)
+      premium.rs   premium module loader (F4, see "Premium module loader")
+      console.rs   premium console window (F4, see "Premium console window")
       e2e.rs       debug-only scripted e2e driver (see "e2e verification")
   ui/            static frontend, served directly as `frontendDist`
     index.html     single-page app: main window + settings + call overlay
@@ -106,6 +111,123 @@ core_binary_path }` (see `settings.rs`).
   simplicity, so the (ungated-on-the-backend) theme buttons happen to sit
   behind it too until unlock. A real front-desk user unlocks once per
   launch anyway, so this was an acceptable simplification given F2's scope.
+
+## Premium module loader (F4)
+
+`premium.rs` looks for `centinelo_premium` directly beside this executable
+at startup (`centinelo_premium_abi::expected_library_path`), verifies its
+Ed25519 side-car `.sig` **before** ever calling `libloading::Library::new`
+(so a tampered file's code never executes, not even briefly), and loads it
+if the signature checks out. Missing, corrupt, or tampered all degrade to
+ordinary free-mode operation - this can never fail app startup. Full design
+writeup (threat model, why a dylib not a static link, why side-car not
+appended bytes): `premium/docs/loader-integration.md` in the private
+premium repo.
+
+- **`centinelo-premium-abi/`** (vendored here) is the wire contract only -
+  zero dependencies, no secrets, no feature logic. A Community build
+  (`git clone` + `cargo build`, no private repo involved) compiles the exact
+  same loader path as an official Pro build; the only difference is whether
+  the installer step below happened to drop a dylib next to the executable.
+  Re-syncing it when the private repo's copy changes is a plain
+  `cp -r .../centinelo-premium-abi shell/src-tauri/centinelo-premium-abi`
+  (see that crate's own doc comment, "Extending this enum"/"struct" for why
+  changes there are additive, nothing to hand-merge).
+- **Where the license check actually happens**: never in this shell. This
+  file only ever asks the loaded dylib "what's the status of capability N"
+  and relays the answer - `centinelo-license` never appears as a dependency
+  here, not even transitively (see `premium.rs`'s own module doc for the
+  full reasoning, and `centinelo-premium-abi`'s crate doc, "Why the split is
+  a dylib").
+- **Dev/test key**: `premium.rs`'s embedded `LIB_PUBKEY_BYTES` is a
+  known, non-secret placeholder (`SigningKey::from_bytes(&[0x24; 32])`) so a
+  dylib built and signed against that same well-known seed loads during
+  development without Felix's real offline key. Before an official release:
+  generate a real keypair with `premium-sign keygen` (private premium repo,
+  offline, never in CI), replace `LIB_PUBKEY_BYTES` with the real public
+  half, and re-sign the shipped dylib with the matching private half.
+  Until that swap happens, an official installer built from this repo only
+  loads a dylib signed by the well-known dev key - a safe default (free
+  mode), not a broken one.
+- **Building + signing a dylib for local testing**: from the private
+  premium repo, `scripts/build-and-sign-premium.sh --key <path to a
+  centinelo_libsign.key file containing the 64-hex-char dev seed
+  `2424...24`>` produces `target/release/libcentinelo_premium.dylib(.sig)`
+  (macOS naming; see that crate's `expected_library_filename` for
+  Windows/Linux). Copy both next to this app's own built executable
+  (`shell/src-tauri/target/debug/` for a plain `cargo build`/`cargo run`,
+  or the `.app` bundle's `Contents/MacOS/` for a `tauri build`).
+
+## Premium console window (F4)
+
+The receptionist BLF console (`premium/console-ui` in the private repo,
+drag-to-transfer grid, live tiles) opens as its own Tauri window
+(`console.rs`), from the tray menu's "Console…" item or a titlebar button
+next to Settings - **both only ever appear when the premium license gate
+clears** (`premium_capability_status("blf_console")` resolves to
+`available` or `not_implemented` - see `console.rs`'s `unlocks_console` doc
+for why `not_implemented` counts too: `centinelo-premium`'s v0 build has no
+real implementation behind *any* capability yet, by design, so a licensed
+capability landing on `not_implemented` rather than `available` is what a
+cleared gate looks like today - not a reason to hide a feature this shell
+itself implements). `commands::open_console` re-checks the gate itself too,
+independent of whether either button happened to be visible.
+
+- **Premium UI assets never ship in this public repo.** `console.rs`
+  registers a custom `premium-console://` URI scheme (not the bundled
+  `frontendDist`) that serves a small, wholly-generic wrapper page
+  (embedded directly in `console.rs` - zero console-ui-specific content,
+  just `<script src>` tags in `premium/console-ui/dev/mock.html`'s own
+  documented dependency order, plus the EngineBridge wiring
+  `premium/console-ui/README.md` describes as "Option B": one Tauri command
+  per protocol verb, matching this file's existing dial/answer/hangup
+  convention rather than a single generic passthrough - see `commands.rs`'s
+  `sidecar_hold`/`sidecar_blind_transfer`/etc.) plus every other file
+  (`tokens.css`, `console.css`, `components/*.js`, `store/ConsoleStore.js`,
+  `bridge/EngineBridge.js`, `console-app.js`) read live from a directory
+  *beside the running executable* - the same "next to the exe" convention
+  the dylib itself uses, so one packaging step drops both in the same
+  place.
+- **Populating that directory for local testing**: copy
+  `premium/console-ui/src/*` (private repo) verbatim, preserving its
+  internal `components/`/`store/`/`bridge/` structure, into
+  `<exe dir>/premium-console-assets/` (or point
+  `CENTINELO_PREMIUM_ASSETS_DIR` at wherever you put it instead - same
+  override shape as `CENTINELO_CORE_BIN`). Nothing under this directory is
+  ever committed to this repo; `target/` is already gitignored, which is
+  where a plain `cargo build`'s executable (and therefore this directory)
+  lives during development.
+- **Official installer layout** (not yet built - out of scope this round,
+  F5 in the product spec): a post-`tauri build` packaging step, owned by the
+  private premium repo's release tooling, copies the signed dylib + `.sig`
+  (see "Premium module loader" above) *and* a `premium-console-assets/`
+  tree built from `premium/console-ui/src/*` into the bundle's output
+  directory - macOS: `Centinelo Phone.app/Contents/MacOS/` (beside
+  `centinelo-shell`); Windows: the install directory, beside
+  `centinelo-shell.exe`.
+- **Roster**: sourced from the operator's own configured favorites
+  (`commands::get_favorites`) - the only extension directory this shell has
+  (no CRM/directory lookup yet, same limitation the main window's favorites
+  grid already has). Honest, not fabricated: every tile the console shows
+  is a real, user-configured extension. `selfExt` is left unset so a
+  favorite that happens to match the operator's own account extension still
+  gets a live, subscribed BLF tile in the grid (rather than being
+  suppressed as "self") - the "Your call" panel's own state comes from
+  `call_state` events regardless.
+- **`blf_subscribe`/`blf_unsubscribe` are idempotent** (`SidecarHandle`,
+  `sidecar.rs`): the favorites auto-subscribe (on registration) and the
+  console's own subscribe-on-mount can legitimately both want the same
+  extension watched - `core/PROTOCOL.md`'s `blf_subscribe` errors on a
+  literal duplicate, so this shell now tracks which extensions are already
+  watched and no-ops a repeat request instead of forwarding it to the wire.
+- **Window chrome**: `decorations: false`, native-titlebar-free - the
+  console-ui package renders its own titlebar (minimize/close glyphs,
+  intentionally inert in the vendored package, "Wired by the embedding
+  shell" per its own doc) which this shell's wrapper script wires to the
+  real window (`getCurrentWindow().minimize()/close()`) plus dragging (no
+  `data-tauri-drag-region` attribute is possible on console-ui's
+  JS-constructed DOM, so dragging goes through the explicit
+  `startDragging()` API instead).
 
 ## Design fidelity notes
 
@@ -206,7 +328,8 @@ production signing/notarization is out of scope for F2.
 |---|---|
 | `CENTINELO_CORE_BIN` | Override the auto-detected core binary path. |
 | `CENTINELO_OPEN_DEVTOOLS=1` | Auto-open the WKWebView/WebView2 inspector on launch. |
-| `CENTINELO_E2E_SCRIPT` | Scripted dial/answer/hangup driver, see below. |
+| `CENTINELO_E2E_SCRIPT` | Scripted call-control + premium/console driver, see below. |
+| `CENTINELO_PREMIUM_ASSETS_DIR` | Override the auto-detected premium console-ui assets directory (see "Premium console window"). Not debug-only - same "next to the exe unless overridden" shape as `CENTINELO_CORE_BIN`. |
 
 ## e2e verification
 
@@ -216,7 +339,12 @@ automation for the final verified runs) and the captured evidence: the
 complete `ready`/`reg_state`/`call_state` event trail from the real running
 app, and independent PBX-side RTP packet-count confirmation
 (`asterisk -rx "pjsip show channelstats"`, read-only) for four separate
-real calls to the `*43` echo test extension over WSS.
+real calls to the `*43` echo test extension over WSS. `E2E.md`'s "F4
+premium" section covers the premium loader's three gating scenarios
+(missing dylib / tampered signature / valid dylib+license) and the premium
+console's own live e2e (BLF tiles via the dual-contact trick,
+`blind_transfer` from the console's own code path, PBX-side confirmation of
+the surviving channel).
 
 ## F3 additions: live BLF favorites, click-to-call bridge, deep links
 
@@ -262,14 +390,29 @@ real calls to the `*43` echo test extension over WSS.
   installed, and the in-app toggle there instead gates whether an incoming
   `tel:` link is acted on at all.
 
-## Known limitations (F2/F3 scope)
+## Known limitations (F2/F3/F4 scope)
 
-- No `hold`/`mute`/`transfer`/`dtmf` — not wired to the shell UI yet, even
-  though `core/`'s v1 protocol now supports them (see `core/PROTOCOL.md`).
+- No `hold`/`mute`/`transfer`/`dtmf` **in the main window's own UI** — F4
+  added the backend commands (`sidecar_hold`/`sidecar_mute`/
+  `sidecar_blind_transfer`/`sidecar_attended_transfer`/etc., see
+  `commands.rs`) and wired them into the premium console, but the main
+  window's dialpad/in-call overlay still has no buttons for them — a real
+  gap for a Community-only user (free tier never sees a hold button even
+  though the protocol and backend now support it), tracked as follow-up,
+  not this round's scope (F4 was "integrate the premium module + console",
+  not "redesign the free-tier call UI").
 - No cert pinning (`sip_verify_server no`) — matches `core/BUILD.md`'s own
   documented TODO; the v1 app's `pinnedCertSha256` setting isn't ported.
-- No console (receptionist grid), transcript, recording, or licensing UI —
-  those are Pro/later-phase surfaces per `DIRECTION.md`.
+- Transcript/recording UI — still Pro/later-phase surfaces per
+  `DIRECTION.md`, not part of F4 (F4 scope was specifically the loader +
+  the `blf_console` capability/console window).
+- Premium console's roster is favorites-only (see "Premium console window"
+  above) — no real directory/CRM lookup, same limitation the main window's
+  own favorites grid already has.
+- Official installer packaging (dropping the signed dylib + console-ui
+  assets into a `tauri build` bundle automatically) is not built — F5 in
+  the product spec. Today both are placed manually for local testing (see
+  "Premium module loader"/"Premium console window" above).
 - Windows: untested this session (no Windows machine available - same
   caveat as `core/BUILD.md`'s own Windows CI note). `shell-build.yml`'s
   Windows job is `continue-on-error: true` for the same reason. The new

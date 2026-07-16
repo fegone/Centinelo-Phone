@@ -6,6 +6,8 @@ use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{App, AppHandle, Manager};
 
+use crate::premium::PremiumHandle;
+
 const TRAY_ICON_BYTES: &[u8] = include_bytes!("../icons/tray-icon@2x.png");
 
 /// Also used by bridge.rs and deeplink.rs - any external dial trigger
@@ -19,11 +21,37 @@ pub(crate) fn show_and_focus(app: &AppHandle) {
     }
 }
 
-pub fn setup(app: &App) -> tauri::Result<()> {
+pub fn setup(app: &App, premium: &PremiumHandle) -> tauri::Result<()> {
     let show_item = MenuItem::with_id(app, "show", "Show", true, None::<&str>)?;
     let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
     let separator = PredefinedMenuItem::separator(app)?;
-    let menu = Menu::with_items(app, &[&show_item, &separator, &quit_item])?;
+
+    // "Console…" only ever appears on the menu at all when the premium
+    // license gate is cleared (see console::is_unlocked's doc for why
+    // that's "Available or NotImplemented", not a literal Available
+    // check) - decided once here at startup, not toggled at runtime,
+    // because v0 has no way for a license to change mid-session (no
+    // activate-license flow yet; see premium.rs's "Never fails startup"
+    // doc) and tray-icon's MenuItem has no visibility toggle on all
+    // platforms, only enabled/disabled - so "absent" (task e2e scenario
+    // (a): "console entry absent") has to mean "never added", not
+    // "added but disabled".
+    let menu = if crate::console::is_unlocked(premium) {
+        let console_item = MenuItem::with_id(app, "console", "Console…", true, None::<&str>)?;
+        let console_separator = PredefinedMenuItem::separator(app)?;
+        Menu::with_items(
+            app,
+            &[
+                &show_item,
+                &console_separator,
+                &console_item,
+                &separator,
+                &quit_item,
+            ],
+        )?
+    } else {
+        Menu::with_items(app, &[&show_item, &separator, &quit_item])?
+    };
 
     let icon = tauri::image::Image::from_bytes(TRAY_ICON_BYTES)?;
 
@@ -35,6 +63,11 @@ pub fn setup(app: &App) -> tauri::Result<()> {
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id().as_ref() {
             "show" => show_and_focus(app),
+            "console" => {
+                if let Err(e) = crate::console::open_or_focus(app) {
+                    log::warn!("tray: open console failed: {e}");
+                }
+            }
             "quit" => app.exit(0),
             _ => {}
         })

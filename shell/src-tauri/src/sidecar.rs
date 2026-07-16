@@ -17,7 +17,7 @@
 use crate::settings::{AccountSettings, SettingsStore, TransportPriority};
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -102,6 +102,21 @@ struct Shared {
     /// `boot()`) and (b) it's real, backend-tracked "app state" a scripted
     /// e2e driver can read without any GUI - see e2e.rs.
     blf_states: Mutex<HashMap<String, String>>,
+    /// Extensions this process has already sent `blf_subscribe` for -
+    /// tracked explicitly (not inferred from `blf_states`, which only
+    /// gains an entry once the *first* NOTIFY arrives) so
+    /// `blf_subscribe`/`blf_unsubscribe` (see those methods below) can be
+    /// idempotent. Needed because two independent callers now legitimately
+    /// want "make sure this extension is watched": the favorites
+    /// auto-subscribe below (on every `reg_state:"registered"`) and the
+    /// premium console mounting with a roster that can - and in the F3/F4
+    /// e2e setup, does - overlap favorites. `core/PROTOCOL.md`'s
+    /// `blf_subscribe` errors on a literal duplicate subscribe; without
+    /// this, opening the console after favorites already subscribed the
+    /// same extension would surface a spurious `error` event instead of
+    /// the idempotent "already watching it, nothing to do" this file's
+    /// callers actually want.
+    subscribed_exts: Mutex<HashSet<String>>,
 }
 
 #[derive(Clone)]
@@ -124,6 +139,7 @@ impl SidecarHandle {
             registered: AtomicBool::new(false),
             call_phase: Mutex::new(CallPhase::None),
             blf_states: Mutex::new(HashMap::new()),
+            subscribed_exts: Mutex::new(HashSet::new()),
         }))
     }
 
@@ -232,6 +248,56 @@ impl SidecarHandle {
     pub fn send_cmd(&self, value: Value) -> Result<(), String> {
         send_cmd_raw(&self.0, value)
     }
+
+    /// Idempotent `blf_subscribe` - see `Shared::subscribed_exts`'s doc
+    /// for why this needs to be safe to call more than once for the same
+    /// extension (favorites auto-subscribe + the console's own
+    /// subscribe-on-mount can both reach the same ext). A second call for
+    /// an already-watched extension is `Ok(())` without touching the
+    /// wire at all, not a duplicate `blf_subscribe` command.
+    pub fn blf_subscribe(&self, ext: &str) -> Result<(), String> {
+        blf_subscribe_raw(&self.0, ext)
+    }
+
+    /// Idempotent counterpart to [`Self::blf_subscribe`] - unsubscribing
+    /// an extension nothing currently has watched is `Ok(())`, matching
+    /// `core/PROTOCOL.md`'s own "errors if not currently subscribed"
+    /// caveat being something callers here shouldn't need to track by
+    /// hand.
+    pub fn blf_unsubscribe(&self, ext: &str) -> Result<(), String> {
+        blf_unsubscribe_raw(&self.0, ext)
+    }
+}
+
+/// Shared implementation of [`SidecarHandle::blf_subscribe`], also used
+/// directly (via `&Arc<Shared>`) by the favorites auto-subscribe loop in
+/// [`spawn_stdout_reader`], which only ever holds the inner `Shared`, not
+/// a `SidecarHandle` wrapper (same reason `send_cmd_raw` is a free
+/// function - see that function's own doc).
+fn blf_subscribe_raw(shared: &Shared, ext: &str) -> Result<(), String> {
+    let mut subscribed = shared.subscribed_exts.lock().expect("poisoned");
+    if !subscribed.insert(ext.to_string()) {
+        return Ok(()); // already watching it - nothing to do
+    }
+    drop(subscribed);
+    let result = send_cmd_raw(shared, serde_json::json!({"cmd": "blf_subscribe", "ext": ext}));
+    if result.is_err() {
+        // Didn't actually reach the wire (sidecar not running) - don't
+        // leave it marked subscribed, or a later real subscribe attempt
+        // (e.g. once the sidecar comes back up) would be silently
+        // swallowed by this same idempotency check.
+        shared.subscribed_exts.lock().expect("poisoned").remove(ext);
+    }
+    result
+}
+
+fn blf_unsubscribe_raw(shared: &Shared, ext: &str) -> Result<(), String> {
+    let mut subscribed = shared.subscribed_exts.lock().expect("poisoned");
+    if !subscribed.remove(ext) {
+        return Ok(()); // not currently watching it - nothing to do
+    }
+    drop(subscribed);
+    send_cmd_raw(shared, serde_json::json!({"cmd": "blf_unsubscribe", "ext": ext}))
 }
 
 /// Writes one `ctrl_json` command line (core/PROTOCOL.md framing: one JSON
@@ -343,6 +409,12 @@ fn supervisor_loop(shared: Arc<Shared>) {
         shared.registered.store(false, Ordering::SeqCst);
         *shared.call_phase.lock().expect("poisoned") = CallPhase::None;
         shared.blf_states.lock().expect("poisoned").clear();
+        // A fresh process starts with no subscriptions either - matches
+        // blf_states being cleared above, and lets a respawned process's
+        // favorites auto-subscribe (and any console still open across the
+        // respawn) re-subscribe for real instead of blf_subscribe_raw's
+        // idempotency check silently swallowing it as "already watching".
+        shared.subscribed_exts.lock().expect("poisoned").clear();
         let _ = std::fs::remove_dir_all(&plan.scratch_dir);
 
         let signal = std::mem::replace(&mut *shared.control.lock().expect("poisoned"), ControlSignal::None);
@@ -455,14 +527,6 @@ fn spawn_stdout_reader(
     std::thread::spawn(move || {
         let reader = BufReader::new(stdout);
         let mut registered_once = false;
-        // Guards the BLF auto-subscribe below to exactly once per process:
-        // `blf_subscribe` errors ("already subscribed") on a repeat call,
-        // and `regint=120` periodic re-REGISTER (or a transient reg blip)
-        // can legitimately fire more than one `"registered"` reg_state
-        // within a single process's lifetime - see core/PROTOCOL.md
-        // `blf_subscribe`. Resets naturally on every respawn since this is
-        // a fresh local in a freshly-spawned thread per attempt.
-        let mut favorites_subscribed = false;
         for line in reader.lines().map_while(Result::ok) {
             let trimmed = line.trim_start();
             if !trimmed.starts_with('{') {
@@ -487,20 +551,20 @@ fn spawn_stdout_reader(
                 if state == "registered" {
                     registered_once = true;
                     shared.registered.store(true, Ordering::SeqCst);
-                    if !favorites_subscribed {
-                        favorites_subscribed = true;
-                        let favorites = shared.settings.snapshot().favorites;
-                        for fav in favorites {
-                            let ext = fav.ext.trim();
-                            if ext.is_empty() {
-                                continue; // unconfigured slot - nothing to watch
-                            }
-                            if let Err(e) = send_cmd_raw(
-                                &shared,
-                                serde_json::json!({"cmd": "blf_subscribe", "ext": ext}),
-                            ) {
-                                log::warn!("sidecar: blf_subscribe({ext}) failed: {e}");
-                            }
+                    // blf_subscribe_raw is idempotent (see Shared::subscribed_exts's
+                    // doc) - safe to run on every "registered" transition,
+                    // including regint=120's periodic re-REGISTER within
+                    // the same process, and safe to overlap with the
+                    // premium console's own subscribe-on-mount for the
+                    // same extensions.
+                    let favorites = shared.settings.snapshot().favorites;
+                    for fav in favorites {
+                        let ext = fav.ext.trim();
+                        if ext.is_empty() {
+                            continue; // unconfigured slot - nothing to watch
+                        }
+                        if let Err(e) = blf_subscribe_raw(&shared, ext) {
+                            log::warn!("sidecar: blf_subscribe({ext}) failed: {e}");
                         }
                     }
                 } else {

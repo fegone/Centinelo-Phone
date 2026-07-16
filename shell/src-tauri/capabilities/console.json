@@ -1,0 +1,17 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "console",
+  "description": "Capabilities for the premium receptionist console window - close/minimize (wired to the console-ui package's own titlebar buttons, see console.rs) + dragging (no data-tauri-drag-region attribute possible on its JS-constructed DOM).",
+  "windows": [
+    "console"
+  ],
+  "permissions": [
+    "core:default",
+    "core:window:allow-close",
+    "core:window:allow-minimize",
+    "core:window:allow-hide",
+    "core:window:allow-show",
+    "core:window:allow-set-focus",
+    "core:window:allow-start-dragging"
+  ]
+}
