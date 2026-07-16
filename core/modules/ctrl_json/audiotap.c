@@ -50,6 +50,7 @@
 #include <rem.h>
 #include <baresip.h>
 #include <errno.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "audiotap.h"
@@ -510,9 +511,23 @@ int audiotap_start(struct call *call, const char *dir,
 	path_build(r->rx_path, sizeof(r->rx_path), dir, r->call_id, "rx");
 	path_build(r->tx_path, sizeof(r->tx_path), dir, r->call_id, "tx");
 
+	/* All-or-nothing: if rx opens but tx doesn't (or vice versa - e.g.
+	 * the filesystem fills up or hits an inode limit between the two
+	 * calls, unlikely but not impossible), don't leave the one that
+	 * *did* succeed sitting on disk as an orphaned empty file - a
+	 * failed tap_start should leave exactly zero trace, matching
+	 * "started" being the only tap_state a caller will ever see paired
+	 * with these paths. remove() on a path whose wav_writer_create()
+	 * never actually got to fopen() (rx failed, so tx_path's own
+	 * create() never even ran - short-circuit `||` below) is a
+	 * harmless no-op (ENOENT, return value ignored) - see this
+	 * function's own early-return sequencing, not a real error at that
+	 * point. */
 	if (wav_writer_create(&r->rx_w, r->rx_path) ||
 	    wav_writer_create(&r->tx_w, r->tx_path)) {
 		*errmsg = e_open;
+		(void)remove(r->rx_path);
+		(void)remove(r->tx_path);
 		mem_deref(r);
 		return EIO;
 	}
