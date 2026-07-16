@@ -22,3 +22,18 @@ core/**/*.dylib
 centinelo-spike.*/
 *.baresip-scratch/
 graphify-out/
+
+# shell/dist-injected/ - Windows installer resource staging (F5 packaging,
+# scripts/package-official.sh + shell/src-tauri/tauri.official.conf.json).
+# Populated by CI (or locally, from a private-repo checkout + Felix's
+# offline-signed dylib) right before `tauri build --config
+# tauri.official.generated.json` - never contains anything checked into this
+# public repo, and must never be committed.
+shell/dist-injected/
+
+# shell/src-tauri/tauri.official.generated.json - the per-run FILTERED copy
+# of tauri.official.conf.json that scripts/package-official.sh's step 9a
+# writes (only the bundle.resources entries actually staged this run -
+# Community/Pro-without-console/Pro-with-console each get a different
+# filtered set). Generated, never hand-edited, never committed.
+shell/src-tauri/tauri.official.generated.json

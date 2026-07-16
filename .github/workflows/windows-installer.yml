@@ -1,0 +1,564 @@
+name: windows installer (F5 packaging)
+
+# Builds the actual Windows installer (.msi via WiX + .exe via NSIS) for
+# Centinelo Phone, using shell/src-tauri/tauri.official.conf.json's
+# `bundle.resources` override (filtered per-run by scripts/package-
+# official.sh's step 9a into tauri.official.generated.json - see that
+# script's header comment, "Windows target", plus step 9a's own comment,
+# for why a per-run FILTER exists: a static, unconditional resources
+# declaration made `tauri build` hard-fail for any combination that doesn't
+# populate every declared resource, e.g. a Community edition build with no
+# premium dylib) to pull in the core engine binary, the signed premium
+# dylib+.sig, and the premium console-ui assets that package-official.sh
+# stages into shell/dist-injected/ (see that script's header comment,
+# "Windows target", for why this two-step stage-then-bundle shape exists -
+# NSIS/MSI package a manifest, not whatever's sitting in target/release/
+# afterward, unlike macOS's .app).
+#
+# workflow_dispatch is the intended long-term trigger for the gated
+# official-pro-build job (manual, on purpose - it's expensive and needs a
+# secret that doesn't exist yet, see that job's comments) - but GitHub only
+# allows dispatching a workflow that already exists on the repo's DEFAULT
+# branch, which for this repo is `main` (v1, permanently off-limits per
+# CLAUDE.md's hard rules; v2 hasn't been promoted to default yet). So
+# workflow_dispatch here is NOT currently invokable via CLI/API/UI - it's
+# left in place for when v2 (or wherever this file ends up) eventually
+# becomes the default branch. For now, verification happens via the `push`
+# trigger below (same pattern core-build.yml/shell-build.yml already use
+# for v2/v2-shell), scoped to this feature branch for its initial
+# smoke-test run - whoever integrates this into v2 should retarget these
+# `branches:` entries the same way shell-build.yml targets `v2-shell`.
+on:
+  push:
+    branches: [feature/windows-installer]
+    paths:
+      - 'shell/src-tauri/tauri.conf.json'
+      - 'shell/src-tauri/tauri.official.conf.json'
+      - 'scripts/package-official.sh'
+      - '.github/workflows/windows-installer.yml'
+  workflow_dispatch:
+    inputs:
+      build_official_pro:
+        description: >-
+          Also run the official Pro build job (needs core-win merged +
+          PREMIUM_REPO_PAT secret + a real signed dylib - see that job's
+          comments. Leave false to only run the resources-mechanism smoke
+          test, which needs none of that.)
+        type: boolean
+        default: false
+      i_understand_public_artifact_risk:
+        description: >-
+          SECOND, independent confirmation required to actually run
+          official-pro-build (build_official_pro alone is not enough - see
+          that job's guard step and header comment). Uploading the
+          OFFICIAL installer (signed premium dylib + premium console-ui
+          source) as a GitHub Actions artifact on THIS PUBLIC repo makes it
+          downloadable by any GitHub user for the artifact's retention
+          window - Actions artifacts have no per-repo-visibility ACL beyond
+          "public repo -> public artifact." There is no approved
+          publication path for the real official installer yet. Leave
+          false until Felix has decided where it actually gets published
+          (private storage, or this job moved to the private repo's own
+          Actions).
+        type: boolean
+        default: false
+
+# 4R/RISK minor fix 2026-07-16: default token scope is read-only for
+# everything this workflow does (checkout public + private-via-PAT repos,
+# build, upload-artifact - none of those need `contents: write` or any
+# other elevated scope). Narrowing here means a future step added to
+# either job that DOES need to write something has to opt in explicitly,
+# rather than silently inheriting a broader default.
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------
+  # Always runs on dispatch. Proves the NSIS/MSI + `bundle.resources`
+  # mechanism itself works — that a real installer is produced and that
+  # it actually contains files staged into shell/dist-injected/ at the
+  # expected install-time locations — using synthetic, clearly-fake
+  # fixtures. Needs NEITHER core-win NOR the private premium repo NOR any
+  # secret: it is a test of this repo's own Tauri config + packaging
+  # script, nothing else.
+  #
+  # 4R/RELIABILITY fix 2026-07-16 (BLOCKER #1): this job now runs as a
+  # matrix over the THREE combinations package-official.sh --help
+  # documents as supported - Community (no premium at all),
+  # Pro-without-console (premium dylib, no console-ui assets), and
+  # Pro-with-console (all three) - and drives each one through
+  # scripts/package-official.sh itself (not a hand-rolled `tauri build`
+  # call), so the SAME code path a real official build uses is what gets
+  # proven here. Previously this job only ever staged all fixtures
+  # unconditionally and called `tauri build` directly against the static
+  # template, which never exercised the Community or
+  # Pro-without-console cases at all - both of which hard-failed against
+  # that static template's unconditional resource declarations (the actual
+  # blocker this matrix closes).
+  # ---------------------------------------------------------------------
+  resources-mechanism-smoke-test:
+    name: NSIS/MSI resources mechanism (${{ matrix.combo }}, synthetic fixtures)
+    runs-on: windows-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        combo: [community, pro-no-console, pro-full]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Rust toolchain
+        run: rustup show
+
+      - name: Stage synthetic core build + OpenSSL DLLs + (combo-dependent) premium fixtures
+        # Clearly-fake content, same shape package-official.sh's own steps
+        # 6-8 produce for real - marker strings below are grepped for after
+        # bundling, as proof the files really rode into the installer
+        # rather than this job just trusting a green exit code. The core
+        # build fixture lands where --skip-core-build expects it
+        # (core/deps/baresip/build/Release/baresip.exe on Windows - see
+        # package-official.sh's CORE_BIN_SUBDIR), so this job exercises
+        # package-official.sh's OWN staging + config-generation logic
+        # end-to-end, not a reimplementation of it.
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "core\deps\baresip\build\Release" | Out-Null
+          "FAKE-FIXTURE-CENTINELO-BARESIP-MARKER" | Out-File -Encoding ascii "core\deps\baresip\build\Release\baresip.exe"
+
+          # OpenSSL runtime DLL fixtures (blocker #1 fix, 2026-07-16, and
+          # blocker #2's stricter basename check, 2026-07-16): names match
+          # what a real Chocolatey openssl v4.x install (current, OpenSSL
+          # 3.x) produces and what package-official.sh's own validation now
+          # requires by name (libssl-*.dll / libcrypto-*.dll), not just
+          # "some .dll".
+          New-Item -ItemType Directory -Force -Path "fake-openssl-dlls" | Out-Null
+          "FAKE-FIXTURE-CENTINELO-LIBSSL-MARKER" | Out-File -Encoding ascii "fake-openssl-dlls\libssl-3-x64.dll"
+          "FAKE-FIXTURE-CENTINELO-LIBCRYPTO-MARKER" | Out-File -Encoding ascii "fake-openssl-dlls\libcrypto-3-x64.dll"
+
+          $combo = "${{ matrix.combo }}"
+          if ($combo -ne "community") {
+            New-Item -ItemType Directory -Force -Path "fake-premium" | Out-Null
+            "FAKE-FIXTURE-CENTINELO-DYLIB-MARKER" | Out-File -Encoding ascii "fake-premium\centinelo_premium.dll"
+            "FAKE-FIXTURE-CENTINELO-SIG-MARKER" | Out-File -Encoding ascii "fake-premium\centinelo_premium.dll.sig"
+          }
+          if ($combo -eq "pro-full") {
+            New-Item -ItemType Directory -Force -Path "fake-console-ui\bridge" | Out-Null
+            New-Item -ItemType Directory -Force -Path "fake-console-ui\components" | Out-Null
+            New-Item -ItemType Directory -Force -Path "fake-console-ui\store" | Out-Null
+            "FAKE-FIXTURE-CENTINELO-CONSOLEAPP-MARKER" | Out-File -Encoding ascii "fake-console-ui\console-app.js"
+            "FAKE-FIXTURE-CENTINELO-BRIDGE-MARKER" | Out-File -Encoding ascii "fake-console-ui\bridge\EngineBridge.js"
+            "FAKE-FIXTURE-CENTINELO-COMPONENT-MARKER" | Out-File -Encoding ascii "fake-console-ui\components\extension-grid.js"
+            "FAKE-FIXTURE-CENTINELO-STORE-MARKER" | Out-File -Encoding ascii "fake-console-ui\store\ConsoleStore.js"
+          }
+
+      - name: Run scripts/package-official.sh --target windows (${{ matrix.combo }})
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARGS=(--target windows --skip-core-build --openssl-dll-dir "$PWD/fake-openssl-dlls" --output-dir "dist/windows-${{ matrix.combo }}")
+          if [[ "${{ matrix.combo }}" != "community" ]]; then
+            ARGS+=(--premium-dylib "$PWD/fake-premium/centinelo_premium.dll" --premium-sig "$PWD/fake-premium/centinelo_premium.dll.sig")
+          fi
+          if [[ "${{ matrix.combo }}" == "pro-full" ]]; then
+            ARGS+=(--premium-console-assets "$PWD/fake-console-ui")
+          fi
+          bash scripts/package-official.sh "${ARGS[@]}"
+
+      - name: List produced installer artifacts
+        shell: pwsh
+        run: |
+          Get-ChildItem -Recurse "shell\src-tauri\target\release\bundle\nsis"
+          Get-ChildItem -Recurse "shell\src-tauri\target\release\bundle\msi"
+
+      - name: Extract MSI (admin install, no actual install) and verify staged files are present
+        shell: pwsh
+        run: |
+          $combo = "${{ matrix.combo }}"
+          $msi = Get-ChildItem "shell\src-tauri\target\release\bundle\msi\*.msi" | Select-Object -First 1
+          if (-not $msi) { Write-Error "no .msi produced"; exit 1 }
+          $extractDir = "$PWD\msi-extracted"
+
+          # 4R/RESILIENCE fix 2026-07-16 (blocker #7): `msiexec /a` launches
+          # its admin-install and returns to the shell BEFORE the install
+          # actually finishes writing files - the previous `Start-Sleep -Seconds
+          # 5` was a guess at how long that takes, not a real synchronization
+          # primitive (fails silently-flaky if the extract is ever slower than
+          # 5s, e.g. a loaded runner). Start-Process -Wait blocks on the real
+          # process exit instead.
+          $p = Start-Process -FilePath "msiexec.exe" -ArgumentList @('/a', "`"$($msi.FullName)`"", '/qn', "TARGETDIR=`"$extractDir`"") -PassThru -Wait
+          if ($p.ExitCode -ne 0) { Write-Error "msiexec /a exited with code $($p.ExitCode)"; exit 1 }
+
+          Write-Host "== MSI extracted tree =="
+          Get-ChildItem -Recurse "$extractDir"
+
+          # Select-String has no -Recurse parameter of its own (that's a
+          # Get-ChildItem thing) - piping a recursive file listing into it
+          # is the correct shape.
+          $hits = Get-ChildItem -Path $extractDir -Recurse -File -ErrorAction SilentlyContinue | Select-String -Pattern "FAKE-FIXTURE-CENTINELO" -ErrorAction SilentlyContinue
+          if (-not $hits) {
+            Write-Error "none of the FAKE-FIXTURE-CENTINELO marker strings were found anywhere in the extracted MSI - bundle.resources did not make it into the installer"
+            exit 1
+          }
+          Write-Host "== Marker strings found in MSI (proof resources rode along) =="
+          $hits | ForEach-Object { Write-Host $_.Path }
+
+          # core-engine/ + OpenSSL DLLs: required in EVERY combo.
+          $baresipExe = Get-ChildItem -Recurse "$extractDir" -Filter "baresip.exe" | Select-Object -First 1
+          if (-not $baresipExe) { Write-Error "baresip.exe (core-engine fixture) not found in extracted MSI"; exit 1 }
+          # 4R/RESILIENCE fix 2026-07-16 (blocker #2): explicit basename
+          # checks (libssl-*.dll / libcrypto-*.dll), not "any *.dll" - a
+          # directory with the wrong DLLs must fail this check, both here
+          # and in package-official.sh's own validation.
+          $libssl = Get-ChildItem -Recurse "$extractDir" -Filter "libssl-*.dll" | Select-Object -First 1
+          $libcrypto = Get-ChildItem -Recurse "$extractDir" -Filter "libcrypto-*.dll" | Select-Object -First 1
+          if (-not $libssl) { Write-Error "no libssl-*.dll found in extracted MSI - core.exe would fail to start on a clean machine"; exit 1 }
+          if (-not $libcrypto) { Write-Error "no libcrypto-*.dll found in extracted MSI - core.exe would fail to start on a clean machine"; exit 1 }
+          if ($baresipExe.DirectoryName -ne $libssl.DirectoryName -or $baresipExe.DirectoryName -ne $libcrypto.DirectoryName) {
+            Write-Error "OpenSSL DLLs are NOT beside baresip.exe: baresip.exe in $($baresipExe.DirectoryName), libssl in $($libssl.DirectoryName), libcrypto in $($libcrypto.DirectoryName)"
+            exit 1
+          }
+          Write-Host "OK: baresip.exe + libssl-*.dll + libcrypto-*.dll all beside each other at $($baresipExe.DirectoryName)"
+
+          $exe = Get-ChildItem -Recurse "$extractDir" -Filter "centinelo-shell.exe" | Select-Object -First 1
+          if (-not $exe) { Write-Error "centinelo-shell.exe not found in extracted MSI"; exit 1 }
+
+          $dll = Get-ChildItem -Recurse "$extractDir" -Filter "centinelo_premium.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($combo -eq "community") {
+            # BLOCKER #1 fix, verified from the other direction: a Community
+            # build must NOT ship the premium dylib at all - proves the
+            # dynamic resources filter actually excludes it, not just that
+            # it happens to be absent.
+            if ($dll) { Write-Error "Community combo shipped centinelo_premium.dll - the resources filter leaked a premium artifact into a Community build"; exit 1 }
+            Write-Host "OK: Community combo correctly ships no centinelo_premium.dll"
+          } else {
+            if (-not $dll) { Write-Error "centinelo_premium.dll not found in extracted MSI for combo '$combo'"; exit 1 }
+            if ($exe.DirectoryName -ne $dll.DirectoryName) {
+              Write-Error "centinelo_premium.dll is NOT beside centinelo-shell.exe: exe in $($exe.DirectoryName), dll in $($dll.DirectoryName)"
+              exit 1
+            }
+            Write-Host "OK: centinelo_premium.dll is beside centinelo-shell.exe at $($exe.DirectoryName)"
+          }
+
+          $consoleMarker = Get-ChildItem -Recurse "$extractDir" -Filter "console-app.js" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($combo -eq "pro-full") {
+            if (-not $consoleMarker) { Write-Error "console-app.js (premium-console-assets fixture) not found in extracted MSI for pro-full combo"; exit 1 }
+            $bridge = Get-ChildItem -Recurse "$extractDir" -Filter "EngineBridge.js" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (-not $bridge) { Write-Error "premium-console-assets/bridge/EngineBridge.js not found in extracted MSI - subfolder resource entries did not ride along"; exit 1 }
+            Write-Host "OK: premium-console-assets (base + bridge subfolder) found in pro-full combo"
+          } else {
+            if ($consoleMarker) { Write-Error "combo '$combo' shipped premium-console-assets/console-app.js - it should not have any console assets" ; exit 1 }
+            Write-Host "OK: combo '$combo' correctly ships no premium-console-assets"
+          }
+
+      - name: Extract NSIS installer (7-Zip) and verify staged files are present
+        # 4R/RELIABILITY fix 2026-07-16 (major #5): this used to be a
+        # Write-Warning that never failed the job - a real regression in
+        # the NSIS payload (as opposed to the MSI's) would have shipped
+        # silently green. 7-Zip extracts NSIS payloads fine in practice
+        # (confirmed on this runner image), so there is no real reason left
+        # to only warn here - now blocking, same as the MSI check above.
+        shell: pwsh
+        run: |
+          $nsis = Get-ChildItem "shell\src-tauri\target\release\bundle\nsis\*.exe" | Select-Object -First 1
+          if (-not $nsis) { Write-Error "no NSIS .exe produced"; exit 1 }
+          $extractDir = "$PWD\nsis-extracted"
+          New-Item -ItemType Directory -Force -Path $extractDir | Out-Null
+          & "C:\Program Files\7-Zip\7z.exe" x "$($nsis.FullName)" "-o$extractDir" -y
+          Write-Host "== NSIS extracted tree =="
+          Get-ChildItem -Recurse "$extractDir"
+          $hits = Get-ChildItem -Path $extractDir -Recurse -File -ErrorAction SilentlyContinue | Select-String -Pattern "FAKE-FIXTURE-CENTINELO" -ErrorAction SilentlyContinue
+          if (-not $hits) {
+            Write-Error "no FAKE-FIXTURE-CENTINELO marker strings found anywhere in the extracted NSIS payload - bundle.resources did not make it into the NSIS installer"
+            exit 1
+          }
+          Write-Host "== Marker strings found in NSIS installer =="
+          $hits | ForEach-Object { Write-Host $_.Path }
+
+      - name: Verify installer bundle before upload
+        # Same rigor as official-pro-build's own pre-upload check (blocker
+        # #3): both files must exist and be non-empty, or nothing gets
+        # uploaded.
+        shell: pwsh
+        run: |
+          $nsis = Get-ChildItem "shell\src-tauri\target\release\bundle\nsis\*.exe" -ErrorAction SilentlyContinue
+          $msi = Get-ChildItem "shell\src-tauri\target\release\bundle\msi\*.msi" -ErrorAction SilentlyContinue
+          if (-not $nsis) { Write-Error "no .exe under bundle/nsis/ - refusing to upload"; exit 1 }
+          if (-not $msi) { Write-Error "no .msi under bundle/msi/ - refusing to upload"; exit 1 }
+          foreach ($f in @($nsis) + @($msi)) {
+            if ($f.Length -eq 0) { Write-Error "$($f.FullName) exists but is zero bytes"; exit 1 }
+          }
+          Write-Host "OK: NSIS + MSI both present and non-empty"
+
+      - name: Upload installer artifacts (synthetic fixtures only, nothing secret)
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer-smoke-test-${{ matrix.combo }}
+          path: |
+            shell/src-tauri/target/release/bundle/nsis/*
+            shell/src-tauri/target/release/bundle/msi/*
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------
+  # The real official Pro build. DELIBERATELY GATED OFF (only runs when
+  # dispatched with build_official_pro=true AND, per the guard step below,
+  # i_understand_public_artifact_risk=true) and UNTESTED this pass - see
+  # .claude/reports/release-ci-2026-07-16-windows-installer.md for exactly
+  # why. Blockers remain, outside release-ci's scope to resolve alone (core-
+  # win closed 2026-07-16, see below):
+  #
+  #   1. [CLOSED 2026-07-16] core-win (feature/windows-media-modules,
+  #      ausine/aufile/ice/dtls_srtp/wasapi) merged to v2 at 47df112 -
+  #      the "Build core/ (Windows)" steps below now mirror the CURRENT
+  #      core-build.yml Windows job (including the wasapi module and the
+  #      fuller MODULES list), pulled in via merging origin/v2 into this
+  #      branch. Still never run as part of *this* workflow though - only
+  #      core-build.yml's own job has actually exercised these exact
+  #      commands on a real runner.
+  #   2. PREMIUM_REPO_PAT does not exist as a repo secret yet. Needs a
+  #      fine-grained PAT (or deploy key) scoped to READ-ONLY on
+  #      fegone/centinelo-premium, created by Felix, added under this
+  #      repo's Settings > Secrets > Actions. NEVER logged, NEVER echoed -
+  #      actions/checkout's `token` input passes it straight to git's
+  #      credential helper without printing it.
+  #   3. No agreed convention yet for WHERE in the private premium repo a
+  #      real, offline-signed dylib+.sig lives for CI to fetch. Proposed
+  #      here (not yet built or agreed with Felix/licensing):
+  #      Felix runs premium/scripts/build-and-sign-premium.sh locally
+  #      (offline, has the real centinelo_libsign.key - see
+  #      premium/docs/PACKAGING-SIGNATURES.md), then commits the output
+  #      pair to a fixed path in the premium repo, e.g.
+  #      premium/dist-signed/windows/centinelo_premium.dll(.sig), and
+  #      pushes. This job then just reads that path from its private-repo
+  #      checkout - no signing, no key material, ever touches this
+  #      workflow or any GitHub Actions runner.
+  #   4. [ADDED 2026-07-16, 4R RISK blocker] Even once 1-3 are resolved,
+  #      this job's own "Upload official installer" step uploads the real
+  #      signed installer via actions/upload-artifact - and Actions
+  #      artifacts on a PUBLIC repo are downloadable by any GitHub user for
+  #      the retention window, with no additional ACL. That is NOT an
+  #      approved publication path for the real official build (as opposed
+  #      to the smoke test's synthetic fixtures above, which are
+  #      deliberately fake and fine to leak). The guard step immediately
+  #      below fails the job before any real work happens unless
+  #      i_understand_public_artifact_risk=true is ALSO passed (separate
+  #      from build_official_pro=true) - this keeps the job inert by
+  #      default until Felix decides where the real installer actually
+  #      gets published (private storage, or this job moves to the private
+  #      premium repo's own Actions, which has no such public-download
+  #      problem).
+  official-pro-build:
+    name: Official Pro build (core + shell + signed premium)
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.build_official_pro == true }}
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: Guard - public-repo artifact publication not approved
+        # 4R/RISK blocker fix 2026-07-16 (blocker #4): fails immediately,
+        # before checkout or any build work, unless a SECOND explicit
+        # dispatch input confirms the publication risk is understood.
+        # build_official_pro=true alone (the job-level `if` above) is not
+        # enough - that only means "someone wants this job to attempt to
+        # run", not "someone has weighed uploading a signed official
+        # installer as a public-repo Actions artifact." See gap #4 above
+        # for the full risk.
+        if: ${{ inputs.i_understand_public_artifact_risk != true }}
+        shell: pwsh
+        run: |
+          Write-Host "::error::official artifact publication path not approved: artifacts on a public repo are world-downloadable; move this job to the private repo or publish to private storage before enabling. Re-dispatch with i_understand_public_artifact_risk=true only once Felix has approved a real publication path (see this job's header comment, gap #4)."
+          exit 1
+
+      - name: Checkout phone (public, this ref)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Checkout premium (private) — signed dylib + console-ui source
+        # Read-only checkout. Never writes back to this repo, never logs
+        # secret contents (checkout's token handling keeps it out of the
+        # step's stdout). See blocker #2/#3 in the comment above this job.
+        uses: actions/checkout@v4
+        with:
+          repository: fegone/centinelo-premium
+          token: ${{ secrets.PREMIUM_REPO_PAT }}
+          path: premium-checkout
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install OpenSSL (Chocolatey)
+        # Mirrors core-build.yml's Windows job exactly (same choco package,
+        # same path-detection dance) — kept as a literal copy rather than a
+        # shared composite action for this first pass; see Known gap #6 in
+        # scripts/package-official.sh about the same series-of-patches
+        # duplication problem applying here too.
+        #
+        # 4R/RISK minor fix 2026-07-16: version pinned explicitly rather
+        # than floating on whatever choco resolves "latest" to at run time
+        # - an unpinned package can silently change DLL names/ABI between
+        # runs with zero corresponding change to this workflow. Current as
+        # of this pass: openssl 4.0.1 (community.chocolatey.org/packages/
+        # openssl). Bumping this version is a conscious, reviewed decision,
+        # not something that happens automatically - if the openssl package
+        # publishes a new version, this pin does NOT move until someone
+        # edits it here (and re-verifies the DLL basename check below still
+        # matches what the new version deploys).
+        run: choco install openssl -y --no-progress --version=4.0.1
+
+      - name: Locate OpenSSL install dir (choco deploy path varies by pkg version)
+        shell: pwsh
+        run: |
+          $candidates = @('C:\Program Files\OpenSSL', 'C:\Program Files\OpenSSL-Win64')
+          $root = $candidates | Where-Object { Test-Path "$_\include\openssl\ssl.h" } | Select-Object -First 1
+          if (-not $root) {
+            Write-Error "OpenSSL headers not found under: $($candidates -join ', ')"
+            exit 1
+          }
+          "OPENSSL_ROOT_DIR=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Apply local re/baresip patches
+        # This is (as of this pass) a FOURTH place the four core/ patches
+        # are hand-listed independently of this script's apply_patch() and
+        # core-build.yml's two jobs - see scripts/package-official.sh's
+        # "Known gaps" #6 (count corrected 2026-07-16) for the full DRY
+        # problem and the proposed core/patches/series.txt fix, not
+        # implemented this pass.
+        shell: bash
+        run: |
+          git apply --directory=core/deps/re core/patches/0001-re-configurable-sip-ws-path.patch
+          git apply --directory=core/deps/re core/patches/0002-re-tls-fingerprint-pin.patch
+          git apply --directory=core/deps/re core/patches/0004-re-json-stdout-purity.patch
+          git apply --directory=core/deps/baresip core/patches/0003-baresip-json-stdout-purity.patch
+
+      - name: Configure + build + install libre (static)
+        shell: bash
+        run: |
+          set -o pipefail
+          RE_INSTALL="$(pwd -W)/re-install-prefix"
+          cmake -S core/deps/re -B core/deps/re/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$RE_INSTALL" \
+            -DLIBRE_BUILD_SHARED=OFF \
+            -DLIBRE_BUILD_STATIC=ON \
+            -DOPENSSL_ROOT_DIR="$OPENSSL_ROOT_DIR"
+          cmake --build core/deps/re/build --config Release
+          cmake --install core/deps/re/build --config Release
+
+      - name: Configure + build baresip + ctrl_json
+        # MODULES list kept identical to core-build.yml's own Windows job
+        # (as of 47df112, the windows-media-modules merge) - THIS IS A
+        # fourth copy of that list (core-build.yml's macOS job, its Windows
+        # job, package-official.sh's macOS branch, and here) — see Known
+        # gap #6 above, no shared source today, drift is manual-sync-only.
+        shell: bash
+        run: |
+          set -o pipefail
+          RE_INSTALL="$(pwd -W)/re-install-prefix"
+          cmake -S core/deps/baresip -B core/deps/baresip/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DRE_LIBRARY="$RE_INSTALL/lib/re-static.lib" \
+            -DRE_INCLUDE_DIR="$(pwd -W)/core/deps/re/include" \
+            -DOPENSSL_ROOT_DIR="$OPENSSL_ROOT_DIR" \
+            -DMODULES="account;g711;auconv;auresamp;ausine;aufile;ice;dtls_srtp;menu;wasapi" \
+            -DAPP_MODULES="ctrl_json" \
+            -DAPP_MODULES_DIR="$(pwd -W)/core/modules"
+          cmake --build core/deps/baresip/build --config Release
+
+      - name: Stage artifacts + build the installer (package-official.sh)
+        # --openssl-dll-dir (blocker #1 fix, 2026-07-16): $OPENSSL_ROOT_DIR
+        # was resolved by the "Locate OpenSSL install dir" step above (same
+        # env var core-build.yml's own Windows job resolves and uses) - its
+        # `bin\` subdir is where the Chocolatey openssl package deploys the
+        # runtime DLLs baresip.exe needs beside itself (see
+        # package-official.sh's "2b. Validate OpenSSL DLL dir" / "6b. Copy
+        # OpenSSL runtime DLLs" for the full rationale). Without this flag
+        # the script now hard-fails for --target windows rather than
+        # silently producing a broken installer. package-official.sh's own
+        # step 9a then filters tauri.official.conf.json down to only the
+        # resources this Pro-with-console run actually stages (dylib+sig+
+        # console assets all present here, so nothing gets filtered out for
+        # THIS specific invocation - the filtering matters for Community/
+        # Pro-without-console runs, exercised by the smoke-test matrix
+        # above, not this always-Pro-with-console job).
+        shell: bash
+        run: |
+          bash scripts/package-official.sh --target windows \
+            --skip-core-build \
+            --openssl-dll-dir "$OPENSSL_ROOT_DIR/bin" \
+            --premium-dylib premium-checkout/dist-signed/windows/centinelo_premium.dll \
+            --premium-sig premium-checkout/dist-signed/windows/centinelo_premium.dll.sig \
+            --premium-console-assets premium-checkout/console-ui/src \
+            --output-dir dist/windows
+
+      - name: Verify OpenSSL runtime DLLs staged beside baresip.exe
+        # Fails fast, before spending time on `tauri build`, if the DLL
+        # copy silently produced nothing (e.g. an OpenSSL install with a
+        # bin/ dir that has headers but no runtime DLLs - shouldn't happen
+        # with choco's package, but this is the exact failure class that
+        # caused blocker #1 in the first place, so it gets its own explicit
+        # check rather than trusting the script's internal validation
+        # alone).
+        #
+        # 4R/RESILIENCE fix 2026-07-16 (blocker #2): explicit basename
+        # checks (libssl-*.dll / libcrypto-*.dll), same as
+        # package-official.sh's own now-stricter validation and the
+        # smoke-test matrix job's MSI-extraction check above - "any *.dll
+        # exists" previously passed even if the staged DLLs were the wrong
+        # ones.
+        shell: pwsh
+        run: |
+          $libssl = Get-ChildItem "shell\dist-injected\core-engine\libssl-*.dll" -ErrorAction SilentlyContinue
+          $libcrypto = Get-ChildItem "shell\dist-injected\core-engine\libcrypto-*.dll" -ErrorAction SilentlyContinue
+          if (-not $libssl) {
+            Write-Error "no libssl-*.dll staged in shell/dist-injected/core-engine/ - baresip.exe would not start"
+            exit 1
+          }
+          if (-not $libcrypto) {
+            Write-Error "no libcrypto-*.dll staged in shell/dist-injected/core-engine/ - baresip.exe would not start"
+            exit 1
+          }
+          Write-Host "== OpenSSL runtime DLLs staged =="
+          $libssl | ForEach-Object { Write-Host $_.Name }
+          $libcrypto | ForEach-Object { Write-Host $_.Name }
+
+      - name: Verify official installer bundle before upload
+        # 4R/RESILIENCE fix 2026-07-16 (blocker #3): previously the upload
+        # step ran with `if: always()` and `if-no-files-found: warn`, with
+        # no check of the bundle itself - a failed `tauri build` (or a
+        # build that silently produced only one of the two installer
+        # formats) still "succeeded" at the workflow level, uploading
+        # whatever partial bundle happened to exist (or nothing, with only
+        # a warning). This step makes the job fail loudly instead, before
+        # any upload is attempted.
+        shell: pwsh
+        run: |
+          $nsis = Get-ChildItem "shell\src-tauri\target\release\bundle\nsis\*.exe" -ErrorAction SilentlyContinue
+          $msi = Get-ChildItem "shell\src-tauri\target\release\bundle\msi\*.msi" -ErrorAction SilentlyContinue
+          if (-not $nsis) { Write-Error "no .exe produced under bundle/nsis/ - refusing to upload an incomplete official installer"; exit 1 }
+          if (-not $msi) { Write-Error "no .msi produced under bundle/msi/ - refusing to upload an incomplete official installer"; exit 1 }
+          foreach ($f in @($nsis) + @($msi)) {
+            if ($f.Length -eq 0) { Write-Error "$($f.FullName) exists but is zero bytes"; exit 1 }
+          }
+          Write-Host "OK: NSIS + MSI both present and non-empty"
+          $nsis | ForEach-Object { Write-Host " nsis: $($_.FullName) ($($_.Length) bytes)" }
+          $msi | ForEach-Object { Write-Host " msi:  $($_.FullName) ($($_.Length) bytes)" }
+
+      - name: Upload official installer
+        # 4R/RESILIENCE fix 2026-07-16 (blocker #3): `if: success()` (not
+        # `always()`) and `if-no-files-found: error` (not `warn`) - a
+        # failure anywhere above (including the new verification step)
+        # must NOT be followed by an upload attempt that silently no-ops
+        # or uploads partial content.
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: centinelo-phone-windows-installer-official
+          path: |
+            shell/src-tauri/target/release/bundle/nsis/*
+            shell/src-tauri/target/release/bundle/msi/*
+          if-no-files-found: error
