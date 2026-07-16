@@ -666,6 +666,152 @@ static void test_pathsafe_unique_component(void)
 
 
 /*
+ * v1.3 4R finding (F2, resilience) regression guard: pathsafe_unique_
+ * component()'s first fix truncated its sanitized `base` to the FULL
+ * out_size-1 width before ever appending a "-N" suffix - for an input
+ * long enough to fill the whole output buffer on its own (a SIP Call-ID
+ * has no length cap this engine enforces before this point, and the far
+ * end controls it), every suffixed retry truncated right back down to
+ * the identical bytes, so a genuinely resolvable collision looked
+ * unresolvable and a real caller (audiotap_start()) would have wrongly
+ * denied recording. Fixed by reserving room for the largest possible
+ * suffix in `base` up front - these tests exercise inputs at/over
+ * out_size to prove retries now actually change the result.
+ */
+static void test_pathsafe_unique_component_long_input(void)
+{
+	char out[128];
+	char long_in[200];
+	size_t i;
+	bool ok;
+
+	for (i = 0; i < sizeof(long_in) - 1; i++)
+		long_in[i] = 'a';
+	long_in[sizeof(long_in) - 1] = '\0';
+
+	ok = pathsafe_unique_component(long_in, out, sizeof(out), NULL, NULL,
+					5);
+	CHECK(ok, "pathsafe_unique: long input (> out_size), no collision"
+	      " -> succeeds");
+	CHECK(str_len(out) < sizeof(out) - 1,
+	      "pathsafe_unique: F2 fix - the plain candidate leaves room"
+	      " for a suffix (shorter than the full buffer), rather than"
+	      " filling it completely the way the pre-fix truncation did");
+
+	/* Force a collision on that exact candidate - the retry MUST
+	 * produce something different, not the same truncated bytes again. */
+	{
+		char first_candidate[128];
+		const char *taken1[1];
+		struct fake_taken_ctx ctx;
+
+		str_ncpy(first_candidate, out, sizeof(first_candidate));
+		taken1[0] = first_candidate;
+		ctx.taken = taken1;
+		ctx.count = 1;
+
+		ok = pathsafe_unique_component(long_in, out, sizeof(out),
+						fake_is_taken, &ctx, 5);
+		CHECK(ok, "pathsafe_unique: long input, one collision ->"
+		      " still succeeds (pre-fix: exhausted every retry on"
+		      " the identical truncated candidate, returned false)");
+		CHECK(0 != str_cmp(out, first_candidate),
+		      "pathsafe_unique: F2 regression guard - retry produces"
+		      " a DIFFERENT candidate even for an input long enough"
+		      " to fill the entire output buffer on its own");
+	}
+
+	/* Two distinct long call_ids sharing a common prefix long enough to
+	 * collide once naively truncated (the real-world shape this bug
+	 * actually denies recording for) must still resolve to two
+	 * different final paths once a real is_taken predicate reports the
+	 * first one active. */
+	{
+		char long_in_b[200];
+		char out_a[128], out_b[128];
+		const char *taken1[1];
+		struct fake_taken_ctx ctx;
+
+		memcpy(long_in_b, long_in, sizeof(long_in_b));
+		long_in_b[sizeof(long_in_b) - 2] = 'b';
+
+		ok = pathsafe_unique_component(long_in, out_a, sizeof(out_a),
+						NULL, NULL, 5);
+		CHECK(ok, "pathsafe_unique: long input A -> succeeds");
+
+		taken1[0] = out_a;
+		ctx.taken = taken1;
+		ctx.count = 1;
+
+		ok = pathsafe_unique_component(long_in_b, out_b,
+						sizeof(out_b), fake_is_taken,
+						&ctx, 5);
+		CHECK(ok, "pathsafe_unique: long input B colliding with A's"
+		      " candidate -> still succeeds");
+		CHECK(0 != str_cmp(out_a, out_b),
+		      "pathsafe_unique: two long, distinct call_ids that"
+		      " collide after truncation end up with two DIFFERENT"
+		      " final paths, not silently the same one (the real"
+		      " bug this finding describes: silent denial of"
+		      " recording for a legitimate call)");
+	}
+
+	/* max_attempts genuinely exhausted (every candidate the retry loop
+	 * could ever try, including the suffixed one, reported taken)
+	 * still fails cleanly - the fix doesn't turn a real exhaustion into
+	 * an infinite loop or a false success. Learn what the base (attempt
+	 * 0) and "-2" (attempt 1, the only retry max_attempts=1 allows)
+	 * candidates actually are first, rather than guessing their exact
+	 * bytes. */
+	{
+		char base_cand[128], suffixed_cand[128];
+		const char *taken1[1];
+		struct fake_taken_ctx ctx;
+
+		ok = pathsafe_unique_component(long_in, base_cand,
+						sizeof(base_cand), NULL, NULL,
+						0);
+		CHECK(ok, "pathsafe_unique: setup - learn the base candidate"
+		      " (max_attempts=0, no retries possible)");
+
+		taken1[0] = base_cand;
+		ctx.taken = taken1;
+		ctx.count = 1;
+
+		ok = pathsafe_unique_component(long_in, suffixed_cand,
+						sizeof(suffixed_cand),
+						fake_is_taken, &ctx, 1);
+		CHECK(ok, "pathsafe_unique: setup - learn the '-2' candidate"
+		      " (base taken, exactly 1 retry allowed, must succeed)");
+		CHECK(0 != str_cmp(base_cand, suffixed_cand),
+		      "pathsafe_unique: setup - the two learned candidates"
+		      " are themselves distinct (sanity check for this"
+		      " sub-test, not a new assertion about the fix)");
+
+		/* Now both are taken, with max_attempts=1 (still only one
+		 * retry allowed) - genuinely exhausted, must report false. */
+		{
+			const char *taken2[2];
+
+			taken2[0] = base_cand;
+			taken2[1] = suffixed_cand;
+			ctx.taken = taken2;
+			ctx.count = 2;
+
+			ok = pathsafe_unique_component(long_in, out,
+							sizeof(out),
+							fake_is_taken, &ctx,
+							1);
+			CHECK(!ok, "pathsafe_unique: long input, real"
+			      " exhaustion (both reachable candidates taken,"
+			      " max_attempts=1) -> false, not a false"
+			      " success");
+		}
+	}
+}
+
+
+/*
  * v1.2: wav_writer.c - see wav_writer.h's own top comment for why this
  * is unit tested (pure C99 stdio, no baresip/re) unlike audiotap.c (the
  * caller that actually feeds it real call audio - covered by
@@ -1045,7 +1191,7 @@ static void test_dialog_info_real_capture_1100_confirmed_no_hold_signal(void)
 		"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n"
 		"<dialog-info xmlns=\"urn:ietf:params:xml:ns:dialog-info\""
 		" version=\"2\" state=\"full\""
-		" entity=\"sip:1100@100.119.230.80\">\r\n"
+		" entity=\"sip:1100@192.0.2.10\">\r\n"
 		" <dialog id=\"1100\">\r\n"
 		"  <state>confirmed</state>\r\n"
 		" </dialog>\r\n"
@@ -1219,6 +1365,7 @@ int main(void)
 
 	test_pathsafe_component();
 	test_pathsafe_unique_component();
+	test_pathsafe_unique_component_long_input();
 
 	test_wav_writer_basic();
 	test_wav_writer_multi_write();

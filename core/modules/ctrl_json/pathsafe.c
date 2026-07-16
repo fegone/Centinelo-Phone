@@ -85,6 +85,18 @@ static void copy_truncated(char *dst, size_t dst_size, const char *src)
  * the common, no-collision case's filename exactly what it's always
  * been), then retry with a "-2", "-3", ... suffix until the caller's own
  * `is_taken` predicate reports a free one.
+ *
+ * `base` is capped to `out_size` minus room for the *largest* suffix this
+ * call could ever produce ("-" + `max_attempts + 1`'s digit count),
+ * computed up front - not truncated to the full `out_size - 1` first and
+ * only then suffixed. Truncating to the full width first (this
+ * function's own earlier bug - a 4R finding, see PROTOCOL.md/E2E-F1.md
+ * "F5") left zero room for a long, peer-controlled Call-ID's suffix to
+ * ever change the truncated result: every attempt produced the
+ * byte-identical candidate, retries exhausted, and audiotap_start()
+ * wrongly denied recording for a call that never genuinely needed a
+ * fallback - a caller-visible availability regression, not a cosmetic
+ * truncation quirk.
  */
 bool pathsafe_unique_component(const char *in, char *out, size_t out_size,
 				bool (*is_taken)(const char *candidate,
@@ -92,19 +104,29 @@ bool pathsafe_unique_component(const char *in, char *out, size_t out_size,
 				void *arg, unsigned max_attempts)
 {
 	char base[256];
+	char suffix_probe[16];
+	size_t suffix_margin, base_cap;
 	unsigned attempt;
 
 	if (!out || !out_size)
 		return false;
 
-	pathsafe_component(in, base, sizeof(base));
+	(void)snprintf(suffix_probe, sizeof(suffix_probe), "-%u",
+		       max_attempts + 1);
+	suffix_margin = strlen(suffix_probe);
+
+	base_cap = (out_size > suffix_margin) ? out_size - suffix_margin : 1;
+	if (base_cap > sizeof(base))
+		base_cap = sizeof(base);
+
+	pathsafe_component(in, base, base_cap);
 	copy_truncated(out, out_size, base);
 
 	if (!is_taken || !is_taken(out, arg))
 		return true;
 
 	for (attempt = 0; attempt < max_attempts; attempt++) {
-		char withsuf[280];
+		char withsuf[sizeof(base) + 16];
 
 		(void)snprintf(withsuf, sizeof(withsuf), "%s-%u", base,
 			       attempt + 2);

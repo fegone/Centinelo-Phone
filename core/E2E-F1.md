@@ -606,7 +606,7 @@ configuration was changed at any point.
 
 ### answer with explicit call_id
 
-**PASS.** Engine A dials `sip:1100@100.119.230.80` (own extension, dual
+**PASS.** Engine A dials `sip:1100@<pbx host>` (own extension, dual
 contact); engine B (the other registered contact) receives
 `call_state incoming` and captures its own `call_id`. B sends
 `{"cmd":"answer","call_id":"<that id>","id":"ans1"}` → `result` `ok:true`
@@ -634,7 +634,7 @@ one stale capture), and all three are byte-for-byte:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
-<dialog-info xmlns="urn:ietf:params:xml:ns:dialog-info" version="2" state="full" entity="sip:1100@100.119.230.80">
+<dialog-info xmlns="urn:ietf:params:xml:ns:dialog-info" version="2" state="full" entity="sip:1100@<pbx host>">
  <dialog id="1100">
   <state>confirmed</state>
  </dialog>
