@@ -399,7 +399,7 @@ verification status of each, and `core/E2E-F1.md` "F5 presence_override"/
   indication; real e2e proved this engine's actual test PBX doesn't emit
   that signal for a locally-held call (a real, useful finding — documented
   as a regression-guard unit test, `test_dialog_info_real_capture_
-  1100_confirmed_no_hold_signal()`, not treated as a bug in this parser).
+  ext1000_confirmed_no_hold_signal()`, not treated as a bug in this parser).
   `dnd` is a best-effort, non-standard hook, not verified against a real
   Asterisk capture.
 - **Security fix: `call_id` is sanitized before ever reaching a
