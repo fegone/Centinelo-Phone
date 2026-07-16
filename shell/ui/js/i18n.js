@@ -26,7 +26,6 @@ export const SUPPORTED_LOCALES = ["en", "pt-BR", "es"];
 const ENTRIES = [
   // -- titlebar --------------------------------------------------------
   ["titlebar.brandAria", "Centinelo — watching, line healthy", "Centinelo — vigiando, linha saudável", "Centinelo — vigilando, línea saludable"],
-  ["titlebar.starting", "Starting…", "Iniciando…", "Iniciando…"],
   ["titlebar.consoleAria", "Console", "Console", "Consola"],
   ["titlebar.consoleTitle", "Open the receptionist console", "Abrir o console da recepção", "Abrir la consola de recepción"],
   ["titlebar.transcriptAria", "Transcript", "Transcrição", "Transcripción"],
@@ -518,14 +517,29 @@ export function localeTag() {
 /// dictionary). `vars` does simple `{name}` substitution — no plural rules
 /// engine; call sites needing a plural (see panel.matchOne/matchOther)
 /// pick the key themselves.
+///
+/// Substitution is a single pass over the ORIGINAL string (one combined
+/// regex, computed from `str` before any replacement happens - not a
+/// split/join per var run sequentially, 2026-07-16 4R re-review LOW
+/// finding): with more than one var, a sequential loop can accidentally
+/// re-substitute a token that only exists because an EARLIER var's own
+/// *value* happened to contain literal `{laterVarName}` text (e.g.
+/// `t("x", { a: "{b}", b: "y" })` looping a-then-b would turn the `{a}`
+/// slot's literal "{b}" into "y" too, on the second iteration). No caller
+/// value collides with a var name today and the result is always escaped
+/// before it reaches the DOM either way, but this closes the class
+/// entirely rather than merely not hitting it by luck.
 export function t(key, vars) {
   const dict = DICTS[activeLocale] || DICTS.en;
   let str = dict[key];
   if (str === undefined) str = DICTS.en[key];
   if (str === undefined) return key;
   if (vars) {
-    for (const k of Object.keys(vars)) {
-      str = str.split(`{${k}}`).join(String(vars[k]));
+    const keys = Object.keys(vars);
+    if (keys.length) {
+      const escaped = keys.map((k) => k.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+      const pattern = new RegExp(`\\{(${escaped.join("|")})\\}`, "g");
+      str = str.replace(pattern, (_match, name) => String(vars[name]));
     }
   }
   return str;

@@ -846,3 +846,83 @@ mod hid_settings_tests {
         assert_eq!(id.serial_number, None);
     }
 }
+
+// 2026-07-16 4R re-review (RELIABILITY A2): LocalePref used a hand-written
+// #[serde(rename = "...")] per variant (not #[serde(rename_all = ...)] like
+// ThemePref) BECAUSE "pt-BR" isn't expressible by any of serde's built-in
+// case conventions (not snake/kebab/camel/etc.) - a typo in one of those
+// four rename strings would silently break persistence (a saved "pt-BR"
+// preference would fail to round-trip, or fall back to Auto without any
+// visible error) with zero coverage catching it. These tests pin the exact
+// wire representation for all four variants plus the two AppSettings-level
+// behaviors (missing key, unknown variant) shared with every other
+// #[serde(default)] field in this file.
+#[cfg(test)]
+mod locale_pref_tests {
+    use super::*;
+
+    #[test]
+    fn default_is_auto() {
+        assert_eq!(LocalePref::default(), LocalePref::Auto);
+    }
+
+    #[test]
+    fn wire_representation_matches_the_frontends_locale_codes() {
+        // ui/js/i18n.js's SUPPORTED_LOCALES + "auto" send/expect exactly
+        // these four strings - a mismatch here breaks get_locale/set_locale
+        // silently (the command still "succeeds", it just never resolves to
+        // the locale the operator picked).
+        assert_eq!(serde_json::to_string(&LocalePref::Auto).unwrap(), r#""auto""#);
+        assert_eq!(serde_json::to_string(&LocalePref::En).unwrap(), r#""en""#);
+        assert_eq!(serde_json::to_string(&LocalePref::PtBr).unwrap(), r#""pt-BR""#);
+        assert_eq!(serde_json::to_string(&LocalePref::Es).unwrap(), r#""es""#);
+    }
+
+    #[test]
+    fn deserializes_from_the_same_four_wire_strings() {
+        assert_eq!(serde_json::from_str::<LocalePref>(r#""auto""#).unwrap(), LocalePref::Auto);
+        assert_eq!(serde_json::from_str::<LocalePref>(r#""en""#).unwrap(), LocalePref::En);
+        assert_eq!(serde_json::from_str::<LocalePref>(r#""pt-BR""#).unwrap(), LocalePref::PtBr);
+        assert_eq!(serde_json::from_str::<LocalePref>(r#""es""#).unwrap(), LocalePref::Es);
+    }
+
+    #[test]
+    fn rejects_pt_pt_and_other_lookalikes_rather_than_silently_aliasing() {
+        // This product only ships Brazilian Portuguese (task brief: "PT-BR
+        // real, não português de Portugal") - "pt-PT", "pt", or a wrong-case
+        // "PT-BR" must fail loudly (serde error), not silently collapse to
+        // some default that would mask a frontend/backend drift.
+        assert!(serde_json::from_str::<LocalePref>(r#""pt-PT""#).is_err());
+        assert!(serde_json::from_str::<LocalePref>(r#""pt""#).is_err());
+        assert!(serde_json::from_str::<LocalePref>(r#""PT-BR""#).is_err());
+    }
+
+    #[test]
+    fn round_trips_through_json_for_every_variant() {
+        for locale in [LocalePref::Auto, LocalePref::En, LocalePref::PtBr, LocalePref::Es] {
+            let json = serde_json::to_string(&locale).unwrap();
+            let back: LocalePref = serde_json::from_str(&json).unwrap();
+            assert_eq!(locale, back);
+        }
+    }
+
+    #[test]
+    fn app_settings_without_locale_key_defaults_to_auto() {
+        // Same #[serde(default)] discipline as every other AppSettings
+        // field (see hid_settings_tests/transcription_settings_tests above)
+        // - an existing settings.json predating this sprint must still load
+        // and resolve to "follow the OS language" rather than failing.
+        let json = r#"{"account":{"host":"pbx.example.test","ext":"9999","secret":"x"}}"#;
+        let app: AppSettings = serde_json::from_str(json).unwrap();
+        assert_eq!(app.locale, LocalePref::Auto);
+    }
+
+    #[test]
+    fn app_settings_locale_round_trips_an_explicit_choice() {
+        let app = AppSettings { locale: LocalePref::PtBr, ..Default::default() };
+        let json = serde_json::to_string(&app).unwrap();
+        assert!(json.contains(r#""locale":"pt-BR""#), "expected a literal pt-BR in the wire JSON, got: {json}");
+        let back: AppSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.locale, LocalePref::PtBr);
+    }
+}

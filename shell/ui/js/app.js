@@ -7,6 +7,7 @@
 
 import { renderTranscriptBody, renderPendingRetriesOnly } from "./transcript-panel.js";
 import { t, setLocale, localeTag, applyStaticI18n } from "./i18n.js";
+import { escapeHtml, escapeAttr } from "./dom-utils.js";
 
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
@@ -202,7 +203,7 @@ function renderIdentity() {
   $("setup-prompt").hidden = configured;
   $("configured-area").hidden = !configured;
   if (!configured) return;
-  const name = state.account.display_name || `Extension ${state.account.ext}`;
+  const name = state.account.display_name || t("provisioning.extensionOnly", { ext: state.account.ext });
   $("me-name").textContent = name;
   $("me-plate").textContent = `EXT ${state.account.ext}`;
   $("me-medal").textContent = initials(name);
@@ -252,22 +253,6 @@ function renderFavorites() {
     }
     grid.appendChild(btn);
   }
-}
-
-function escapeHtml(s) {
-  const d = document.createElement("div");
-  d.textContent = s ?? "";
-  return d.innerHTML;
-}
-
-/// `escapeHtml` covers text-node content only - not safe to interpolate
-/// into an HTML attribute value (a translated string containing `"` would
-/// break out of a `placeholder="..."` attribute otherwise). Mirrors
-/// transcript-panel.js's own escapeAttr for the same reason (2026-07-16
-/// 4R re-review, M1 there) - the only two places in this codebase that
-/// build HTML attributes from translated/dynamic strings.
-function escapeAttr(s) {
-  return escapeHtml(s).replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
 
 // ---------------------------------------------------------------------------
@@ -1054,6 +1039,21 @@ function refreshAllUiText() {
   renderRecents(state.recents);
   if (state.account) {
     $("secret-hint").textContent = state.account.secret_set ? t("settings.secretCurrentlySet") : t("settings.secretNotSet");
+  }
+  // Favorites card inside Settings (4R re-review 2026-07-16, A1): its
+  // "Label"/"Extension" field labels + placeholders are built in JS via
+  // t() (renderFavoritesFields), not sitting in static [data-i18n*]
+  // markup, so a language switch with Settings open left them stale until
+  // Settings was closed/reopened. Re-render it here too - but seeded from
+  // whatever's CURRENTLY TYPED in the fields (collectFavoritesFields),
+  // never from state.favorites (the main dial screen's own copy, which
+  // can already differ from an in-progress, unsaved edit here): a naive
+  // renderFavoritesFields(state.favorites) would silently discard
+  // whatever the admin was mid-typing the moment they picked a language -
+  // trading one staleness bug for a data-loss one. Only when Settings is
+  // actually open - closed, #favorites-fields has nothing to relabel.
+  if (!$("screen-settings").hidden) {
+    renderFavoritesFields(collectFavoritesFields());
   }
   if (!$("screen-transcript").hidden) {
     $("tr-peer-name").textContent = state.transcript ? extractUser(state.transcript.peer) || t("transcript.defaultTitle") : t("transcript.defaultTitle");

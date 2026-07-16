@@ -38,6 +38,12 @@
 // switched there - i18n.js defaults to "en").
 
 import { t, localeTag } from "./i18n.js";
+// escapeHtml/escapeAttr used to be defined here (and byte-identically
+// copied into app.js) - extracted to dom-utils.js (2026-07-16 4R
+// re-review, READABILITY R2) once i18n work made both files lean on them
+// more heavily; see that module's own header for why they're DOM-free
+// pure functions (real `node:test` coverage, no jsdom dependency).
+import { escapeHtml, escapeAttr } from "./dom-utils.js";
 
 const SPEAKER_TAG_KEY = { agent: "panel.you", caller: "panel.caller" };
 
@@ -50,37 +56,6 @@ const SPEAKER_TAG_KEY = { agent: "panel.you", caller: "panel.caller" };
 // phase always renders every segment (that render only ever happens
 // once, and is the authoritative saved transcript).
 const LIVE_TAPE_MAX_TURNS = 50;
-
-// Manual replacement, not the `div.textContent = s; d.innerHTML` trick
-// this module used to use - functionally identical for text-node content
-// (the WHATWG HTML serialization algorithm escapes exactly these three
-// characters in text content: an ambiguous `&`, `<`, and `>`) but doesn't
-// require a live `document`, which is what let this module's pure string
-// helpers (`tapeHtml`, `plainTextTranscript`, everything in
-// `__testables`) gain real `node:test` coverage (2026-07-16 4R re-review,
-// T1) without a jsdom-style dependency this project has otherwise never
-// needed.
-function escapeHtml(s) {
-  return String(s ?? "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-}
-
-/// `escapeHtml` is only safe for TEXT node content - `"`/`'` don't need
-/// escaping there, but DO when the same string is interpolated inside an
-/// HTML attribute value (2026-07-16 4R re-review, M1: the find input's
-/// `value="${escapeHtml(query)}"` let a query containing a literal `"`
-/// break out of the attribute and inject arbitrary markup/handlers on a
-/// re-render). Use this instead for any string placed inside an
-/// attribute; prefer setting the DOM property directly
-/// (`el.value = query`) over interpolating into markup at all wherever
-/// that's an option (see `renderTranscriptBody`'s find input, which does
-/// exactly that now) - this helper covers the remaining cases (`data-*`
-/// attributes) where the value has to be part of the initial HTML string.
-function escapeAttr(s) {
-  return escapeHtml(s).replace(/"/g, "&quot;").replace(/'/g, "&#39;");
-}
 
 function fmtClock(ms) {
   return new Date(ms).toLocaleTimeString(localeTag(), { hour: "numeric", minute: "2-digit" });
