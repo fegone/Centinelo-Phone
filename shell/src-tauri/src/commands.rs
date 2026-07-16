@@ -4,9 +4,9 @@
 use crate::premium::{CapabilityStatusView, PremiumHandle, PremiumInfoView};
 use crate::sidecar::SidecarHandle;
 use crate::settings::{
-    self, AccountSettings, AdminSession, CallDirection, FavoriteSlot, ModelTier, RecentCall,
-    SettingsStore, ThemePref, TranscriptionActivation, TranscriptionMode, TranscriptionSettings,
-    TransportPriority,
+    self, AccountSettings, AdminSession, CallDirection, FavoriteSlot, LocalePref, ModelTier,
+    RecentCall, SettingsStore, ThemePref, TranscriptionActivation, TranscriptionMode,
+    TranscriptionSettings, TransportPriority,
 };
 use crate::transcription::{PendingRetryView, TranscriptionHandle};
 use serde::{Deserialize, Serialize};
@@ -255,6 +255,25 @@ pub fn get_theme(settings: State<Arc<SettingsStore>>) -> ThemePref {
 #[tauri::command(rename_all = "snake_case")]
 pub fn set_theme(settings: State<Arc<SettingsStore>>, theme: ThemePref) -> Result<(), String> {
     settings.update_theme(theme).map_err(|e| e.to_string())
+}
+
+// ---- language (i18n, F4 packaging sprint) ---------------------------------
+// Same "Auto" semantic as theme (see settings.rs LocalePref doc) - resolved
+// client-side (ui/js/i18n.js detectSystemLocale), not gated behind
+// require_unlocked() here for the same reason set_theme isn't: the ONE
+// admin-lock enforcement point for both is visual, index.html's
+// #lock-overlay covering the whole #settings-body (task brief: "setting
+// bajo admin lock" - reaching either control at all already requires an
+// admin unlock, see index.html's #locale-row comment).
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn get_locale(settings: State<Arc<SettingsStore>>) -> LocalePref {
+    settings.snapshot().locale
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn set_locale(settings: State<Arc<SettingsStore>>, locale: LocalePref) -> Result<(), String> {
+    settings.update_locale(locale).map_err(|e| e.to_string())
 }
 
 // ---- admin lock ------------------------------------------------------

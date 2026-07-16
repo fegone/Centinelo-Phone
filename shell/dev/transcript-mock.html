@@ -38,6 +38,10 @@
   <button data-theme="auto" class="on">Auto</button>
   <button data-theme="light">Light</button>
   <button data-theme="dark">Dark</button>
+  <h2>Language</h2>
+  <button data-locale="en" class="on">EN</button>
+  <button data-locale="pt-BR">PT-BR</button>
+  <button data-locale="es">ES</button>
 </div>
 
 <div class="frame">
@@ -57,6 +61,8 @@
 
 <script type="module">
 import { renderTranscriptBody, renderPendingRetriesOnly } from "../ui/js/transcript-panel.js";
+import { t, setLocale } from "../ui/js/i18n.js";
+setLocale("en");
 
 const STARTED = Date.now() - 8 * 60_000 - 42_000; // 8m42s ago, like the mockup's own "lasted 08:42"
 
@@ -125,13 +131,16 @@ const SCENARIOS = {
   "pending-only": () => null,
 };
 
-const TRANSCRIPT_STATE_LABEL = { live: "Live", writing: "Writing…", done: "Saved", error: "Couldn't save" };
+const TRANSCRIPT_STATE_LABEL_KEY = { live: "transcript.live", writing: "transcript.writing", done: "transcript.saved", error: "transcript.couldntSave" };
 const PENDING_ONLY_RETRIES = [
   { callId: "call-earlier-1", peer: "+1 (352) 555-0199", lastError: "could not write to storage_dir: No such file or directory" },
   { callId: "call-earlier-2", peer: "Front desk transfer", lastError: "disk full" },
 ];
 
+let currentScenario = "live";
+
 function render(scenarioKey) {
+  currentScenario = scenarioKey;
   const model = SCENARIOS[scenarioKey]();
   const handlers = {
     onCopy: (text) => console.log("copy:", text),
@@ -141,13 +150,13 @@ function render(scenarioKey) {
     onRetryOther: (callId) => console.log("retry other:", callId),
   };
   if (!model) {
-    document.getElementById("tr-peer-name").textContent = "Transcript";
-    document.getElementById("tr-state-label").textContent = "Couldn't save";
+    document.getElementById("tr-peer-name").textContent = t("transcript.defaultTitle");
+    document.getElementById("tr-state-label").textContent = t("transcript.couldntSave");
     renderPendingRetriesOnly(document.getElementById("transcript-body"), PENDING_ONLY_RETRIES, handlers);
     return;
   }
-  document.getElementById("tr-peer-name").textContent = model.peerName || "Transcript";
-  document.getElementById("tr-state-label").textContent = TRANSCRIPT_STATE_LABEL[model.phase] || "";
+  document.getElementById("tr-peer-name").textContent = model.peerName || t("transcript.defaultTitle");
+  document.getElementById("tr-state-label").textContent = TRANSCRIPT_STATE_LABEL_KEY[model.phase] ? t(TRANSCRIPT_STATE_LABEL_KEY[model.phase]) : "";
   renderTranscriptBody(document.getElementById("transcript-body"), model, handlers);
 }
 
@@ -165,6 +174,15 @@ document.querySelectorAll(".controls button[data-theme]").forEach((btn) => {
     const v = btn.dataset.theme;
     if (v === "auto") document.documentElement.removeAttribute("data-theme");
     else document.documentElement.setAttribute("data-theme", v);
+  });
+});
+document.querySelectorAll(".controls button[data-locale]").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".controls button[data-locale]").forEach((b) => b.classList.remove("on"));
+    btn.classList.add("on");
+    setLocale(btn.dataset.locale);
+    document.documentElement.lang = btn.dataset.locale;
+    render(currentScenario);
   });
 });
 

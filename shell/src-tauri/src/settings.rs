@@ -393,6 +393,29 @@ pub enum ThemePref {
     Dark,
 }
 
+/// The shell's language, mirroring `ThemePref`'s own "Auto" semantic
+/// exactly: `Auto` (default) means "follow this computer's language" and
+/// is resolved client-side (ui/js/i18n.js `detectSystemLocale`, from
+/// `navigator.language`) rather than written back to settings - the same
+/// reason `ThemePref::Auto` doesn't get rewritten to `Light`/`Dark` the
+/// first time the OS theme is read. An explicit choice (`En`/`PtBr`/`Es`)
+/// always wins over the OS language and is what actually gets persisted
+/// when someone picks a language in Settings. `PtBr` only (not `PtPt`) -
+/// Brazilian Portuguese is the only Portuguese variant this product ships
+/// (task brief: "PT-BR real, não português de Portugal").
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum LocalePref {
+    #[default]
+    #[serde(rename = "auto")]
+    Auto,
+    #[serde(rename = "en")]
+    En,
+    #[serde(rename = "pt-BR")]
+    PtBr,
+    #[serde(rename = "es")]
+    Es,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AppSettings {
     #[serde(default)]
@@ -403,6 +426,8 @@ pub struct AppSettings {
     pub favorites: Vec<FavoriteSlot>,
     #[serde(default)]
     pub theme: ThemePref,
+    #[serde(default)]
+    pub locale: LocalePref,
     /// Explicit override for the core binary path. `None` = auto-resolve
     /// (see sidecar.rs `default_core_binary_path`).
     #[serde(default)]
@@ -518,6 +543,12 @@ impl SettingsStore {
     pub fn update_theme(&self, theme: ThemePref) -> std::io::Result<()> {
         let mut guard = self.inner.lock().expect("settings mutex poisoned");
         guard.theme = theme;
+        self.persist(&guard)
+    }
+
+    pub fn update_locale(&self, locale: LocalePref) -> std::io::Result<()> {
+        let mut guard = self.inner.lock().expect("settings mutex poisoned");
+        guard.locale = locale;
         self.persist(&guard)
     }
 

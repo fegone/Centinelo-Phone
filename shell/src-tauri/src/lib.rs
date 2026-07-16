@@ -135,6 +135,8 @@ pub fn run() {
             commands::get_blf_states,
             commands::get_theme,
             commands::set_theme,
+            commands::get_locale,
+            commands::set_locale,
             commands::admin_status,
             commands::admin_set_password,
             commands::admin_unlock,
