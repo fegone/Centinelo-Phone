@@ -8,16 +8,29 @@
 # §2 and shell/README.md "Premium module loader"/"Premium console window"
 # for the full design this mirrors.
 #
-# Status: DRAFT / not wired into CI yet. Exercised locally on macOS against
+# Status: DRAFT / partially wired into CI. Exercised locally on macOS against
 # real core+shell builds and synthetic (non-secret) premium fixtures — see
 # .claude/reports/release-ci-2026-07-16-f5-prep.md (main report + 4R-fix
 # appendix) for the exact commands and what they produced, including a
-# dedicated symlink-fixture re-test (see item 1 below). Not yet run against
-# a *real* signed premium dylib (that requires Felix's offline signing key,
-# which never touches this repo or CI) or on Windows (no Windows machine
-# available this pass — the Windows branch below is written to the same
-# contract core-build.yml's Windows job already proves builds/links, but is
-# unexercised by this script specifically).
+# dedicated symlink-fixture re-test (see "Known gaps" #1 below). Not yet run
+# against a *real* signed premium dylib (that requires Felix's offline
+# signing key, which never touches this repo or CI) or a *real* Windows core
+# build (feature/windows-media-modules not merged yet).
+#
+# Windows target (added 2026-07-16, windows-installer pass): unlike macOS —
+# where the .app is just a directory, so copying files in after `tauri
+# build` works fine — NSIS/MSI installers are built from a manifest
+# (`bundle.resources` in tauri.conf.json), not by scanning whatever's sitting
+# in target/release/ afterward. So on Windows this script stages artifacts
+# into shell/dist-injected/ (gitignored) instead of beside a pre-built exe,
+# and the actual installer only gets built at the very end (step 9b), via
+# `tauri build --config tauri.official.conf.json` — that override file
+# (added this pass, sibling to tauri.conf.json) is the one place
+# `bundle.resources` is declared, kept OUT of the base tauri.conf.json on
+# purpose so plain community/dev builds and shell-build.yml's existing
+# Windows CI job are entirely unaffected. Verified end-to-end with synthetic
+# fixtures via .github/workflows/windows-installer.yml (run URL in the
+# report) — not yet against a real core-win build or a real signed dylib.
 #
 # 🚨 This script NEVER embeds, generates, or receives a signing key. It only
 # copies already-built, already-signed artifacts whose paths are passed in
@@ -79,11 +92,22 @@ Usage:
 
 Options:
   --target {macos|windows}       Build target. Default: current OS (uname).
+                                   macOS: artifacts land beside the built
+                                   .app's exe. Windows: artifacts are staged
+                                   into shell/dist-injected/, then a real
+                                   NSIS/MSI installer is built around them
+                                   via `tauri build --config
+                                   tauri.official.conf.json` (see "Windows
+                                   target" in this file's header comment).
   --skip-core-build               Reuse an existing core/deps/baresip/build
                                    instead of rebuilding it (faster local
                                    iteration; CI should NOT pass this).
   --skip-shell-build              Reuse an existing shell/src-tauri/target
                                    build instead of rebuilding it (ditto).
+                                   On Windows this also skips building the
+                                   final NSIS/MSI installer (step 9b) —
+                                   artifacts are staged but no .msi/.exe is
+                                   produced.
   --premium-dylib PATH            Signed premium dylib/dll. Omit for a
                                    Community-edition package (no premium
                                    module — shell degrades to free mode,
@@ -251,7 +275,20 @@ fi
 
 CORE_BUILD_DIR="$REPO_ROOT/core/deps/baresip/build"
 CORE_BIN_NAME="baresip"
-[[ "$TARGET" == "windows" ]] && CORE_BIN_NAME="baresip.exe"
+# core-build.yml's Windows job builds via MSVC (a multi-config generator),
+# so `cmake --build --config Release` lands the exe one level deeper than
+# the single-config Unix Makefiles macOS build does: core/deps/baresip/
+# build/Release/baresip.exe, not .../build/baresip.exe (confirmed by
+# reading that job's own "Sanity - baresip + ctrl_json built" step, which
+# checks exactly that path). CORE_BIN_SUBDIR captures that difference so
+# every consumer below (--skip-core-build's existence check, the copy in
+# step 6) resolves the same real path instead of only working for macOS.
+CORE_BIN_SUBDIR=""
+if [[ "$TARGET" == "windows" ]]; then
+    CORE_BIN_NAME="baresip.exe"
+    CORE_BIN_SUBDIR="Release"
+fi
+CORE_BIN_PATH="$CORE_BUILD_DIR${CORE_BIN_SUBDIR:+/$CORE_BIN_SUBDIR}/$CORE_BIN_NAME"
 
 # Applies one patch idempotently: skip cleanly if it's already applied
 # (checked via `git apply --reverse --check`), apply it if it isn't, and —
@@ -277,9 +314,9 @@ apply_patch() {
 
 if [[ "$SKIP_CORE_BUILD" -eq 1 ]]; then
     echo "-- Skipping core build (--skip-core-build); expecting an existing build at:"
-    echo "   $CORE_BUILD_DIR"
-    [[ -f "$CORE_BUILD_DIR/$CORE_BIN_NAME" ]] || {
-        echo "error: --skip-core-build given but $CORE_BUILD_DIR/$CORE_BIN_NAME does not exist" >&2
+    echo "   $CORE_BIN_PATH"
+    [[ -f "$CORE_BIN_PATH" ]] || {
+        echo "error: --skip-core-build given but $CORE_BIN_PATH does not exist" >&2
         exit 1
     }
 elif [[ "$TARGET" == "macos" ]]; then
@@ -311,21 +348,45 @@ fi
 # ---------------------------------------------------------------------------
 # 4. Build shell/ (skip with --skip-shell-build to reuse an existing build)
 # ---------------------------------------------------------------------------
+# macOS only. Windows does NOT build here anymore (2026-07-16 windows-
+# installer pass) — see step 9b below for why: the NSIS/MSI bundlers are
+# config-driven (they package whatever `bundle.resources` in
+# tauri.conf.json/tauri.official.conf.json declares at build time), not a
+# post-hoc scan of whatever loose files happen to sit in target/release/.
+# So for Windows, premium artifacts must be staged into shell/dist-injected/
+# (step 5-8 below) BEFORE `tauri build` ever runs — running it here, before
+# staging, would just produce a plain unsigned-community exe and waste a
+# full compile that step 9b repeats anyway.
 
-if [[ "$SKIP_SHELL_BUILD" -eq 1 ]]; then
-    echo "-- Skipping shell build (--skip-shell-build)"
+if [[ "$TARGET" == "macos" ]]; then
+    if [[ "$SKIP_SHELL_BUILD" -eq 1 ]]; then
+        echo "-- Skipping shell build (--skip-shell-build)"
+    else
+        echo "-- Building shell/ (tauri build, release, macOS .app bundle)"
+        (cd shell && npm install && npx tauri build --bundles app)
+    fi
 else
-    echo "-- Building shell/ (tauri build, release)"
-    (cd shell && npm install && npx tauri build --bundles "$([[ "$TARGET" == "macos" ]] && echo app || echo none)")
+    echo "-- Windows: shell build deferred to step 9b (after premium artifacts are staged)"
 fi
 
 # ---------------------------------------------------------------------------
-# 5. Locate the built executable's directory (where premium artifacts land)
+# 5. Locate where premium artifacts land
 # ---------------------------------------------------------------------------
-# Mirrors centinelo-premium-abi::expected_library_path: "directly beside the
-# running executable" — macOS .app/Contents/MacOS/, Windows install dir
-# (here: the raw cargo/tauri release output dir; a real installer's final
-# install path is a later, not-yet-built step, see "Known gaps").
+# macOS: mirrors centinelo-premium-abi::expected_library_path exactly -
+# "directly beside the running executable", i.e. the already-built
+# .app/Contents/MacOS/. The .app is a plain directory, so files copied in
+# here ride along unchanged into a later `hdiutil`/zip step - no re-build
+# needed after this script runs.
+#
+# Windows: NOT the exe dir (see step 4's comment above) - this is
+# shell/dist-injected/, the staging directory tauri.official.conf.json's
+# `bundle.resources` reads from. Step 9b's `tauri build --config
+# tauri.official.conf.json` is what actually copies these into the
+# NSIS/MSI installer, at the SAME per-file destinations
+# (core-engine/, centinelo_premium.dll(.sig), premium-console-assets/)
+# this script has always used for macOS - kept identical on purpose so the
+# runtime lookup code (premium.rs, PROTOCOL.md's ctrl_json contract) sees
+# the same layout on both platforms once installed.
 
 if [[ "$TARGET" == "macos" ]]; then
     APP_BUNDLE="$(find "$REPO_ROOT/shell/src-tauri/target/release/bundle/macos" -maxdepth 1 -name '*.app' | head -n1)"
@@ -333,14 +394,15 @@ if [[ "$TARGET" == "macos" ]]; then
         echo "error: no .app bundle found under shell/src-tauri/target/release/bundle/macos" >&2
         exit 1
     fi
-    EXE_DIR="$APP_BUNDLE/Contents/MacOS"
+    ARTIFACT_DEST_DIR="$APP_BUNDLE/Contents/MacOS"
     PREMIUM_LIB_NAME="libcentinelo_premium.dylib"
+    [[ -d "$ARTIFACT_DEST_DIR" ]] || { echo "error: expected exe dir does not exist: $ARTIFACT_DEST_DIR" >&2; exit 1; }
 else
-    EXE_DIR="$REPO_ROOT/shell/src-tauri/target/release"
+    ARTIFACT_DEST_DIR="$REPO_ROOT/shell/dist-injected"
     PREMIUM_LIB_NAME="centinelo_premium.dll"
+    mkdir -p "$ARTIFACT_DEST_DIR"
 fi
-[[ -d "$EXE_DIR" ]] || { echo "error: expected exe dir does not exist: $EXE_DIR" >&2; exit 1; }
-echo "-- exe dir: $EXE_DIR"
+echo "-- artifact staging dir: $ARTIFACT_DEST_DIR"
 
 # Filename mapping above must stay in sync with
 # shell/src-tauri/centinelo-premium-abi/src/paths.rs::expected_library_filename()
@@ -359,10 +421,10 @@ echo "-- exe dir: $EXE_DIR"
 # Settings > Advanced > core binary path (or CENTINELO_CORE_BIN at launch)
 # pointed at this directory by hand. Flagged for shell-tauri to close before
 # F5 ships to anyone but Felix/Edgar.
-CORE_ENGINE_DIR="$EXE_DIR/core-engine"
+CORE_ENGINE_DIR="$ARTIFACT_DEST_DIR/core-engine"
 rm -rf "$CORE_ENGINE_DIR"
 mkdir -p "$CORE_ENGINE_DIR"
-cp "$CORE_BUILD_DIR/$CORE_BIN_NAME" "$CORE_ENGINE_DIR/"
+cp "$CORE_BIN_PATH" "$CORE_ENGINE_DIR/"
 # Every module baresip's own CMake build actually *symlinks* flat into
 # build/ (core/BUILD.md step 4b: "this is baresip's own CMake doing that
 # symlinking... a post-build step") — NOT plain regular files. 4R/BLOCKING
@@ -375,6 +437,19 @@ cp "$CORE_BUILD_DIR/$CORE_BIN_NAME" "$CORE_ENGINE_DIR/"
 # 4R-fix appendix for the re-test with a real `ln -s` fixture). `-L` makes
 # `find` follow symlinks for the purposes of `-type`, so a symlink whose
 # target is a regular file now correctly matches `-type f`.
+#
+# Windows-only wrinkle (2026-07-16 windows-installer pass, read straight off
+# core-build.yml's Windows job comments — not exercised here, that job's
+# branch, feature/windows-media-modules, isn't merged yet): baresip on
+# Windows builds STATIC ("there is no ctrl_json.dll - the module is
+# compiled into the static baresip lib via the generated src/static.c
+# exports table"), so this `find` step will legitimately find zero module
+# files there - that is NOT a bug once core-win lands, unlike macOS where
+# finding zero .dylib files would mean something broke. (Searching
+# $CORE_BUILD_DIR itself, not the MSVC Release/ subdir CORE_BIN_PATH uses -
+# baresip's CMake symlinks modules flat into the build root per
+# core/BUILD.md step 4b; unverified for Windows specifically since this
+# branch never runs there today, module count is zero either way.)
 find -L "$CORE_BUILD_DIR" -maxdepth 1 -type f \( -name '*.so' -o -name '*.dylib' -o -name '*.dll' \) -exec cp -L {} "$CORE_ENGINE_DIR/" \;
 echo "-- copied core engine binary + modules -> $CORE_ENGINE_DIR"
 # Post-copy verification, not just an optimistic exit 0: ctrl_json is the
@@ -382,14 +457,28 @@ echo "-- copied core engine binary + modules -> $CORE_ENGINE_DIR"
 # shell<->core protocol bridge, PROTOCOL.md) — if it didn't make it into
 # the bundle, the packaged app is silently broken, and that must be a hard
 # failure here, not discovered later at first launch.
-ls "$CORE_ENGINE_DIR"/ctrl_json.* >/dev/null 2>&1 || {
-    echo "error: ctrl_json module not found in $CORE_ENGINE_DIR after copy." >&2
-    echo "       The shell cannot function without it (core/PROTOCOL.md)." >&2
-    echo "       Check that $CORE_BUILD_DIR contains a ctrl_json.{so,dylib,dll}" >&2
-    echo "       (baresip symlinks it there, see core/BUILD.md step 4b) from a" >&2
-    echo "       real baresip CMake build with -DAPP_MODULES=\"ctrl_json\"." >&2
-    exit 1
-}
+#
+# Windows is exempt from this specific check (2026-07-16 windows-installer
+# pass): per the comment above, ctrl_json is statically linked into
+# baresip.exe there, so there is no standalone module file to find - only
+# the binary itself is verified. This is a WEAKER guarantee than macOS's
+# (a successful link isn't the same proof as "the module file shipped"),
+# documented here rather than silently narrowed.
+if [[ "$TARGET" == "windows" ]]; then
+    [[ -f "$CORE_ENGINE_DIR/$CORE_BIN_NAME" ]] || {
+        echo "error: $CORE_BIN_NAME not found in $CORE_ENGINE_DIR after copy." >&2
+        exit 1
+    }
+else
+    ls "$CORE_ENGINE_DIR"/ctrl_json.* >/dev/null 2>&1 || {
+        echo "error: ctrl_json module not found in $CORE_ENGINE_DIR after copy." >&2
+        echo "       The shell cannot function without it (core/PROTOCOL.md)." >&2
+        echo "       Check that $CORE_BUILD_DIR contains a ctrl_json.{so,dylib,dll}" >&2
+        echo "       (baresip symlinks it there, see core/BUILD.md step 4b) from a" >&2
+        echo "       real baresip CMake build with -DAPP_MODULES=\"ctrl_json\"." >&2
+        exit 1
+    }
+fi
 
 # ---------------------------------------------------------------------------
 # 7. Copy premium dylib + .sig (Pro builds only)
@@ -411,16 +500,16 @@ ls "$CORE_ENGINE_DIR"/ctrl_json.* >/dev/null 2>&1 || {
 #       either "no premium files" or "a complete, matched pair", never a
 #       broken partial. The `cleanup_tmp` trap (registered above) removes
 #       any leftover temp file if this script dies before the `mv`s run.
-rm -f "$EXE_DIR/$PREMIUM_LIB_NAME" "$EXE_DIR/$PREMIUM_LIB_NAME.sig"
+rm -f "$ARTIFACT_DEST_DIR/$PREMIUM_LIB_NAME" "$ARTIFACT_DEST_DIR/$PREMIUM_LIB_NAME.sig"
 if [[ "$IS_COMMUNITY" -eq 0 ]]; then
-    TMP_DYLIB="$EXE_DIR/.${PREMIUM_LIB_NAME}.tmp.$$"
-    TMP_SIG="$EXE_DIR/.${PREMIUM_LIB_NAME}.sig.tmp.$$"
+    TMP_DYLIB="$ARTIFACT_DEST_DIR/.${PREMIUM_LIB_NAME}.tmp.$$"
+    TMP_SIG="$ARTIFACT_DEST_DIR/.${PREMIUM_LIB_NAME}.sig.tmp.$$"
     CLEANUP_TMP_FILES+=("$TMP_DYLIB" "$TMP_SIG")
     cp "$PREMIUM_DYLIB" "$TMP_DYLIB"
     cp "$PREMIUM_SIG" "$TMP_SIG"
-    mv "$TMP_DYLIB" "$EXE_DIR/$PREMIUM_LIB_NAME"
-    mv "$TMP_SIG" "$EXE_DIR/$PREMIUM_LIB_NAME.sig"
-    echo "-- copied premium dylib+sig (atomic) -> $EXE_DIR/$PREMIUM_LIB_NAME(.sig)"
+    mv "$TMP_DYLIB" "$ARTIFACT_DEST_DIR/$PREMIUM_LIB_NAME"
+    mv "$TMP_SIG" "$ARTIFACT_DEST_DIR/$PREMIUM_LIB_NAME.sig"
+    echo "-- copied premium dylib+sig (atomic) -> $ARTIFACT_DEST_DIR/$PREMIUM_LIB_NAME(.sig)"
 else
     echo "-- no premium dylib to copy (Community edition; any stale dylib+sig from a"
     echo "   previous run in this exe dir were removed above)"
@@ -435,7 +524,7 @@ fi
 # previously a Pro-with-console run followed by a later Community (or
 # Pro-without-console) run into the same exe dir left the old console-ui
 # assets in place.
-CONSOLE_DEST="$EXE_DIR/premium-console-assets"
+CONSOLE_DEST="$ARTIFACT_DEST_DIR/premium-console-assets"
 rm -rf "$CONSOLE_DEST"
 if [[ -n "$PREMIUM_CONSOLE_ASSETS" ]]; then
     cp -r "$PREMIUM_CONSOLE_ASSETS" "$CONSOLE_DEST"
@@ -453,25 +542,75 @@ mkdir -p "$OUTPUT_DIR"
 LAYOUT_FILE="$OUTPUT_DIR/layout.txt"
 {
     echo "package-official.sh — final layout ($TARGET, $([[ "$IS_COMMUNITY" -eq 1 ]] && echo community || echo pro))"
-    echo "exe dir: $EXE_DIR"
+    echo "$([[ "$TARGET" == "macos" ]] && echo "exe dir" || echo "artifact staging dir"): $ARTIFACT_DEST_DIR"
     echo
-    find "$EXE_DIR" -maxdepth 2 | sort
+    find "$ARTIFACT_DEST_DIR" -maxdepth 2 | sort
 } > "$LAYOUT_FILE"
 echo
 echo "== Done. Layout written to $LAYOUT_FILE =="
 cat "$LAYOUT_FILE"
 
 # ---------------------------------------------------------------------------
+# 9b. Windows only: build the actual NSIS/MSI installer around the staged
+#     artifacts (skip with --skip-shell-build to just leave the staging
+#     directory populated for manual inspection)
+# ---------------------------------------------------------------------------
+# This is the step that makes step 5's "staging dir, not exe dir" comment
+# true: `tauri build --config tauri.official.conf.json` reads
+# tauri.official.conf.json's `bundle.resources` map (added 2026-07-16,
+# windows-installer pass), which points at shell/dist-injected/ - the exact
+# directory steps 6-8 just populated - and copies each entry into the
+# NSIS/MSI installer at build time. This only runs NOW, after staging,
+# because both bundlers are config/manifest-driven: they package what
+# `bundle.resources` declares, not whatever loose files happen to be
+# sitting in target/release/ afterward (that's the mac-only trick step 4/5
+# rely on - a .app is just a directory, an NSIS/MSI installer is not).
+#
+# tauri.conf.json's base config intentionally does NOT declare these
+# resources (only tauri.official.conf.json, merged in here via --config)
+# so a plain community `cargo tauri build`/`tauri dev`, or shell-build.yml's
+# existing Windows CI job, is completely unaffected by this file's
+# existence - it never passes --config, so it never looks at
+# shell/dist-injected/ at all, and doesn't care whether that directory
+# exists or is empty.
+if [[ "$TARGET" == "windows" ]]; then
+    if [[ "$SKIP_SHELL_BUILD" -eq 1 ]]; then
+        echo
+        echo "-- Skipping installer build (--skip-shell-build); staged artifacts are"
+        echo "   sitting in $ARTIFACT_DEST_DIR but no .msi/.exe was produced this run."
+    else
+        echo
+        echo "-- Building the Windows installer (tauri build --config tauri.official.conf.json, nsis+msi)"
+        (cd shell && npm install && npx tauri build --config src-tauri/tauri.official.conf.json --bundles nsis,msi)
+        echo "-- installer(s) at: shell/src-tauri/target/release/bundle/{nsis,msi}/"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # Known gaps (honest, not hidden — see also inline comments above):
-#   1. --target windows does not build core itself (needs the re-install-
-#      prefix dance core-build.yml's Windows job already runs — porting it
-#      here is a follow-up, not done this pass; use --skip-core-build with
-#      a CI-produced Windows build in the meantime).
-#   2. No installer step (DMG signing/notarization, Windows MSI/NSIS +
-#      OV cert signing) — this script only produces the flat "everything
-#      beside the exe" layout `cargo tauri build` already makes; wiring a
-#      real installer artifact is separate F5 work, and OS code-signing is
-#      explicitly deferred until public launch per CLAUDE.md.
+#   1. --target windows still does not build core itself (needs the
+#      re-install-prefix dance core-build.yml's Windows job already runs —
+#      porting it here is a follow-up, not done this pass; use
+#      --skip-core-build with a CI-produced Windows build in the meantime).
+#      Also note (found this pass, reading core-build.yml's Windows job
+#      closely): that build is STATIC (no ctrl_json.dll, no separate
+#      OpenSSL linked in - see the step 6 comment above) and needs the
+#      Chocolatey-installed OpenSSL DLLs on PATH at *runtime*, which this
+#      script does not stage anywhere - a real Windows installer needs
+#      either core/ switched to static-link OpenSSL, or this script (or
+#      the workflow) to know where those DLLs live and bundle them too.
+#      Neither is done here; flagged for core-engine/core-win.
+#   2. [Partially closed 2026-07-16, windows-installer pass] Windows now HAS
+#      an installer path: tauri.official.conf.json's `bundle.resources`
+#      (merged via `tauri build --config`, see step 9b) turns the artifacts
+#      this script stages in shell/dist-injected/ into a real NSIS/MSI
+#      installer — verified end-to-end with synthetic fixtures against
+#      resources placement + build succeeding, see
+#      .claude/reports/release-ci-2026-07-16-windows-installer.md for the
+#      run URL. Still open: macOS DMG signing/notarization, and Windows OV
+#      cert code-signing (`bundle.windows.certificateThumbprint` is
+#      deliberately unset) — both explicitly deferred until public launch
+#      per CLAUDE.md, SmartScreen/Gatekeeper will warn once for the beta.
 #   3. shell/src-tauri/src/sidecar.rs's default_core_binary_path() doesn't
 #      look in the installed-layout `core-engine/` subdir this script
 #      creates yet — an installed build still needs a manual Settings >
@@ -479,11 +618,19 @@ cat "$LAYOUT_FILE"
 #      wires that lookup, OR this moves to Tauri's own `externalBin`
 #      sidecar mechanism (tauri.conf.json has no `bundle.externalBin`
 #      entry today) — either is a shell-tauri decision, not made here.
-#   4. Not wired into any GitHub Actions workflow. The private-repo access
-#      question ("build oficial = con acceso al repo privado" per
-#      .claude/skills/release-ci/SKILL.md) — submodule vs. artifact-
-#      download vs. separate private-repo-triggered workflow — is a Felix
-#      decision, not made by this script.
+#   4. Not wired into a fully automated GitHub Actions workflow yet.
+#      .github/workflows/windows-installer.yml (added this pass) proves the
+#      NSIS/MSI + `bundle.resources` mechanism works with synthetic
+#      fixtures, but its "official Pro build" job (checkout the private
+#      premium repo via a PAT secret, build core-win, run this script, then
+#      the real `tauri build --config`) is deliberately gated off
+#      (workflow_dispatch input, defaults to false) and UNTESTED — it needs
+#      core-win merged, a `PREMIUM_REPO_PAT` repo secret Felix has not
+#      created yet, and a real signed dylib to exist somewhere the
+#      workflow can fetch it from (proposed convention, not yet agreed:
+#      Felix commits the offline-signed dylib+.sig to a fixed path inside
+#      the private premium repo after each local sign). See the report for
+#      the full design and exactly what's blocking it.
 #   5. [Fixed 2026-07-16, 4R review] Premium dylib/.sig and console-assets
 #      are now cleared unconditionally every run before being
 #      (re-)populated (steps 7-8 above), so re-running against a dirty exe
