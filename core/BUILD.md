@@ -481,45 +481,79 @@ weight beyond its current F4-foundation role.
 ## Windows CI
 
 `.github/workflows/core-build.yml` builds `core/` on both `macos-latest`
-and `windows-latest`. The Windows job is marked
-`continue-on-error: true` (allowed to fail) and its build log is uploaded
-as an artifact either way — see that workflow file for the exact commands
-(same submodule + all four patches + CMake sequence as above).
+and `windows-latest`. **The Windows job (`Windows (experimental)`) is
+GATING as of 2026-07-16 — no longer `continue-on-error`.** Both jobs are
+required checks on `v2`; do not regress either one. Its build log is
+still uploaded as an artifact on every run (pass or fail) via
+`actions/upload-artifact@v4` (`windows-core-build-logs`), useful for the
+things that only show up in the raw CMake/MSVC output.
 
-**F1 status**: `ctrl_json.c`'s stdin path — the specific, previously-
-flagged Windows blocker (`unistd.h`/`read()`/`STDIN_FILENO`, POSIX-only)
-— now has a `_WIN32`-gated implementation (reader thread + `fgets()` +
-`re_mqueue.h`, see `core/PROTOCOL.md` "Framing / stdin" for the full
-design and rationale). No Windows machine was available to run this
-engine on real Windows hardware.
+**Confirmed green run** (not "should work" — an actual passing run,
+checked): [`29459035249`](https://github.com/fegone/Centinelo-Phone/actions/runs/29459035249)
+(`5be8dbf`, `v2-winci` branch) — `macOS (supported)` in 38s, `Windows
+(experimental)` in 4m9s, both ✓.
 
-**Actual `windows-latest` CI result for this version (run checked, not
-assumed): still red, but for a different, earlier, unrelated reason.**
-`re` builds successfully; baresip's own configure step then fails before
-reaching `ctrl_json` at all:
+### What's actually different on Windows (read the workflow file, not this doc, for the literal commands — this section explains *why*)
 
-```
-CMake Error at .../FindPackageHandleStandardArgs.cmake:290 (message):
-  Could NOT find RE (missing: RE_LIBRARY)
-Call Stack (most recent call first):
-  cmake/FindRE.cmake:25 (find_package_handle_standard_args)
-  CMakeLists.txt:39 (find_package)
-```
+1. **OpenSSL via Chocolatey, not brew**, and its install path is
+   **detected at runtime, not hardcoded**. The `choco install openssl`
+   package changed its deploy directory between versions — `v3.x` lands
+   at `C:\Program Files\OpenSSL-Win64`, current `v4.x` at
+   `C:\Program Files\OpenSSL` (no `-Win64` suffix). A prior run hardcoded
+   the old path and failed (`find_package(OpenSSL)` → "missing:
+   OPENSSL_CRYPTO_LIBRARY OPENSSL_INCLUDE_DIR"). The fix (this version):
+   a `pwsh` step probes both candidate paths for
+   `include\openssl\ssl.h` and exports whichever one exists to
+   `$GITHUB_ENV` as `OPENSSL_ROOT_DIR`, which every later `cmake`
+   invocation then forwards via `-DOPENSSL_ROOT_DIR="$OPENSSL_ROOT_DIR"`.
+   This is genuinely Windows-only — there is no brew-path-drift
+   equivalent to reproduce on macOS; the macOS job still uses
+   `$(brew --prefix openssl)` directly, unchanged.
 
-This is baresip's own top-level `CMakeLists.txt` failing to locate the
-`re` library it just built, on Windows specifically (likely an MSVC
-`.lib` naming/layout mismatch against what `cmake/FindRE.cmake` expects
-— not investigated further, out of scope: this is a pre-existing
-re/baresip CMake-on-Windows packaging question, unrelated to
-`ctrl_json.c`'s own portability, and touching baresip's/`re`'s own
-`FindRE.cmake`/CMake config generation is outside this version's actual
-scope, which was `ctrl_json.c`'s stdin path specifically). Net effect:
-`ctrl_json.c`'s own Windows-portability work in this version is
-**unreached by this CI run either way** — neither confirmed nor
-contradicted by it, only syntax-checked locally (see below).
-`continue-on-error` correctly stays `true`; do not flip it without first
-resolving the `RE_LIBRARY` discovery issue (a separate task) and then
-seeing an actual green run.
+2. **`re` is built STATIC and explicitly `cmake --install`ed**, then
+   handed to baresip's configure as explicit `-DRE_LIBRARY=...`/
+   `-DRE_INCLUDE_DIR=...` flags, instead of relying on baresip's own
+   `find_package(RE CONFIG REQUIRED HINTS ../re/cmake)` the way macOS
+   does (see "Clone + submodules" above). Root cause: baresip's
+   `cmake/FindRE.cmake` only searches `../re`, `../re/build`, and
+   `../re/build/Debug` for the library — but MSVC's multi-config
+   generator puts the `Release` build's `.lib` at `../re/build/Release`,
+   a path `FindRE.cmake` never looks in, so the raw build-tree lookup
+   failed with `Could NOT find RE (missing: RE_LIBRARY)`. Installing `re`
+   to a known prefix (`cmake --install core/deps/re/build --config
+   Release`) and pointing baresip straight at the installed
+   `re-install-prefix/lib/re-static.lib` sidesteps `FindRE.cmake`'s
+   search-path assumption entirely, rather than patching
+   `FindRE.cmake` itself (upstream file, would need to survive the next
+   `git submodule update`).
+
+3. **Smaller `MODULES` set on Windows** than macOS:
+   `account;g711;auconv;auresamp;menu` — **`ausine`, `aufile`, `ice`, and
+   `dtls_srtp` are not built on Windows today.** This is a real,
+   intentional-for-now scope reduction (not yet investigated further, so
+   flagged here rather than left silently implicit): the Windows job
+   only proves the engine + `ctrl_json` **link and produce a runnable
+   `baresip.exe`**, not that a full WSS/ICE/DTLS-SRTP call actually
+   works on Windows — see "Sanity" below. core-engine owns closing this
+   gap (getting `ice`/`dtls_srtp` building under MSVC) before Windows can
+   be a real e2e target, not just a green compile.
+
+4. **No runtime smoke test** — the Windows job only checks the artifacts
+   exist (`test -x .../Release/baresip.exe`, `test -f
+   .../re-static.lib`), it does not run `baresip.exe -h` the way the
+   macOS job does. Reason: the static Windows build still links against
+   OpenSSL's import libs, and the OpenSSL DLLs aren't on `PATH` at
+   sanity-check time — actually invoking the binary would need that
+   sorted out first. So a green Windows run today means "builds and
+   links cleanly on MSVC", not "runs".
+
+**F1 status** (`ctrl_json.c`'s stdin path, still accurate, unchanged by
+the above): the previously-flagged Windows blocker (`unistd.h`/`read()`/
+`STDIN_FILENO`, POSIX-only) has a `_WIN32`-gated implementation (reader
+thread + `fgets()` + `re_mqueue.h`, see `core/PROTOCOL.md` "Framing /
+stdin" for the full design and rationale). No Windows machine was
+available to run this engine interactively on real Windows hardware —
+CI's static-link build is the only Windows signal that exists today.
 
 Before pushing, the `_WIN32` branch was also sanity-checked locally with
 a forced-macro syntax-only compile (no real MSVC available, but this
