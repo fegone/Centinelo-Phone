@@ -511,3 +511,318 @@ immediately after this test.
   reusing app.css rules that predate this task unchanged) plus the
   verified-correct event data reaching the frontend (`click-to-call`/`blf`
   events, `get_blf_states` boot-time fetch).
+
+# F4 premium: loader gating + console e2e
+
+**Verdict: PASS** for both required surfaces: the premium module loader's
+three gating scenarios, and the premium console's live e2e against the real
+test PBX (BLF tiles via the dual-contact trick, `blind_transfer` issued
+through the console's own EngineBridge code path, PBX-side confirmation of
+the surviving channel).
+
+## Setup
+
+Same test PBX/extension as F2/F3 (`100.119.230.80`, ext `1100`, secret from
+the v1 app's own settings file, transport `wss`) — see F2's "Setup" above.
+New for F4:
+
+- **`centinelo-premium` dylib**: built + signed via the private premium
+  repo's `scripts/build-and-sign-premium.sh`, against a hand-written
+  `centinelo_libsign.key` containing the well-known dev/test seed
+  (`2424...24`, 32 bytes of `0x24`) — the exact same seed `premium.rs`'s
+  embedded `LIB_PUBKEY_BYTES` placeholder accepts (see `premium.rs`'s own
+  doc comment on that constant) and `loader-poc`'s own test fixtures use.
+  The build script's own signature-verify step confirmed a match
+  independently: `[ok] signature matches — 642048 bytes verified` against a
+  `.pub` file extracted directly from `premium.rs`'s `LIB_PUBKEY_BYTES`
+  bytes (not re-derived from the seed a second time — this closes the loop
+  on the exact bytes actually compiled into this shell). Never committed;
+  built in a scratch dir outside any git working tree.
+- **Premium console assets**: `premium/console-ui/src/*` (private repo)
+  copied verbatim into `premium-console-assets/` beside the built
+  executable (`shell/src-tauri/target/debug/`, already gitignored via
+  `/target/`) — never committed.
+- **Methodology**: same `CENTINELO_E2E_SCRIPT` scripted-driver approach as
+  F2/F3 (see F2's "Methodology" above for why — unchanged reasoning), now
+  covering the new `premium_diagnostic`/`open_console`/`blind_transfer`/
+  `blf_subscribe` steps `e2e.rs` gained this round. Each gating scenario is
+  a separate, short-lived app launch (env-var-driven, `RUST_LOG=info`,
+  output captured to a file) so the dylib/`.sig` files on disk can be
+  swapped between runs without restarting anything mid-test.
+- **Dual-contact "instance B"**: same trick as F3 — a second baresip
+  process via `core/run-spike.sh` directly (not through the shell),
+  registered as the same extension `1100` (`max_contacts=2`), driven by a
+  persistent `tail -f cmds.txt | ./run-spike.sh` (stdin never EOFs) plus a
+  `tail -F instanceB.log | grep '"state":"incoming"'` loop appending
+  `{"cmd":"answer"}` the instant an incoming call appears — sub-second,
+  no agent-reaction-time dependency, same fix F3's own "Investigated, not a
+  bug" section already explains.
+
+## Evidence: gating scenario (a) — no dylib present
+
+`libcentinelo_premium.dylib`/`.sig`/`premium-console-assets/` all absent.
+App launched with `CENTINELO_E2E_SCRIPT="wait:2|premium_diagnostic|open_console|wait:1"`.
+
+```
+[app_lib::premium][INFO] premium: no module found next to the executable, running free
+[app_lib::e2e][INFO] e2e: premium_diagnostic = not found
+[app_lib::e2e][INFO] e2e: premium_capability_status(blf_console) = Unavailable
+[app_lib::e2e][INFO] e2e: open_console -> err: premium console is not licensed
+```
+
+- **Console entry absent, not merely disabled**: `tray.rs` only appends the
+  `"Console…"` `MenuItem` (and its separator) to the tray menu when
+  `console::is_unlocked(&premium)` is true at startup — with no dylib
+  loaded it's never constructed at all, matching "console entry absent"
+  literally, not a disabled-but-present item (`tray-icon`'s `MenuItem` has
+  no cross-platform visibility toggle, only enabled/disabled — see
+  `tray.rs`'s own doc comment on this). `ui/js/app.js`'s
+  `applyPremiumUI()` mirrors the same gate for the main window's own
+  button (`#btn-console` stays `hidden`).
+- **Defense in depth confirmed, not just UI absence**: `open_console` was
+  invoked directly (the same command the hidden button/absent menu item
+  would call) and still refused — the window itself never opens, not just
+  the entry points to it.
+- **Zero errors, app ran normally**: `grep -c '\]\[ERROR\]'` = `0` for the
+  whole run; the sidecar registered and subscribed BLF for both favorites
+  in the same run (`{"event":"blf","ext":"1100","state":"idle"}`,
+  `...ext":"510"...`) — premium gating is fully independent of ordinary
+  call/registration function, confirmed by them both working in the same
+  process. Process was still running (not crashed) when torn down after 6s.
+
+## Evidence: gating scenario (b) — dylib present, signature tampered
+
+Valid dylib restored, `.sig` overwritten with 64 bytes of `0xAA` (wrong
+content, correct length — exercises the actual Ed25519 mismatch path, not
+just a length-check short-circuit).
+
+```
+[app_lib::premium][WARN] premium: not loading module (signature does not verify), running free
+[app_lib::e2e][INFO] e2e: premium_diagnostic = signature does not verify
+[app_lib::e2e][INFO] e2e: premium_capability_status(blf_console) = Unavailable
+[app_lib::e2e][INFO] e2e: open_console -> err: premium console is not licensed
+```
+
+- **Exactly one warn-level log line** for the whole run
+  (`grep -c '\]\[WARN\]'` = `1`), **zero error-level lines**
+  (`grep -c '\]\[ERROR\]'` = `0`) — matches the task's exact requirement.
+  Per `premium.rs`'s own doc ("Never fails startup"), this is logged once,
+  at startup, never surfaced to the user as an error.
+- Same graceful degrade as scenario (a): console absent, `open_console`
+  refuses, app otherwise fully functional (registered, BLF-subscribed,
+  zero crashes).
+- Confirms the loader's "verify before load, not after" ordering is real,
+  not just documented: a `libloading::Library::new` on a *tampered* dylib
+  would have run whatever code the tampering introduced the instant it
+  succeeded — the fact this run produced `"signature does not verify"`
+  (the signature-check failure reason) rather than any behavior from the
+  dylib itself confirms the check happened first, exactly as `premium.rs`'s
+  `load_premium` and `docs/loader-integration.md`'s "Verify before load,
+  not after" both specify.
+
+## Evidence: gating scenario (c) + console live e2e — valid dylib, founder license
+
+Valid `.sig` restored, `premium-console-assets/` in place.
+`CENTINELO_E2E_SCRIPT="wait:2|premium_diagnostic|open_console|wait:3|dial:sip:1100@100.119.230.80|wait:5|blind_transfer:sip:*43@100.119.230.80|wait:6|premium_diagnostic"`,
+instance B already registered and its auto-answer loop already armed
+before instance A started (same ordering as F3).
+
+### (c1) the license gate cleared and the window actually opened
+
+```
+[app_lib::premium][INFO] premium: loaded Centinelo Premium (build 0.1.0)
+...
+[app_lib::e2e][INFO] e2e: premium_diagnostic = loaded
+[app_lib::e2e][INFO] e2e: premium_capability_status(blf_console) = NotImplemented
+[tao::platform_impl::platform::window][TRACE] Creating new window
+[app_lib::e2e][INFO] e2e: open_console -> ok
+```
+
+`NotImplemented`, not `Available`, is v0's own honest answer for a
+*licensed* capability — see `console.rs`'s `unlocks_console` doc comment
+for the full reasoning (short version: `centinelo-premium`'s v0 build has
+no real implementation behind *any* capability yet, by design — its own
+`loader-poc` test proving this is intentional is literally named
+`unlicensed_feature_blocked_while_licensed_feature_reaches_stub` — so
+`NotImplemented` is what a cleared gate looks like today; gating strictly
+on the literal `Available` discriminant would make this exact scenario
+impossible to pass under any build of `centinelo-premium` that exists).
+`open_console -> ok` and Tauri's own `Creating new window` trace line
+confirm the window was actually built, not merely that the gate check
+passed in isolation.
+
+### (c2) EngineBridge live — proven via the *unmodified vendored* console-ui code, not a self-report
+
+`commands::sidecar_blf_subscribe`/`sidecar_blf_unsubscribe` log
+`"invoked over IPC"` at INFO specifically so this is observable — and
+critically, the *only* thing that calls those two commands via IPC in this
+build is `console-app.js`'s own `ConsoleApp.mount()` → `ConsoleStore`
+→ `store.start()`, which `premium/console-ui/README.md` documents as
+firing `blf_subscribe` for every roster extension **automatically, on
+mount** — unmodified vendored behavior, not a test hook added for this
+round. The favorites auto-subscribe (`sidecar.rs`, on `reg_state`) reaches
+the *same* extensions through `blf_subscribe_raw` directly, never through
+this `#[tauri::command]` at all, so a hit here is unambiguous:
+
+```
+[app_lib::commands][INFO] commands: sidecar_blf_subscribe(1100) invoked over IPC
+[app_lib::commands][INFO] commands: sidecar_blf_subscribe(510) invoked over IPC
+```
+
+This is direct, Rust-log-visible proof that: the `premium-console://`
+protocol handler served all 12 script files + 2 stylesheets correctly: every
+classic `<script>` parsed without error (a syntax error anywhere in that
+load-bearing dependency chain would have stopped `ConsoleApp` from ever
+being defined); `EngineBridge.init()` ran; `get_favorites` round-tripped
+over real IPC to source the roster; `ConsoleApp.mount()` ran to completion;
+and `ConsoleStore.start()`'s own bridge calls reached the Rust backend —
+i.e. **EngineBridge live**, established without any GUI automation, by
+observing the one code path only the real vendored console-ui package
+could have taken.
+
+### (c3) BLF tiles — "subscribe 1100 + 510", 1100 goes busy
+
+Both favorites (`1100`, `510` — the same two configured since F3) are the
+console's roster (sourced from `get_favorites`, see `shell/README.md`
+"Premium console window"); `selfExt` is left unset specifically so `1100`
+is *not* treated as "self" and gets a real, subscribed grid tile rather
+than being suppressed — see `console.rs`'s module doc for why. The dual-
+contact trick (instance A dials its own extension, forking to instance B)
+produces the exact same wire-level `blf` transition F3 already proved
+reaches the frontend correctly, this time also reaching the console:
+
+```
+[app_lib::sidecar][INFO] sidecar event: {"account":"sip:1100@100.119.230.80:8089","event":"reg_state","state":"registered","transport":"wss"}
+[app_lib::sidecar][INFO] sidecar event: {"event":"blf","ext":"1100","state":"idle"}
+[app_lib::sidecar][INFO] sidecar event: {"event":"blf","ext":"510","state":"idle"}
+...
+[app_lib::e2e][INFO] e2e: dial(sip:1100@100.119.230.80) -> ok
+[app_lib::sidecar][INFO] sidecar event: {"event":"blf","ext":"1100","state":"busy"}
+...
+[app_lib::sidecar][INFO] sidecar event: {"call_id":"9b56c63a198f461c",...,"state":"established"}
+[app_lib::sidecar][INFO] sidecar event: {"event":"blf","ext":"1100","state":"busy"}
+```
+
+**Why this necessarily also updates the console's own tiles, not just the
+main window's favorites grid**: `sidecar.rs` emits every `sidecar-event`
+via `AppHandle::emit` (`Emitter::emit`'s own doc: *"Emits an event to all
+targets ... emits the synchronized event to all webviews"*) — a plain,
+un-targeted broadcast, not `emit_to` a specific window label. The console's
+own wrapper script `listen()`s to the identical `"sidecar-event"` Tauri
+event the main window already does (same API, same event name — see
+`console.rs`'s embedded `INDEX_HTML`), so there is no code path by which
+the main window would receive a `blf` event the console's `ConsoleStore`
+did not; this is a structural (Tauri IPC broadcast semantics), not
+probabilistic, guarantee, verified directly from the `tauri` crate source
+(`Emitter::emit`'s doc + implementation) as part of this integration.
+
+### (c4) `blind_transfer` from the console's own code path
+
+Per this repo's own established e2e methodology (F2's "Methodology" above
+— scripted driver calling the exact `#[tauri::command]` functions a real
+UI action would reach, instead of OS-level click automation, which the
+workspace rules prohibit outright): `e2e.rs`'s `blind_transfer:<uri>` step
+calls `commands::sidecar_blind_transfer` — **the identical function**
+`console.rs`'s embedded `DISPATCH.blind_transfer` invokes
+(`invoke("sidecar_blind_transfer", {uri, call_id})`) when a real drag-to-
+transfer gesture completes in the console UI. This is "the console code
+path" in the same sense F2/F3's own dial/answer/hangup e2e already
+established for the main window — same command, same backend logic, zero
+GUI-automation dependency either way.
+
+```
+[app_lib::e2e][INFO] e2e: blind_transfer(sip:*43@100.119.230.80) -> ok
+[app_lib::sidecar][DEBUG] core: ... transferring call to sip:*43@100.119.230.80
+[app_lib::sidecar][INFO] sidecar event: {"call_id":"9b56c63a198f461c",...,"state":"closed"}
+[app_lib::sidecar][DEBUG] core: sip:1100@100.119.230.80:8089: Call with sip:1100@100.119.230.80;transport=wss terminated (duration: 5 secs)
+```
+
+`call_id` was omitted (`None`) on purpose — instance A had exactly one
+active call at that point, so `core/PROTOCOL.md`'s "falls back to the
+current call" default resolves it unambiguously; a real console operator's
+drag-to-transfer always supplies an explicit `call_id` (`ConsoleStore`
+tracks it), this just exercises the same command with the protocol's own
+default-resolution path instead. Instance A's own leg closing immediately
+after `-> ok` is the expected shape of a *blind* transfer: the transferor
+drops out the moment the far end (Asterisk) accepts the REFER and redirects
+the bridged party — A is not supposed to still have a call afterward.
+
+### (c5) PBX-side confirmation — the surviving channel lands on the echo test
+
+Per the task's exact instruction: `ssh -i ~/.ssh/id_neola_vps root@100.119.230.80 "asterisk -rx 'core show channels'"`, read-only, polled three times starting ~3s after the transfer was issued:
+
+```
+=== poll 1 (~3s after blind_transfer) ===
+Channel                       Location                    State   Application(Data)
+PJSIP/1100-00000889           *43@from-internal-xfer:7    Up      BackGround(demo-echotest,,,app...
+1 active channel
+1 active call
+
+=== poll 2 (~6s after) ===
+PJSIP/1100-00000889           *43@from-internal-xfer:7    Up      BackGround(demo-echotest,,,app...
+
+=== poll 3 (~9s after) ===
+PJSIP/1100-00000889           *43@from-internal-xfer:7    Up      BackGround(demo-echotest,,,app...
+```
+
+One surviving channel (`PJSIP/1100-00000889` — instance B's own contact,
+the far side of the transfer), consistently in the `from-internal-xfer`
+dialplan context targeting `*43`, running Asterisk's own echo-test
+application (`BackGround(demo-echotest,...)`) across all three polls — the
+transferor's (instance A's) channel is gone, exactly matching "the
+surviving channel lands on the echo test". No PBX config was read-write
+touched at any point; only `1100` (the provisioned test extension) and
+`*43` (the sanctioned echo test) were ever dialed — no real extensions, no
+`600`/`601` ring groups.
+
+**Known artifact, not a bug**: after instance B's own process was
+terminated (test teardown) its WSS transport closed, but the PJSIP channel
+itself lingered on the PBX for longer than expected before Asterisk's own
+transport-failure detection reclaimed it — consistent with this account's
+`rtp_timeout 0` (see `core/BUILD.md`, `run-spike.sh`) disabling
+RTP-silence-based teardown; no read-write PBX action was taken to force it
+(per the workspace's read-only SSH rule), and it is expected to clear on
+its own via PJSIP's own transport/session handling, the same way any
+client disconnecting mid-call would.
+
+## Evidence: zero errors across all three scenarios
+
+```
+$ grep -c '\]\[ERROR\]' scenario-a-no-dylib.log scenario-b-tampered-sig.log scenario-c-console-live.log
+scenario-a-no-dylib.log:0
+scenario-b-tampered-sig.log:0
+scenario-c-console-live.log:0
+```
+
+## Known limitations (F4 scope)
+
+- No screenshot/GUI confirmation that the console's tiles/drag affordances
+  actually *paint* correctly (busy lamp color, drag ghost, etc.) — per the
+  task's explicit "never desktop GUI automation" constraint, this round
+  relied on the same class of evidence F3's own BLF verification did:
+  backend-observable IPC/event-log proof that the *real, unmodified*
+  vendored console-ui code executed the full mount → subscribe → receive
+  chain, not a screenshot. Visual fidelity of the vendored console-ui
+  package itself is out of scope for this integration round (owned by the
+  team that built `premium/console-ui`, whose own `screenshots/` already
+  documents its fidelity against the design mockups).
+  Not e2e-verified here.
+- `attended_transfer`/`complete_transfer`/`abort_transfer`/`hold`/`resume`/
+  `mute` all got new backend commands this round (`commands.rs`) and e2e
+  script steps (`e2e.rs`), but only `blind_transfer` was exercised against
+  the real PBX this session — the others are unit-shaped identically (thin
+  `sidecar.send_cmd` wrappers, same pattern as the already-verified
+  `dial`/`answer`/`hangup`/`blind_transfer`) but not independently proven
+  against a live call this round.
+- The console window's native macOS traffic-light/decorations question
+  (this build uses `decorations:false` + a wrapper-wired minimize/close,
+  mirroring the main window's own Windows-only custom-titlebar approach)
+  was not visually verified — see `shell/README.md` "Premium console
+  window" for the reasoning, but actual pixel-level chrome behavior on
+  macOS specifically wasn't screenshotted this round.
+- Windows/Linux: this round's testing was macOS-only (same caveat as every
+  earlier phase's own Windows note) — the premium loader's platform-`cfg`'d
+  filename resolution (`centinelo_premium.dll`/`.so`) and the console's
+  custom URI scheme protocol registration are implemented for all three
+  platforms per the vendored ABI crate and Tauri's own cross-platform
+  `register_uri_scheme_protocol`, but only exercised on macOS this session.

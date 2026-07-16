@@ -1,12 +1,15 @@
 mod bridge;
 mod commands;
+mod console;
 mod deeplink;
 #[cfg(debug_assertions)]
 mod e2e;
+mod premium;
 mod settings;
 mod sidecar;
 mod tray;
 
+use premium::PremiumHandle;
 use settings::{AdminSession, SettingsStore};
 use sidecar::SidecarHandle;
 use std::sync::Arc;
@@ -29,6 +32,18 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_log::Builder::default().build())
+        // Serves the premium console UI (console-ui package) to the
+        // "console" webview window - see console.rs's module doc for why
+        // a custom protocol instead of a bundled frontendDist path (short
+        // version: the console-ui source is premium and must never ship
+        // in this public repo, so it can't live under `ui/`, the one
+        // directory tauri.conf.json's `frontendDist` bundles). Registered
+        // unconditionally on the builder (Tauri requires protocol
+        // registration before `.build()`) - harmless when no premium
+        // assets directory exists, since the "console" window itself is
+        // only ever created when PremiumHandle reports the capability
+        // licensed (see commands::open_console / tray.rs).
+        .register_uri_scheme_protocol(console::ASSET_SCHEME, console::asset_protocol_handler)
         .setup(|app| {
             let app_data_dir = app.path().app_data_dir()?;
             let settings = Arc::new(SettingsStore::load(&app_data_dir)?);
@@ -44,7 +59,15 @@ pub fn run() {
             bridge::start(app.handle().clone(), settings.clone(), sidecar.clone());
             deeplink::setup(app, settings.clone());
 
-            tray::setup(app)?;
+            // Looks for centinelo_premium next to this executable, verifies
+            // + loads it if present, silently stays in free mode if not -
+            // never fails app startup either way. See premium.rs and
+            // docs/loader-integration.md (private premium repo) for the
+            // full design.
+            let premium = PremiumHandle::load(app.handle().clone());
+            app.manage(premium.clone());
+
+            tray::setup(app, &premium)?;
 
             #[cfg(debug_assertions)]
             {
@@ -86,6 +109,19 @@ pub fn run() {
             commands::get_bridge_settings,
             commands::set_auto_dial,
             commands::set_register_tel_handler,
+            commands::premium_info,
+            commands::premium_capability_status,
+            commands::premium_diagnostic,
+            commands::open_console,
+            commands::sidecar_hold,
+            commands::sidecar_resume,
+            commands::sidecar_mute,
+            commands::sidecar_blind_transfer,
+            commands::sidecar_attended_transfer,
+            commands::sidecar_complete_transfer,
+            commands::sidecar_abort_transfer,
+            commands::sidecar_blf_subscribe,
+            commands::sidecar_blf_unsubscribe,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

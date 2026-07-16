@@ -680,6 +680,9 @@ function wireStaticHandlers() {
   $("btn-settings").addEventListener("click", openSettings);
   $("settings-back").addEventListener("click", closeSettings);
   $("btn-cancel-settings").addEventListener("click", closeSettings);
+  $("btn-console").addEventListener("click", () => {
+    invoke("open_console").catch((e) => showBanner(String(e), "err"));
+  });
 
   $("setup-open-settings").addEventListener("click", openSettings);
 
@@ -863,6 +866,23 @@ async function attachTauriListeners() {
   await listen("click-to-call", (e) => handleClickToCall(e.payload));
 }
 
+// Premium receptionist console entry point - hidden unless the license
+// gate cleared. "Available" or "not_implemented" both mean "offer it"
+// (see console.rs::unlocks_console's doc for why NotImplemented, v0's
+// actual answer for a licensed capability, counts here); "not_licensed"/
+// "unavailable" (no dylib, tampered signature, FFI error) hide it -
+// mirrors tray.rs's own gating exactly, so both surfaces agree.
+async function applyPremiumUI() {
+  try {
+    const status = await invoke("premium_capability_status", { capability: "blf_console" });
+    const unlocked = status === "available" || status === "not_implemented";
+    $("btn-console").hidden = !unlocked;
+  } catch (e) {
+    console.error("premium_capability_status failed", e);
+    $("btn-console").hidden = true;
+  }
+}
+
 async function boot() {
   document.documentElement.dataset.os = detectOS();
   wireStaticHandlers();
@@ -890,6 +910,7 @@ async function boot() {
   renderAll();
   await loadRecents();
   await attachTauriListeners();
+  await applyPremiumUI();
 }
 
 boot();

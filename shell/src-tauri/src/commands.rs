@@ -1,6 +1,7 @@
 //! Tauri commands exposed to the frontend. Kept thin: validation + admin-lock
 //! enforcement here, actual work delegated to `settings` / `sidecar`.
 
+use crate::premium::{CapabilityStatusView, PremiumHandle, PremiumInfoView};
 use crate::sidecar::SidecarHandle;
 use crate::settings::{
     self, AccountSettings, AdminSession, CallDirection, FavoriteSlot, RecentCall, SettingsStore,
@@ -34,9 +35,14 @@ pub fn sidecar_answer(sidecar: State<SidecarHandle>) -> Result<(), String> {
     sidecar.send_cmd(serde_json::json!({ "cmd": "answer" }))
 }
 
+/// `call_id` targets a specific call (e.g. a consultation leg during an
+/// attended transfer, from the console); omitted/`None` falls back to
+/// "the current call" (`core/PROTOCOL.md`'s own default) - unchanged
+/// behavior for the main window's own hangup/decline buttons, which never
+/// pass one.
 #[tauri::command(rename_all = "snake_case")]
-pub fn sidecar_hangup(sidecar: State<SidecarHandle>) -> Result<(), String> {
-    sidecar.send_cmd(serde_json::json!({ "cmd": "hangup" }))
+pub fn sidecar_hangup(sidecar: State<SidecarHandle>, call_id: Option<String>) -> Result<(), String> {
+    sidecar.send_cmd(with_call_id(serde_json::json!({ "cmd": "hangup" }), call_id))
 }
 
 /// Manual "retry now" (also used right after saving new account settings).
@@ -317,4 +323,155 @@ pub fn set_register_tel_handler(
         .map_err(|e| e.to_string())?;
     crate::deeplink::apply_tel_registration(&app, enabled);
     Ok(())
+}
+
+// ---- premium ---------------------------------------------------------
+//
+// No admin-lock check here (contrast the settings/account commands above)
+// - these are read-only status queries, not mutations, and the premium
+// module itself is the only thing that ever decides "licensed" (see
+// premium.rs's doc, "Where the license check actually happens"). Nothing
+// here can turn a feature on; it can only report what's already true.
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn premium_info(premium: State<PremiumHandle>) -> Option<PremiumInfoView> {
+    premium.info()
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn premium_capability_status(
+    premium: State<PremiumHandle>,
+    capability: String,
+) -> CapabilityStatusView {
+    premium.capability_status(&capability)
+}
+
+/// Short, non-user-facing reason string - see `PremiumHandle::diagnostic`.
+#[tauri::command(rename_all = "snake_case")]
+pub fn premium_diagnostic(premium: State<PremiumHandle>) -> String {
+    premium.diagnostic().to_string()
+}
+
+/// Opens (or focuses, if already open) the premium receptionist console
+/// window - see `console.rs::open_or_focus` for the license-gate
+/// re-check this delegates to. The tray menu entry and the main window's
+/// own button that call this are both already gated on
+/// `premium_capability_status`/`console::is_unlocked` before they're ever
+/// shown (`tray.rs`, `ui/js/app.js`) - this command re-checks anyway,
+/// since it's reachable by any webview that can invoke it, hidden button
+/// or not.
+#[tauri::command(rename_all = "snake_case")]
+pub fn open_console(app: tauri::AppHandle) -> Result<(), String> {
+    crate::console::open_or_focus(&app)
+}
+
+// ---- EngineBridge verbs (console) -------------------------------------
+//
+// One thin command per core/PROTOCOL.md verb, matching this file's
+// existing dial/answer/hangup convention rather than a single generic
+// passthrough - see premium/console-ui/README.md "EngineBridge contract",
+// "Option B". Not admin-gated: these are the same call-control primitives
+// dial/answer/hangup above already expose ungated - the premium *gate* is
+// on whether the console WINDOW is offered at all (console.rs), not on
+// these underlying sidecar verbs, which core/PROTOCOL.md documents as
+// ordinary v1.1 call control, nothing console-exclusive about them.
+
+/// Folds an optional `call_id` onto a command object - every call-scoped
+/// `core/PROTOCOL.md` command accepts it, falling back to "the current
+/// call" when omitted.
+fn with_call_id(mut cmd: serde_json::Value, call_id: Option<String>) -> serde_json::Value {
+    if let Some(id) = call_id {
+        if let serde_json::Value::Object(map) = &mut cmd {
+            map.insert("call_id".to_string(), serde_json::Value::String(id));
+        }
+    }
+    cmd
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn sidecar_hold(sidecar: State<SidecarHandle>, call_id: Option<String>) -> Result<(), String> {
+    sidecar.send_cmd(with_call_id(serde_json::json!({ "cmd": "hold" }), call_id))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn sidecar_resume(sidecar: State<SidecarHandle>, call_id: Option<String>) -> Result<(), String> {
+    sidecar.send_cmd(with_call_id(serde_json::json!({ "cmd": "resume" }), call_id))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn sidecar_mute(
+    sidecar: State<SidecarHandle>,
+    on: bool,
+    call_id: Option<String>,
+) -> Result<(), String> {
+    sidecar.send_cmd(with_call_id(serde_json::json!({ "cmd": "mute", "on": on }), call_id))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn sidecar_blind_transfer(
+    sidecar: State<SidecarHandle>,
+    uri: String,
+    call_id: Option<String>,
+) -> Result<(), String> {
+    sidecar.send_cmd(with_call_id(
+        serde_json::json!({ "cmd": "blind_transfer", "uri": uri }),
+        call_id,
+    ))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn sidecar_attended_transfer(
+    sidecar: State<SidecarHandle>,
+    uri: String,
+    call_id: Option<String>,
+) -> Result<(), String> {
+    sidecar.send_cmd(with_call_id(
+        serde_json::json!({ "cmd": "attended_transfer", "uri": uri }),
+        call_id,
+    ))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn sidecar_complete_transfer(
+    sidecar: State<SidecarHandle>,
+    call_id: Option<String>,
+) -> Result<(), String> {
+    sidecar.send_cmd(with_call_id(
+        serde_json::json!({ "cmd": "complete_transfer" }),
+        call_id,
+    ))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn sidecar_abort_transfer(sidecar: State<SidecarHandle>) -> Result<(), String> {
+    sidecar.send_cmd(serde_json::json!({ "cmd": "abort_transfer" }))
+}
+
+/// Idempotent: a second `blf_subscribe` for an extension already being
+/// watched is a no-op success rather than the `error` event
+/// `core/PROTOCOL.md` documents for a raw duplicate subscribe - see
+/// `SidecarHandle::blf_subscribe`'s own doc for why that's necessary now
+/// that two independent callers (the favorites auto-subscribe on
+/// registration, and the console mounting with a roster that can overlap
+/// favorites) both legitimately want "make sure this extension is
+/// watched".
+#[tauri::command(rename_all = "snake_case")]
+pub fn sidecar_blf_subscribe(sidecar: State<SidecarHandle>, ext: String) -> Result<(), String> {
+    // INFO, not DEBUG: this line is part of this repo's e2e evidence
+    // trail (mirrors sidecar.rs's own "Evidence trail" doc on its
+    // per-event log line) - the console-ui package's ConsoleStore.start()
+    // calls this once per roster extension via EngineBridge on mount, so
+    // seeing it in a captured log is direct, Rust-log-visible proof the
+    // console's *own vendored JS* reached this command over real IPC -
+    // distinct from sidecar.rs's favorites auto-subscribe, which never
+    // goes through this `#[tauri::command]` at all (it calls
+    // `blf_subscribe_raw` directly from the stdout-reader thread).
+    log::info!("commands: sidecar_blf_subscribe({ext}) invoked over IPC");
+    sidecar.blf_subscribe(&ext)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn sidecar_blf_unsubscribe(sidecar: State<SidecarHandle>, ext: String) -> Result<(), String> {
+    log::info!("commands: sidecar_blf_unsubscribe({ext}) invoked over IPC");
+    sidecar.blf_unsubscribe(&ext)
 }
