@@ -576,6 +576,95 @@ static void test_pathsafe_component(void)
 }
 
 
+struct fake_taken_ctx {
+	const char **taken;
+	size_t count;
+};
+
+
+static bool fake_is_taken(const char *candidate, void *arg)
+{
+	const struct fake_taken_ctx *ctx = arg;
+	size_t i;
+
+	for (i = 0; i < ctx->count; i++) {
+		if (0 == str_cmp(ctx->taken[i], candidate))
+			return true;
+	}
+	return false;
+}
+
+
+/*
+ * v1.3 4R finding (R1) regression guard: pathsafe_component() is
+ * many-to-one by construction ("abc/def" and "abc_def" both sanitize to
+ * "abc_def") - audiotap.c's real collision-avoidance (checking the live
+ * tap registry + filesystem) isn't itself pure/unit-testable, but the
+ * retry/suffix algorithm it's built on (pathsafe_unique_component()) is
+ * - tested here with a fake is_taken predicate.
+ */
+static void test_pathsafe_unique_component(void)
+{
+	char out[64];
+	bool ok;
+
+	ok = pathsafe_unique_component("abc123", out, sizeof(out), NULL,
+					NULL, 10);
+	CHECK(ok, "pathsafe_unique: no is_taken -> always succeeds");
+	CHECK_STREQ(out, "abc123",
+		    "pathsafe_unique: no collision -> filename unchanged"
+		    " from plain pathsafe_component() (common case stays"
+		    " byte-identical)");
+
+	{
+		const char *taken[] = { "abc_def" };
+		struct fake_taken_ctx ctx = { taken, 1 };
+
+		/* R1: "abc/def" sanitizes to "abc_def", same as a
+		 * DIFFERENT raw call_id "abc_def" would - simulate that
+		 * second one already being active. */
+		ok = pathsafe_unique_component("abc/def", out, sizeof(out),
+						fake_is_taken, &ctx, 10);
+		CHECK(ok, "pathsafe_unique: one collision -> still succeeds");
+		CHECK(0 != str_cmp(out, "abc_def"),
+		      "pathsafe_unique: R1 regression - a taken candidate is"
+		      " never returned as-is");
+		CHECK_STREQ(out, "abc_def-2",
+			    "pathsafe_unique: first retry is '-2'");
+	}
+
+	{
+		const char *taken[] = { "x", "x-2", "x-3" };
+		struct fake_taken_ctx ctx = { taken, 3 };
+
+		ok = pathsafe_unique_component("x", out, sizeof(out),
+						fake_is_taken, &ctx, 10);
+		CHECK(ok, "pathsafe_unique: 3 chained collisions -> still"
+		      " succeeds within max_attempts");
+		CHECK_STREQ(out, "x-4",
+			    "pathsafe_unique: skips every already-taken"
+			    " suffix in order");
+	}
+
+	{
+		const char *taken[] = { "y", "y-2", "y-3" };
+		struct fake_taken_ctx ctx = { taken, 3 };
+
+		ok = pathsafe_unique_component("y", out, sizeof(out),
+						fake_is_taken, &ctx, 2);
+		CHECK(!ok, "pathsafe_unique: max_attempts exhausted -> false,"
+		      " never a silent false-success");
+	}
+
+	ok = pathsafe_unique_component(NULL, out, sizeof(out), NULL, NULL, 5);
+	CHECK(ok, "pathsafe_unique: NULL input, no is_taken -> succeeds");
+	CHECK_STREQ(out, "", "pathsafe_unique: NULL input -> empty string");
+
+	CHECK(!pathsafe_unique_component("abc", NULL, 0, NULL, NULL, 5),
+	      "pathsafe_unique: NULL out -> false, no crash");
+}
+
+
 /*
  * v1.2: wav_writer.c - see wav_writer.h's own top comment for why this
  * is unit tested (pure C99 stdio, no baresip/re) unlike audiotap.c (the
@@ -1029,9 +1118,12 @@ static void test_dialog_info_held(void)
 
 /*
  * v1.3 presence_override - DND: best-effort, non-standard hook, NOT
- * confirmed against a real Asterisk capture (see dialog_info.h's header
- * comment) - these fixtures exercise the parser's own documented
- * contract, not a claim about what any real PBX actually sends.
+ * confirmed against a real Asterisk capture (see dialog_info.h). Scope
+ * is deliberately narrow (v1.3 4R finding R1... R4 - see dialog_info.c's
+ * own comment): only overrides what would otherwise be "idle" (no
+ * <dialog> element at all) - never a genuinely active dialog, including
+ * one that's merely "terminated" (still a real <dialog> element, handled
+ * by the normal <state> parsing path, unaffected by dnd).
  */
 static void test_dialog_info_dnd(void)
 {
@@ -1043,10 +1135,20 @@ static void test_dialog_info_dnd(void)
 		"<dialog-info state=\"full\" entity=\"sip:510@host\""
 		" dnd=\"true\">"
 		"</dialog-info>";
-	static const char dnd_with_dialog[] =
+	static const char dnd_with_terminated_dialog[] =
 		"<dialog-info state=\"full\">"
 		"<dnd>true</dnd>"
 		"<dialog id=\"abc\"><state>terminated</state></dialog>"
+		"</dialog-info>";
+	static const char dnd_with_confirmed_dialog[] =
+		"<dialog-info state=\"full\">"
+		"<dnd>true</dnd>"
+		"<dialog id=\"abc\"><state>confirmed</state></dialog>"
+		"</dialog-info>";
+	static const char dnd_with_early_dialog[] =
+		"<dialog-info state=\"full\">"
+		"<dnd>true</dnd>"
+		"<dialog id=\"abc\"><state>early</state></dialog>"
 		"</dialog-info>";
 
 	CHECK(CENT_BLF_DND ==
@@ -1056,10 +1158,25 @@ static void test_dialog_info_dnd(void)
 	CHECK(CENT_BLF_DND ==
 	      dialog_info_parse(dnd_attr, str_len(dnd_attr)),
 	      "dialog_info: dnd=\"true\" attribute -> dnd");
-	CHECK(CENT_BLF_DND ==
-	      dialog_info_parse(dnd_with_dialog, str_len(dnd_with_dialog)),
-	      "dialog_info: dnd marker present alongside a terminated"
-	      " <dialog> -> dnd still wins (checked first)");
+
+	/* R4 regression guard: a dnd marker must NEVER override a real
+	 * active dialog state - only the "no <dialog> at all" case. */
+	CHECK(CENT_BLF_IDLE ==
+	      dialog_info_parse(dnd_with_terminated_dialog,
+				 str_len(dnd_with_terminated_dialog)),
+	      "dialog_info: dnd marker + a real (terminated) <dialog>"
+	      " element -> idle, NOT dnd (a terminated dialog is a real"
+	      " <dialog>, handled by the normal <state> path)");
+	CHECK(CENT_BLF_BUSY ==
+	      dialog_info_parse(dnd_with_confirmed_dialog,
+				 str_len(dnd_with_confirmed_dialog)),
+	      "dialog_info: dnd marker + <state>confirmed</state> -> busy,"
+	      " NOT dnd - dnd never overrides a genuinely active dialog");
+	CHECK(CENT_BLF_RINGING ==
+	      dialog_info_parse(dnd_with_early_dialog,
+				 str_len(dnd_with_early_dialog)),
+	      "dialog_info: dnd marker + <state>early</state> -> ringing,"
+	      " NOT dnd - same guarantee for the ringing case");
 }
 
 
@@ -1101,6 +1218,7 @@ int main(void)
 	test_cmd_tap();
 
 	test_pathsafe_component();
+	test_pathsafe_unique_component();
 
 	test_wav_writer_basic();
 	test_wav_writer_multi_write();

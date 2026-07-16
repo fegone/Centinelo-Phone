@@ -220,8 +220,7 @@ enum cent_cmd_type cent_cmd_decode(struct cent_cmd *out,
 		 * extension - required, not defaulted, since a parking
 		 * lot's pilot extension is per-PBX configuration this
 		 * engine has no business guessing (see PROTOCOL.md "park"
-		 * for why - this engine's own test PBX uses "70", but that's
-		 * this deployment's config, not a protocol constant). */
+		 * for why). */
 		if (!require_str(od, "ext", out->ext, sizeof(out->ext),
 				  "park", errmsg))
 			return CENT_CMD_NONE;

@@ -97,6 +97,11 @@ enum {
 				   * see core/deps/re/src/sipevent/subscribe.c
 				   * tmr_handler - no manual re-SUBSCRIBE loop
 				   * needed here. */
+
+	/* v1.3: "accept " (7 bytes) + a little slack, for the
+	 * CENT_CMD_ANSWER "accept <call-id>" long-command buffer below -
+	 * see process_line()'s CENT_CMD_ANSWER/CENT_CMD_QUIT case. */
+	ACCEPT_CMD_PREFIX_SLACK = 16,
 };
 
 struct ctrl_st {
@@ -517,17 +522,10 @@ static void emit_attended_transfer_started(struct call *source,
 
 
 /*
- * v1.3 (see PROTOCOL.md "park"): confirms a park request's own
- * *synchronous* dispatch (the REFER was accepted and sent) - same
- * "ok:true is not a promise about the async outcome" caveat as
- * blind_transfer's own call_state "closed"/error story (see
- * cmd_blind_transfer()'s comment): the far end's own eventual REFER
- * NOTIFY outcome, and which specific parking-lot slot Asterisk's
- * Park() app actually auto-assigns, are not observable over plain SIP
- * signaling this engine's call leg is party to - see PROTOCOL.md
- * "park" for the full explanation of why `ext` here is the pilot
- * extension the park request targeted, not a specific auto-assigned
- * slot number.
+ * v1.3 (see PROTOCOL.md "park"/"Changes from v1.2"): confirms a park
+ * request's synchronous dispatch only, same "not a promise about the
+ * async outcome" caveat as blind_transfer. `ext` is the pilot extension
+ * targeted, never a specific auto-assigned slot - see PROTOCOL.md for why.
  */
 static void emit_park(struct call *call, const char *ext)
 {
@@ -1281,24 +1279,13 @@ static void cmd_blind_transfer(const struct cent_cmd *cmd)
 
 
 /*
- * v1.3 "park" (see PROTOCOL.md "park"): parks a call by blind-transferring
- * it (REFER, same call_transfer() mechanism as cmd_blind_transfer() right
- * above - park IS a blind transfer, just to a specific kind of PBX
- * resource) to `cmd->ext` - the target parking lot's *pilot* extension
- * (e.g. this engine's own test PBX's "70", confirmed read-only via
- * `asterisk -rx "parking show"`/`"dialplan show 70@from-internal"` to run
- * `Park()` - see core/E2E-F1.md "F5 park" for the exact commands/output).
- * `ext` is required (see cmd.c) rather than defaulted to any particular
- * value - a parking lot's pilot extension is per-PBX configuration, not
- * a protocol constant this engine should guess at (this repo is public;
- * baking in this deployment's own "70" would also embed one test PBX's
- * config into shipped code for no protocol reason - see PROTOCOL.md
- * "park" for the full explanation, including why the resulting
- * confirmation event's `ext` field is the *pilot* extension the park
- * request targeted, not a specific auto-assigned parking slot number -
- * that's genuinely not observable over plain SIP signaling this engine's
- * call leg is party to, confirmed by reading how Asterisk's REFER
- * handling and Park() app interact here, not guessed).
+ * v1.3 "park" (see PROTOCOL.md "park"/"Changes from v1.2"): parks a call
+ * by blind-transferring it (REFER, same call_transfer() mechanism as
+ * cmd_blind_transfer() above) to `cmd->ext`, the parking lot's *pilot*
+ * extension. `ext` is required, never defaulted - a pilot extension is
+ * per-PBX config, not a protocol constant (this repo is public - see
+ * PROTOCOL.md for why). Real-PBX e2e status: see PROTOCOL.md's v1.3
+ * status paragraph and core/E2E-F1.md "F5".
  */
 static void cmd_park(const struct cent_cmd *cmd)
 {
@@ -1564,24 +1551,18 @@ static void process_line(const char *line, size_t len)
 	case CENT_CMD_QUIT: {
 		struct mbuf *resp = mbuf_alloc(256);
 		struct re_printf pf = {print_handler, resp};
-		char buf[16 + CENT_ID_SIZE];
+		char buf[ACCEPT_CMD_PREFIX_SLACK + CENT_ID_SIZE];
 		int err;
 
 		if (!resp)
 			break;
 
 		/*
-		 * v1.3: an explicit call_id (see PROTOCOL.md "answer") rides
-		 * as baresip's own "accept <call-id>" long-command parameter
-		 * - modules/menu/static_menu.c's cmd_answer() already
-		 * resolves that exact shape via uag_call_find() (confirmed
-		 * by reading it, not assumed - see core/BUILD.md's own
-		 * "read the source, don't guess" precedent), so this needed
-		 * no new resolve-call path here, just building the right
-		 * string. No call_id keeps the plain "accept"/"quit" this
-		 * case has always sent - byte-for-byte unchanged for a
-		 * caller that never sends call_id, and CENT_CMD_QUIT never
-		 * decodes one (see cmd.c) so it's unaffected either way.
+		 * v1.3 (see PROTOCOL.md "answer"): an explicit call_id rides
+		 * as baresip's own existing "accept <call-id>" long-command
+		 * parameter (modules/menu/static_menu.c cmd_answer() already
+		 * resolves it via uag_call_find()) - no new resolve-call path
+		 * needed. No call_id -> plain "accept"/"quit", unchanged.
 		 */
 		if (type == CENT_CMD_ANSWER && cmd.have_call_id)
 			(void)re_snprintf(buf, sizeof(buf), "accept %s",

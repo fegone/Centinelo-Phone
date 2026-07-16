@@ -679,48 +679,32 @@ implemented and unit-tested against synthetic fixtures only.
 **Command/protocol layer confirmed; end-to-end parking not yet
 confirmed — a real, reproducible finding, not a PBX-config gap.**
 
-First, read-only PBX verification of the actual parking-lot pilot
-extension/feature code (task asked to confirm this rather than assume
-`*70`/`71` from memory):
-
-```
-$ asterisk -rx "features show"            # Park Call: no *code configured
-$ asterisk -rx "dialplan show 70@from-internal"
-[ Included context 'parkedcalls' created by 'res_parking/default' ]
-  '70' =>           1. Park()                                     [res_parking]
-$ asterisk -rx "parking show default"
-Parking Lot: default
-  Parking Extension   :  70
-  Parking Context     :  parkedcalls
-  Parking Spaces      :  71-78
-```
-
-Confirms: this PBX's parking pilot is the **bare extension `70`** (not a
-`*`-prefixed feature code — `features show`'s built-in "Park Call" row
-has no code assigned; parking here is reached by dialing the lot's own
-pilot extension, which is unrelated to that DTMF-during-call feature),
-reachable from ext 1100's own dialplan context (`from-internal` →
-`from-internal-xfer`/`-noxfer` → includes `parkedcalls`), auto-assigning
-a free slot from `71`-`78`.
+The test PBX's actual parking-lot pilot extension and dialplan reachability
+were confirmed read-only before this scenario ran (task asked to verify
+rather than assume from memory) — the operational detail (exact extension/
+slot numbers, `asterisk -rx` output) is PBX-deployment-specific, not
+protocol-relevant, and lives in `premium/docs/` (private) rather than this
+public file; what matters here is that the target this scenario used is a
+genuine, dialplan-reachable Asterisk `Park()` application, not a
+mistargeted or unconfigured one.
 
 Bridge setup identical to the `held` scenario above (dual-contact,
 confirmed media flowing, ~18s settle before acting — ruled out as an
 ICE-timing artifact by re-running with both a 5s and an 18s settle
-window, same result both times). B sends
-`{"cmd":"park","ext":"70","call_id":...,"id":"park1"}` →
-`{"event":"park","call_id":...,"ext":"70"}` then
-`{"event":"result","id":"park1","ok":true}` — the command layer works
-exactly as designed: decode, call resolution, URI construction (reusing
-`build_pbx_ext_uri()`, the same helper `blf_subscribe` uses,
-independently proven correct by that command's own passing e2e in the
-`held` scenario above), and the synchronous confirmation events, all
-correct.
+window, same result both times). B sends `{"cmd":"park","ext":"<pilot
+ext>","call_id":...,"id":"park1"}` → `{"event":"park","call_id":...,
+"ext":"<pilot ext>"}` then `{"event":"result","id":"park1","ok":true}` —
+the command layer works exactly as designed: decode, call resolution, URI
+construction (reusing `build_pbx_ext_uri()`, the same helper
+`blf_subscribe` uses, independently proven correct by that command's own
+passing e2e in the `held` scenario above), and the synchronous
+confirmation events, all correct.
 
 But B's own stderr (SIP trace) shows the REFER itself never actually
 reaches the wire:
 
 ```
-transferring call to sip:70@100.119.230.80
+transferring call to sip:<pilot ext>@<pbx host>
 call: subscription closed: Destination address required [39]
 ```
 
@@ -730,18 +714,7 @@ is `EDESTADDRREQ`, a **local** socket/transport-layer error, not a SIP
 response code; the PBX never sent anything back (no 4xx/5xx), and
 read-only PBX verification immediately after confirmed the original
 call was left completely undisturbed — still a normal 2-party bridge,
-not parked, not dropped:
-
-```
-$ asterisk -rx "parking show default"
-Parked Calls
-------------
-  (none)
-$ asterisk -rx "core show channels"
-PJSIP/1100-00000010   (None)                       Up  AppDial((Outgoing Line))
-PJSIP/1100-0000000f   1100@dialOne-with-exten:2     Up  Dial(PJSIP/1100/sip:1100@100.9...
-2 active channels, 1 active call
-```
+not parked, not dropped, no parked calls anywhere in the lot.
 
 Reproduced twice (independent runs, both with the longer 18s settle
 window) — same error, same "call left untouched" outcome both times, not
@@ -750,9 +723,10 @@ a flake. Root-causing attempted: `call_transfer()` (`src/call.c`) calls
 (`sipsess_dialog(call->sess)`) for the REFER's own destination
 resolution — confirmed by reading `sipevent_drefer()`/`sipsub_alloc()`
 in `core/deps/re/src/sipevent/subscribe.c` — so the Refer-To URI's own
-content (`sip:70@100.119.230.80`, built via the same `build_pbx_ext_uri()`
-helper `blf_subscribe` already proved correct) should never itself be
-consulted for *where* the REFER request is sent; it's carried in the
+content (`sip:<pilot ext>@<pbx host>`, built via the same
+`build_pbx_ext_uri()` helper `blf_subscribe` already proved correct)
+should never itself be consulted for *where* the REFER request is sent;
+it's carried in the
 `Refer-To:` header value only. `sipsub_close_handler()` in `src/call.c`
 is what logs the "subscription closed" line, when the closing error
 (`err`) is non-zero — meaning some part of `re`'s own sipevent-subscribe

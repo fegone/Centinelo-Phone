@@ -450,6 +450,62 @@ void audiotap_close(void)
 }
 
 
+enum {
+	/* Upper bound on pathsafe_unique_component()'s suffixed retries
+	 * (see path_taken() below) - headroom against a deliberately
+	 * adversarial collision, not a realistic accidental count. */
+	AUDIOTAP_PATH_COLLISION_RETRIES = 64,
+};
+
+
+struct path_collision_ctx {
+	const char *dir;
+};
+
+
+/* is_taken predicate for pathsafe_unique_component() (see pathsafe.h -
+ * pathsafe_component() sanitizes but doesn't guarantee uniqueness).
+ * "Taken" = an rx_path/tx_path of a currently-active audiotap_regl
+ * entry, or a file that already exists on disk (covers a stale leftover
+ * from an earlier, unrelated call whose sanitized call_id happened to
+ * match, not just a same-process concurrent collision). */
+static bool path_taken(const char *candidate_id, void *arg)
+{
+	const struct path_collision_ctx *ctx = arg;
+	char rx[AUDIOTAP_PATH_SIZE], tx[AUDIOTAP_PATH_SIZE];
+	struct le *le;
+	FILE *fp;
+
+	path_build(rx, sizeof(rx), ctx->dir, candidate_id, "rx");
+	path_build(tx, sizeof(tx), ctx->dir, candidate_id, "tx");
+
+	for (le = list_head(&audiotap_regl); le; le = le->next) {
+		struct audiotap_reg *r = le->data;
+
+		if (!r->active)
+			continue;
+
+		if (!str_cmp(r->rx_path, rx) || !str_cmp(r->tx_path, rx) ||
+		    !str_cmp(r->rx_path, tx) || !str_cmp(r->tx_path, tx))
+			return true;
+	}
+
+	fp = fopen(rx, "rb");
+	if (fp) {
+		(void)fclose(fp);
+		return true;
+	}
+
+	fp = fopen(tx, "rb");
+	if (fp) {
+		(void)fclose(fp);
+		return true;
+	}
+
+	return false;
+}
+
+
 int audiotap_start(struct call *call, const char *dir,
 		    struct audiotap_result *res, const char **errmsg)
 {
@@ -462,6 +518,9 @@ int audiotap_start(struct call *call, const char *dir,
 		"tap_start: could not open output file(s)"
 		" (bad 'dir'? not writable?)";
 	static const char *e_nomem    = "tap_start: out of memory";
+	static const char *e_collision =
+		"tap_start: could not find a free output path"
+		" (too many sanitized call_id collisions)";
 	struct audio *au;
 	struct audiotap_reg *r;
 	const char *cid;
@@ -512,23 +571,25 @@ int audiotap_start(struct call *call, const char *dir,
 	r->au = au;
 	cid = call_id(call);
 
-	/*
-	 * v1.3 security fix (see pathsafe.h's top comment for the full
-	 * story): call_id(call) is the SIP Call-ID header verbatim for an
-	 * incoming call - caller-controlled, not engine-generated - and
-	 * RFC 3261's own `word` grammar legally allows '/' in it. Route it
-	 * through pathsafe_component() before it ever reaches path_build()
-	 * below, which otherwise interpolates it directly into a
-	 * filesystem path - an unsanitized Call-ID containing "../" is a
-	 * real path-traversal vector into an attacker-chosen location
-	 * outside the caller-supplied `dir`, not merely a theoretical one.
-	 * r->call_id (used below for path_build() and echoed back
-	 * nowhere else - the `call_id` field on tap_state/other JSON
-	 * events always comes from call_id(call) directly, see
-	 * ctrl_json.c - a JSON string handles arbitrary bytes safely,
-	 * unlike a filesystem path) is now always the *sanitized* form.
-	 */
-	pathsafe_component(cid, r->call_id, sizeof(r->call_id));
+	/* v1.3 security fix - see pathsafe.h and path_taken() above:
+	 * call_id(call) is caller-controlled for an incoming call, so it's
+	 * sanitized (pathsafe_component() semantics) *and* disambiguated
+	 * against any collision with an active tap or an existing file
+	 * before it's used for r->call_id / path_build() below. r->call_id
+	 * is echoed nowhere else (JSON events use call_id(call) directly,
+	 * see ctrl_json.c) - only this filesystem-path use needs it. */
+	{
+		struct path_collision_ctx ctx = { .dir = dir };
+
+		if (!pathsafe_unique_component(cid, r->call_id,
+						sizeof(r->call_id),
+						path_taken, &ctx,
+						AUDIOTAP_PATH_COLLISION_RETRIES)) {
+			*errmsg = e_collision;
+			mem_deref(r);
+			return EEXIST;
+		}
+	}
 
 	path_build(r->rx_path, sizeof(r->rx_path), dir, r->call_id, "rx");
 	path_build(r->tx_path, sizeof(r->tx_path), dir, r->call_id, "tx");

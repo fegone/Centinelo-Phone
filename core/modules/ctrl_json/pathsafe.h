@@ -1,35 +1,22 @@
 /**
  * @file pathsafe.h  Centinelo Phone v2 - filesystem-path-component sanitizer
  *
- * v1.3 security fix (4R risk-lens finding, 2026-07-16): `call_id(call)`
- * (baresip's `struct call::id`) is **not** an engine-generated value for an
- * *incoming* call - `src/call.c`'s `sipsess_accept_handler()` sets it
- * verbatim from `sip_dialog_callid()`, i.e. the SIP `Call-ID` header the
- * *far end* sent in its own INVITE. RFC 3261's `word` token grammar
- * (`callid = word ["@" word]`) legally permits `/` (and `\`, quotes, and
- * most other punctuation) inside a Call-ID - a real SIP peer, not just a
- * hypothetically malicious one, could send one containing `../` sequences
- * and still be spec-compliant.
- *
- * `audiotap.c`'s `audiotap_start()` interpolates this same call_id
- * directly into a filesystem path (`<dir>/<call_id>-rx.wav`/`-tx.wav`,
- * see PROTOCOL.md "tap_start") - unsanitized, that's a real path-traversal
- * vector: a crafted Call-ID could write a WAV file outside the caller-
- * supplied `dir`. This module is the fix: every remote-controlled
- * identifier this engine ever interpolates into a filesystem path MUST be
- * passed through pathsafe_component() first (currently just the one call
- * site - see audiotap.c `audiotap_start()`).
+ * v1.3 security fix - see core/PROTOCOL.md "Changes from v1.2" for the
+ * full story (call_id(call) is caller-controlled for an incoming call,
+ * not engine-generated, and was reaching a filesystem path unsanitized
+ * in audiotap.c's tap_start).
  *
  * Deliberately pure (no baresip.h / re.h dependency beyond <stddef.h>) so
  * it's unit tested standalone, same pattern as cmd.c/dialog_info.c - see
  * core/modules/ctrl_json/test/test_main.c.
  *
- * Copyright (C) 2026 Neola Dental / Centinelo Phone
+ * Copyright (C) 2026 Centinelo Phone
  */
 
 #ifndef CENTINELO_CTRL_JSON_PATHSAFE_H
 #define CENTINELO_CTRL_JSON_PATHSAFE_H
 
+#include <stdbool.h>
 #include <stddef.h>
 
 /**
@@ -37,30 +24,61 @@
  * (never a full path - the caller still owns joining it with a directory
  * and a suffix, see audiotap.c `path_build()`).
  *
- * Whitelist-only (fails safe, not blacklist): only
- * `[A-Za-z0-9._@-]` bytes are copied through; every other byte -
- * including `/` and `\` (the two path-separator characters this actually
- * needs to stop, on POSIX and Windows respectively - see
- * core/PROTOCOL.md "Framing / stdin" for this engine's own POSIX+Windows
- * dual-platform scope), any control byte, and any non-ASCII byte - is
- * replaced with `_`. A leading run of `.` characters is additionally
- * neutralized (each leading `.` also replaced with `_`) so the output can
- * never itself *be* exactly `.`/`..`/`...` etc, even before a caller
- * appends its own suffix - defense in depth on top of `audiotap.c`'s own
- * "always appends a non-dot `-rx`/`-tx` suffix" behavior, which already
- * independently rules out a bare `..` reaching the filesystem from this
- * engine's one real call site.
+ * Whitelist-only (fails safe, not blacklist): only `[A-Za-z0-9._@-]`
+ * bytes are copied through; every other byte - including `/` and `\`,
+ * any control byte, any non-ASCII byte - is replaced with `_`. A leading
+ * run of `.` characters is additionally neutralized so the output can
+ * never itself *be* `.`/`..`/etc.
+ *
+ * Many-to-one by construction (a whitelist can't also guarantee
+ * uniqueness) - two different inputs can sanitize to the same output.
+ * A caller for whom that collision matters (two concurrent taps writing
+ * to the same path, say) should use pathsafe_unique_component() below
+ * instead of calling this directly.
  *
  * @param in       Input string (any bytes, NUL-terminated). NULL is
  *                 treated the same as "".
  * @param out      Output buffer. Always left NUL-terminated on return,
- *                 even for a NULL/empty `in` or `out_size` of 1 (which
- *                 yields an empty string - there's no room for anything
- *                 else).
+ *                 even for a NULL/empty `in` or `out_size` of 1.
  * @param out_size Size of `out` in bytes, including the NUL terminator.
- *                 A `NULL`/zero `out`/`out_size` is a no-op (nothing
- *                 written anywhere).
+ *                 A `NULL`/zero `out`/`out_size` is a no-op.
  */
 void pathsafe_component(const char *in, char *out, size_t out_size);
+
+/**
+ * pathsafe_component(), plus collision avoidance: if the plain sanitized
+ * value is already "taken" (per the caller-supplied `is_taken`
+ * predicate), retries with a `-2`, `-3`, ... suffix appended until a free
+ * candidate is found or `max_attempts` is exhausted. See pathsafe.c's own
+ * comment for why this exists (the many-to-one collision above is a real
+ * silent-data-corruption risk for a caller like audiotap.c that opens
+ * files at the sanitized path).
+ *
+ * Pure with respect to filesystem/registry state: `is_taken` is the
+ * caller's own predicate (audiotap.c's is impure - checks a live
+ * registry and the filesystem) - this function itself stays unit
+ * testable with a fake one (see test/test_main.c
+ * test_pathsafe_unique_component()).
+ *
+ * @param in           Raw input (see pathsafe_component()).
+ * @param out          Output buffer.
+ * @param out_size     Size of `out`, including the NUL terminator.
+ * @param is_taken     Returns true if `candidate` (always exactly what's
+ *                     currently in `out`) is already in use. NULL means
+ *                     "nothing is ever taken" (behaves like
+ *                     pathsafe_component()).
+ * @param arg          Passed through to `is_taken` unchanged.
+ * @param max_attempts Upper bound on suffixed retries *after* the plain
+ *                     (attempt 0) candidate - a caller-chosen safety net,
+ *                     not a value this function picks. If exhausted, `out`
+ *                     is left at its last attempted value.
+ *
+ * @return true if `out` holds a candidate `is_taken` reported as free (or
+ *         `is_taken` was NULL), false if `max_attempts` was exhausted.
+ */
+bool pathsafe_unique_component(const char *in, char *out, size_t out_size,
+				bool (*is_taken)(const char *candidate,
+						  void *arg),
+				void *arg, unsigned max_attempts);
 
 #endif /* CENTINELO_CTRL_JSON_PATHSAFE_H */
