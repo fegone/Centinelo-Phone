@@ -93,7 +93,11 @@ html[data-os="mac"] .titlebar #btn-close { display: none; }
 /* == dial display ========================================================= */
 .display { flex: none; display: flex; align-items: center; gap: 8px; padding: 12px 4px 8px; border-bottom: 1px solid var(--border-1); margin: 2px 2px 8px; min-height: 30px; }
 .display .num { font: 500 25px/1 var(--font-mono); letter-spacing: .02em; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.display .num:empty::before { content: "Dial a number"; color: var(--text-3); font: 400 15px/1 var(--font-ui); }
+/* Translated via the element's own data-empty-placeholder attribute (set
+   by app.js renderDial()/i18n.js applyStaticI18n path), not a literal CSS
+   string - a pure ::before content: "..." can't be localized (F4 i18n
+   sprint gap found via visual QA, see shell-tauri's i18n report). */
+.display .num:empty::before { content: attr(data-empty-placeholder); color: var(--text-3); font: 400 15px/1 var(--font-ui); }
 .caret { display: inline-block; width: 2px; height: 24px; background: var(--amber-fill); vertical-align: -3px; margin-left: 2px; animation: blink 1.1s steps(2,start) infinite; }
 @keyframes blink { 50% { opacity: 0; } }
 .display .back { margin-left: auto; flex: none; width: 34px; height: 30px; display: grid; place-items: center; border-radius: 8px; color: var(--text-3); }

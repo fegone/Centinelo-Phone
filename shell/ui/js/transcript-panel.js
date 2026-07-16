@@ -28,8 +28,24 @@
 //   // M2) - never dropped just because a new call started tracking here.
 //   otherPendingRetries: [{ callId, peer, lastError }],
 // }
+//
+// i18n (F4 packaging sprint): every human-readable string this module
+// emits comes from `t()` (ui/js/i18n.js) - defaults to English, matching
+// this module's pre-i18n literal strings exactly, so the existing
+// transcript-panel.test.js pure-logic assertions (speakerLabel, tapeHtml's
+// "No speech was picked up"/"Showing the most recent" substrings, ...)
+// keep passing unmodified under plain `node --test` (no locale ever gets
+// switched there - i18n.js defaults to "en").
 
-const SPEAKER_TAG = { agent: "You", caller: "Caller" };
+import { t, localeTag } from "./i18n.js";
+// escapeHtml/escapeAttr used to be defined here (and byte-identically
+// copied into app.js) - extracted to dom-utils.js (2026-07-16 4R
+// re-review, READABILITY R2) once i18n work made both files lean on them
+// more heavily; see that module's own header for why they're DOM-free
+// pure functions (real `node:test` coverage, no jsdom dependency).
+import { escapeHtml, escapeAttr } from "./dom-utils.js";
+
+const SPEAKER_TAG_KEY = { agent: "panel.you", caller: "panel.caller" };
 
 // Bounds how many turns the LIVE tape actually renders (2026-07-16 4R
 // re-review, M4): every new segment used to trigger a full re-render of
@@ -41,43 +57,12 @@ const SPEAKER_TAG = { agent: "You", caller: "Caller" };
 // once, and is the authoritative saved transcript).
 const LIVE_TAPE_MAX_TURNS = 50;
 
-// Manual replacement, not the `div.textContent = s; d.innerHTML` trick
-// this module used to use - functionally identical for text-node content
-// (the WHATWG HTML serialization algorithm escapes exactly these three
-// characters in text content: an ambiguous `&`, `<`, and `>`) but doesn't
-// require a live `document`, which is what let this module's pure string
-// helpers (`tapeHtml`, `plainTextTranscript`, everything in
-// `__testables`) gain real `node:test` coverage (2026-07-16 4R re-review,
-// T1) without a jsdom-style dependency this project has otherwise never
-// needed.
-function escapeHtml(s) {
-  return String(s ?? "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-}
-
-/// `escapeHtml` is only safe for TEXT node content - `"`/`'` don't need
-/// escaping there, but DO when the same string is interpolated inside an
-/// HTML attribute value (2026-07-16 4R re-review, M1: the find input's
-/// `value="${escapeHtml(query)}"` let a query containing a literal `"`
-/// break out of the attribute and inject arbitrary markup/handlers on a
-/// re-render). Use this instead for any string placed inside an
-/// attribute; prefer setting the DOM property directly
-/// (`el.value = query`) over interpolating into markup at all wherever
-/// that's an option (see `renderTranscriptBody`'s find input, which does
-/// exactly that now) - this helper covers the remaining cases (`data-*`
-/// attributes) where the value has to be part of the initial HTML string.
-function escapeAttr(s) {
-  return escapeHtml(s).replace(/"/g, "&quot;").replace(/'/g, "&#39;");
-}
-
 function fmtClock(ms) {
-  return new Date(ms).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  return new Date(ms).toLocaleTimeString(localeTag(), { hour: "numeric", minute: "2-digit" });
 }
 
 function fmtDate(ms) {
-  return new Date(ms).toLocaleDateString([], { month: "short", day: "numeric" });
+  return new Date(ms).toLocaleDateString(localeTag(), { month: "short", day: "numeric" });
 }
 
 function fmtDuration(totalSeconds) {
@@ -107,7 +92,8 @@ function sortedSegments(segments) {
 }
 
 function speakerLabel(speaker) {
-  return SPEAKER_TAG[speaker] || (speaker || "").toUpperCase() || "—";
+  const key = SPEAKER_TAG_KEY[speaker];
+  return (key ? t(key) : "") || (speaker || "").toUpperCase() || "—";
 }
 
 /// Highlights `query` (case-insensitive) inside already-escaped `html`
@@ -140,23 +126,21 @@ function tapeHtml(model, opts = {}) {
   }
   const parts = [];
   if (truncated) {
-    parts.push(
-      `<p class="tr-truncated-note">Showing the most recent ${LIVE_TAPE_MAX_TURNS} turns while the call is live — the saved transcript will have all of it.</p>`
-    );
+    parts.push(`<p class="tr-truncated-note">${escapeHtml(t("panel.truncatedNote", { n: LIVE_TAPE_MAX_TURNS }))}</p>`);
   } else if (model.startedAt) {
-    parts.push(`<div class="tmark"><span>Call began · ${fmtClock(model.startedAt)}</span></div>`);
+    parts.push(`<div class="tmark"><span>${escapeHtml(t("panel.callBegan", { time: fmtClock(model.startedAt) }))}</span></div>`);
   }
   for (const seg of segs) parts.push(turnHtml(seg, query));
   if (trailingListening) {
     parts.push(
-      `<div class="listening" aria-label="Listening"><span class="dots" aria-hidden="true"><i></i><i></i><i></i></span><span>Listening</span></div>`
+      `<div class="listening" aria-label="${escapeAttr(t("panel.listeningAria"))}"><span class="dots" aria-hidden="true"><i></i><i></i><i></i></span><span>${escapeHtml(t("panel.listening"))}</span></div>`
     );
   }
   if (model.phase === "done" && model.endedAt) {
-    parts.push(`<div class="tmark"><span>Call ended · ${fmtClock(model.endedAt)}</span></div>`);
+    parts.push(`<div class="tmark"><span>${escapeHtml(t("panel.callEnded", { time: fmtClock(model.endedAt) }))}</span></div>`);
   }
   if (!segs.length && !trailingListening) {
-    parts.push(`<p class="tr-empty">No speech was picked up on this call yet.</p>`);
+    parts.push(`<p class="tr-empty">${escapeHtml(t("panel.noSpeechYet"))}</p>`);
   }
   return parts.join("\n");
 }
@@ -168,6 +152,12 @@ const ICON = {
   copy: `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M15 5H7a2 2 0 0 0-2 2v10"/></svg>`,
   folder: `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"/></svg>`,
   folderDown: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"/><path d="M4.5 20L20 4.5"/></svg>`,
+  // A crossed-out mic, not the folder-down glyph above - channelsFailed is
+  // an AUDIO read problem (one side's tap couldn't be read), not a
+  // storage/folder one; folderDown is reserved for the actual save-failed
+  // card (renderError/renderPendingRetriesOnly). "One metaphor per icon"
+  // (creative-vigilia's 2026-07-16 panel-fidelity report, finding #3).
+  micOff: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V5a3 3 0 0 0-5.94-.6"/><path d="M17 16.95A7 7 0 0 1 5 12v-2"/><path d="M19 10v2a7 7 0 0 1-.11 1.23"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/><line x1="1" y1="1" x2="23" y2="23"/></svg>`,
   search: `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="11" cy="11" r="6.5"/><path d="M16 16l4.5 4.5"/></svg>`,
   play: `<svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5.5v13l11-6.5-11-6.5z"/></svg>`,
   shield: `<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v5c0 4.5-3 8-7 10-4-2-7-5.5-7-10V6l7-3z"/><path d="M9 11.5l2.2 2.2 4.3-4.2"/></svg>`,
@@ -181,9 +171,9 @@ const ICON = {
 function renderLive(model) {
   return `
     <div class="tr-live">
-      <div class="tr-toprow"><span class="workchip"><i aria-hidden="true"></i>Live</span></div>
+      <div class="tr-toprow"><span class="workchip"><i aria-hidden="true"></i>${escapeHtml(t("panel.liveBadge"))}</span></div>
       <div class="tape" id="tr-tape">${tapeHtml(model, { trailingListening: true, capLive: true })}</div>
-      <p class="trail">Runs a few seconds behind the conversation — turns land whole, already attributed. No word-by-word churn.</p>
+      <p class="trail">${escapeHtml(t("panel.trailNote"))}</p>
     </div>
     ${pendingRetryRowsHtml(model.otherPendingRetries)}`;
 }
@@ -192,31 +182,39 @@ function renderWriting(model) {
   return `
     <div class="writing">
       ${ICON.scribe}
-      <b>Writing the transcript</b>
-      <span class="sub">This can take a few minutes on this computer. You can keep taking calls.</span>
+      <b>${escapeHtml(t("panel.writingHeading"))}</b>
+      <span class="sub">${escapeHtml(t("panel.writingBody"))}</span>
     </div>
     ${pendingRetryRowsHtml(model.otherPendingRetries)}`;
 }
 
 function factsHtml(model) {
   const chips = [];
-  chips.push(`<span class="mchip">${model.direction === "outbound" ? "Outgoing call" : "Incoming call"}</span>`);
+  chips.push(`<span class="mchip">${escapeHtml(model.direction === "outbound" ? t("panel.outgoingCall") : t("panel.incomingCall"))}</span>`);
   if (model.startedAt) chips.push(`<span class="mchip">${fmtDate(model.startedAt)} · ${fmtClock(model.startedAt)}</span>`);
   if (model.startedAt && model.endedAt) {
-    chips.push(`<span class="mchip">Lasted ${fmtDuration((model.endedAt - model.startedAt) / 1000)}</span>`);
+    chips.push(`<span class="mchip">${escapeHtml(t("panel.lasted", { duration: fmtDuration((model.endedAt - model.startedAt) / 1000) }))}</span>`);
   }
   if (model.phase === "done" && model.done) {
-    chips.push(`<span class="mchip ok">Saved</span>`);
+    chips.push(`<span class="mchip ok">${escapeHtml(t("panel.savedChip"))}</span>`);
   }
   return chips.join("");
 }
 
+/// Three whole-sentence variants (not a "{who} audio" template built by
+/// joining possessive words) - "your"/"the caller's"/"both sides'" don't
+/// share one grammatical slot cleanly across English/Portuguese/Spanish
+/// (possessive placement, singular/plural agreement on "couldn't be
+/// read"), so each language gets to phrase its own sentence naturally
+/// instead of fighting a shared template (see i18n.js panel.channelsFailed*).
 function channelsFailedNotice(channelsFailed) {
   if (!channelsFailed || !channelsFailed.length) return "";
-  const who = channelsFailed.map((s) => (s === "agent" ? "your" : "the caller's")).join(" and ");
+  const hasAgent = channelsFailed.includes("agent");
+  const hasCaller = channelsFailed.includes("caller");
+  const key = hasAgent && hasCaller ? "panel.channelsFailedBoth" : hasAgent ? "panel.channelsFailedYouOnly" : "panel.channelsFailedCallerOnly";
   return `<div class="tr-partial" role="status">
-    <span>${ICON.folderDown}</span>
-    <p>Part of this call wasn't transcribed — ${escapeHtml(who)} audio couldn't be read. What follows is what was captured, not the full call.</p>
+    <span>${ICON.micOff}</span>
+    <p>${escapeHtml(t(key))}</p>
   </div>`;
 }
 
@@ -227,6 +225,17 @@ function channelsFailedNotice(channelsFailed) {
 /// `callId`/`peer`/`lastError` here - the fuller shape
 /// (`local*Path`/`channelsFailed`) is for the currently-displayed one via
 /// `model.error`, not this list.
+///
+/// The human paragraph is always the same calm, fixed copy - never the
+/// raw backend error (creative-vigilia's 2026-07-16 panel-fidelity
+/// report, finding #2: a string like "could not write to storage_dir: No
+/// such file or directory" read as prose violates the panel's "cero
+/// jerga" rule). The technical detail, when present, still surfaces - as
+/// a mono whisper line, not prose. `.plate`'s own uppercase+heavy
+/// letter-spacing treatment reads fine for short state words but would
+/// hurt legibility on an arbitrary sentence-length backend message, so
+/// this reuses its font/size/color without those two properties (see
+/// transcript.css's own `.tr-pending-detail`).
 function pendingRetryRowsHtml(retries) {
   const items = retries || [];
   if (!items.length) return "";
@@ -234,15 +243,16 @@ function pendingRetryRowsHtml(retries) {
     .map(
       (r) => `<div class="tr-pending-row">
         <div class="bx">
-          <b>${escapeHtml(r.peer || "Unknown caller")}</b>
-          <p>${escapeHtml(r.lastError || "Couldn't save.")}</p>
+          <b>${escapeHtml(r.peer || t("panel.unknownCaller"))}</b>
+          <p>${escapeHtml(t("panel.savedErrorFallback"))}</p>
+          ${r.lastError ? `<p class="tr-pending-detail">${escapeHtml(r.lastError)}</p>` : ""}
         </div>
-        <button class="ghostbtn tr-pending-retry-btn" data-call-id="${escapeAttr(r.callId)}">Retry now</button>
+        <button class="ghostbtn tr-pending-retry-btn" data-call-id="${escapeAttr(r.callId)}">${escapeHtml(t("panel.retryNow"))}</button>
       </div>`
     )
     .join("");
-  return `<div class="tr-pending-list" aria-label="Other calls waiting to save">
-    <p class="tr-pending-title">Other calls waiting to save</p>
+  return `<div class="tr-pending-list" aria-label="${escapeAttr(t("panel.otherPendingTitle"))}">
+    <p class="tr-pending-title">${escapeHtml(t("panel.otherPendingTitle"))}</p>
     ${rows}
   </div>`;
 }
@@ -255,12 +265,12 @@ function renderDone(model, opts) {
       <div class="idrow">
         <span class="medal">${initials(model.peerName || model.peerNumber)}</span>
         <div class="who">
-          <b>${escapeHtml(model.peerName || model.peerNumber || "Unknown caller")}</b>
+          <b>${escapeHtml(model.peerName || model.peerNumber || t("panel.unknownCaller"))}</b>
           ${model.peerNumber ? `<span class="num">${escapeHtml(model.peerNumber)}</span>` : ""}
         </div>
         <div class="acts">
-          <button class="ghostbtn" id="tr-btn-copy">${ICON.copy}Copy</button>
-          <button class="ghostbtn" id="tr-btn-folder"${model.done && model.done.txtPath ? "" : " disabled"}>${ICON.folder}Show in folder</button>
+          <button class="ghostbtn" id="tr-btn-copy">${ICON.copy}${escapeHtml(t("panel.copy"))}</button>
+          <button class="ghostbtn" id="tr-btn-folder"${model.done && model.done.txtPath ? "" : " disabled"}>${ICON.folder}${escapeHtml(t("panel.showInFolder"))}</button>
         </div>
       </div>
       <div class="plates" aria-label="Call facts">${factsHtml(model)}</div>
@@ -269,7 +279,7 @@ function renderDone(model, opts) {
     <div class="findrow">
       <label class="find">
         ${ICON.search}
-        <input type="text" id="tr-find-input" placeholder="Find in transcript" aria-label="Find in transcript">
+        <input type="text" id="tr-find-input" placeholder="${escapeAttr(t("panel.findPlaceholder"))}" aria-label="${escapeAttr(t("panel.findAria"))}">
       </label>
       <span class="hits" id="tr-find-hits"></span>
     </div>
@@ -277,13 +287,13 @@ function renderDone(model, opts) {
     ${
       audioKept
         ? `<div class="audiorow" aria-label="Kept audio">
-             <button class="playbtn" aria-label="Play audio">${ICON.play}</button>
+             <button class="playbtn" aria-label="${escapeAttr(t("panel.playAria"))}">${ICON.play}</button>
              <span class="wave" aria-hidden="true"></span>
-             <span class="aud">Audio kept · 2 channels</span>
+             <span class="aud">${escapeHtml(t("panel.audioKept"))}</span>
            </div>`
         : ""
     }
-    <div class="tfoot">${ICON.shield}Transcribed on this computer · audio never left it</div>
+    <div class="tfoot">${ICON.shield}<span class="tfoot-text"><span class="tfoot-full">${escapeHtml(t("panel.trustLine"))}</span><span class="tfoot-short">${escapeHtml(t("panel.trustLineShort"))}</span></span></div>
     ${pendingRetryRowsHtml(model.otherPendingRetries)}`;
 }
 
@@ -295,13 +305,13 @@ function renderError(model) {
       <div class="tr-fc-body">
         <span>${ICON.folderDown}</span>
         <div class="bx">
-          <b>Can't save this transcript right now.</b>
-          <p>The transcript is safe on this computer. It moves over on its own once this is fixed.</p>
+          <b>${escapeHtml(t("panel.cantSaveNow"))}</b>
+          <p>${escapeHtml(t("panel.safeOnComputer"))}</p>
         </div>
       </div>
       <div class="bacts">
-        <button class="ghostbtn" id="tr-btn-retry"${err.retryable === false ? " disabled" : ""}>Retry now</button>
-        <button class="ghostbtn" id="tr-btn-local"${hasLocalCopy ? "" : " disabled"}>Show local copy</button>
+        <button class="ghostbtn" id="tr-btn-retry"${err.retryable === false ? " disabled" : ""}>${escapeHtml(t("panel.retryNow"))}</button>
+        <button class="ghostbtn" id="tr-btn-local"${hasLocalCopy ? "" : " disabled"}>${escapeHtml(t("panel.showLocalCopy"))}</button>
       </div>
     </div>
     ${channelsFailedNotice(err.channelsFailed)}
@@ -374,7 +384,7 @@ export function renderTranscriptBody(container, model, handlers = {}) {
       // "N matches", not "N OF N" - there's no current-match cursor to
       // navigate between (no next/prev affordance exists), so a fraction
       // implying one would be misleading (2026-07-16 4R re-review, B1).
-      if (hitsEl) hitsEl.textContent = findInput.value.trim() ? `${hits} match${hits === 1 ? "" : "es"}` : "";
+      if (hitsEl) hitsEl.textContent = findInput.value.trim() ? t(hits === 1 ? "panel.matchOne" : "panel.matchOther", { n: hits }) : "";
       if (handlers.onFindInput) handlers.onFindInput(findInput.value);
     });
   }
@@ -399,8 +409,8 @@ export function renderPendingRetriesOnly(container, retries, handlers = {}) {
       <div class="tr-fc-body">
         ${ICON.folderDown}
         <div class="bx">
-          <b>Transcripts waiting to save.</b>
-          <p>These are safe on this computer and will move over once the issue is fixed.</p>
+          <b>${escapeHtml(t("panel.waitingToSaveTitle"))}</b>
+          <p>${escapeHtml(t("panel.waitingToSaveBody"))}</p>
         </div>
       </div>
     </div>
