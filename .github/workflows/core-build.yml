@@ -46,19 +46,26 @@ jobs:
           cmake --build core/deps/re/build -j"$(sysctl -n hw.ncpu)"
 
       - name: Configure + build baresip + ctrl_json
+        # MODULES (2026-07-16): added coreaudio - the real macOS audio
+        # backend (input/output device access via CoreAudio/AudioToolbox),
+        # analogous to the Windows job's wasapi addition. See
+        # core/BUILD.md "macOS media modules" for the full rationale.
         run: |
+          set -o pipefail
           cmake -S core/deps/baresip -B core/deps/baresip/build \
             -DCMAKE_BUILD_TYPE=Release \
             -DOPENSSL_ROOT_DIR="$(brew --prefix openssl)" \
-            -DMODULES="account;g711;auconv;auresamp;ausine;aufile;ice;dtls_srtp;menu" \
+            -DMODULES="account;g711;auconv;auresamp;ausine;aufile;ice;dtls_srtp;menu;coreaudio" \
             -DAPP_MODULES="ctrl_json" \
-            -DAPP_MODULES_DIR="${{ github.workspace }}/core/modules"
+            -DAPP_MODULES_DIR="${{ github.workspace }}/core/modules" \
+            2>&1 | tee baresip-configure.log
           cmake --build core/deps/baresip/build -j"$(sysctl -n hw.ncpu)"
 
       - name: Sanity - binary + ctrl_json module exist
         run: |
           test -x core/deps/baresip/build/baresip
           test -e core/deps/baresip/build/ctrl_json.so
+          test -e core/deps/baresip/build/coreaudio.so
           # `baresip -h` deliberately exits non-zero (254 - -h's own
           # usage() path, unrelated to any change in this repo, verified
           # pre-existing: the very first CI run for this workflow, before
@@ -66,6 +73,39 @@ jobs:
           # its actual output instead of trusting the exit code for this
           # sanity check.
           core/deps/baresip/build/baresip -h 2>&1 | grep -q "Usage: baresip"
+          # Assert every requested module actually got compiled in, not
+          # just requested: a module whose own CMakeLists.txt hits an
+          # early `return()` (e.g. an unsatisfied optional dependency, or
+          # - coreaudio's own case - a platform guard, `if(NOT Darwin)
+          # return()`, which should never trigger on macos-latest but is
+          # exactly the kind of silent-drop this check exists to catch)
+          # silently drops out of MODULES_DETECTED instead of failing
+          # configure. baresip's CMakeLists.txt prints
+          # `MODULES_DETECTED=...` unconditionally (`message(...)`, not
+          # `message(STATUS ...)`, so it's always in the tee'd log) right
+          # after the per-module add_subdirectory() loop. Same mechanism
+          # as the Windows job's own MODULES_DETECTED assertion (see that
+          # job below) - token-exact match against the `;`-separated
+          # list, not a substring check, for the same reason (a module
+          # whose name is a substring of another present module's name
+          # would otherwise wrongly pass).
+          detected_line="$(grep '^MODULES_DETECTED=' baresip-configure.log || true)"
+          echo "$detected_line"
+          if [ -z "$detected_line" ]; then
+            echo "error: MODULES_DETECTED line not found in baresip-configure.log" >&2
+            exit 1
+          fi
+          detected_tokens=";${detected_line#MODULES_DETECTED=};"
+          for mod in ausine aufile ice dtls_srtp coreaudio; do
+            case "$detected_tokens" in
+              *";$mod;"*) ;;
+              *)
+                echo "error: module '$mod' missing from MODULES_DETECTED - it was requested but silently dropped (check its CMakeLists.txt for an early return())" >&2
+                exit 1
+                ;;
+            esac
+          done
+          echo "OK: re + baresip(+ctrl_json, +ausine, +aufile, +ice, +dtls_srtp, +coreaudio) built on macOS"
 
       - name: Configure + build + run ctrl_json unit tests (ASan)
         # Standalone project (core/modules/ctrl_json/test/), not part of
