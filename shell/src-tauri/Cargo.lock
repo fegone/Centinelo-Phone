@@ -486,6 +486,7 @@ version = "2.0.0"
 dependencies = [
  "argon2",
  "centinelo-premium-abi",
+ "chrono",
  "ed25519-dalek",
  "form_urlencoded",
  "getrandom 0.2.17",

@@ -8,12 +8,14 @@ mod premium;
 mod settings;
 mod sidecar;
 mod tray;
+mod transcription;
 
 use premium::PremiumHandle;
 use settings::{AdminSession, SettingsStore};
 use sidecar::SidecarHandle;
 use std::sync::Arc;
 use tauri::Manager;
+use transcription::TranscriptionHandle;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -66,6 +68,20 @@ pub fn run() {
             // full design.
             let premium = PremiumHandle::load(app.handle().clone());
             app.manage(premium.clone());
+
+            // Wired in after both PremiumHandle and SidecarHandle exist
+            // (transcription needs the license gate + a way to send
+            // tap_start/tap_stop) - see SidecarHandle::attach_transcription's
+            // doc for why this is a post-construction attach rather than a
+            // constructor argument.
+            let transcription = TranscriptionHandle::new(
+                app.handle().clone(),
+                settings.clone(),
+                premium.clone(),
+                sidecar.clone(),
+            );
+            sidecar.attach_transcription(transcription.clone());
+            app.manage(transcription);
 
             tray::setup(app, &premium)?;
 
@@ -122,6 +138,14 @@ pub fn run() {
             commands::sidecar_abort_transfer,
             commands::sidecar_blf_subscribe,
             commands::sidecar_blf_unsubscribe,
+            commands::get_transcription_settings,
+            commands::save_transcription_settings,
+            commands::transcription_manual_start,
+            commands::transcription_manual_stop,
+            commands::transcription_pending_retries,
+            commands::transcription_retry,
+            commands::transcription_model_status,
+            commands::download_transcription_model,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

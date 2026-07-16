@@ -4,9 +4,11 @@
 use crate::premium::{CapabilityStatusView, PremiumHandle, PremiumInfoView};
 use crate::sidecar::SidecarHandle;
 use crate::settings::{
-    self, AccountSettings, AdminSession, CallDirection, FavoriteSlot, RecentCall, SettingsStore,
-    ThemePref, TransportPriority,
+    self, AccountSettings, AdminSession, CallDirection, FavoriteSlot, ModelTier, RecentCall,
+    SettingsStore, ThemePref, TranscriptionActivation, TranscriptionMode, TranscriptionSettings,
+    TransportPriority,
 };
+use crate::transcription::{PendingRetryView, TranscriptionHandle};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tauri::State;
@@ -474,4 +476,172 @@ pub fn sidecar_blf_subscribe(sidecar: State<SidecarHandle>, ext: String) -> Resu
 pub fn sidecar_blf_unsubscribe(sidecar: State<SidecarHandle>, ext: String) -> Result<(), String> {
     log::info!("commands: sidecar_blf_unsubscribe({ext}) invoked over IPC");
     sidecar.blf_unsubscribe(&ext)
+}
+
+// ---- transcription (F4) -----------------------------------------------
+//
+// Settings are admin-gated (require_unlocked) like account/favorites, AND
+// gated behind the `transcription` premium capability
+// (crate::transcription::is_unlocked) - per the task spec, a
+// Community/unlicensed build never even sees these settings exist
+// (get_transcription_settings returns None), matching how console.rs's
+// window itself never appears rather than appearing disabled.
+
+#[derive(Serialize)]
+pub struct TranscriptionSettingsView {
+    pub mode: TranscriptionMode,
+    pub activation: TranscriptionActivation,
+    pub keep_audio: bool,
+    pub storage_dir: String,
+    pub view_only: bool,
+    pub model_tier: ModelTier,
+    pub language: String,
+}
+
+impl From<TranscriptionSettings> for TranscriptionSettingsView {
+    fn from(t: TranscriptionSettings) -> Self {
+        Self {
+            mode: t.mode,
+            activation: t.activation,
+            keep_audio: t.keep_audio,
+            storage_dir: t.storage_dir,
+            view_only: t.view_only,
+            model_tier: t.model_tier,
+            language: t.language,
+        }
+    }
+}
+
+/// `None` when the `transcription` capability isn't licensed - the
+/// frontend's own contract for "this settings section doesn't exist",
+/// same shape `premium_capability_status` already gives every other
+/// premium surface.
+#[tauri::command(rename_all = "snake_case")]
+pub fn get_transcription_settings(
+    settings: State<Arc<SettingsStore>>,
+    premium: State<PremiumHandle>,
+) -> Option<TranscriptionSettingsView> {
+    if !crate::transcription::is_unlocked(&premium) {
+        return None;
+    }
+    Some(settings.snapshot().transcription.into())
+}
+
+#[derive(Deserialize)]
+pub struct SaveTranscriptionInput {
+    pub mode: TranscriptionMode,
+    pub activation: TranscriptionActivation,
+    pub keep_audio: bool,
+    pub storage_dir: String,
+    pub view_only: bool,
+    pub model_tier: ModelTier,
+    pub language: String,
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn save_transcription_settings(
+    settings: State<Arc<SettingsStore>>,
+    admin: State<AdminSession>,
+    premium: State<PremiumHandle>,
+    input: SaveTranscriptionInput,
+) -> Result<(), String> {
+    require_unlocked(&admin)?;
+    if !crate::transcription::is_unlocked(&premium) {
+        return Err("Transcription is not licensed on this installation.".to_string());
+    }
+    let storage_dir = input.storage_dir.trim().to_string();
+    if input.mode != TranscriptionMode::Off && storage_dir.is_empty() {
+        return Err("Set a storage folder (local or NAS path) before turning transcription on.".to_string());
+    }
+    if input.language.trim().is_empty() {
+        return Err("Language is required (e.g. \"es\" or \"auto\").".to_string());
+    }
+    let updated = TranscriptionSettings {
+        mode: input.mode,
+        activation: input.activation,
+        keep_audio: input.keep_audio,
+        storage_dir,
+        view_only: input.view_only,
+        model_tier: input.model_tier,
+        language: input.language.trim().to_string(),
+    };
+    settings.update_transcription(updated).map_err(|e| e.to_string())
+}
+
+/// Manual per-call start (`transcription.activation == "manual"`) - the
+/// ola-2 panel's per-call button. Not admin-gated (a runtime call-control
+/// action, not a settings mutation - same reasoning as `sidecar_hold`/
+/// `sidecar_mute` above); the license + `mode != off` checks happen
+/// inside `TranscriptionHandle::manual_start`.
+#[tauri::command(rename_all = "snake_case")]
+pub fn transcription_manual_start(
+    transcription: State<TranscriptionHandle>,
+    call_id: String,
+    peer: String,
+) -> Result<(), String> {
+    transcription.manual_start(&call_id, &peer)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn transcription_manual_stop(
+    transcription: State<TranscriptionHandle>,
+    call_id: String,
+) -> Result<(), String> {
+    transcription.manual_stop(&call_id)
+}
+
+/// Calls whose transcript/audio couldn't be written to `storage_dir`
+/// (NAS down, disk full, engine binary missing) - see
+/// `transcription::Inner::pending_retries`'s doc. The ola-2 panel is
+/// expected to surface these with a "retry" button; this command just
+/// exposes the data today.
+#[tauri::command(rename_all = "snake_case")]
+pub fn transcription_pending_retries(transcription: State<TranscriptionHandle>) -> Vec<PendingRetryView> {
+    transcription.pending_retries()
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn transcription_retry(transcription: State<TranscriptionHandle>, call_id: String) -> Result<(), String> {
+    transcription.retry(&call_id)
+}
+
+// ---- transcription model management (F4 item 5) -----------------------
+
+#[derive(Serialize)]
+pub struct ModelStatusView {
+    pub tier: ModelTier,
+    pub present: bool,
+    pub path: String,
+    pub size_bytes: Option<u64>,
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn transcription_model_status(app: tauri::AppHandle, tier: ModelTier) -> ModelStatusView {
+    let path = crate::transcription::model_path(&app, tier);
+    let meta = std::fs::metadata(&path).ok();
+    ModelStatusView {
+        tier,
+        present: meta.is_some(),
+        path: path.display().to_string(),
+        size_bytes: meta.map(|m| m.len()),
+    }
+}
+
+/// Kicks off a background download with progress (`transcription://
+/// model-download-progress`) and completion
+/// (`transcription://model-download-done`/`-error`) events - see
+/// `transcription::spawn_model_download`. Gated behind the license (same
+/// as the settings that would select this tier) so a Community build
+/// can't be used to pull hundreds of MB of model file it can never use.
+#[tauri::command(rename_all = "snake_case")]
+pub fn download_transcription_model(
+    app: tauri::AppHandle,
+    premium: State<PremiumHandle>,
+    tier: ModelTier,
+) -> Result<(), String> {
+    if !crate::transcription::is_unlocked(&premium) {
+        return Err("Transcription is not licensed on this installation.".to_string());
+    }
+    crate::transcription::spawn_model_download(app, tier);
+    Ok(())
 }

@@ -15,6 +15,7 @@
 //! `run-spike.sh` itself documents - never anywhere else.
 
 use crate::settings::{AccountSettings, SettingsStore, TransportPriority};
+use crate::transcription::TranscriptionHandle;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -117,6 +118,14 @@ struct Shared {
     /// the idempotent "already watching it, nothing to do" this file's
     /// callers actually want.
     subscribed_exts: Mutex<HashSet<String>>,
+    /// Set once at startup via `SidecarHandle::attach_transcription`
+    /// (`lib.rs`'s `.setup()`, after both handles exist - see that
+    /// method's doc for why this can't be a constructor argument). `None`
+    /// until then, which the stdout reader below treats as "nothing to
+    /// forward to" - never a panic, matching this file's existing
+    /// tolerate-missing-state style elsewhere (e.g. `blf_states` starting
+    /// empty).
+    transcription: Mutex<Option<TranscriptionHandle>>,
 }
 
 #[derive(Clone)]
@@ -140,7 +149,20 @@ impl SidecarHandle {
             call_phase: Mutex::new(CallPhase::None),
             blf_states: Mutex::new(HashMap::new()),
             subscribed_exts: Mutex::new(HashSet::new()),
+            transcription: Mutex::new(None),
         }))
+    }
+
+    /// Wires a [`TranscriptionHandle`] in after construction - `lib.rs`'s
+    /// `.setup()` builds `SidecarHandle` first (transcription needs a
+    /// clone of it to send `tap_start`/`tap_stop`), so this is a
+    /// post-construction attach rather than a constructor parameter, the
+    /// same shape `bridge::start`'s `sidecar: SidecarHandle` argument
+    /// avoids needing by being a free function instead - see `premium.rs`'s
+    /// `PremiumHandle::load` for the sibling "handles get wired together
+    /// in `.setup()`, not all at once" pattern this follows.
+    pub fn attach_transcription(&self, transcription: TranscriptionHandle) {
+        *self.0.transcription.lock().expect("poisoned") = Some(transcription);
     }
 
     /// Snapshot of every extension's last-known BLF state (see `Shared::blf_states`).
@@ -590,20 +612,31 @@ fn spawn_stdout_reader(
                 // full event (with call_id/peer/...) via the emit() below
                 // regardless and does its own richer state machine.
                 let call_state = value.get("state").and_then(Value::as_str).unwrap_or("");
-                let mut phase = shared.call_phase.lock().expect("poisoned");
-                match call_state {
-                    "incoming" => *phase = CallPhase::Incoming,
-                    "ringing" => {
-                        if *phase != CallPhase::Incoming {
-                            *phase = CallPhase::Calling;
+                {
+                    let mut phase = shared.call_phase.lock().expect("poisoned");
+                    match call_state {
+                        "incoming" => *phase = CallPhase::Incoming,
+                        "ringing" => {
+                            if *phase != CallPhase::Incoming {
+                                *phase = CallPhase::Calling;
+                            }
                         }
+                        "established" => *phase = CallPhase::InCall,
+                        "closed" => *phase = CallPhase::None,
+                        // hold/resumed/muted/unmuted: attributes of an
+                        // established call, not a lifecycle change - see
+                        // core/PROTOCOL.md "Events".
+                        _ => {}
                     }
-                    "established" => *phase = CallPhase::InCall,
-                    "closed" => *phase = CallPhase::None,
-                    // hold/resumed/muted/unmuted: attributes of an
-                    // established call, not a lifecycle change - see
-                    // core/PROTOCOL.md "Events".
-                    _ => {}
+                }
+                if let Some(t) = shared.transcription.lock().expect("poisoned").as_ref() {
+                    t.on_call_state(&value);
+                }
+            } else if event_name == "tap_state" {
+                // F4 audio tap (core/PROTOCOL.md v1.2) - forwarded straight
+                // to transcription orchestration, nothing tracked here.
+                if let Some(t) = shared.transcription.lock().expect("poisoned").as_ref() {
+                    t.on_tap_state(&value);
                 }
             } else if event_name == "blf" {
                 if let (Some(ext), Some(blf_state)) = (

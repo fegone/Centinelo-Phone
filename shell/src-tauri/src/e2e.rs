@@ -15,7 +15,9 @@
 //! `blind_transfer:<uri>`, `attended_transfer:<uri>`,
 //! `complete_transfer`, `abort_transfer`,
 //! `blf_subscribe:<ext>`, `blf_unsubscribe:<ext>`,
-//! `open_console`, `premium_diagnostic`.
+//! `open_console`, `premium_diagnostic`,
+//! `transcription_manual_start:<call_id>`, `transcription_manual_stop:<call_id>`,
+//! `transcription_pending_retries`, `transcription_model_status:accurate|light`.
 //!
 //! Every step targets "the current call" (no `call_id`) - matching the
 //! frontend's own single-call-at-a-time UI; there's no scripted way here
@@ -118,6 +120,31 @@ pub fn maybe_run_e2e_script(app: &AppHandle) {
                 log::info!("e2e: premium_diagnostic = {}", premium.diagnostic());
                 let status = premium.capability_status("blf_console");
                 log::info!("e2e: premium_capability_status(blf_console) = {status:?}");
+                let transcription_status = premium.capability_status("transcription");
+                log::info!("e2e: premium_capability_status(transcription) = {transcription_status:?}");
+            } else if let Some(call_id) = step.strip_prefix("transcription_manual_start:") {
+                let transcription: tauri::State<crate::transcription::TranscriptionHandle> = app.state();
+                match commands::transcription_manual_start(transcription, call_id.to_string(), "sip:e2e-test@example.invalid".to_string()) {
+                    Ok(()) => log::info!("e2e: transcription_manual_start({call_id}) -> ok"),
+                    Err(e) => log::info!("e2e: transcription_manual_start({call_id}) -> err: {e}"),
+                }
+            } else if let Some(call_id) = step.strip_prefix("transcription_manual_stop:") {
+                let transcription: tauri::State<crate::transcription::TranscriptionHandle> = app.state();
+                match commands::transcription_manual_stop(transcription, call_id.to_string()) {
+                    Ok(()) => log::info!("e2e: transcription_manual_stop({call_id}) -> ok"),
+                    Err(e) => log::info!("e2e: transcription_manual_stop({call_id}) -> err: {e}"),
+                }
+            } else if step == "transcription_pending_retries" {
+                let transcription: tauri::State<crate::transcription::TranscriptionHandle> = app.state();
+                let pending = commands::transcription_pending_retries(transcription);
+                log::info!("e2e: transcription_pending_retries = {pending:?}");
+            } else if let Some(tier) = step.strip_prefix("transcription_model_status:") {
+                let parsed_tier = match tier {
+                    "light" => crate::settings::ModelTier::Light,
+                    _ => crate::settings::ModelTier::Accurate,
+                };
+                let status = commands::transcription_model_status(app.clone(), parsed_tier);
+                log::info!("e2e: transcription_model_status({tier}) present={} path={}", status.present, status.path);
             } else {
                 log::warn!("e2e: unknown step '{step}'");
             }

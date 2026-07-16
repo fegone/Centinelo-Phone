@@ -112,6 +112,90 @@ impl AccountSettings {
     }
 }
 
+// ---- transcription (F4) --------------------------------------------------
+//
+// All fields here are admin-gated, same as account/favorites - see
+// commands.rs `get_transcription_settings`/`save_transcription_settings`.
+// Additionally gated behind the `transcription` premium capability
+// (src/transcription.rs `is_unlocked`) - a Community/unlicensed build
+// never even reports these settings to the frontend, per the task spec's
+// "sin dylib/licencia -> settings de transcripcion ni aparecen".
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptionMode {
+    #[default]
+    Off,
+    Live,
+    PostCall,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptionActivation {
+    #[default]
+    AllCalls,
+    Manual,
+}
+
+/// Which whisper.cpp ggml model tier to use - see
+/// `transcription::model_filename`/`transcription::model_download_url` for
+/// the concrete file this maps to (`transcribe` skill's model research,
+/// 2026-07-16: large-v3-turbo-q5_0 default "accurate", small-q5_1 "light").
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelTier {
+    #[default]
+    Accurate,
+    Light,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TranscriptionSettings {
+    #[serde(default)]
+    pub mode: TranscriptionMode,
+    #[serde(default)]
+    pub activation: TranscriptionActivation,
+    /// Delete the tap WAVs once transcription finishes (default) or keep
+    /// them alongside the transcript in `storage_dir` (= the recording
+    /// feature, gated separately behind the `recording` capability -
+    /// this flag is honored here regardless, since keeping raw audio
+    /// around is the operator's explicit choice either way).
+    #[serde(default)]
+    pub keep_audio: bool,
+    /// Local path or NAS (SMB-mounted) path. Empty = not configured yet -
+    /// `save_transcription_settings` requires a non-empty value once
+    /// `mode != Off`.
+    #[serde(default)]
+    pub storage_dir: String,
+    /// See `transcription.rs`'s `finalize_artifacts` doc for exactly what
+    /// this changes (and doesn't) about where files land.
+    #[serde(default)]
+    pub view_only: bool,
+    #[serde(default)]
+    pub model_tier: ModelTier,
+    #[serde(default = "default_transcription_language")]
+    pub language: String,
+}
+
+fn default_transcription_language() -> String {
+    "es".to_string()
+}
+
+impl Default for TranscriptionSettings {
+    fn default() -> Self {
+        Self {
+            mode: TranscriptionMode::default(),
+            activation: TranscriptionActivation::default(),
+            keep_audio: false,
+            storage_dir: String::new(),
+            view_only: false,
+            model_tier: ModelTier::default(),
+            language: default_transcription_language(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AdminSettings {
     /// Argon2 PHC hash string, e.g. "$argon2id$v=19$...". `None` until the
@@ -145,6 +229,8 @@ pub struct AppSettings {
     pub core_binary_path: Option<String>,
     #[serde(default)]
     pub bridge: BridgeSettings,
+    #[serde(default)]
+    pub transcription: TranscriptionSettings,
 }
 
 fn default_favorites() -> Vec<FavoriteSlot> {
@@ -250,6 +336,12 @@ impl SettingsStore {
     pub fn update_bridge_register_tel(&self, register: bool) -> std::io::Result<()> {
         let mut guard = self.inner.lock().expect("settings mutex poisoned");
         guard.bridge.register_tel_handler = register;
+        self.persist(&guard)
+    }
+
+    pub fn update_transcription(&self, transcription: TranscriptionSettings) -> std::io::Result<()> {
+        let mut guard = self.inner.lock().expect("settings mutex poisoned");
+        guard.transcription = transcription;
         self.persist(&guard)
     }
 
@@ -371,4 +463,72 @@ pub fn add_recent(path: &Path, entry: RecentCall) -> std::io::Result<Vec<RecentC
     let json = serde_json::to_string_pretty(&list)?;
     fs::write(path, json)?;
     Ok(list)
+}
+
+#[cfg(test)]
+mod transcription_settings_tests {
+    use super::*;
+
+    #[test]
+    fn defaults_are_off_all_calls_accurate_spanish() {
+        let t = TranscriptionSettings::default();
+        assert_eq!(t.mode, TranscriptionMode::Off);
+        assert_eq!(t.activation, TranscriptionActivation::AllCalls);
+        assert_eq!(t.model_tier, ModelTier::Accurate);
+        assert_eq!(t.language, "es");
+        assert!(!t.keep_audio);
+        assert!(!t.view_only);
+        assert!(t.storage_dir.is_empty());
+    }
+
+    #[test]
+    fn round_trips_through_json() {
+        let t = TranscriptionSettings {
+            mode: TranscriptionMode::Live,
+            activation: TranscriptionActivation::Manual,
+            keep_audio: true,
+            storage_dir: "/mnt/nas/transcripts".to_string(),
+            view_only: true,
+            model_tier: ModelTier::Light,
+            language: "auto".to_string(),
+        };
+        let json = serde_json::to_string(&t).unwrap();
+        let back: TranscriptionSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(t, back);
+    }
+
+    #[test]
+    fn deserializing_missing_field_falls_back_to_off() {
+        // An older settings.json predating this field (or a hand-edited
+        // one missing it) must not fail to load the rest of the file -
+        // matches every other #[serde(default)] field in AppSettings.
+        let json = r#"{}"#;
+        let t: TranscriptionSettings = serde_json::from_str(json).unwrap();
+        assert_eq!(t.mode, TranscriptionMode::Off);
+    }
+
+    #[test]
+    fn app_settings_without_transcription_key_defaults_gracefully() {
+        // Simulates loading a pre-F4 settings.json - SettingsStore::load's
+        // `unwrap_or_default()` path plus #[serde(default)] on the field
+        // must produce a usable AppSettings, not an error.
+        // "9999" here, never the real test PBX extension (1100, see this
+        // workspace's CLAUDE.md) - this file is in a public repo
+        // (2026-07-16 review, finding B3).
+        let json = r#"{"account":{"host":"pbx.example.test","ext":"9999","secret":"x"}}"#;
+        let app: AppSettings = serde_json::from_str(json).unwrap();
+        assert_eq!(app.transcription.mode, TranscriptionMode::Off);
+        assert_eq!(app.account.host, "pbx.example.test");
+    }
+
+    #[test]
+    fn mode_and_activation_serialize_as_expected_wire_values() {
+        // Locks in the exact snake_case wire shape the frontend will match
+        // against (ola-2 panel) - a serde rename change here is a breaking
+        // change for that consumer.
+        assert_eq!(serde_json::to_string(&TranscriptionMode::PostCall).unwrap(), "\"post_call\"");
+        assert_eq!(serde_json::to_string(&TranscriptionMode::Live).unwrap(), "\"live\"");
+        assert_eq!(serde_json::to_string(&TranscriptionActivation::AllCalls).unwrap(), "\"all_calls\"");
+        assert_eq!(serde_json::to_string(&ModelTier::Accurate).unwrap(), "\"accurate\"");
+    }
 }
