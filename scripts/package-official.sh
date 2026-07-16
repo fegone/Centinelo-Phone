@@ -310,6 +310,13 @@ if [[ -n "$PREMIUM_DYLIB" || -n "$PREMIUM_SIG" ]]; then
 fi
 if [[ -n "$PREMIUM_CONSOLE_ASSETS" ]]; then
     [[ -d "$PREMIUM_CONSOLE_ASSETS" ]] || { echo "error: --premium-console-assets not a directory: $PREMIUM_CONSOLE_ASSETS" >&2; exit 1; }
+    # An existing-but-empty dir passes the -d check above yet still leaves
+    # include_console=1 downstream (step 9a), keeping the
+    # "premium-console-assets/*" glob in the generated Tauri resources
+    # config with nothing on disk to match it - Tauri's bundler fails that
+    # the exact same way as the original GlobPathNotFound blocker (4R/
+    # RESILIENCE finding 2026-07-16). Fail fast here instead.
+    [[ -n "$(find "$PREMIUM_CONSOLE_ASSETS" -mindepth 1 -print -quit)" ]] || { echo "error: --premium-console-assets directory is empty: $PREMIUM_CONSOLE_ASSETS" >&2; exit 1; }
 fi
 
 if [[ "$IS_COMMUNITY" -eq 1 ]]; then
@@ -736,12 +743,23 @@ generate_windows_resources_config() {
     # otherwise silently never make it into the installer until someone
     # remembered to also hand-edit this JSON file).
     if [[ "$include_console" -eq 1 ]]; then
-        local subdir name
+        local subdir name subdirs_output
+        # `find` piped straight into `while read < <(...)` runs the loop in
+        # the current shell (good, "local" above stays visible) but the
+        # process substitution means `find`'s exit code never reaches
+        # `set -e` - an unreadable subfolder (permissions, unexpected
+        # symlink loop) would make find fail and the loop would just quietly
+        # see fewer subdirs instead of aborting the build (4R/RESILIENCE
+        # finding 2026-07-16). Capture the output via a plain command
+        # substitution instead: `set -e` DOES fire on a failed
+        # `var="$(cmd)"` assignment, then iterate over the captured text.
+        subdirs_output="$(find "$PREMIUM_CONSOLE_ASSETS" -mindepth 1 -maxdepth 1 -type d)"
         while IFS= read -r subdir; do
+            [[ -z "$subdir" ]] && continue
             name="$(basename "$subdir")"
             filtered="$(printf '%s' "$filtered" | jq --arg name "$name" \
                 '.bundle.resources["../dist-injected/premium-console-assets/" + $name + "/**/*"] = ("premium-console-assets/" + $name + "/")')"
-        done < <(find "$PREMIUM_CONSOLE_ASSETS" -mindepth 1 -maxdepth 1 -type d)
+        done <<< "$subdirs_output"
     fi
 
     printf '%s\n' "$filtered" > "$generated"
