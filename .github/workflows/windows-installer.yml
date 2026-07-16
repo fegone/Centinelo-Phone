@@ -109,7 +109,15 @@ jobs:
           Start-Sleep -Seconds 5
           Write-Host "== MSI extracted tree =="
           Get-ChildItem -Recurse "$extractDir"
-          $hits = Select-String -Path "$extractDir\*" -Pattern "FAKE-FIXTURE-CENTINELO" -Recurse -ErrorAction SilentlyContinue
+          # Select-String has no -Recurse parameter of its own (that's a
+          # Get-ChildItem thing) - piping a recursive file listing into it
+          # is the correct shape. First attempt (this comment added after a
+          # real run failed here with "A parameter cannot be found that
+          # matches parameter name 'Recurse'" - a bug in this verification
+          # script, not in the installer it was checking; the extracted
+          # tree logged just above already showed the files in the right
+          # place before this line even ran).
+          $hits = Get-ChildItem -Path $extractDir -Recurse -File -ErrorAction SilentlyContinue | Select-String -Pattern "FAKE-FIXTURE-CENTINELO" -ErrorAction SilentlyContinue
           if (-not $hits) {
             Write-Error "none of the FAKE-FIXTURE-CENTINELO marker strings were found anywhere in the extracted MSI - bundle.resources did not make it into the installer"
             exit 1
@@ -138,7 +146,7 @@ jobs:
           & "C:\Program Files\7-Zip\7z.exe" x "$($nsis.FullName)" "-o$extractDir" -y
           Write-Host "== NSIS extracted tree =="
           Get-ChildItem -Recurse "$extractDir"
-          $hits = Select-String -Path "$extractDir\*" -Pattern "FAKE-FIXTURE-CENTINELO" -Recurse -ErrorAction SilentlyContinue
+          $hits = Get-ChildItem -Path $extractDir -Recurse -File -ErrorAction SilentlyContinue | Select-String -Pattern "FAKE-FIXTURE-CENTINELO" -ErrorAction SilentlyContinue
           if (-not $hits) {
             Write-Warning "7z could not find marker strings in the NSIS payload (some NSIS installers resist generic 7z extraction) - the MSI check above is the authoritative proof for this run; not failing the job on this alone."
           } else {
