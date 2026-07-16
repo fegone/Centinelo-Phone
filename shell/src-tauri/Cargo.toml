@@ -63,3 +63,13 @@ percent-encoding = "2"
 centinelo-premium-abi = { path = "centinelo-premium-abi" }
 libloading = "0.8"
 ed25519-dalek = "2"
+# Transcription (F4): local wall-clock/date formatting for the
+# storage_dir/YYYY/MM/DD layout (src/transcription.rs), model download
+# (ureq - blocking, matches this crate's existing thread-per-subsystem
+# style, no async runtime) + checksum verification (sha2) of the
+# whisper.cpp ggml model tiers. See src/transcription.rs module doc for
+# why the download/checksum logic lives here rather than in
+# centinelo-transcribe (tech debt noted there and in the task report).
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+ureq = { version = "2", features = ["tls"] }
+sha2 = "0.10"

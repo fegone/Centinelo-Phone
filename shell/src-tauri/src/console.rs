@@ -73,38 +73,42 @@ const ASSETS_DIR_NAME: &str = "premium-console-assets";
 ///
 /// # Why this isn't just `status == Available`
 ///
-/// `centinelo-premium`'s v0 `capability_status_for` (private repo,
-/// `crates/centinelo-premium/src/license.rs`) always resolves a
-/// *licensed* capability to `NotImplemented`, **never** `Available` -
-/// every one of v0's three capabilities (`blf_console`, `transcription`,
-/// `recording`) has no real behavior behind its FFI stub yet, by design
-/// (see that function's own doc: "all of v0's capabilities resolve here
-/// once they clear the license gate"). `loader-poc`'s own test proving
-/// this is intentional is literally named
-/// `unlicensed_feature_blocked_while_licensed_feature_reaches_stub` - the
-/// *stub* (`NotImplemented`) is what a cleared gate looks like today, not
-/// a bug to route around.
+/// Early v0 builds of `centinelo-premium`'s `capability_status_for`
+/// (private repo, `crates/centinelo-premium/src/license.rs`) resolved
+/// *every* licensed capability to `NotImplemented`, never `Available` -
+/// none of v0's three capabilities (`blf_console`, `transcription`,
+/// `recording`) had real behavior behind its FFI stub yet, by design (see
+/// that function's own doc history: "all of v0's capabilities resolve
+/// here once they clear the license gate"). That's since changed for
+/// `blf_console` specifically - the tech debt item tracked in this
+/// workspace's `docs/HANDOFF.md` ("dylib v0 reporta NotImplemented pa
+/// blf_console — debe pasar a Available") - so a current dylib can now
+/// answer either `Available` or `NotImplemented` for a licensed
+/// `blf_console`, depending on build. This function accepts both on
+/// purpose, not just for historical-build compatibility: see the next
+/// paragraph for why `NotImplemented` alone was never actually "not
+/// ready", even before that fix landed.
 ///
-/// That distinction matters here because the console **window** this
-/// module builds is not one of `centinelo-premium`'s FFI capabilities at
-/// all - it's implemented entirely in this shell plus the vendored
-/// console-ui package, talking to the sidecar directly (see
-/// `commands.rs`'s new `sidecar_*` verbs). `centinelo-premium`'s only role
-/// is the license *probe*: "does the active license include
-/// `blf_console`". Gating window visibility on the literal `Available`
-/// discriminant would mean the console could never open under any build
-/// of `centinelo-premium` that exists today, in any configuration,
-/// including a founder license - which would make the very e2e scenario
+/// The console **window** this module builds is not one of
+/// `centinelo-premium`'s FFI capabilities at all - it's implemented
+/// entirely in this shell plus the vendored console-ui package, talking
+/// to the sidecar directly (see `commands.rs`'s `sidecar_*` verbs).
+/// `centinelo-premium`'s only role is the license *probe*: "does the
+/// active license include `blf_console`". Gating window visibility on
+/// only the literal `Available` discriminant would have made the console
+/// unable to open under any pre-fix dylib build, in any configuration,
+/// including a founder license - which would have made the e2e scenario
 /// this integration is required to prove (`shell/E2E.md` "F4 premium",
 /// scenario (c): "valid dylib + founder license -> console available,
-/// opens") structurally impossible to pass. Treating `NotImplemented` as
-/// "gate cleared, offer the shell-side feature" is what
+/// opens") structurally impossible to pass on those builds. Treating
+/// either status as "gate cleared, offer the shell-side feature" is what
 /// `centinelo_premium_abi::Capability`'s own crate doc describes as the
 /// contract: "the shell never decides whether a capability is licensed,
 /// it only ever asks the dylib" - the dylib's answer *is* "yes,
-/// licensed"; `NotImplemented` is only its honest report that its own
-/// stub has nothing behind it yet, which is irrelevant to whether *this
-/// shell's* console window should be offered.
+/// licensed" either way; `NotImplemented` was only ever its honest report
+/// that a given build's own stub had nothing behind it yet, which is
+/// irrelevant to whether *this shell's* console window should be
+/// offered.
 ///
 /// `NotLicensed` and `Unavailable` (no dylib loaded, tampered signature,
 /// FFI error, unrecognized capability name) both still hide the console,
