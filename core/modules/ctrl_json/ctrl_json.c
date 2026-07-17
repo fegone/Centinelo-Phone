@@ -544,6 +544,51 @@ static void emit_park(struct call *call, const char *ext)
 }
 
 
+/*
+ * v1.4 (see PROTOCOL.md "audio_error"): a distinct, call_id-correlated
+ * event for BEVENT_AUDIO_ERROR, in addition to (not instead of) the
+ * plain "error" event event_handler() already emitted for it under
+ * v1.3 and earlier - see event_handler()'s BEVENT_AUDIO_ERROR case for
+ * why both still fire (backward compatibility: a pre-v1.4 consumer that
+ * only ever watched generic "error" events keeps seeing exactly what it
+ * always did).
+ *
+ * The gap this closes is real but was entirely on this side of the
+ * wire, not baresip's: `src/call.c`'s `audio_error_handler()` already
+ * calls `bevent_call_emit(BEVENT_AUDIO_ERROR, call, ...)` with the
+ * failing call still valid at that point (confirmed by reading it - the
+ * call is only torn down *after*, via the immediately-following
+ * `call_stream_stop()`/`call_event_handler(..., CALL_EVENT_CLOSED, ...)`
+ * in the same function), and this module's event_handler() already
+ * received that bevent correctly (`bevent_get_call(event)` above). What
+ * was missing was purely a call_id-bearing, type-distinguishable *event*
+ * on this side - the old plain "error" event has no call_id field at
+ * all (see emit_error()), so with more than one call in play a consumer
+ * had no reliable way to tell "this specific call's mic just died" apart
+ * from any other command-validation error. No baresip/re patch was
+ * needed for this half - see PROTOCOL.md's v1.4 changelog for the full
+ * "what was actually broken vs. what already worked" writeup, including
+ * the *separate*, genuinely-unfixed-here gap on the audio *player*
+ * (speaker/output) side.
+ */
+static void emit_audio_error(struct call *call, const char *message)
+{
+	struct odict *od = NULL;
+	const char *id = call ? call_id(call) : "";
+
+	if (odict_alloc(&od, 8))
+		return;
+
+	(void)odict_entry_add(od, "event", ODICT_STRING, "audio_error");
+	(void)odict_entry_add(od, "call_id", ODICT_STRING, id);
+	(void)odict_entry_add(od, "message", ODICT_STRING,
+			       message ? message : "");
+
+	emit(od);
+	mem_deref(od);
+}
+
+
 /* ------------------------------------------------------------------- */
 /* Devices (v1.1 - see PROTOCOL.md "devices"/"set_device")             */
 
@@ -1681,6 +1726,13 @@ static void process_line(const char *line, size_t len)
  *     since "cmd X failed" is exactly what this already communicates for
  *     any other command's synchronous failure, and this is a transfer's
  *     *asynchronous* one.
+ * v1.4 adds:
+ *   - BEVENT_AUDIO_ERROR now also emits a dedicated, call_id-bearing
+ *     "audio_error" event (see emit_audio_error()'s own comment) - the
+ *     plain "error" event it fell back to alone through v1.3 had no
+ *     call_id at all. Only ausrc (microphone/input) failures actually
+ *     reach this bevent in practice - see PROTOCOL.md's v1.4 changelog
+ *     for the known, unfixed gap on the auplay (speaker/output) side.
  * Still not mapped (see PROTOCOL.md "Planned"): BEVENT_CALL_TRANSFER/
  * _REDIRECT (the transfer-*target*-side perspective - this account never
  * plays that role in any tested flow), DTMF-received, RTCP/VU-meter,
@@ -1764,6 +1816,12 @@ static void event_handler(enum bevent_ev ev, struct bevent *event, void *arg)
 		break;
 
 	case BEVENT_AUDIO_ERROR:
+		/* v1.4: emit_audio_error() first (see its own comment for
+		 * the full "what changed" story) - call still valid here,
+		 * confirmed by reading call.c's audio_error_handler(), the
+		 * only bevent_call_emit(BEVENT_AUDIO_ERROR, ...) call site -
+		 * then the unchanged plain "error" for back-compat. */
+		emit_audio_error(call, bevent_get_text(event));
 		emit_error(bevent_get_text(event));
 		break;
 

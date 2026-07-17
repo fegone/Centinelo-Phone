@@ -758,6 +758,142 @@ specifically for that purpose, which was judged out of scope for this
 task; the unit tests exercise the exact same `pathsafe_component()`
 function `audiotap.c` calls, not a re-implementation.
 
+## F6 audio_error + park transport finding (v1.4)
+
+Methodology: same as F3-F5 — a small Python harness (not checked in,
+scratch tooling), NDJSON over `run-spike.sh` child process(es), a
+`wait_for(predicate, timeout)` primitive, read-only PBX-side snapshots.
+No PBX configuration was changed at any point. Same pre-authorized
+safe-target list as every prior scenario (`*43`, `*60`, dual-contact
+`1000`, blind/attended transfer, park to pilot ext `700`).
+
+### audio_error (fault-injected `ausrc` error, real call)
+
+**PASS.** Real running call (register → dial `sip:*43@<pbx host>` →
+`established`), then a temporary, uncommitted 1-line change to
+`core/deps/baresip/modules/aufile/aufile_src.c` (its EOF `errh` call —
+`st->errh(0, "end of file", ...)` — flipped to a nonzero test error code
+for this run only, reverted immediately after capturing evidence, before
+any commit) used to make `set_device` (already v1.1-verified, see F3
+above) switch the call's live input to `aufile,<short local wav>`; once
+that file's short playout reaches EOF, the (now nonzero-`err`) `errh`
+call fires `ausrc_error_handler()` → `struct audio`'s `a->errh` →
+`call.c`'s own, unmodified `audio_error_handler()` → a real
+`BEVENT_AUDIO_ERROR` against a real call bridged through the test PBX —
+the same underlying bevent a genuine microphone failure would produce,
+without needing physical hardware to actually fail on demand.
+
+Captured on stdout, in order:
+
+```
+{"event":"audio_error","call_id":"<real call id>","message":"<n>,<injected test message>"}
+{"event":"error","message":"<n>,<injected test message>"}
+{"event":"call_state","state":"closed","peer":"sip:*43@<pbx host>","id":"<real call id>","call_id":"<real call id>"}
+```
+
+- `audio_error`'s `call_id` matches the call under test exactly.
+- The plain `error` event still fires too (back-compat — a v1.3 consumer
+  watching only `error` sees exactly what it always did).
+- `call_state closed` follows, unchanged behavior from `audio_error_handler()`'s
+  own `call_stream_stop()`/`CALL_EVENT_CLOSED` (not new in v1.4).
+
+Regression (same session, no fault injection): register → dial
+`sip:*60@<pbx host>` → `established` → `quality_stats` → `hangup` — PASS,
+happy path unaffected by the `ctrl_json.c` change.
+
+**Not verified this session**: a genuine `auplay` (speaker/output)
+device failure — see `PROTOCOL.md`'s v1.4 status paragraph for why (no
+error-callback path exists in baresip's `auplay` API at all, a separate,
+unfixed, deeper gap this fault-injection technique can't exercise since
+there's no `errh` callback there to inject a fault into).
+
+### park — wss vs. udp (root-cause narrowing)
+
+Dual-contact bridge on ext `1000` (`max_contacts: 2`, same trick as F5
+above): engine A dials `sip:1000@<pbx host>` (own extension) → engine B
+(the other registered contact) receives `call_state incoming`, answers →
+genuine 2-party bridge, ~18s settle (same discipline as F5's `held`
+scenario) before acting. B sends
+`{"cmd":"park","ext":"700","call_id":"<call id>","id":"park1"}` — `700`
+is the real, read-only-confirmed parking-lot pilot extension for this
+PBX (verified via `asterisk -rx "parking show default"` before this
+scenario ran; operational detail lives in `premium/docs/` per the
+existing F5 `park` write-up above, not repeated here).
+
+**Over `wss`** (the transport every prior F1-F5 scenario in this file
+used): reproduces the F5 finding exactly — `call: subscription closed:
+Destination address required [39]` on B's own stderr, no `REFER
+sip:...` request line anywhere in the full `-s` capture, and (**new in
+v1.4**, `core/patches/0005-*`) B's stdout now also emits:
+
+```
+{"event":"park","call_id":"<call id>","ext":"700"}
+{"event":"result","id":"park1","ok":true}
+{"event":"error","message":"transfer failed: Destination address required [39]"}
+```
+
+— the third line is new; through v1.3 nothing arrived at all for this
+failure mode past the synchronous `result ok:true`. The original call
+confirmed still up (not closed) for several seconds after, same as F5's
+own "left untouched" finding.
+
+**Over `udp`** (same harness, only the transport changed — `run-spike.sh`'s
+own `CENT_TRANSPORT`): the REFER genuinely reaches the wire this time.
+Captured `-s` SIP trace (sanitized — real IPs/ports/tags/Call-IDs
+replaced with placeholders, sequence and message content byte-accurate):
+
+```
+REFER sip:asterisk@<pbx nat host>:5060 SIP/2.0
+Refer-To: sip:700@<pbx host>
+Referred-by: sip:1000@<pbx host>
+
+SIP/2.0 202 Accepted
+Contact: <sip:asterisk@<pbx nat host>:5060>
+
+NOTIFY sip:1000@<local host>:<port> SIP/2.0
+Event: refer
+Subscription-State: active;expires=598
+Content-Type: message/sipfrag;version=2.0
+
+SIP/2.0 100 Trying
+
+NOTIFY sip:1000@<local host>:<port> SIP/2.0
+Event: refer
+Subscription-State: terminated;reason=noresource
+Content-Type: message/sipfrag;version=2.0
+
+SIP/2.0 200 OK
+```
+
+The final NOTIFY's sipfrag body is `SIP/2.0 200 OK` — the REFER-driven
+park genuinely succeeded. B's engine then correctly closes its own leg
+(`call_state closed`, via `sipsub_notify_handler()`'s existing, unmodified
+`sc >= 200` → `CALL_EVENT_CLOSED "Call transfered"` path — the call was
+successfully handed off, so this engine's own leg to it is done, exactly
+as `call_transfer()` is designed to behave) and sends a `BYE` to close
+its own dialog. Read-only PBX check shortly after showed the parking lot
+empty again and 0 active channels for the test extension — consistent
+with the 45s parking-lot timeout (`Comeback to Origin: no`) having
+already elapsed by the time the check ran (several seconds of harness
+teardown + the read-only `asterisk -rx` round trip), not with a failure —
+the REFER/202/NOTIFY-200-OK sequence above is the actual, positive,
+on-the-wire confirmation the call landed in the lot, independent of that
+later timing.
+
+**Conclusion**: the v1.3 finding ("`park` dispatches OK but the REFER
+never reaches the wire against `Park()`") is real but narrower than it
+read — it is `wss`-transport-specific. `park` works end-to-end over
+`udp` today. `tcp`/`tls` were not separately re-verified this session
+(only `udp` and `wss`). The wss-specific root cause inside `re`'s
+sipevent-subscribe machinery remains open — see `PROTOCOL.md` "Planned"
+for the current hypothesis (a WS-transport dialog needing a live
+connection/socket handle for the REFER-progress subscription's own
+address resolution, unlike a UDP socket's trivially-reusable remote
+address) and suggested next step (a `re`-level trace comparing the two
+transports' `sipsub_alloc()` paths directly) — not attempted this
+session, judged too deep/risky for a bounded patch without it (risk of
+regressing `blind_transfer`'s already-working wss path).
+
 ## Summary of findings (for future F-phases)
 
 1. ICE needs real settle time here (~15-20s) before relying on live RTP

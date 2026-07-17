@@ -1,0 +1,32 @@
+diff --git a/src/call.c b/src/call.c
+index 0fc6f6d0..1c9e461b 100644
+--- a/src/call.c
++++ b/src/call.c
+@@ -2938,6 +2938,27 @@ static void sipsub_close_handler(int err, const struct sip_msg *msg,
+ 
+ 	if (err) {
+ 		info("call: subscription closed: %m\n", err);
++
++		/* Centinelo Phone: a subscription-establishment failure
++		 * (no SIP response at all - e.g. EDESTADDRREQ, a local
++		 * transport-layer error before the REFER-progress SUBSCRIBE
++		 * ever reaches the wire) used to be silently swallowed here
++		 * - an info()-only log line, with no bevent/call_event at
++		 * all - unlike the sibling `msg->scode >= 300` branch just
++		 * below, which already reports a *rejected* transfer via
++		 * CALL_EVENT_TRANSFER_FAILED. A blind_transfer/park caller
++		 * had no way to learn this specific failure mode ever
++		 * happened; the call itself is left untouched (this
++		 * function only derefs call->sub, never the call), so it
++		 * just looks like the transfer/park request silently did
++		 * nothing. Mirrors the neighboring branch's own call,
++		 * reusing the existing CALL_EVENT_TRANSFER_FAILED/
++		 * BEVENT_CALL_TRANSFER_FAILED path (ua.c) rather than
++		 * inventing a new one - see ctrl_json.c's existing
++		 * BEVENT_CALL_TRANSFER_FAILED handling, unchanged by this
++		 * patch. */
++		call_event_handler(call, CALL_EVENT_TRANSFER_FAILED,
++				   "%m", err);
+ 	}
+ 	else if (msg && msg->scode >= 300) {
+ 		info("call: transfer failed: %u %r\n",

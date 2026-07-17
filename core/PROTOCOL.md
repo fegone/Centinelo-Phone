@@ -1,4 +1,4 @@
-# core/ — ctrl_json wire protocol (v1.3)
+# core/ — ctrl_json wire protocol (v1.4)
 
 `ctrl_json` (`core/modules/ctrl_json/`) is a baresip "application" module
 that turns the running engine into a sidecar controllable over stdio:
@@ -80,6 +80,61 @@ presence_override"/"F5 park", dual-contact ext 1000 trick):
 See "Changes from v1.2" below for the full v1.3 changelog, and `core/
 E2E-F1.md` "F5 presence_override"/"F5 park" for the underlying evidence
 behind every claim above.
+
+**v1.4 status: two independent HANDOFF-tracked engine-side gaps closed,
+one of them changing this file's own `park` write-up above.** Both
+e2e-verified against the real test PBX — see "Changes from v1.3" below
+for the full changelog and `core/E2E-F1.md` for anything added there:
+
+- **`audio_error`** (new event) — a distinct, `call_id`-correlated event
+  for `BEVENT_AUDIO_ERROR`, alongside (not instead of) the plain `error`
+  event this bevent already produced through v1.3. e2e-verified: a real
+  running call's `ausrc` (microphone-side) error callback was fault-
+  injected (a temporary, uncommitted 1-line change to
+  `core/deps/baresip/modules/aufile/aufile_src.c`'s EOF-`errh` call,
+  reverted immediately after capturing evidence — no baresip source
+  patch was needed for this half, see "Changes from v1.3") to produce a
+  real, nonzero-`err` `BEVENT_AUDIO_ERROR` against a real call bridged
+  through the test PBX; both the new `audio_error` (correct `call_id`)
+  and the unchanged `error` event fired, then the call correctly closed
+  — matching `call.c`'s own unmodified `audio_error_handler()` behavior.
+  **A real, separate, *not*-fixed-here gap this closes only half of:**
+  only `ausrc` (microphone/input) failures reach `BEVENT_AUDIO_ERROR` at
+  all — baresip's `auplay` (speaker/output) abstraction
+  (`include/baresip.h`'s `auplay_alloc_h`/`auplay_alloc()`,
+  `src/auplay.c`, `src/aureceiver.c`'s `aurecv_start_player()`) has no
+  error-callback parameter whatsoever, unlike `ausrc_alloc()`'s own
+  `ausrc_error_h` — an output device disconnecting/failing mid-call is
+  architecturally invisible to this engine today, on every platform,
+  regardless of any patch downstream of it. See "Changes from v1.3" for
+  the full writeup of why this wasn't force-fixed here (it needs a
+  baresip core API change plus real per-platform device-removal
+  detection in every compiled `auplay` backend module — `coreaudio`,
+  `wasapi` — verified against real hardware, not available this
+  session).
+- **`park`'s previously-100%-silent `EDESTADDRREQ` failure now
+  surfaces** as a normal `error` event (`"transfer failed: Destination
+  address required [39]"`, via the existing, unmodified
+  `BEVENT_CALL_TRANSFER_FAILED` path — no new event type) instead of
+  vanishing into an engine-local `info()` log line only visible with
+  `-s`. **New, more precise finding, real e2e evidence both ways**: the
+  `EDESTADDRREQ` failure this file's own v1.3 status paragraph above
+  documents is **wss-transport-specific** — re-running the *exact* same
+  dual-contact-1000-into-`Park()` scenario over plain `udp` (this
+  session, real test PBX, full `-s` SIP trace captured) shows the REFER
+  genuinely reaching the wire, a `202 Accepted`, and a final `NOTIFY`
+  sipfrag body of `SIP/2.0 200 OK` — **`park` works end-to-end over
+  udp/tcp transport today**, contradicting nothing above (every prior
+  documented `park`/`held` scenario in `core/E2E-F1.md` used `wss`,
+  never `udp`) but meaningfully narrowing the gap: it is not "`park`
+  doesn't work", it is "`park` doesn't work specifically when the
+  engine's own SIP signaling transport is `wss`". The underlying
+  wss-specific root cause inside `re`'s sipevent/websocket-transport
+  interaction remains genuinely unresolved (see "Planned" below) — not
+  forced, per this version's own scope decision to fix the *silent*
+  half (a real, safe, bounded patch) and document rather than guess at
+  the *transport* half (deep, `re`-internal, needs a `re`-level trace
+  this session's time budget didn't extend to).
 
 ## Framing
 
@@ -186,7 +241,7 @@ either, both, or neither.
 | `{"cmd":"set_device","kind":"input","name":"..."}` | **New in v1.1.** Select an audio device for `kind` (`"input"` or `"output"`, required, case-insensitive). `name` (required) is a `devices` event's own `"name"` value, round-tripped verbatim — see "Events" `devices` row for its `"<module>[,<device>]"` shape. Persists as the default for calls started after this command (`conf_config()->audio.{src,play}_{mod,dev}`) **and** applies live to whatever call is active right now, if any, via baresip's `audio_set_source()`/`audio_set_player()` hot-swap API (investigated while building this: both genuinely stop and restart the running audio source/player against the same live call, no re-INVITE needed — see `ctrl_json.c` `cmd_set_device()`'s own comment). Scoped to "the current call" like every other no-`call_id` command in this file (see `resolve_call()`) — a concurrent second call (an attended-transfer consultation leg) is not touched. |
 | `{"cmd":"tap_start","dir":"/abs/path","call_id":"..."}` | **New in v1.2.** Starts tapping the resolved call's audio to two new mono 16-bit PCM WAV files under `dir` (required — an absolute, already-existing, writable directory; this command doesn't create it): `<dir>/<call_id>-rx.wav` (the remote party — decoded incoming audio) and `<dir>/<call_id>-tx.wav` (the local party — outgoing audio before encode). `call_id` is optional like every other call-scoped command (falls back to "the current call" — see `resolve_call()`); resolving to no call is an `error`, same as `hold`/`mute`/etc, **not** an "arm for the next call" — a tap always targets a call that already exists at the moment this command runs (see `core/E2E-F1.md` "F4 audio tap" for why the e2e sequence dials first, then taps). Errors (all `error` events, none of them crash the engine or the call): no current/resolvable call, the call has no audio yet, `dir` is missing/empty, a tap is already running for this call (stop it first), or the output file(s) couldn't be opened (bad `dir`, not writable, ...). Both files exist on disk (0 bytes) as soon as this command succeeds; each one's real WAV header is committed on that direction's first actual audio frame, not synchronously with this command (see `core/modules/ctrl_json/wav_writer.h`) — typically sub-20ms later on an already-flowing call. Sample rate is whatever the negotiated codec's audio path actually runs at, taken from each direction's real first frame, never guessed — this build's actual account (`audio_codecs=pcmu,pcma`, see `run-spike.sh`) runs at 8000 Hz mono; see `core/E2E-F1.md` "F4 audio tap" for the real numbers. Output is always mono — a source frame with more than one channel is downmixed (integer average) first, though this build's actual codec set never produces one (G.711 decodes to mono) — see `audiotap.c` `write_frame()`. |
 | `{"cmd":"tap_stop","call_id":"..."}` | **New in v1.2.** Stops a running tap on the resolved call, finalizing both WAV headers (correct final `RIFF`/`data` chunk sizes — a tap is also auto-finalized on call teardown even without this command, see "Events" `tap_state` row). Errors if the resolved call doesn't exist, has no audio, or has no tap currently running. |
-| `{"cmd":"park","ext":"<pilot ext>","call_id":"..."}` | **New in v1.3.** Parks a call by blind-transferring it (REFER, the exact same `call_transfer()` mechanism `blind_transfer` already uses) to `ext` — the target parking lot's **pilot** extension. `ext` is **required**, not defaulted — a pilot extension is per-PBX configuration, not a protocol constant this engine should guess at (unlike `*43`/`*60` test codes, which `park` never used either). Same target-address shape as `blf_subscribe`'s own `ext` (`sip:<ext>@<same PBX host the account registered against>` — see `build_pbx_ext_uri()` in `ctrl_json.c`, shared by both). `call_id` is optional, same `resolve_call()` fallback convention as every other call-scoped command. **The confirmation event's `ext` is always the pilot extension targeted, never a specific auto-assigned parking slot** — see "Events" `park` row for why, and this file's own v1.3 status paragraph plus `core/E2E-F1.md` "F5" for this command's current real-PBX e2e status. |
+| `{"cmd":"park","ext":"<pilot ext>","call_id":"..."}` | **New in v1.3.** Parks a call by blind-transferring it (REFER, the exact same `call_transfer()` mechanism `blind_transfer` already uses) to `ext` — the target parking lot's **pilot** extension. `ext` is **required**, not defaulted — a pilot extension is per-PBX configuration, not a protocol constant this engine should guess at (unlike `*43`/`*60` test codes, which `park` never used either). Same target-address shape as `blf_subscribe`'s own `ext` (`sip:<ext>@<same PBX host the account registered against>` — see `build_pbx_ext_uri()` in `ctrl_json.c`, shared by both). `call_id` is optional, same `resolve_call()` fallback convention as every other call-scoped command. **The confirmation event's `ext` is always the pilot extension targeted, never a specific auto-assigned parking slot** — see "Events" `park` row for why, and this file's own v1.3/v1.4 status paragraphs plus `core/E2E-F1.md` "F5" for this command's current real-PBX e2e status (**v1.4: works end-to-end over udp/tcp; over wss, the async failure now at least surfaces as an `error` event instead of vanishing silently — see v1.4 status paragraph**). |
 
 Unknown `cmd` values, a required field missing/wrong-typed (e.g. `dial`
 without `uri`, `mute` without a real boolean `on`, `set_device` with a
@@ -211,14 +266,15 @@ exactly what `ok:true`/`ok:false` do and don't promise about a command's
 | `{"event":"ready"}` | Once, right after `ctrl_json` finishes initializing — the earliest point commands can safely be sent. Unchanged from v0. |
 | `{"event":"reg_state","account":"...","state":"registering\|registered\|failed\|unregistered","transport":"udp\|tcp\|tls\|ws\|wss","reason":"..."}` | On every registration transition — now including transitions caused by the runtime `register`/`unregister` commands, not just process-start registration. `reason` present only on `failed`. Unchanged shape from v0. |
 | `{"event":"call_state","state":"...","peer":"...","id":"...","call_id":"...","}` | **`call_id` is new in v1** (added alongside the original `id` field, same value — kept both so a v0 consumer reading `id` doesn't break; a future v2 may drop `id`). `state` values beyond v0's `incoming\|ringing\|established\|closed`: **`hold`/`resumed`** (fired both for this engine's own local hold/resume commands — synthetically, right at the command's own success path, since baresip has no bevent for *locally*-initiated hold/resume, only peer-initiated — and relayed from `BEVENT_CALL_HOLD`/`BEVENT_CALL_RESUME` for a *peer*-initiated hold/resume) and **`muted`/`unmuted`** (from `mute`). None of these correspond to baresip's own `CALL_STATE_*` lifecycle machine changing — hold/mute are attributes of an otherwise-established call, not lifecycle transitions — they're folded into `call_state` anyway rather than inventing a new event per attribute, since from a consumer's perspective they're all "something about this call just changed, here's its id". |
-| `{"event":"error","message":"..."}` | Malformed/unparseable input line, unknown `cmd`, a required field missing/wrong-typed, a baresip command that returned an error, `BEVENT_AUDIO_ERROR`, or (new in v1) `BEVENT_CALL_TRANSFER_FAILED` (an async transfer failure reported by the far end after `blind_transfer`/`complete_transfer` already returned success synchronously — reuses this existing event/shape rather than inventing a transfer-specific one). |
+| `{"event":"error","message":"..."}` | Malformed/unparseable input line, unknown `cmd`, a required field missing/wrong-typed, a baresip command that returned an error, `BEVENT_AUDIO_ERROR` (also emits the dedicated `audio_error` event below, **new in v1.4** — this plain `error` still fires too, unchanged, for back-compat), or `BEVENT_CALL_TRANSFER_FAILED` (an async transfer failure reported by the far end after `blind_transfer`/`complete_transfer` already returned success synchronously — reuses this existing event/shape rather than inventing a transfer-specific one; **as of v1.4** also fires for a `park`/`blind_transfer` subscription-*establishment* failure, e.g. the wss-specific `EDESTADDRREQ` finding under `park` below — previously silently swallowed, see "Changes from v1.3" and `core/patches/0005-*`). |
+| `{"event":"audio_error","call_id":"...","message":"..."}` | **New in v1.4**, from `BEVENT_AUDIO_ERROR`, alongside the plain `error` event above (both fire, same underlying bevent). `call_id` is the failing call's real id (same convention as `call_state`/`tap_state`/`park`) — the plain `error` event has no `call_id` at all, so this is the only way to know *which* call's audio failed when more than one is in play. `message` is the identical text the plain `error` event's own `message` carries (baresip's own `"%d,%s", err, str` format from `call.c`'s `audio_error_handler()` — not re-parsed/restructured here). e2e-verified via fault injection (see this file's own top-of-file v1.4 status paragraph) — **only reachable for `ausrc`/microphone-side failures today**, see that same paragraph for the separate, unfixed `auplay`/speaker-side gap. |
 | `{"event":"stats","call_id":"...","rtt_us":N,"tx_packets":N,"tx_lost":N,"tx_jitter_us":N,"rx_packets":N,"rx_lost":N,"rx_jitter_us":N,"codec":"...","transport":"udp\|tcp\|tls\|ws\|wss"}` | New in v1, from `quality_stats`. Sourced from `stream_rtcp_stats()` (`src/stream.c`) — **this reflects the most recently *received* RTCP Sender/Receiver Report, not a live per-packet counter.** Querying more often than the RTCP interval (empirically ~10-20s against the test PBX, see `core/E2E-F1.md`) returns identical numbers between reports; that's correct RTCP behavior, not a bug or a stale/broken reading. Query again after waiting a few RTCP intervals if you need fresher numbers. `rtt_us` is frequently `0` against a real PBX even while every other field is healthy/non-zero — RTCP round-trip-time needs a full SR/RR/DLSR round trip to populate, which this repo's test PBX has never been observed to complete (see `core/E2E-F1.md` scenario (d)); don't read a `0` there as "stats are broken". **`codec`/`transport` are new in v1.1**: `codec` is the call's negotiated TX/encoder codec name (`audio_codec()`, `src/audio.c`) — omitted entirely (not an empty string) if not yet negotiated; `transport` is the *call's own* actual SIP transport (`call_transp()`, not the account's static config) using the same vocabulary as `reg_state`'s `transport`. |
 | `{"event":"blf","ext":"...","state":"idle\|ringing\|busy\|held\|dnd\|offline"}` | New in v1, from `blf_subscribe`. `idle`: no active dialog for that extension (either no `<dialog>` element in the NOTIFY body, *or* one present with `<state>terminated</state>` — both occur in practice, see `core/E2E-F1.md` for the real captured body, which uses the second shape). `ringing`: `<state>` is `early`/`proceeding`/`trying`. `busy`: `<state>confirmed</state>`, no hold signal (see `held` below). `held` (**new in v1.3, "presence_override"**): `<state>confirmed</state>` *and* the dialog's NOTIFY body also carries the RFC 4235/RFC 3840 standard hold indication (a `<target>` `+sip.rendering` param, `pvalue="no"`) — see `core/modules/ctrl_json/dialog_info.h`'s own header comment on `CENT_BLF_HELD` for the full parsing rule. **Real-PBX finding**: this engine's test PBX (FreePBX 17.0.30 / Asterisk 22.8.2, chan_pjsip) does **not** actually emit this signal for a locally-held call — confirmed via a real NOTIFY captured mid-hold (3 separate NOTIFYs across the hold window, `version=` incrementing each time, all byte-identical to the plain `busy` shape) — so a held call on *this* PBX currently still reports `busy`, not `held`; the parser rule itself is implemented correctly to the RFC-documented shape and unit tested against synthetic RFC-compliant fixtures, and will report `held` the moment a NOTIFY body actually carries the param (a different/future PBX config, or a different vendor). See `core/E2E-F1.md` "F5 presence_override" for the full real-capture evidence. `dnd` (**new in v1.3, "presence_override", best-effort**): a non-standard `<dnd>true</dnd>` element or `dnd=` attribute anywhere in the NOTIFY body — see `dialog_info.h`'s `CENT_BLF_DND` comment. **Not verified against a real Asterisk capture** — standard Asterisk chan_pjsip `Event: dialog` hints have no dedicated element for "this extension is in DND" (dialog-info is a *dialog* package; DND is a device-config state, not a dialog — an idle-but-DND'd extension has zero active dialogs either way, indistinguishable from plain idle at this layer without something extra in the XML, which this repo has not observed Asterisk actually send). `offline`: the subscription itself failed/was rejected/expired before a NOTIFY could be parsed, *or* a `<dialog>` element was present with no parseable `<state>` — the "can't currently tell" bucket. Parsing is pure, tiny, and unit-tested against both synthetic bodies and real captures (idle *and*, new in v1.3, the mid-hold "still busy" real capture) — see `core/modules/ctrl_json/dialog_info.c` and `test/test_main.c`. |
 | `{"event":"attended_transfer_started","source_call_id":"...","target_call_id":"..."}` | New in v1, from `attended_transfer`, right after the consultation call's dial succeeds. Lets a consumer correlate exactly which two `call_id`s a pending `complete_transfer`/`abort_transfer` will act on — there's no other way to learn `target_call_id` (it's a brand new call, not something the caller supplied). |
 | `{"event":"devices","input":[{"name":"...","active":true\|false},...],"output":[...]}` | **New in v1.1**, from `devices`. `name` is a `"<module>[,<device>]"` composite (matching baresip's own `audio_source`/`audio_player` config-file syntax) — pass it straight back as `set_device`'s own `"name"` field to select that device. This spike's actual module set (`ausine` input / `aufile` output only, see `core/BUILD.md` "Module selection" — no `coreaudio`/`alsa`/`wasapi`/...) has no real per-device enumeration, so today each of `input`/`output` always has exactly one entry — the driver module itself standing in for "the device" — rather than a genuinely empty or fake-populated list; a future real device-backend module plugs in with no protocol change (see `ctrl_json.c` `devices_add_driver()`'s own comment for exactly how the fallback works). |
 | `{"event":"result","id":"...","ok":true\|false,"error":"...?", ...}` | **New in v1.1**, from any command that carried an `id` (see "Commands") — a direct, correlated acknowledgment of that *specific* command's own synchronous dispatch. `ok:true` means the command was accepted and dispatched without a synchronous validation/API failure — it is **not** a promise about anything asynchronous: e.g. a `blind_transfer` that gets `result ok:true` can still fail far-end minutes later, surfaced the same way it always was, as a `BEVENT_CALL_TRANSFER_FAILED`-sourced `error` event — watch the normal `call_state`/`reg_state`/`stats`/`blf`/... events for that, same as always; `result` only ever reports the exact same synchronous success/failure an `id`-less send of the same command would have shown via a normal event (an `error` event on failure, nothing extra on success) — `id` doesn't change *what* happens, only whether you get a correlated acknowledgment of it. `error` is present (and identical to the text a plain `error` event would carry) only when `ok:false`. `quality_stats` and `devices` additionally merge their own "command-specific fields" (the same fields their own `stats`/`devices` event would carry) directly onto a successful `result`, so a correlated caller doesn't need to also match up a second event by hand just to read the data it asked for — every other command's `result` is just `{"event":"result","id":"...","ok":true}` on success. `tap_start`/`tap_stop` are **not** in the merge list (like `hold`/`mute`/`blind_transfer`/...) — they're action commands, not query commands; their real data travels on the dedicated `tap_state` event below, the same way `hold`'s travels on `call_state`. |
 | `{"event":"tap_state","call_id":"...","state":"started"\|"stopped","rx_path":"...","tx_path":"...", ...}` | **New in v1.2**, from `tap_start` (`state:"started"`) and from `tap_stop` **or** call teardown (`state:"stopped"` either way — see `audiotap.h` `audiotap_call_closed()`: a tap that outlives its own `tap_stop`, e.g. the peer hangs up first, is auto-finalized so a WAV file is never left open/corrupt). `call_id` is always the resolved call's real id, regardless of whether the triggering command supplied one — same convention as `call_state`. `rx_path`/`tx_path` are present on both states (the same two paths `tap_start` chose, echoed back on `stopped` too so a consumer doesn't have to have kept them from the `started` event). `"stopped"` additionally carries `rx_bytes`/`tx_bytes` (PCM data bytes written, WAV header excluded) and `rx_duration_ms`/`tx_duration_ms` (derived from bytes/sample-rate/sample-size, integer math) — `"started"` never carries these fields at all (nothing's been written yet, not even a zero) — see `core/E2E-F1.md` "F4 audio tap" for real captured numbers. **Security note (v1.3):** `rx_path`/`tx_path`'s filename component is derived from `call_id`, which — for an *incoming* call — is the far end's own SIP `Call-ID` header, not an engine-generated value; see "Changes from v1.2" below and `core/modules/ctrl_json/pathsafe.h` for why that value is sanitized before ever reaching a filesystem path, and confirm any future code that interpolates a call_id into a path does the same. |
-| `{"event":"park","call_id":"...","ext":"..."}` | **New in v1.3**, from `park`, right after the REFER dispatches successfully (synchronous acceptance only — same "not a promise about the async outcome" caveat as `blind_transfer`'s own `call_state`/`error` story, see that command's row and `cmd_park()`'s own comment in `ctrl_json.c`). `call_id` is the resolved call's real id (same convention as `call_state`/`tap_state`). `ext` is always the **pilot** extension the park request targeted (echoed back from the command), **never** a specific auto-assigned parking-lot slot number — genuinely not observable over plain SIP signaling this engine's call leg is party to (confirmed by reading how Asterisk's REFER handling and `Park()` interact here, not guessed — see `core/E2E-F1.md` "F5 park"); a future consumer that needs the *actual* assigned slot would need an AMI/ARI integration, out of scope for this SIP-only engine. See this file's own top-of-file v1.3 status paragraph for `park`'s current real-PBX e2e status (dispatch/event confirmed; end-to-end "call actually lands in the lot" not yet confirmed — an unresolved local REFER-progress-subscription issue was found targeting `Park()` specifically). |
+| `{"event":"park","call_id":"...","ext":"..."}` | **New in v1.3**, from `park`, right after the REFER dispatches successfully (synchronous acceptance only — same "not a promise about the async outcome" caveat as `blind_transfer`'s own `call_state`/`error` story, see that command's row and `cmd_park()`'s own comment in `ctrl_json.c`). `call_id` is the resolved call's real id (same convention as `call_state`/`tap_state`). `ext` is always the **pilot** extension the park request targeted (echoed back from the command), **never** a specific auto-assigned parking-lot slot number — genuinely not observable over plain SIP signaling this engine's call leg is party to (confirmed by reading how Asterisk's REFER handling and `Park()` interact here, not guessed — see `core/E2E-F1.md` "F5 park"); a future consumer that needs the *actual* assigned slot would need an AMI/ARI integration, out of scope for this SIP-only engine. See this file's own top-of-file v1.3/v1.4 status paragraphs for `park`'s current real-PBX e2e status — **v1.4**: confirmed landing in the lot end-to-end over udp/tcp (real SIP trace: REFER on the wire, `202 Accepted`, final NOTIFY sipfrag `SIP/2.0 200 OK`); over wss specifically, the REFER-progress-subscription issue remains (see "Planned"), but the failure now surfaces via a normal `error` event (`BEVENT_CALL_TRANSFER_FAILED`, `core/patches/0005-*`) instead of silently vanishing. |
 
 ## Changes from v0
 
@@ -429,7 +485,63 @@ verification status of each, and `core/E2E-F1.md` "F5 presence_override"/
   1000, real UUID-shaped call_id) that a normal call_id's filename is
   unaffected — see `core/E2E-F1.md` "F5 pathsafe regression".
 
-## Planned (still not in v1.3)
+## Changes from v1.3
+
+v1.4 is additive and fully backward compatible — nothing a v1.3 consumer
+already relies on changed shape or behavior (the one existing event this
+version touches, plain `error`, still fires exactly as before for every
+case it already covered — see both bullets below for what's *added*
+alongside it). Everything below is new — see this file's own top-of-file
+v1.4 status paragraph for the full "what was actually broken vs. what
+already worked" writeup and the real e2e evidence behind both:
+
+- **`audio_error`** (see "Commands"[none - event-only]/"Events") — a
+  distinct, `call_id`-bearing event for `BEVENT_AUDIO_ERROR`
+  (`ctrl_json.c`'s `emit_audio_error()`, called from `event_handler()`'s
+  existing `BEVENT_AUDIO_ERROR` case alongside the unchanged `emit_error()`
+  call already there). No baresip/re patch was needed for this half — by
+  reading `src/call.c`'s `audio_error_handler()`, the bevent itself was
+  already correctly emitted with the failing call still valid at that
+  point; the gap was purely that this module's own JSON shape for it
+  (the generic `error` event) carried no `call_id`, so a consumer with
+  more than one call in play had no reliable way to tell which call's
+  audio device just failed. Separately, and *not* fixed by this change:
+  only `ausrc` (microphone/input) failures are wired to
+  `BEVENT_AUDIO_ERROR` in baresip at all — see this file's own v1.4
+  status paragraph for the `auplay` (speaker/output) gap, a real
+  baresip-core API limitation, not something `ctrl_json.c` can route
+  around.
+- **`park`/`blind_transfer` subscription-establishment failures now
+  surface** (`core/patches/0005-baresip-transfer-subscription-error-event.patch`,
+  `src/call.c`'s `sipsub_close_handler()`) — this handler's `if (err)`
+  branch (fired when the REFER-progress SUBSCRIBE itself fails to be
+  established at all, e.g. the wss-specific `EDESTADDRREQ` finding under
+  `park` above, *before* any SIP response with a status code is ever
+  received) used to only `info()`-log the failure, with no
+  `call_event_handler()`/bevent call at all — unlike the very next
+  branch in the same function (`msg && msg->scode >= 300`, a *rejected*
+  transfer), which already reported via `CALL_EVENT_TRANSFER_FAILED`.
+  The fix mirrors that sibling branch exactly: reuses the existing
+  `CALL_EVENT_TRANSFER_FAILED` → `BEVENT_CALL_TRANSFER_FAILED` path
+  (`ua.c`, unchanged) → `ctrl_json.c`'s pre-existing
+  `BEVENT_CALL_TRANSFER_FAILED` case (unchanged — reuses the plain
+  `error` event shape, exactly like it already did for the rejection
+  case). No new protocol event type; a caller that already watches for
+  `error` events with `"transfer failed: "` in `message` now also
+  catches this failure mode, where before it saw nothing at all for it.
+  Real e2e evidence both directions (this session, real test PBX, `-s`
+  SIP trace, dual-contact 1000 into pilot ext `700`): over **wss**, the
+  `EDESTADDRREQ` failure reproduces and now correctly emits
+  `{"event":"error","message":"transfer failed: Destination address
+  required [39]"}`, with the original call confirmed still up/untouched
+  afterward; over **udp**, no failure occurs at all — the REFER reaches
+  the wire, gets a `202 Accepted`, and a final NOTIFY sipfrag body of
+  `SIP/2.0 200 OK` confirms the call actually lands in the parking lot —
+  narrowing "`park` doesn't work" (the v1.3 finding) to "`park` doesn't
+  work specifically when the engine's own SIP signaling transport is
+  wss" (see "Planned" below for the still-open wss-specific root cause).
+
+## Planned (still not in v1.4)
 
 - `devices`'s device-name granularity is exactly baresip's own module
   set for this spike build (`ausine`/`aufile`, see `core/BUILD.md`
@@ -493,22 +605,34 @@ verification status of each, and `core/E2E-F1.md` "F5 presence_override"/
   Not a concern for any call length this repo's e2e testing (or a real
   dental-office phone call) produces; would need an RF64/W64 header or a
   rollover-to-a-new-file policy if that ever changed.
-- **`park` end-to-end confirmation.** The command dispatches, the REFER
-  is genuinely sent (confirmed: the resolved call is left cleanly
-  untouched/unaffected, not errored, and the PBX never sent a
-  rejection), and this engine's own `result`/`park` events fire
-  correctly — but a client-side (baresip/`re`, not PBX-side) error in
-  the REFER-progress-subscription tracking specific to targeting
-  Asterisk's `Park()` app (`call: subscription closed: Destination
-  address required`, `errno` 39/`EDESTADDRREQ`) means this version does
-  **not** yet have positive PBX-side confirmation that a parked call
-  lands in a parking-lot slot end-to-end — see `core/E2E-F1.md` "F5
-  park" for the full repro/root-causing attempt. Next step: bisect
-  whether this is `sipevent_drefer()`'s dialog-reuse path mishandling
-  something about how Asterisk's `Park()` responds/re-INVITEs versus a
-  normal `Background()`/echo-app blind-transfer target (which works
-  fine, see "(b) blind_transfer" in `core/E2E-F1.md`), ideally with a
-  `re`-level (not just `ctrl_json`-level) trace.
+- **`park` over wss specifically.** As of v1.4, `park` is confirmed
+  end-to-end (real PBX, real SIP trace: REFER on the wire, `202
+  Accepted`, final NOTIFY sipfrag `SIP/2.0 200 OK`) when the engine's
+  own SIP signaling transport is **udp** (or, by the same mechanism,
+  presumably `tcp`/`tls` — not separately re-verified this session, only
+  `udp` and `wss` were). Over **wss** specifically, a client-side
+  (baresip/`re`, not PBX-side) error in the REFER-progress-subscription
+  tracking still reproduces every time (`call: subscription closed:
+  Destination address required`, `errno` 39/`EDESTADDRREQ`) — this is
+  now a *narrower*, more precise open question than v1.3's framing
+  ("does `park` work at all against `Park()`") — see `core/E2E-F1.md`
+  "F5 park" for the original v1.3 repro and this file's own v1.4 status
+  paragraph for the transport-dependence finding. As of v1.4 the failure
+  at least surfaces as a normal `error` event (`core/patches/0005-*`)
+  instead of vanishing silently — see "Changes from v1.3" — but the
+  underlying wss-specific cause is still unresolved. Next step: bisect
+  whether this is `sipevent_drefer()`'s dialog-reuse path interacting
+  differently with a WS-transport dialog specifically (needs a live WS
+  connection/socket handle for address resolution, unlike a plain UDP
+  socket's trivially-reusable remote address) versus a normal
+  `Background()`/echo-app blind-transfer target over the same wss
+  transport (which works fine, see "(b) blind_transfer" in
+  `core/E2E-F1.md` — also wss); a `re`-level (not just `ctrl_json`-level)
+  trace of `re/src/sipevent/subscribe.c`'s `sipsub_alloc()` specifically
+  comparing its udp-transport and wss-transport code paths would be the
+  most direct way to pin this down, not attempted this session (deep,
+  `re`-internal, genuinely out of this task's bounded-patch scope — see
+  this version's own scope decision in the v1.4 status paragraph).
 - **`park`'s actual assigned parking slot is not observable over plain
   SIP** — see "Events" `park` row. Would need an AMI/ARI integration (a
   different, out-of-scope layer for this SIP-only engine) to report the

@@ -39,6 +39,7 @@ git apply --directory=core/deps/re core/patches/0001-re-configurable-sip-ws-path
 git apply --directory=core/deps/re core/patches/0002-re-tls-fingerprint-pin.patch
 git apply --directory=core/deps/baresip core/patches/0003-baresip-json-stdout-purity.patch
 git apply --directory=core/deps/re core/patches/0004-re-json-stdout-purity.patch
+git apply --directory=core/deps/baresip core/patches/0005-baresip-transfer-subscription-error-event.patch
 ```
 
 These are the **only** local modifications to either submodule. They are
@@ -49,14 +50,21 @@ status` is clean after a fresh `submodule update`), so `git submodule
 update` always gives you real, verifiable upstream source, and each fix
 is a visible, reviewable diff. See "Findings" below for *why* patch 0001
 exists (the WSS e2e test does not pass without it), "TLS verification"
-below for patch 0002 (`CENT_TLS_PIN` cert pinning), and "`lg.enable_stdout`
+below for patch 0002 (`CENT_TLS_PIN` cert pinning), "`lg.enable_stdout`
 defaults to `true`" below for patches 0003/0004 (pure-JSON-stdout, v1.1 —
 0003 is the baresip-side fix: `main.c`'s new `CENT_JSON_STDOUT` gate +
 `log.c`'s stderr fallback + `uag.c`'s SIP-trace redirect; 0004 is a
 second, smaller re-side fix for a handful of unconditional
 `re_printf()`s in `core/deps/re/src/sip/transp.c`'s WS-client connect/
 send/close paths, found only by actually running the F3 e2e regression
-against the real PBX after 0003 — see `core/E2E-F1.md` "F3 regression").
+against the real PBX after 0003 — see `core/E2E-F1.md` "F3 regression"),
+and `core/PROTOCOL.md`'s v1.4 changelog for patch 0005 (`src/call.c`'s
+`sipsub_close_handler()` — a subscription-establishment failure, e.g.
+the WSS-specific `EDESTADDRREQ` finding under `park`/"Planned" below,
+used to be silently swallowed with no bevent at all; now reuses the
+existing `CALL_EVENT_TRANSFER_FAILED`/`BEVENT_CALL_TRANSFER_FAILED` path
+the sibling rejection branch already had, so a caller learns the attempt
+failed instead of seeing nothing).
 
 ## 4. Build re, then baresip
 
@@ -481,7 +489,7 @@ against the *live* engine specifically exercising tap traffic, which
 would be a reasonable next step before this feature carries production
 weight beyond its current F4-foundation role.
 
-## Windows CI
+## CI (macOS + Windows)
 
 `.github/workflows/core-build.yml` builds `core/` on both `macos-latest`
 and `windows-latest`. **The Windows job (`Windows (experimental)`) is
