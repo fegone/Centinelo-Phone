@@ -1,9 +1,14 @@
 name: shell build (v2 desktop shell)
 
-# Builds shell/ (the Tauri v2 desktop app) on the v2-shell branch. Scoped
-# separately from build.yml (v1 Electron, watches `main`) and
-# core-build.yml (the native engine, watches `v2`) via branch + path
-# filters, so none of the three workflows fire on the others' changes.
+# Builds shell/ (the Tauri v2 desktop app). Runs on `main` (2026-07-16:
+# main now IS v2 — v2 was merged into main via phone PR #2 — so this is
+# what actually gates merges there) plus `v2`/`v2-shell` while those
+# integration branches still exist. Scoped by the `shell/**` path filter,
+# not by branch alone: build.yml (v1 Electron) and core-build.yml (the
+# native engine) both also watch `main`, so all three workflows
+# legitimately fire together on a push touching multiple areas — that's
+# expected, not a collision, since each builds an unrelated artifact and
+# none depends on another's result.
 #
 # This job builds the shell app itself (Rust backend + static frontend) -
 # it does NOT build core/, since shell/'s sidecar binary path is resolved
@@ -12,15 +17,24 @@ name: shell build (v2 desktop shell)
 
 on:
   push:
-    branches: [v2-shell]
+    branches: [main, v2, v2-shell]
     paths:
       - 'shell/**'
       - '.github/workflows/shell-build.yml'
   pull_request:
-    branches: [v2, v2-shell]
+    branches: [main, v2, v2-shell]
     paths:
       - 'shell/**'
       - '.github/workflows/shell-build.yml'
+
+# A PR from v2 (or v2-shell) into main fires push (on the head branch) AND
+# pull_request for the same commit - two redundant runs. Group by
+# workflow+ref so the second dedupes against the first; cancel-in-progress
+# only cancels a STALE run of the SAME branch/ref (e.g. a superseded push
+# to that PR), never a run on a different branch like main.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   macos:

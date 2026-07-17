@@ -25,13 +25,29 @@ name: windows installer (F5 packaging)
 # build_official_pro=true) can explain the move rather than the input simply
 # vanishing out from under anyone with it saved in a previous dispatch form.
 #
-# `push` trigger below is scoped to `feature/windows-installer`, this
-# workflow's original feature branch (now merged - phone PR #2, v2 -> main,
-# 2026-07-16) - left as-is since retargeting to `main`/`v2` is a separate,
-# unrelated decision from retiring official-pro-build, not made in this pass.
+# `push`/`pull_request` triggers below (2026-07-16, release-ci pass):
+# retargeted off `feature/windows-installer` (this workflow's original
+# feature branch, now merged - phone PR #2, v2 -> main) onto `main` (where
+# merges land after 4R review) plus `v2` while that integration branch
+# still exists - the same pair core-build.yml/shell-build.yml now use.
+# `pull_request` is new here: this job never ran on a PR before, so a PR
+# that touched packaging (tauri.conf.json / tauri.official.conf.json /
+# package-official.sh / this file) could merge to main with the resources
+# mechanism unproven - the matrix smoke test below is cheap (synthetic
+# fixtures, no core/premium build) and now runs as a PR check the same way
+# core-build.yml/shell-build.yml already do. Path filters stay unchanged:
+# this job only cares about packaging-shaped changes, not every push to
+# main.
 on:
   push:
-    branches: [feature/windows-installer]
+    branches: [main, v2]
+    paths:
+      - 'shell/src-tauri/tauri.conf.json'
+      - 'shell/src-tauri/tauri.official.conf.json'
+      - 'scripts/package-official.sh'
+      - '.github/workflows/windows-installer.yml'
+  pull_request:
+    branches: [main, v2]
     paths:
       - 'shell/src-tauri/tauri.conf.json'
       - 'shell/src-tauri/tauri.official.conf.json'
@@ -63,6 +79,17 @@ on:
           Actions).
         type: boolean
         default: false
+
+# A PR from v2 into main fires push (on the head branch) AND pull_request
+# for the same commit - two redundant matrix runs (3 combos each, on
+# windows-latest - not cheap to duplicate). Group by workflow+ref so the
+# second dedupes against the first; cancel-in-progress only cancels a
+# STALE run of the SAME branch/ref (e.g. a superseded push to that PR or
+# an accidental double workflow_dispatch), never a run on a different
+# branch like main.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
 
 # 4R/RISK minor fix 2026-07-16: default token scope is read-only for
 # everything this workflow does (checkout public + private-via-PAT repos,
