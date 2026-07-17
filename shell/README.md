@@ -551,6 +551,105 @@ module's doc). QR is explicitly out of scope for this pass (webcam capture
 specifically) — see `PROVISIONING.md` "QR" for what's left for a future
 pass to build on.
 
+## License activation (P3, activation-server plan)
+
+Settings → License gains a serial paste field, an activation server URL
+field (default **empty**, same "no internal hostname ships in this public
+repo" rule the STT/provisioning endpoints already follow), and an
+"Activate" button — the shell side of "generic signed serial in →
+seat-counted, machine-bound, signed license out" (private premium repo:
+`docs/SPEC-2026-07-17-activation-server-design.md`,
+`docs/PLAN-2026-07-17-activation-server.md` §P3, read-only references —
+the server half, `centinelo-activationd`, is a separate premium-repo
+piece this shell only ever talks HTTP to).
+
+All logic lives in `src/activation.rs`; `commands.rs`'s `activate_license`
+is thin plumbing (admin-lock + `Result` mapping), same split every other
+command in this file follows. The flow: validate the URL (`https://`
+always, `http://127.0.0.1`/`http://localhost` only for local testing),
+compute this machine's fingerprint, `POST {server}/activate`
+`{serial, machine_fingerprint}` over `ureq` (reused, no new HTTP crate —
+the same client `provisioning.rs`'s remote fetch already uses; the
+plugin-only `reqwest` `tauri-plugin-updater` pulls in isn't a usable
+direct dependency of this crate without adding it as one, so `ureq` is
+the better fit for "reuse what's already here"), and on a `200` whose
+returned license verifies locally against an embedded activation pubkey
+**before** anything touches disk, write it atomically (`tmp` + rename,
+`0600`, `settings::write_private_file` — the exact same helper
+`settings.json` itself uses) to `license.json`, a new sibling of
+`settings.json` in the app-data directory
+(`SettingsStore::license_path`). Any failure at any step — bad URL,
+network down, a non-2xx response, or a `200` whose signature does NOT
+verify — leaves whatever license state already existed completely
+untouched (spec §5.4: "a failed activation changes nothing"; the shell
+never persists the serial itself, only the server URL preference).
+
+**Errors cross the Tauri command boundary as short codes**
+(`"seats_exhausted"`, `"serial_revoked"`, `"invalid_serial"`,
+`"expired_serial"`, `"network"`, ...; see `activation::ActivationError::code`),
+not prose — `ui/js/i18n.js`'s `activation.error.<code>` keys hold the
+actual displayed copy, in all three of this product's real languages
+(EN/PT-BR/ES; the ES wording matches the P3 task brief's exact spec).
+This is a deliberate difference from `provisioning_apply`'s own
+English-only backend error string (which never runs through i18n.js
+today) — this feature routes through the real i18n system instead of
+adding a second, inconsistent all-one-language error path, while this
+repo's "UI text English" rule (`.claude/skills/shell-tauri/SKILL.md`) is
+satisfied because what's hardcoded in Rust is a short identifier, never
+displayed prose.
+
+### Machine fingerprint and the signed-license envelope are duplicated, not imported
+
+This crate never depends on the private `centinelo-license` crate — same
+rule `premium.rs`'s own doc states for the dylib loader ("a public,
+forkable repo... a fork could delete any gating logic that lived here").
+`activation.rs`'s `machine_fingerprint()` and its minimal
+`{payload, sig}` envelope verifier are hand-duplicated from
+`centinelo-license/src/fingerprint.rs` and `.../src/container.rs`
+(private repo, read-only references) — the same precedent
+`centinelo-premium-abi/src/capability.rs` already sets for the
+`FEATURE_*` name strings. `machine_fingerprint()` mirrors the private
+crate's algorithm bit-for-bit (macOS `IOPlatformUUID` via `ioreg`,
+Windows `MachineGuid` from the registry, `CENTINELO_MACHINE_ID` env
+override for dev/test/CI) so a license this shell requests binds to the
+same fingerprint a future real consumer of `license.json` would compute
+independently for the same machine.
+
+### Activation pubkey — dev/test placeholder, same pattern as the other two
+
+`ACTIVATION_PUBKEY_BYTES` (`activation.rs`) is a third, distinct dev/test
+Ed25519 keypair — `premium.rs`'s `LIB_PUBKEY_BYTES` authenticates the
+`centinelo_premium` dylib *binary*; `centinelo-premium`'s own (private
+repo) `DEV_TEST_LICENSE_SIGNING_SEED` gates its dev-only
+`CENTINELO_PREMIUM_LICENSE_PATH` override; this one authenticates a
+*license issued by an activation server*. **Before an official release**,
+Felix generates a real activation keypair offline (same ceremony this
+file's own "Dev signing key" section documents for the updater), replaces
+`ACTIVATION_PUBKEY_BYTES` with the real public half, and the private half
+becomes `centinelo-activationd`'s `ACTIVATIOND_KEY` (server-side, private
+repo, never in this repo).
+
+### The real gap this piece leaves open — flagged, not papered over
+
+`activate_and_persist` writes a verified `license.json` — but **nothing
+reads it back yet**. Confirmed by reading `centinelo-premium/src/
+license.rs` (private repo, read-only reference, this repo's scope never
+includes editing it): `active_license()` there is
+`founder_license().or_else(license_from_override_env)`, and that
+`or_else` arm is an explicit dev/test-only escape hatch
+(`CENTINELO_PREMIUM_LICENSE_PATH`), documented in that file's own doc
+comment as "not yet a real app-data-dir file read... out of scope for the
+v0 loader mechanism this crate implements." This piece is code-complete
+and tested end to end up to a correctly-verified `license.json` landing
+on disk at `SettingsStore::license_path()`; making an activated license
+actually change what `premium_capability_status` reports needs a
+follow-up in `centinelo-premium` (licensing agent's ambit, not this
+one) — teaching `active_license()` to also try reading from this shell's
+real path, not only the dev env-var override. The UI's own success copy
+(`settings.licenseActivatedStatus`) is worded to match what actually
+happened today ("License saved for {customer}"), not a restart-to-apply
+claim this shell can't back up yet.
+
 ## Auto-updater (roadmap debt fix)
 
 Every build used to require a manual reinstall. `tauri-plugin-updater` +
@@ -924,6 +1023,17 @@ follows, nothing new to invent here.
 
 ## Known limitations (F2/F3/F4 scope)
 
+- **License activation writes a verified `license.json`, but nothing
+  reads it back yet** — see "License activation (P3, activation-server
+  plan)" above, "The real gap this piece leaves open", for the full
+  explanation. `centinelo-premium` (private repo) needs a follow-up to
+  read from this shell's real app-data-dir path instead of only its
+  dev-only `CENTINELO_PREMIUM_LICENSE_PATH` env override before an
+  activated license changes what `premium_capability_status` reports.
+  Also not built this pass (out of P3's scope per the plan): a real
+  `centinelo-activationd` round trip from inside a running desktop app
+  (this piece's own tests cover the mock-server flow only, see
+  `activation.rs`) — that's P4's job, once P2 (the server) exists.
 - No `hold`/`mute`/`transfer`/`dtmf` **in the main window's own UI** — F4
   added the backend commands (`sidecar_hold`/`sidecar_mute`/
   `sidecar_blind_transfer`/`sidecar_attended_transfer`/etc., see
