@@ -238,6 +238,36 @@ html[data-os="mac"] .settings-header { padding-left: 78px; }
 .themerow button { font: 500 11px/1 var(--font-ui); padding: 6px 12px; border-radius: var(--r-pill); color: var(--text-2); }
 .themerow button.on { background: var(--bg-1); color: var(--text-1); box-shadow: var(--shadow-1); }
 
+/* == transcription settings (Plate 08) — model rows + privacy note ========
+   Model rows reuse .tcard's radio-dot language (see above) but lay out
+   horizontally (label+description on the left, install/download status on
+   the right) instead of .tcard's stacked row1+p, since each row also needs
+   to carry an install chip or a live download bar. Download progress is
+   deliberately ink-only (--text-3 fill, no amber) - REVIEW.md §4b.4/4b's
+   "no amber, nothing glows here" rule for this pane's download UI. */
+.modelrows { display: flex; flex-direction: column; gap: 6px; }
+.modelrow { display: flex; align-items: center; gap: 10px; text-align: left; width: 100%; background: var(--bg-1); border: 1px solid var(--border-1); border-radius: var(--r-2); box-shadow: var(--edge), var(--shadow-1); padding: 9px 10px; transition: background var(--t-fast) var(--ease); cursor: pointer; }
+.modelrow:hover { background: var(--bg-3); }
+.modelrow:focus-visible { outline: 2px solid var(--amber-fill); outline-offset: 2px; }
+.modelrow .radio { width: 14px; height: 14px; border-radius: 50%; border: 1.6px solid var(--border-2); flex: none; display: grid; place-items: center; }
+.modelrow.sel .radio { border-color: var(--amber-fill); }
+.modelrow.sel .radio::after { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--amber-fill); }
+.modelrow .mrx { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.modelrow .mrx b { font: 600 12.5px/1.2 var(--font-ui); }
+.modelrow .mrx span { font: 400 10.5px/1.4 var(--font-ui); color: var(--text-2); }
+.modelrow .mrstatus { flex: none; display: flex; align-items: center; gap: 7px; }
+.modelchip { font: 700 8.5px/1 var(--font-mono); letter-spacing: .1em; color: var(--text-3); border: 1px solid var(--border-2); border-radius: 5px; padding: 3.5px 6px 3px; text-transform: uppercase; white-space: nowrap; }
+.modelchip.ok { color: var(--st-idle); border-color: color-mix(in srgb, var(--st-idle) 45%, transparent); }
+.modelchip.btn:hover { background: var(--bg-3); color: var(--text-1); }
+.dlwrap { display: flex; align-items: center; gap: 7px; }
+.dlbar { width: 46px; height: 3px; border-radius: 2px; background: var(--bg-3); overflow: hidden; flex: none; }
+.dlbar i { display: block; height: 100%; width: 0%; border-radius: 2px; background: var(--text-3); }
+.dlpct { font: 500 9px/1 var(--font-mono); color: var(--text-3); white-space: nowrap; }
+
+.privacy-note { display: flex; gap: 8px; margin-top: 10px; padding: 10px 12px; background: var(--bg-2); border: 1px solid var(--border-1); border-radius: var(--r-2); }
+.privacy-note svg { flex: none; color: var(--st-idle); margin-top: 1px; }
+.privacy-note p { margin: 0; font: 400 11px/1.5 var(--font-ui); color: var(--text-2); }
+
 .save-bar { position: absolute; left: 0; right: 0; bottom: 0; padding: 10px 16px; background: light-dark(rgba(245,244,239,.92), rgba(12,17,14,.92)); border-top: 1px solid var(--border-1); display: flex; align-items: center; gap: 10px; backdrop-filter: blur(6px); }
 .save-bar .status { font: 400 11px/1.4 var(--font-ui); color: var(--text-3); flex: 1; min-width: 0; }
 .save-bar .status.ok { color: var(--st-idle); }
