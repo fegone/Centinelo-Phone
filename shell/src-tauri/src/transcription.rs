@@ -85,6 +85,7 @@ use crate::settings::{
     ModelTier, SettingsStore, TranscriptionActivation, TranscriptionMode, TranscriptionSettings,
 };
 use crate::sidecar::SidecarHandle;
+use crate::sync_ext::PoisonRecover;
 
 /// The [`centinelo_premium_abi::Capability::feature_name`] this whole
 /// module is gated behind - see `console.rs`'s `CAPABILITY`/`is_unlocked`
@@ -323,7 +324,7 @@ impl TranscriptionHandle {
         if state != "established" {
             return; // "closed" is handled entirely via tap_state:"stopped" - see on_tap_stopped's doc.
         }
-        let already_active = self.0.active.lock().expect("poisoned").contains_key(call_id);
+        let already_active = self.0.active.lock_or_recover().contains_key(call_id);
         let settings = self.0.settings.snapshot().transcription;
         if !should_auto_tap(&settings, already_active) {
             return;
@@ -372,7 +373,7 @@ impl TranscriptionHandle {
     /// (finalize/move/cleanup) runs the same way it would for a natural
     /// hangup, off the resulting `tap_state:"stopped"` event.
     pub fn manual_stop(&self, call_id: &str) -> Result<(), String> {
-        if !self.0.active.lock().expect("poisoned").contains_key(call_id) {
+        if !self.0.active.lock_or_recover().contains_key(call_id) {
             return Err("Not currently transcribing this call.".to_string());
         }
         self.0
@@ -381,13 +382,7 @@ impl TranscriptionHandle {
     }
 
     pub fn pending_retries(&self) -> Vec<PendingRetryView> {
-        self.0
-            .pending_retries
-            .lock()
-            .expect("poisoned")
-            .values()
-            .map(PendingRetryView::from)
-            .collect()
+        self.0.pending_retries.lock_or_recover().values().map(PendingRetryView::from).collect()
     }
 
     /// Re-runs the transcribe pass for a call whose finalize step failed
@@ -401,7 +396,7 @@ impl TranscriptionHandle {
     /// every failure and always re-transcribed from scratch).
     pub fn retry(&self, call_id: &str) -> Result<(), String> {
         let retry = {
-            let mut guard = self.0.pending_retries.lock().expect("poisoned");
+            let mut guard = self.0.pending_retries.lock_or_recover();
             guard
                 .remove(call_id)
                 .ok_or_else(|| "No pending retry for this call.".to_string())?
@@ -442,7 +437,7 @@ impl TranscriptionHandle {
 
         if !retry.rx_path.is_file() && !retry.tx_path.is_file() {
             let call_id_owned = retry.call_id.clone();
-            self.0.pending_retries.lock().expect("poisoned").insert(call_id_owned, retry);
+            self.0.pending_retries.lock_or_recover().insert(call_id_owned, retry);
             return Err("The original audio for this call is no longer on disk - nothing to retry.".to_string());
         }
 
@@ -491,7 +486,7 @@ impl TranscriptionHandle {
         // both observe "not active yet" and both proceed - the second
         // one's `Entry::Occupied` always wins the race, deterministically.
         {
-            let mut active = self.0.active.lock().expect("poisoned");
+            let mut active = self.0.active.lock_or_recover();
             match active.entry(call_id.to_string()) {
                 std::collections::hash_map::Entry::Occupied(_) => {
                     return Err("Already transcribing this call.".to_string());
@@ -510,7 +505,7 @@ impl TranscriptionHandle {
 
         if let Err(e) = std::fs::create_dir_all(&tap_dir) {
             log::warn!("transcription: could not create tap dir for {call_id}: {e}");
-            self.0.active.lock().expect("poisoned").remove(call_id);
+            self.0.active.lock_or_recover().remove(call_id);
             return Err(format!("Could not create a working directory for this call: {e}"));
         }
         #[cfg(unix)]
@@ -562,7 +557,7 @@ impl TranscriptionHandle {
         let call_id = call_id.to_string();
         std::thread::spawn(move || {
             std::thread::sleep(tap_start_confirm_timeout());
-            let mut active = inner.active.lock().expect("poisoned");
+            let mut active = inner.active.lock_or_recover();
             let Some(entry) = active.get(&call_id) else {
                 return; // already finished/cleaned up through the normal path
             };
@@ -587,7 +582,7 @@ impl TranscriptionHandle {
         let call_id = call_id.to_string();
         std::thread::spawn(move || {
             let ctx = {
-                let mut active = inner.active.lock().expect("poisoned");
+                let mut active = inner.active.lock_or_recover();
                 match active.get_mut(&call_id) {
                     Some(e) => {
                         e.tap_confirmed = true;
@@ -600,13 +595,13 @@ impl TranscriptionHandle {
                 return; // post-call mode starts its process at tap_stop, not tap_start
             }
             let Some(mut child) = spawn_transcribe_for(&inner, &ctx, "live") else {
-                inner.active.lock().expect("poisoned").remove(&ctx.call_id);
+                inner.active.lock_or_recover().remove(&ctx.call_id);
                 return;
             };
             let stdin = child.stdin.take();
             let mut send_stop_now = false;
             {
-                let mut active = inner.active.lock().expect("poisoned");
+                let mut active = inner.active.lock_or_recover();
                 if let Some(entry) = active.get_mut(&call_id) {
                     entry.live_stdin = stdin;
                     send_stop_now = entry.coordination.mark_live_spawned();
@@ -615,7 +610,7 @@ impl TranscriptionHandle {
             if send_stop_now {
                 // tap_state:"stopped" already raced ahead of this spawn (a
                 // very short call) - see TapCoordination's doc.
-                let mut active = inner.active.lock().expect("poisoned");
+                let mut active = inner.active.lock_or_recover();
                 if let Some(entry) = active.get_mut(&call_id) {
                     if let Some(stdin) = entry.live_stdin.as_mut() {
                         let _ = writeln!(stdin, "stop");
@@ -633,7 +628,7 @@ impl TranscriptionHandle {
         let tx_bytes = event.get("tx_bytes").and_then(Value::as_u64);
         std::thread::spawn(move || {
             let run_post_call_ctx: Option<FinalizeContext> = {
-                let mut active = inner.active.lock().expect("poisoned");
+                let mut active = inner.active.lock_or_recover();
                 let Some(entry) = active.get_mut(&call_id) else {
                     return; // not a call this handle armed
                 };
@@ -796,11 +791,7 @@ fn stash_pending_retry(
         last_error: reason.clone(),
         channels_failed,
     };
-    inner
-        .pending_retries
-        .lock()
-        .expect("poisoned")
-        .insert(ctx.call_id.clone(), retry);
+    inner.pending_retries.lock_or_recover().insert(ctx.call_id.clone(), retry);
     let _ = inner.app.emit(
         "transcription://error",
         serde_json::json!({"call_id": ctx.call_id, "message": reason, "retryable": true}),
@@ -1070,7 +1061,7 @@ fn spawn_reader_and_finalize(inner: Arc<Inner>, ctx: FinalizeContext, mut child:
         // as "yes, expected" so post-call finalize behaves exactly as an
         // always-expected exit.
         let stop_was_requested = {
-            let active = inner.active.lock().expect("poisoned");
+            let active = inner.active.lock_or_recover();
             active
                 .get(&ctx.call_id)
                 .map(|e| e.coordination.stop_requested())
@@ -1083,7 +1074,7 @@ fn spawn_reader_and_finalize(inner: Arc<Inner>, ctx: FinalizeContext, mut child:
                  will run a full pass once the call actually hangs up",
                 ctx.call_id
             );
-            let mut active = inner.active.lock().expect("poisoned");
+            let mut active = inner.active.lock_or_recover();
             if let Some(entry) = active.get_mut(&ctx.call_id) {
                 entry.live_stdin = None;
                 entry.live_died_early = true;
@@ -1100,7 +1091,7 @@ fn spawn_reader_and_finalize(inner: Arc<Inner>, ctx: FinalizeContext, mut child:
             return; // do NOT remove from active, do NOT stash a terminal retry
         }
 
-        inner.active.lock().expect("poisoned").remove(&ctx.call_id);
+        inner.active.lock_or_recover().remove(&ctx.call_id);
 
         match (done_txt, done_json) {
             (Some(txt), Some(json)) => match finalize_artifacts(&ctx, &txt, &json) {
