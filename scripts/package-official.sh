@@ -457,27 +457,48 @@ apply_patch() {
 # BSD stat/date (macOS, where most local iteration + the "elif macos" build
 # below runs) and GNU stat/date (Windows CI runners, which invoke this
 # script via Git Bash/MSYS — see official-windows-build.yml in the private
-# premium repo) disagree on flag syntax, so try BSD first, then GNU.
+# premium repo) disagree on flag syntax.
+#
+# file_mtime_epoch() tries GNU's `stat -c` FIRST, not BSD's `stat -f`
+# (4R/RELIABILITY blocker fix 2026-07-16, reproduced in a plain Ubuntu
+# container before fixing): on GNU coreutils, `-f` does not mean "format" —
+# it switches stat into filesystem-status mode entirely, where `%m` isn't a
+# recognized directive either. That mode still prints a multi-line
+# filesystem report to STDOUT before exiting 1, so `stat -f %m FILE
+# 2>/dev/null || stat -c %Y FILE 2>/dev/null` on GNU did NOT cleanly fall
+# through: the first command's garbage stdout and the fallback's real epoch
+# both land in the same `$(...)` capture, producing a multi-line
+# "$bin_mtime" that made `[[ "$bin_mtime" -ge ... ]]` below either error out
+# or silently misbehave — i.e. every GNU (Windows CI) run of the
+# --skip-core-build freshness check was broken, always on the "false STALE"
+# side. Swapped the order (GNU's `-c` first) and confirmed in both
+# directions: GNU `stat -c %Y` succeeds cleanly on Ubuntu/coreutils, and on
+# BSD (macOS) `stat -c %Y` fails fast with a plain "illegal option" to
+# stderr only (no stdout contamination) so the `stat -f %m` fallback still
+# runs and returns a clean value there too. Belt-and-suspenders: the numeric
+# assertion in check_core_freshness() below (`=~ ^[0-9]+$`) means even a
+# stat variant neither of us has tested degrades to the existing "could not
+# read mtime, skipping check" warning path instead of a bad comparison.
 file_mtime_epoch() {
-    stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null
+    stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null
 }
 format_epoch() {
     date -r "$1" 2>/dev/null || date -d "@$1" 2>/dev/null || printf '%s (epoch)\n' "$1"
 }
 
-# --skip-core-build freshness check: reusing a stale core/deps/baresip/build
-# binary has reached qa-e2e TWICE (once pre-v1.3, once again the same day
-# this check was added — see docs/HANDOFF.md) because nothing verified the
-# binary sitting on disk still matched the source. Compares the existing
-# binary's mtime against the last commit that touched core/ (source,
-# patches, or the submodule pointers themselves) and aborts if the binary
-# predates that commit — it cannot possibly contain that change. The one
-# legitimate case this must NOT block is a CI job that builds core fresh in
-# an earlier step of the SAME job, then calls this script with
-# --skip-core-build right after (premium's official-windows-build.yml does
-# exactly this): there the binary's mtime is always "just now", newer than
-# any historical commit, so it passes this check on its own without needing
-# --allow-stale-core at all.
+# --skip-core-build freshness check: --skip-core-build means "trust whatever
+# binary is already sitting in core/deps/baresip/build" — but nothing
+# actually verified that binary still matched core/'s current source before
+# this check existed, so a caller could silently package stale code just by
+# reusing an old build dir. Compares the existing binary's mtime against the
+# last commit that touched core/ (source, patches, or the submodule
+# pointers themselves) and aborts if the binary predates that commit — it
+# cannot possibly contain that change. The one legitimate case this must
+# NOT block is a CI job that builds core fresh in an earlier step of the
+# SAME job, then calls this script with --skip-core-build right after
+# (premium's official-windows-build.yml does exactly this): there the
+# binary's mtime is always "just now", newer than any historical commit, so
+# it passes this check on its own without needing --allow-stale-core at all.
 check_core_freshness() {
     local last_core_commit_ts bin_mtime
     last_core_commit_ts="$(git log -1 --format=%ct -- core/ 2>/dev/null || true)"
@@ -486,8 +507,8 @@ check_core_freshness() {
         return 0
     fi
     bin_mtime="$(file_mtime_epoch "$CORE_BIN_PATH")"
-    if [[ -z "$bin_mtime" ]]; then
-        echo "warning: could not read $CORE_BIN_PATH's mtime — skipping the --skip-core-build freshness check" >&2
+    if [[ -z "$bin_mtime" || ! "$bin_mtime" =~ ^[0-9]+$ ]]; then
+        echo "warning: could not read a clean numeric mtime for $CORE_BIN_PATH (got: '${bin_mtime:-<empty>}') — skipping the --skip-core-build freshness check" >&2
         return 0
     fi
     if [[ "$bin_mtime" -ge "$last_core_commit_ts" ]]; then
@@ -502,9 +523,8 @@ check_core_freshness() {
     echo "       binary mtime:                $(format_epoch "$bin_mtime")" >&2
     echo "       last commit touching core/:  $(format_epoch "$last_core_commit_ts")" >&2
     echo "       core/ has changed since this binary was built, so --skip-core-build" >&2
-    echo "       would silently ship a stale core (this has reached qa-e2e twice —" >&2
-    echo "       see docs/HANDOFF.md). Drop --skip-core-build to rebuild, or if you" >&2
-    echo "       are certain this binary is fine (e.g. it was built in an earlier" >&2
+    echo "       would silently ship a stale core. Drop --skip-core-build to rebuild," >&2
+    echo "       or if you are certain this binary is fine (e.g. it was built in an earlier" >&2
     echo "       step of this same CI job), pass --allow-stale-core explicitly." >&2
     exit 1
 }
@@ -519,14 +539,13 @@ if [[ "$SKIP_CORE_BUILD" -eq 1 ]]; then
     check_core_freshness
 elif [[ "$TARGET" == "macos" ]]; then
     echo "-- Building core/ (macOS) — see core/BUILD.md for the same steps run by hand"
-    # 4R/RELIABILITY fix: force a clean build every time --skip-core-build is
-    # NOT given, instead of letting CMake's incremental build reuse whatever
-    # was already sitting in these dirs from a previous, possibly-different
-    # run. An incremental build was the OTHER way a stale core binary reached
-    # qa-e2e (docs/HANDOFF.md) — e.g. a patch that failed to apply cleanly
-    # the second time, or a MODULES list that changed between runs, could
-    # leave a build/ dir whose binary doesn't reflect the config this run
-    # asked for, and CMake would happily "build" that into a no-op.
+    # 4R/RELIABILITY fix 2026-07-16: force a clean build every time
+    # --skip-core-build is NOT given, instead of letting CMake's incremental
+    # build reuse whatever was already sitting in these dirs from a
+    # previous, possibly-different run — e.g. a patch that failed to apply
+    # cleanly the second time, or a MODULES list that changed between runs,
+    # could leave a build/ dir whose binary doesn't reflect the config this
+    # run asked for, and CMake would happily "build" that into a no-op.
     # Removing both build dirs up front makes "core build ran" and "core
     # build dir is clean-cut from this run's source+config" the same thing.
     echo "-- Removing existing core/deps/{re,baresip}/build for a clean rebuild"
