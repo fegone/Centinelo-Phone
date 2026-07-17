@@ -8,6 +8,15 @@
 import { renderTranscriptBody, renderPendingRetriesOnly } from "./transcript-panel.js";
 import { t, setLocale, localeTag, applyStaticI18n } from "./i18n.js";
 import { escapeHtml, escapeAttr } from "./dom-utils.js";
+import {
+  mapCliTierToSettingsTier,
+  buildSaveTranscriptionInput,
+  formatModelSize,
+  startDownload,
+  applyProgressEvent,
+  isDownloadStalled,
+  computeModelChipState,
+} from "./transcription-settings.js";
 
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
@@ -916,37 +925,48 @@ let selectedTranscriptionLanguage = "auto";
 let transcriptionKeepAudio = false;
 let transcriptionViewOnly = false;
 
-// tier -> {present, sizeBytes} | null (not yet loaded from
-// transcription_model_status) for modelStatus. tier -> {downloadedBytes,
-// totalBytes} | null (no download in flight) for modelDownload - a failed
-// download clears back to null rather than latching an error shape (see
-// startModelDownload/handleModelDownloadSettled - the failure itself is a
-// transient banner, not a stuck chip).
+// tier -> {present, sizeBytes} | {error: true} | null (not yet fetched
+// this Settings session) for modelStatus - see transcription-settings.js's
+// computeModelChipState doc for what each shape means and why {error:
+// true} must stay distinct from {present: false} (RESILIENCE #5: a failed
+// status CHECK is not the same fact as a confirmed-absent model, and must
+// not silently offer a live "Download" for a tier that might already be
+// installed). tier -> a download record (see transcription-settings.js) |
+// null (no download in flight) for modelDownload.
 const modelStatus = { accurate: null, light: null };
 const modelDownload = { accurate: null, light: null };
+// tier -> this tier's last-used generation number (see
+// transcription-settings.js's startDownload doc for why this can't just
+// live on modelDownload[tier] - it must survive the record clearing back
+// to null when a download settles). tier -> the watchdog's setInterval id
+// | null for downloadWatchdogs (RESILIENCE #3).
+const modelDownloadGeneration = { accurate: 0, light: 0 };
+const downloadWatchdogs = { accurate: null, light: null };
 
-/// `transcription_model_status`/`download_transcription_model` speak the
-/// `ModelTier` enum's own serde name ("accurate"/"light" - what this file
-/// uses as its keys everywhere), but the `transcription://model-download-*`
-/// EVENTS instead carry `tier_cli_name(tier)` - the real whisper.cpp model
-/// filename tier (`transcription.rs` relays `centinelo-transcribe`'s own
-/// stdout protocol lines verbatim, which speak in CLI tier names, not the
-/// shell's settings enum). Translate back at the one place events arrive
-/// rather than let two different "tier" vocabularies leak into every
-/// caller here.
-const MODEL_CLI_TIER_TO_SETTINGS_TIER = { "large-v3-turbo-q5_0": "accurate", "small-q5_1": "light" };
+// A download that's gone this long without a progress event is presumed
+// dead (its transcribe-engine sidecar exited without ever emitting a
+// terminal event) - checked every DOWNLOAD_WATCHDOG_POLL_MS. Generous on
+// purpose: a real download of these models (500 MB-1 GB) over a slow
+// connection can plausibly go quiet between chunks for tens of seconds;
+// this is a "the process is gone" detector, not a speed complaint.
+const DOWNLOAD_WATCHDOG_TIMEOUT_MS = 60_000;
+const DOWNLOAD_WATCHDOG_POLL_MS = 5_000;
 
 function setTranscriptionModeUI(mode) {
   selectedTranscriptionMode = mode;
   document.querySelectorAll("#transcription-mode-choice .tcard").forEach((card) => {
-    card.classList.toggle("sel", card.dataset.transcriptionMode === mode);
+    const sel = card.dataset.transcriptionMode === mode;
+    card.classList.toggle("sel", sel);
+    card.setAttribute("aria-checked", String(sel));
   });
 }
 
 function setTranscriptionActivationUI(activation) {
   selectedTranscriptionActivation = activation;
   document.querySelectorAll("#transcription-activation-choice .tcard").forEach((card) => {
-    card.classList.toggle("sel", card.dataset.transcriptionActivation === activation);
+    const sel = card.dataset.transcriptionActivation === activation;
+    card.classList.toggle("sel", sel);
+    card.setAttribute("aria-checked", String(sel));
   });
 }
 
@@ -966,75 +986,138 @@ function setModelTierUI(tier) {
   });
 }
 
-/// `1.0 GB`/`547 MB` - the plate's own mono chip register (TOKENS.md
-/// "Numbers are facts"). GB only once it's actually ≥1000 MB; every model
-/// this app ships today (large-v3-turbo-q5_0, small-q5_1) is well under
-/// 2 GB, so one decimal place of GB is enough precision to stay honest
-/// without turning into "1.04857 GB".
-function formatModelSize(bytes) {
-  if (typeof bytes !== "number" || !Number.isFinite(bytes)) return "";
-  if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(1)} GB`;
-  return `${Math.round(bytes / 1e6)} MB`;
-}
-
-/// Rebuilds the one `.mrstatus` chip for `tier` from whatever's currently
-/// known: an in-flight download (progress bar or the indeterminate
-/// "Downloading…" label before the first progress event arrives), a failed
-/// one, an installed model's size, or a "Download" button when neither.
-/// Ink-only throughout (--text-3/--st-idle, no amber) - REVIEW.md §4b's
-/// "no amber, nothing glows here" rule for this pane's download UI.
+/// Rebuilds the one `.mrstatus` chip for `tier` from computeModelChipState's
+/// verdict on the current (modelDownload[tier], modelStatus[tier]) pair -
+/// see transcription-settings.js for the state machine itself (tested
+/// there without any DOM). This function's only job is turning that pure
+/// state into markup/i18n/DOM. Ink-only throughout (--text-3/--st-idle, no
+/// amber) - REVIEW.md §4b's "no amber, nothing glows here" rule for this
+/// pane's download UI.
 function renderModelStatusChip(tier) {
   const el = $(`model-status-${tier}`);
   if (!el) return;
-  const dl = modelDownload[tier];
-  if (dl) {
-    const pct = dl.totalBytes ? Math.min(100, Math.round((dl.downloadedBytes / dl.totalBytes) * 100)) : null;
-    el.innerHTML = `<span class="dlwrap"><span class="dlbar" aria-hidden="true"><i style="width:${pct === null ? 0 : pct}%"></i></span><span class="dlpct">${
-      pct === null ? escapeHtml(t("settings.transcriptionModelDownloading")) : `${pct}%`
-    }</span></span>`;
-    return;
-  }
-  const status = modelStatus[tier];
-  if (status && status.present) {
-    const sizeText = status.sizeBytes != null ? ` · ${formatModelSize(status.sizeBytes)}` : "";
-    el.innerHTML = `<span class="modelchip ok">${escapeHtml(t("settings.transcriptionModelInstalled"))}${escapeHtml(sizeText)}</span>`;
-    return;
-  }
-  if (status) {
-    // Loaded and confirmed absent - offer the real download this app can
-    // actually perform (download_transcription_model), not a dead button.
-    el.innerHTML = `<button type="button" class="modelchip btn" data-download-tier="${escapeAttr(tier)}">${escapeHtml(t("settings.transcriptionModelDownload"))}</button>`;
-  } else {
-    el.innerHTML = "";
+  const chip = computeModelChipState(modelDownload[tier], modelStatus[tier]);
+  switch (chip.kind) {
+    case "downloading": {
+      const dl = modelDownload[tier];
+      const pct = chip.pct;
+      const sizeTitle =
+        dl.totalBytes != null
+          ? escapeAttr(`${formatModelSize(dl.downloadedBytes)} / ${formatModelSize(dl.totalBytes)}`)
+          : escapeAttr(formatModelSize(dl.downloadedBytes));
+      el.innerHTML = `<span class="dlwrap" title="${sizeTitle}"><span class="dlbar" aria-hidden="true"><i style="width:${pct === null ? 0 : pct}%"></i></span><span class="dlpct">${
+        pct === null ? escapeHtml(t("settings.transcriptionModelDownloading")) : `${pct}%`
+      }</span></span>`;
+      return;
+    }
+    case "installed": {
+      const sizeText = chip.sizeBytes != null ? ` · ${formatModelSize(chip.sizeBytes)}` : "";
+      el.innerHTML = `<span class="modelchip ok">${escapeHtml(t("settings.transcriptionModelInstalled"))}${escapeHtml(sizeText)}</span>`;
+      return;
+    }
+    case "offer-download":
+      // Confirmed absent - offer the real download this app can actually
+      // perform (download_transcription_model), not a dead button.
+      el.innerHTML = `<button type="button" class="modelchip btn" data-download-tier="${escapeAttr(tier)}">${escapeHtml(t("settings.transcriptionModelDownload"))}</button>`;
+      return;
+    case "check-failed":
+      // RESILIENCE #5 - the transcription_model_status fetch itself
+      // failed, which is NOT "confirmed absent": offer a real retry
+      // (retryModelStatus) instead of a "Download" button that could
+      // silently re-download an already-installed model.
+      el.innerHTML = `<span class="dlwrap"><span class="modelchip">${escapeHtml(t("settings.transcriptionModelCheckFailed"))}</span><button type="button" class="modelchip btn" data-retry-status-tier="${escapeAttr(
+        tier,
+      )}">${escapeHtml(t("settings.transcriptionModelRetry"))}</button></span>`;
+      return;
+    case "unknown":
+    default:
+      el.innerHTML = "";
   }
 }
 
-/// Fetches `transcription_model_status` for both tiers and renders their
-/// chips - called when Settings opens and again after a download settles
-/// (handleModelDownloadSettled), so "Installed · N MB" always reflects
-/// what's actually on disk rather than an assumption from the download
-/// event alone.
-async function refreshModelStatuses() {
-  for (const tier of ["accurate", "light"]) {
-    try {
-      const status = await invoke("transcription_model_status", { tier });
-      modelStatus[tier] = { present: status.present, sizeBytes: status.size_bytes };
-    } catch (e) {
-      console.error(`transcription_model_status(${tier}) failed`, e);
-      modelStatus[tier] = { present: false, sizeBytes: null };
-    }
-    renderModelStatusChip(tier);
+/// Fetches `transcription_model_status` for a single tier and renders its
+/// chip - the unit `refreshModelStatuses` (both tiers) and
+/// `retryModelStatus` (the check-failed chip's "Retry" button, one tier)
+/// both build on. A failed fetch is recorded as `{error: true}`, NOT
+/// `{present: false, ...}` (RESILIENCE #5 - see modelStatus's own comment
+/// above for why those two must stay distinguishable).
+async function refreshOneModelStatus(tier) {
+  try {
+    const status = await invoke("transcription_model_status", { tier });
+    modelStatus[tier] = { present: status.present, sizeBytes: status.size_bytes };
+  } catch (e) {
+    console.error(`transcription_model_status(${tier}) failed`, e);
+    modelStatus[tier] = { error: true };
   }
+  renderModelStatusChip(tier);
+}
+
+/// Refreshes both tiers - called when Settings opens and again after a
+/// download settles (handleModelDownloadSettled), so "Installed · N MB"
+/// always reflects what's actually on disk rather than an assumption from
+/// the download event alone.
+async function refreshModelStatuses() {
+  await Promise.all(["accurate", "light"].map(refreshOneModelStatus));
+}
+
+/// The check-failed chip's "Retry" action - re-fetches just the one tier
+/// that failed rather than both (refreshModelStatuses), so a working tier's
+/// chip doesn't flash while only the broken one is being retried.
+function retryModelStatus(tier) {
+  refreshOneModelStatus(tier);
+}
+
+function clearDownloadWatchdog(tier) {
+  if (downloadWatchdogs[tier] != null) {
+    clearInterval(downloadWatchdogs[tier]);
+    downloadWatchdogs[tier] = null;
+  }
+}
+
+/// RESILIENCE #3: if `download_transcription_model`'s sidecar dies without
+/// ever emitting `transcription://model-download-done`/`-error`, nothing
+/// would otherwise clear `modelDownload[tier]` - the chip would read
+/// "Downloading…" forever. Polls every DOWNLOAD_WATCHDOG_POLL_MS and, once
+/// isDownloadStalled says this attempt has gone quiet too long, degrades it
+/// to a banner + "Download" button, same shape as any other download
+/// failure (startModelDownload's own catch block).
+///
+/// `generation` is the value this specific attempt was started with
+/// (startDownload's return) - checked on every tick (not just once) so
+/// that if a NEWER download for the same tier starts and this stale timer
+/// somehow wasn't cleared by clearDownloadWatchdog first, it silently
+/// stops itself instead of ever touching the newer attempt's record.
+function armDownloadWatchdog(tier, generation) {
+  clearDownloadWatchdog(tier);
+  downloadWatchdogs[tier] = setInterval(() => {
+    const dl = modelDownload[tier];
+    if (!dl || dl.generation !== generation) {
+      clearDownloadWatchdog(tier);
+      return;
+    }
+    if (isDownloadStalled(dl, Date.now(), DOWNLOAD_WATCHDOG_TIMEOUT_MS)) {
+      clearDownloadWatchdog(tier);
+      modelDownload[tier] = null;
+      renderModelStatusChip(tier);
+      showBanner(t("settings.transcriptionModelDownloadStalled"), "err");
+    }
+  }, DOWNLOAD_WATCHDOG_POLL_MS);
 }
 
 async function startModelDownload(tier) {
   if (modelDownload[tier]) return; // already downloading
-  modelDownload[tier] = { downloadedBytes: 0, totalBytes: null };
+  modelDownload[tier] = startDownload(modelDownloadGeneration[tier], Date.now());
+  modelDownloadGeneration[tier] = modelDownload[tier].generation;
+  armDownloadWatchdog(tier, modelDownload[tier].generation);
   renderModelStatusChip(tier);
   try {
     // `download_transcription_model` only rejects synchronously for an
-    // immediate precondition (not licensed) - a download that starts and
-    // later fails mid-transfer instead settles via the
+    // immediate precondition - it checks the `transcription` license
+    // server-side (crate::transcription::is_unlocked) before ever calling
+    // spawn_model_download, same gate save_transcription_settings itself
+    // uses (commands.rs) - so this catch also covers "license revoked
+    // since Settings opened", not just a hypothetical. A download that
+    // starts and later fails mid-transfer instead settles via the
     // transcription://model-download-error event, handled by
     // handleModelDownloadSettled. Either way, don't leave the chip stuck
     // on a dead "failed" state forever: clear modelDownload[tier] back to
@@ -1043,6 +1126,7 @@ async function startModelDownload(tier) {
     // - #save-status is Settings' own, not this chip's).
     await invoke("download_transcription_model", { tier });
   } catch (e) {
+    clearDownloadWatchdog(tier);
     modelDownload[tier] = null;
     renderModelStatusChip(tier);
     showBanner(String(e), "err");
@@ -1051,9 +1135,11 @@ async function startModelDownload(tier) {
 
 function handleModelDownloadProgress(payload) {
   if (!payload || !payload.tier) return;
-  const tier = MODEL_CLI_TIER_TO_SETTINGS_TIER[payload.tier];
+  const tier = mapCliTierToSettingsTier(payload.tier);
   if (!tier || !(tier in modelDownload)) return;
-  modelDownload[tier] = { downloadedBytes: payload.downloaded_bytes || 0, totalBytes: payload.total_bytes || null };
+  const next = applyProgressEvent(modelDownload[tier], payload, Date.now());
+  if (next === modelDownload[tier]) return; // ignored - see applyProgressEvent's doc (RESILIENCE #4)
+  modelDownload[tier] = next;
   renderModelStatusChip(tier);
 }
 
@@ -1063,8 +1149,9 @@ function handleModelDownloadProgress(payload) {
 /// (disk truth), not an inference from which event fired.
 function handleModelDownloadSettled(payload, errorMessage) {
   if (!payload || !payload.tier) return;
-  const tier = MODEL_CLI_TIER_TO_SETTINGS_TIER[payload.tier];
+  const tier = mapCliTierToSettingsTier(payload.tier);
   if (!tier || !(tier in modelDownload)) return;
+  clearDownloadWatchdog(tier);
   modelDownload[tier] = null;
   if (errorMessage) {
     showBanner(errorMessage, "err");
@@ -1193,6 +1280,20 @@ async function openTranscriptionSettingsSection() {
   $("in-transcription-storage-dir").value = settings.storage_dir || "";
   modelStatus.accurate = null;
   modelStatus.light = null;
+  // RESILIENCE #3 belt-and-suspenders: the watchdog interval (see
+  // armDownloadWatchdog) already degrades a silently-dead download on its
+  // own poll cycle, but a backgrounded/suspended window (macOS can throttle
+  // or fully pause a hidden webview's timers) may not have ticked while
+  // Settings was closed. Re-check on every reopen too, so a download that
+  // went stale while this section was closed doesn't sit there reading
+  // "Downloading…" until the next poll happens to land.
+  for (const tier of ["accurate", "light"]) {
+    if (modelDownload[tier] && isDownloadStalled(modelDownload[tier], Date.now(), DOWNLOAD_WATCHDOG_TIMEOUT_MS)) {
+      clearDownloadWatchdog(tier);
+      modelDownload[tier] = null;
+      showBanner(t("settings.transcriptionModelDownloadStalled"), "err");
+    }
+  }
   renderModelStatusChip("accurate");
   renderModelStatusChip("light");
   await refreshModelStatuses();
@@ -1287,6 +1388,18 @@ function refreshAllUiText() {
   }
 }
 
+/// Two independent backend calls make up one "Save": save_account_settings
+/// (+ set_core_binary_path + save_favorites, which all live or die
+/// together with it) always runs first and reconnects the engine on
+/// success; save_transcription_settings runs after, and can fail on its
+/// own validation (e.g. mode=live with no storage_dir) without the account
+/// half having failed at all. Structured as two nested try blocks rather
+/// than one flat one specifically so those two outcomes stay distinguishable
+/// (2026-07-17 4R re-review, RELIABILITY #2 - the flat version used to
+/// treat a transcription-only failure as if NOTHING saved: raw backend
+/// error text with no "account saved" context, and identity/secret-hint
+/// left showing pre-save values even though the account was, in fact,
+/// already saved and the engine already reconnected by that point).
 async function saveAccountSettings() {
   const statusEl = $("save-status");
   statusEl.className = "status";
@@ -1295,6 +1408,9 @@ async function saveAccountSettings() {
   const ext = $("in-ext").value.trim();
   const secret = $("in-secret").value;
   const displayName = $("in-display-name").value.trim();
+
+  let accountSaved = false;
+  let transcriptionError = null;
   try {
     await invoke("save_account_settings", {
       input: {
@@ -1310,36 +1426,66 @@ async function saveAccountSettings() {
     const favorites = await invoke("save_favorites", { favorites: collectFavoritesFields() });
     state.favorites = favorites;
     renderFavorites();
+    accountSaved = true;
+
     if (!$("transcription-section").hidden) {
-      await invoke("save_transcription_settings", {
-        input: {
-          mode: selectedTranscriptionMode,
-          activation: selectedTranscriptionActivation,
-          keep_audio: transcriptionKeepAudio,
-          storage_dir: $("in-transcription-storage-dir").value.trim(),
-          view_only: transcriptionViewOnly,
-          model_tier: selectedModelTier,
-          language: selectedTranscriptionLanguage,
-        },
-      });
-      // mode/activation feed maybeAutoStartTranscript/renderManualTranscribeButton
-      // on the main window - keep state.transcription in sync with what was
-      // just saved rather than waiting for the next applyTranscriptionUI
-      // call (boot/call-state events only).
-      state.transcription.mode = selectedTranscriptionMode;
-      state.transcription.activation = selectedTranscriptionActivation;
-      renderManualTranscribeButton();
+      try {
+        await invoke("save_transcription_settings", {
+          input: buildSaveTranscriptionInput({
+            mode: selectedTranscriptionMode,
+            activation: selectedTranscriptionActivation,
+            keepAudio: transcriptionKeepAudio,
+            storageDir: $("in-transcription-storage-dir").value,
+            viewOnly: transcriptionViewOnly,
+            modelTier: selectedModelTier,
+            language: selectedTranscriptionLanguage,
+          }),
+        });
+        // mode/activation feed maybeAutoStartTranscript/renderManualTranscribeButton
+        // on the main window - keep state.transcription in sync with what
+        // was just saved rather than waiting for the next
+        // applyTranscriptionUI call (boot/call-state events only).
+        state.transcription.mode = selectedTranscriptionMode;
+        state.transcription.activation = selectedTranscriptionActivation;
+        renderManualTranscribeButton();
+      } catch (e) {
+        transcriptionError = String(e);
+      }
     }
-    statusEl.textContent = t("settings.savedReconnecting");
-    statusEl.className = "status ok";
-    const account = await invoke("get_account_settings");
-    state.account = account;
-    renderIdentity();
-    $("in-secret").value = "";
-    $("secret-hint").textContent = account.secret_set ? t("settings.secretCurrentlySet") : t("settings.secretNotSet");
   } catch (e) {
+    // Account-level failure: save_account_settings/set_core_binary_path/
+    // save_favorites, in that order - nothing after this point ran,
+    // including transcription. Nothing to refresh either (accountSaved
+    // stays false), so this is the one path that skips the finally
+    // block's identity refresh below.
     statusEl.textContent = String(e);
     statusEl.className = "status err";
+    return;
+  } finally {
+    // Runs whenever save_account_settings's own try block succeeded
+    // (the only early `return` above is on ITS failure) - identity/
+    // secret-hint must always reflect the real server-side state at that
+    // point, independent of whether the transcription save that follows
+    // it also succeeded.
+    if (accountSaved) {
+      try {
+        const account = await invoke("get_account_settings");
+        state.account = account;
+        renderIdentity();
+        $("in-secret").value = "";
+        $("secret-hint").textContent = account.secret_set ? t("settings.secretCurrentlySet") : t("settings.secretNotSet");
+      } catch (e) {
+        console.error("post-save get_account_settings failed", e);
+      }
+    }
+  }
+
+  if (transcriptionError) {
+    statusEl.textContent = t("settings.savedAccountTranscriptionFailed", { reason: transcriptionError });
+    statusEl.className = "status err";
+  } else {
+    statusEl.textContent = t("settings.savedReconnecting");
+    statusEl.className = "status ok";
   }
 }
 
@@ -1433,6 +1579,11 @@ function wireStaticHandlers() {
     const downloadBtn = e.target.closest("[data-download-tier]");
     if (downloadBtn) {
       startModelDownload(downloadBtn.dataset.downloadTier);
+      return; // don't also treat this as a row-selection click
+    }
+    const retryBtn = e.target.closest("[data-retry-status-tier]");
+    if (retryBtn) {
+      retryModelStatus(retryBtn.dataset.retryStatusTier);
       return; // don't also treat this as a row-selection click
     }
     const row = e.target.closest(".modelrow");

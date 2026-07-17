@@ -296,14 +296,19 @@
            #lock-overlay instead of the plate's own per-pane
            "Admin · unlocked/locked" chip - there's only ever one settings
            surface in this shell, already admin-gated as a whole.
-           Two controls the plate draws have no real backend behind them
-           here and are left out rather than shipped dead: the NAS
+           Controls the plate draws that have no real backend behind them
+           here are left out rather than shipped dead: the NAS
            "Reachable · SMB" check and a folder-browse dialog (no
            tauri-plugin-dialog wired into this app - storage folder is a
-           typed path, same as #in-core-path below). A remote STT API tier
-           isn't on this plate at all (transcribe-engine ships it only as
-           a stub - HANDOFF.md's known gap), so there's nothing to grey out
-           for it either. -->
+           typed path, same as #in-core-path below); the plate's download
+           row also draws a "Pause" button next to the progress bar, but
+           there's no cancel/pause command on the backend
+           (download_transcription_model's ensure_model runs to completion
+           or failure, nothing in between it can be told to pause) - the
+           model rows below only ever show progress + the real outcome. A
+           remote STT API tier isn't on this plate at all (transcribe-engine
+           ships it only as a stub - HANDOFF.md's known gap), so there's
+           nothing to grey out for it either. -->
       <div id="transcription-section" hidden>
         <h2 data-i18n="settings.transcriptionHeading">Transcription</h2>
         <div class="settings-card">

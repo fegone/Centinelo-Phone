@@ -333,6 +333,14 @@ const ENTRIES = [
   ["settings.transcriptionModelInstalled", "Installed", "Instalado", "Instalado"],
   ["settings.transcriptionModelDownload", "Download", "Baixar", "Descargar"],
   ["settings.transcriptionModelDownloading", "Downloading…", "Baixando…", "Descargando…"],
+  [
+    "settings.transcriptionModelDownloadStalled",
+    "The download stopped responding — try again.",
+    "O download parou de responder — tente novamente.",
+    "La descarga dejó de responder — intenta de nuevo.",
+  ],
+  ["settings.transcriptionModelCheckFailed", "Couldn't check", "Não foi possível verificar", "No se pudo verificar"],
+  ["settings.transcriptionModelRetry", "Retry", "Tentar novamente", "Reintentar"],
   ["settings.transcriptionLanguageLabel", "Language", "Idioma", "Idioma"],
   ["settings.transcriptionLangAuto", "Auto", "Automático", "Automático"],
   ["settings.transcriptionLangEn", "EN", "EN", "EN"],
@@ -403,6 +411,12 @@ const ENTRIES = [
   ["settings.save", "Save", "Salvar", "Guardar"],
   ["settings.saving", "Saving…", "Salvando…", "Guardando…"],
   ["settings.savedReconnecting", "Saved — reconnecting…", "Salvo — reconectando…", "Guardado — reconectando…"],
+  [
+    "settings.savedAccountTranscriptionFailed",
+    "Account saved; transcription NOT saved: {reason}",
+    "Conta salva; transcrição NÃO salva: {reason}",
+    "Cuenta guardada; transcripción NO guardada: {reason}",
+  ],
 
   // -- auto-provisioning ------------------------------------------------
   [
