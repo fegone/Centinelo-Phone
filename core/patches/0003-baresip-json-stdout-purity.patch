@@ -1,0 +1,126 @@
+diff --git a/src/log.c b/src/log.c
+index 44a780b0..fe4af67a 100644
+--- a/src/log.c
++++ b/src/log.c
+@@ -197,6 +197,35 @@ static void vlog(bool safe, enum log_level level, const char *fmt,
+ 		if (color)
+ 			(void)re_fprintf(stdout, "\x1b[;m");
+ 	}
++	else {
++		/*
++		 * Centinelo Phone v2 F1.1 patch (core/patches/): previously,
++		 * this function had no branch at all for
++		 * !lg.enable_stdout - a log_enable_stdout(false) caller
++		 * (e.g. ctrl_json.c, so its stdout carries nothing but its
++		 * own NDJSON - see core/PROTOCOL.md "Framing") sent every
++		 * info()/warning()/debug() call in the *entire* process
++		 * nowhere at all, silently, for the rest of that process's
++		 * life: nothing in a minimal module build (no `cons`/
++		 * `syslog` - see core/BUILD.md "Module selection") ever
++		 * calls log_register_handler() to give lg.logl below
++		 * somewhere else to send it. Route to stderr instead of
++		 * dropping it - "stdout is reserved for JSON" should mean
++		 * "the human-readable log moved to stderr", not "the
++		 * human-readable log is gone" - same color/format as the
++		 * stdout branch above, stderr instead.
++		 */
++		bool color = level == LEVEL_WARN || level == LEVEL_ERROR;
++
++		color = color && lg.color;
++		if (color)
++			(void)re_fprintf(stderr, "\x1b[31m"); /* Red */
++
++		(void)re_fprintf(stderr, "%s", buf);
++
++		if (color)
++			(void)re_fprintf(stderr, "\x1b[;m");
++	}
+ 
+ 	le = lg.logl.head;
+ 
+diff --git a/src/main.c b/src/main.c
+index c8d38479..624b3fdf 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -103,12 +103,35 @@ int main(int argc, char *argv[])
+ 
+ 	int err;
+ 
++	/*
++	 * Centinelo Phone v2 F1.1 patch (core/patches/): when set (any
++	 * non-empty value - run-spike.sh always sets it, see
++	 * core/PROTOCOL.md "Framing"), stdout is reserved *exclusively* for
++	 * ctrl_json's own NDJSON from the very first byte this process ever
++	 * writes - the startup banner below goes to stderr instead, and
++	 * log_enable_stdout(false) (see src/log.c - now routes to stderr
++	 * rather than dropping output entirely, also part of this patch)
++	 * runs immediately, before conf_configure()/conf_modules() below
++	 * gets a chance to load a single module and log a line the old way.
++	 * ctrl_json.c's own ctrl_init() still calls log_enable_stdout(false)
++	 * too (its ONLY effect under v1), which makes this a no-op by the
++	 * time that runs - see that call site's own comment. Unset: no
++	 * behavior change at all from stock upstream baresip.
++	 */
++	bool cent_json_stdout;
++
+ 	/*
+ 	 * turn off buffering on stdout
+ 	 */
+ 	setbuf(stdout, NULL);
+ 
+-	(void)re_fprintf(stdout, "baresip v%s"
++	{
++		const char *v = getenv("CENT_JSON_STDOUT");
++
++		cent_json_stdout = v && v[0];
++	}
++
++	(void)re_fprintf(cent_json_stdout ? stderr : stdout, "baresip v%s"
+ 			 " Copyright (C) 2010 - 2025"
+ 			 " Alfred E. Heggestad et al.\n",
+ 			 baresip_version());
+@@ -119,6 +142,9 @@ int main(int argc, char *argv[])
+ 	if (err)
+ 		goto out;
+ 
++	if (cent_json_stdout)
++		log_enable_stdout(false);
++
+ #ifdef RE_TRACE_ENABLED
+ 	err = re_trace_init("re_trace.json");
+ 	if (err)
+diff --git a/src/uag.c b/src/uag.c
+index 41d036f4..033e9fbf 100644
+--- a/src/uag.c
++++ b/src/uag.c
+@@ -527,6 +527,21 @@ static bool sub_handler(const struct sip_msg *msg, void *arg)
+ }
+ 
+ 
++/*
++ * Centinelo Phone v2 F1.1 patch (core/patches/): re_printf() prints to
++ * stdout unconditionally (re_vprintf() -> re_vfprintf(stdout, ...), see
++ * core/deps/re/src/fmt/print.c) - it isn't routed through baresip's own
++ * log.c/lg.enable_stdout at all, so -s (SIP trace, CENT_BARESIP_ARGS=
++ * "-s") always leaked raw SIP messages onto stdout even when
++ * ctrl_json's JSON is also there (see core/PROTOCOL.md "Framing",
++ * point 3, pre-v1.1). SIP trace is a debugging aid (see
++ * uag_enable_sip_trace()/`-s`), never something a JSON consumer should
++ * need to parse around - re_fprintf(stderr, ...) instead, unconditional
++ * (no CENT_JSON_STDOUT gate needed, unlike src/main.c's banner: there's
++ * no scenario where stdout-based SIP trace capture was ever a valid
++ * NDJSON stream to begin with, so this is a strict improvement with no
++ * compatibility case to preserve).
++ */
+ static void sip_trace_handler(bool tx, enum sip_transp tp,
+ 			      const struct sa *src, const struct sa *dst,
+ 			      const uint8_t *pkt, size_t len, void *arg)
+@@ -534,7 +549,7 @@ static void sip_trace_handler(bool tx, enum sip_transp tp,
+ 	(void)tx;
+ 	(void)arg;
+ 
+-	re_printf("\x1b[36;1m"
++	re_fprintf(stderr, "\x1b[36;1m"
+ 		  "%H#\n"
+ 		  "%s %J -> %J\n"
+ 		  "%b"

@@ -1,0 +1,19 @@
+{
+  "name": "centinelo-phone-shell",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Centinelo Phone 2.0 - Tauri desktop shell around the core/ baresip sidecar",
+  "scripts": {
+    "tauri": "tauri",
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "test": "node --test ui/js/*.test.js"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2"
+  }
+}

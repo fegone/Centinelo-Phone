@@ -1,0 +1,433 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:">
+<title>Centinelo Phone</title>
+<link rel="stylesheet" href="css/tokens.css">
+<link rel="stylesheet" href="css/app.css">
+<link rel="stylesheet" href="css/transcript.css">
+</head>
+<body>
+<div class="app" id="app">
+
+  <!-- ================= titlebar ================= -->
+  <div class="titlebar" data-tauri-drag-region>
+    <div class="brand" aria-label="Centinelo — watching, line healthy" data-i18n-aria-label="titlebar.brandAria">
+      <svg width="17" height="17" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <path d="M19.4 6.8A9 9 0 1 0 21 12" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/>
+        <circle class="dot" id="watchlamp-dot" cx="12" cy="12" r="3.1" fill="var(--amber-fill)"/>
+      </svg>
+      <b>Centinelo</b>
+    </div>
+    <span class="state" id="titlebar-state" data-i18n="titlebarState.starting">Starting…</span>
+    <div class="winbtns">
+      <!-- Premium receptionist console - hidden until premium_capability_status
+           says the license gate cleared (see ui/js/app.js boot(), console.rs
+           is_unlocked). Absent by default, not merely disabled: matches the
+           tray menu's own "entry absent" gating (tray.rs). -->
+      <button class="wbtn" id="btn-console" aria-label="Console" title="Open the receptionist console" data-i18n-aria-label="titlebar.consoleAria" data-i18n-title="titlebar.consoleTitle" hidden>
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="4" y="4" width="7" height="7" rx="1.6"/><rect x="13" y="4" width="7" height="7" rx="1.6"/><rect x="4" y="13" width="7" height="7" rx="1.6"/><rect x="13" y="13" width="7" height="7" rx="1.6"/></svg>
+      </button>
+      <!-- Transcript panel entry point - hidden until a transcript for the
+           current/last call exists (see ui/js/app.js's transcript state).
+           Absent by default, not merely disabled: matches btn-console's own
+           "entry absent" gating for unlicensed/idle states. -->
+      <button class="wbtn" id="btn-transcript" aria-label="Transcript" title="View this call's transcript" data-i18n-aria-label="titlebar.transcriptAria" data-i18n-title="titlebar.transcriptTitle" hidden>
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M7 4h7l4 4v12a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1z"/><path d="M9 12h6M9 15.5h6M9 8.5h3"/></svg>
+      </button>
+      <button class="wbtn" id="btn-settings" aria-label="Settings" data-i18n-aria-label="titlebar.settingsAria">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M4 7h10M18 7h2M4 12h4M12 12h8M4 17h13"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="19" cy="17" r="2"/></svg>
+      </button>
+      <button class="wbtn" id="btn-minimize" aria-label="Minimize" data-i18n-aria-label="titlebar.minimizeAria"><svg width="10" height="10" viewBox="0 0 10 10"><path d="M1 5h8" stroke="currentColor" stroke-width="1.2"/></svg></button>
+      <button class="wbtn close" id="btn-close" aria-label="Close" data-i18n-aria-label="titlebar.closeAria"><svg width="10" height="10" viewBox="0 0 10 10"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7" stroke="currentColor" stroke-width="1.2"/></svg></button>
+    </div>
+  </div>
+
+  <!-- ================= main (idle / dial) ================= -->
+  <div class="body" id="screen-main">
+
+    <div id="banner-slot"></div>
+
+    <!-- shown only when no SIP account has been configured yet. Auto-
+         provisioning (spec §5, provisioning.rs): paste a link here instead
+         of typing host/extension/secret by hand in Settings - modeled on
+         premium/design/mockups/onboarding.html's "Step 1 of 2 - Connect"
+         (a lighter, single-pane version of that mockup's two-pane branded
+         window - see shell/README.md "Design fidelity notes" for this
+         project's precedent of flagging exactly this kind of scope/
+         fidelity gap for creative-vigilia review rather than silently
+         shipping a divergence). -->
+    <div class="setup-prompt" id="setup-prompt" hidden>
+      <b data-i18n="setup.heading">Connect your phone system</b>
+      <p data-i18n="setup.body">Paste the provisioning link your installer sent you, or set it up by hand in Settings.</p>
+      <div class="prov-row">
+        <label class="prov">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.5 13.5a4 4 0 0 0 5.7 0l3-3a4 4 0 1 0-5.7-5.7l-1.2 1.2"/><path d="M13.5 10.5a4 4 0 0 0-5.7 0l-3 3a4 4 0 1 0 5.7 5.7l1.2-1.2"/></svg>
+          <!-- maxlength headroom above provisioning.rs's MAX_CONFIG_BYTES_ENCODED
+               (~21849 chars for the embedded centinelo://provision?config=...
+               form, the longest legitimate input this field ever needs to
+               hold) - a client-side backstop only, the real cap is
+               server-side in decode_embedded_config (2026-07-16 4R
+               re-review, B1). -->
+          <input type="text" id="prov-input" maxlength="22000" placeholder="Paste your provisioning link" aria-label="Provisioning link" data-i18n-placeholder="setup.inputPlaceholder" data-i18n-aria-label="setup.inputAria">
+        </label>
+        <button class="primary" id="prov-connect" data-i18n="setup.connect">Connect</button>
+      </div>
+      <p class="err" id="prov-error" hidden></p>
+      <p class="hint" data-i18n="setup.hint">A provisioning link contains your account. Treat it like a password.</p>
+      <button class="ghost" id="setup-open-settings" style="align-self:flex-start" data-i18n="setup.manualSetup">Set up by hand in Settings</button>
+    </div>
+
+    <div id="configured-area" hidden>
+      <section class="me" aria-label="Your account" data-i18n-aria-label="main.accountAria">
+        <span class="medal" id="me-medal">--</span>
+        <div class="who">
+          <b id="me-name">—</b>
+          <span class="plate" id="me-plate">EXT — </span>
+        </div>
+        <span class="pill" id="reg-pill" title="Registration status" data-i18n-title="main.regPillTitle">
+          <span class="dot" aria-hidden="true"></span><span id="reg-pill-transport">—</span><em id="reg-pill-detail"></em>
+        </span>
+      </section>
+
+      <div class="display" aria-label="Number to dial" data-i18n-aria-label="main.dialNumAria">
+        <span class="num" id="dial-num"></span><span class="caret" aria-hidden="true"></span>
+        <button class="back" id="btn-backspace" aria-label="Delete last digit" data-i18n-aria-label="main.backspaceAria">
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M8.5 5h10A1.5 1.5 0 0 1 20 6.5v11a1.5 1.5 0 0 1-1.5 1.5h-10L3 12l5.5-7z"/><path d="M11.5 9.5l5 5M16.5 9.5l-5 5"/></svg>
+        </button>
+      </div>
+
+      <div class="pad" role="group" aria-label="Dial pad" id="dialpad" data-i18n-aria-label="main.dialpadAria">
+        <button class="key" data-digit="1"><b>1</b><span>&nbsp;</span></button>
+        <button class="key" data-digit="2"><b>2</b><span>ABC</span></button>
+        <button class="key" data-digit="3"><b>3</b><span>DEF</span></button>
+        <button class="key" data-digit="4"><b>4</b><span>GHI</span></button>
+        <button class="key" data-digit="5"><b>5</b><span>JKL</span></button>
+        <button class="key" data-digit="6"><b>6</b><span>MNO</span></button>
+        <button class="key" data-digit="7"><b>7</b><span>PQRS</span></button>
+        <button class="key" data-digit="8"><b>8</b><span>TUV</span></button>
+        <button class="key" data-digit="9"><b>9</b><span>WXYZ</span></button>
+        <button class="key" data-digit="*"><b>*</b><span>&nbsp;</span></button>
+        <button class="key" data-digit="0"><b>0</b><span>+</span></button>
+        <button class="key" data-digit="#"><b>#</b><span>&nbsp;</span></button>
+      </div>
+
+      <div class="callrow">
+        <button class="callbtn" id="btn-call" aria-label="Call" data-i18n-aria-label="main.callAria">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6.8 10.6a13.8 13.8 0 0 0 6.6 6.6l2-2c.33-.33.8-.44 1.24-.3 1 .33 2.03.5 3.06.5.7 0 1.3.57 1.3 1.28v2.58c0 .7-.6 1.28-1.3 1.28C11 20.5 3.5 13 3.5 4.3c0-.7.58-1.3 1.28-1.3h2.58c.71 0 1.28.6 1.28 1.3 0 1.03.17 2.06.5 3.06.14.44.03.9-.3 1.24l-2.04 2z"/></svg>
+        </button>
+      </div>
+
+      <div class="sect">
+        <h2 data-i18n="main.favoritesHeading">Favorites</h2>
+      </div>
+      <div class="favs" role="group" aria-label="Favorites" id="favorites-grid" data-i18n-aria-label="main.favoritesAria"></div>
+
+      <div class="sect"><h2 data-i18n="main.recentHeading">Recent</h2></div>
+      <div class="recents" aria-label="Recent calls" id="recents-list" data-i18n-aria-label="main.recentAria"></div>
+    </div>
+
+    <!-- ================= call overlay: incoming / ringing-out / established ================= -->
+    <div class="call-overlay" id="call-overlay" hidden>
+      <div class="caller">
+        <span class="medal" id="call-medal">--<span class="lamp" id="call-lamp" aria-hidden="true"></span></span>
+        <div class="who">
+          <b id="call-peer-name">—</b>
+          <span class="num" id="call-peer-uri"></span>
+          <span class="via" id="call-via"></span>
+        </div>
+      </div>
+
+      <div class="timerblock">
+        <div class="ringing-label" id="ringing-label" hidden><span class="rdot" aria-hidden="true"></span><span id="ringing-label-text" data-i18n="call.ringingEllipsis">Ringing…</span></div>
+        <div class="timer" id="call-timer" aria-live="polite" hidden>00:00</div>
+      </div>
+
+      <div class="foot">
+        <!-- Manual-activation transcription: transcription.mode != off and
+             activation == "manual" only (see ui/js/app.js
+             renderManualTranscribeButton). Absent, not disabled, the rest
+             of the time - matching every other premium-gated entry point
+             in this window. -->
+        <button class="ghost manual-transcribe" id="btn-transcribe-manual" data-i18n="call.transcribeThisCall" hidden>Transcribe this call</button>
+        <div class="secure">
+          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>
+          <span data-i18n="call.encryptedCall">Encrypted call</span>
+        </div>
+        <div class="call-actions" id="call-actions-incoming" hidden>
+          <button class="declinebtn" id="btn-decline">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><g transform="rotate(135 12 12)"><path d="M6.8 10.6a13.8 13.8 0 0 0 6.6 6.6l2-2c.33-.33.8-.44 1.24-.3 1 .33 2.03.5 3.06.5.7 0 1.3.57 1.3 1.28v2.58c0 .7-.6 1.28-1.3 1.28C11 20.5 3.5 13 3.5 4.3c0-.7.58-1.3 1.28-1.3h2.58c.71 0 1.28.6 1.28 1.3 0 1.03.17 2.06.5 3.06.14.44.03.9-.3 1.24l-2.04 2z"/></g></svg>
+            <span data-i18n="call.decline">Decline</span>
+          </button>
+          <button class="answerbtn" id="btn-answer">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6.8 10.6a13.8 13.8 0 0 0 6.6 6.6l2-2c.33-.33.8-.44 1.24-.3 1 .33 2.03.5 3.06.5.7 0 1.3.57 1.3 1.28v2.58c0 .7-.6 1.28-1.3 1.28C11 20.5 3.5 13 3.5 4.3c0-.7.58-1.3 1.28-1.3h2.58c.71 0 1.28.6 1.28 1.3 0 1.03.17 2.06.5 3.06.14.44.03.9-.3 1.24l-2.04 2z"/></svg>
+            <span data-i18n="call.answer">Answer</span>
+          </button>
+        </div>
+        <button class="endbtn" id="btn-hangup" hidden>
+          <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><g transform="rotate(135 12 12)"><path d="M6.8 10.6a13.8 13.8 0 0 0 6.6 6.6l2-2c.33-.33.8-.44 1.24-.3 1 .33 2.03.5 3.06.5.7 0 1.3.57 1.3 1.28v2.58c0 .7-.6 1.28-1.3 1.28C11 20.5 3.5 13 3.5 4.3c0-.7.58-1.3 1.28-1.3h2.58c.71 0 1.28.6 1.28 1.3 0 1.03.17 2.06.5 3.06.14.44.03.9-.3 1.24l-2.04 2z"/></g></svg>
+          <span data-i18n="call.endCall">End call</span>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ================= settings ================= -->
+  <div class="settings-screen" id="screen-settings" hidden>
+    <div class="settings-header" data-tauri-drag-region>
+      <button class="back" id="settings-back" aria-label="Back" data-i18n-aria-label="settings.backAria">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 6l-6 6 6 6"/></svg>
+      </button>
+      <h1 data-i18n="settings.title">Settings</h1>
+    </div>
+
+    <div class="settings-body" id="settings-body">
+
+      <h2 data-i18n="settings.general">General</h2>
+      <div class="settings-card">
+        <div class="field">
+          <label for="in-display-name" data-i18n="settings.displayNameLabel">Display name</label>
+          <input id="in-display-name" type="text" placeholder="Front desk" autocomplete="off" style="font-family:var(--font-ui)" data-i18n-placeholder="settings.displayNamePlaceholder">
+        </div>
+        <div class="themerow" role="group" aria-label="Theme" id="theme-row" data-i18n-aria-label="settings.themeAria">
+          <button data-theme-choice="auto" class="on" data-i18n="settings.themeAuto">Auto</button>
+          <button data-theme-choice="light" data-i18n="settings.themeLight">Light</button>
+          <button data-theme-choice="dark" data-i18n="settings.themeDark">Dark</button>
+        </div>
+        <!-- Language picker: no mockup covers this control yet (F4 i18n
+             sprint) - mirrors #theme-row exactly (same .themerow segmented
+             control, no visible label, just an aria-label), the nearest
+             existing precedent for a new settings control the mockups
+             don't cover (see shell/README.md "Design fidelity notes").
+             Codes (EN/PT-BR/ES), not full names: keeps the row narrow at
+             this window's 380px default width and reads as the same
+             "technical mono shorthand" register as the transport cards'
+             WSS/UDP tags - full names live in each button's title. Sits
+             behind the same admin-lock overlay as everything else in this
+             card (task brief: "setting bajo admin lock"). -->
+        <div class="themerow" role="group" aria-label="Language" id="locale-row" data-i18n-aria-label="settings.languageAria" style="margin-top:8px">
+          <button data-locale-choice="auto" class="on" title="Match this computer's language" data-i18n="settings.langAuto" data-i18n-title="settings.langAutoTitle">Auto</button>
+          <button data-locale-choice="en" title="English" data-i18n="settings.langEn" data-i18n-title="settings.langEnTitle">EN</button>
+          <button data-locale-choice="pt-BR" title="Português (Brasil)" data-i18n="settings.langPtBr" data-i18n-title="settings.langPtBrTitle">PT-BR</button>
+          <button data-locale-choice="es" title="Español" data-i18n="settings.langEs" data-i18n-title="settings.langEsTitle">ES</button>
+        </div>
+      </div>
+
+      <h2 data-i18n="settings.phoneSystem">Phone system</h2>
+      <div class="settings-card">
+        <div class="field">
+          <label for="in-host" data-i18n="settings.serverHostLabel">Server host</label>
+          <input id="in-host" type="text" placeholder="pbx.example.com" autocomplete="off" data-i18n-placeholder="settings.serverHostPlaceholder">
+        </div>
+        <div class="field">
+          <label for="in-ext" data-i18n="settings.extensionLabel">Extension</label>
+          <input id="in-ext" type="text" placeholder="1000" autocomplete="off" data-i18n-placeholder="settings.extensionPlaceholder">
+        </div>
+        <div class="field">
+          <label for="in-secret" data-i18n="settings.passwordLabel">Password</label>
+          <input id="in-secret" type="password" placeholder="Unchanged" autocomplete="off" data-i18n-placeholder="settings.passwordPlaceholder">
+          <span class="hint" id="secret-hint"></span>
+        </div>
+      </div>
+
+      <h2 data-i18n="settings.favoritesHeading">Favorites</h2>
+      <div class="settings-card" id="favorites-card">
+        <p class="hint" style="margin:0 0 10px" data-i18n="settings.favoritesHint">Up to 4 extensions with live status on the main window. Calling one always asks for confirmation first.</p>
+        <div id="favorites-fields"></div>
+      </div>
+
+      <h2 data-i18n="settings.transportHeading">How calls travel</h2>
+      <div class="transports" role="radiogroup" aria-label="Transport" id="transport-choice">
+        <button class="tcard" role="radio" data-transport="auto">
+          <span class="row1"><span class="radio" aria-hidden="true"></span><b data-i18n="settings.transportAutoName">Auto</b><span class="mono">WSS→UDP</span></span>
+          <p data-i18n="settings.transportAutoDesc">Centinelo tries the secure route first and falls back automatically if it can't register.</p>
+        </button>
+        <button class="tcard" role="radio" data-transport="classic">
+          <span class="row1"><span class="radio" aria-hidden="true"></span><b data-i18n="settings.transportClassicName">Classic SIP</b><span class="mono">UDP</span></span>
+          <p data-i18n="settings.transportClassicDesc">The traditional route — best when your phone system is on the same network.</p>
+        </button>
+        <button class="tcard" role="radio" data-transport="wss">
+          <span class="row1"><span class="radio" aria-hidden="true"></span><b data-i18n="settings.transportWssName">Secure web</b><span class="mono">WSS</span></span>
+          <p data-i18n="settings.transportWssDesc">Calls travel inside an encrypted web connection — best across the internet and strict firewalls.</p>
+        </button>
+      </div>
+
+      <h2 data-i18n="settings.bridgeHeading">Click-to-call</h2>
+      <div class="settings-card">
+        <p class="hint" style="margin:0 0 10px" data-i18n="settings.bridgeHint">Dial numbers you click on the web with the Centinelo browser extension. Runs on this computer only.</p>
+        <div class="field">
+          <label for="bridge-address" data-i18n="settings.bridgeAddressLabel">Bridge address</label>
+          <input id="bridge-address" type="text" readonly style="font-family:var(--font-mono)">
+        </div>
+        <div class="field">
+          <label for="bridge-token" data-i18n="settings.bridgeTokenLabel">Pairing token</label>
+          <div class="btnrow" style="margin-top:0">
+            <input id="bridge-token" type="text" readonly style="font-family:var(--font-mono);flex:1">
+            <button class="ghost" id="btn-copy-token" data-i18n="settings.copy">Copy</button>
+          </div>
+          <span class="hint" id="copy-token-status"></span>
+        </div>
+        <div class="field">
+          <label data-i18n="settings.dialAutomaticallyLabel">Dial automatically</label>
+          <div class="themerow" role="radiogroup" aria-label="Dial automatically" id="auto-dial-row" data-i18n-aria-label="settings.dialAutomaticallyLabel">
+            <button data-bool-choice="false" class="on" data-i18n="settings.boolOff">Off</button><button data-bool-choice="true" data-i18n="settings.boolOn">On</button>
+          </div>
+          <span class="hint" data-i18n="settings.dialAutomaticallyHint">When off, every click-to-call and centinelo:// or tel: link asks "Call this number?" first.</span>
+        </div>
+        <div class="field">
+          <label data-i18n="settings.telHandlerLabel">Answer tel: links</label>
+          <div class="themerow" role="radiogroup" aria-label="Answer tel: links" id="tel-handler-row" data-i18n-aria-label="settings.telHandlerLabel">
+            <button data-bool-choice="false" class="on" data-i18n="settings.boolOff">Off</button><button data-bool-choice="true" data-i18n="settings.boolOn">On</button>
+          </div>
+          <span class="hint" data-i18n="settings.telHandlerHint">Lets Centinelo offer to dial tel: links from other apps.</span>
+        </div>
+      </div>
+
+      <h2 data-i18n="settings.advancedHeading">Advanced</h2>
+      <div class="settings-card">
+        <div class="field">
+          <label for="in-core-path" data-i18n="settings.corePathLabel">Core engine path</label>
+          <input id="in-core-path" type="text" placeholder="Auto-detected" data-i18n-placeholder="settings.corePathPlaceholder">
+          <span class="hint" data-i18n="settings.corePathHint">Leave blank to auto-detect the locally built engine.</span>
+        </div>
+        <div class="btnrow">
+          <button class="ghost" id="btn-restart-engine" data-i18n="settings.restartEngine">Restart engine</button>
+        </div>
+      </div>
+
+      <h2 data-i18n="settings.adminHeading">Admin password</h2>
+      <div class="settings-card">
+        <p class="hint" id="admin-password-hint" style="margin:0 0 8px" data-i18n="settings.adminHint">Protects account, transport and advanced settings from casual changes at the front desk.</p>
+        <div class="field">
+          <label for="in-admin-new" data-i18n="settings.adminNewLabel">New admin password</label>
+          <input id="in-admin-new" type="password" placeholder="At least 8 characters" autocomplete="off" data-i18n-placeholder="settings.adminNewPlaceholder">
+        </div>
+        <div class="btnrow">
+          <button class="ghost" id="btn-set-admin-password" data-i18n="settings.setPassword">Set password</button>
+          <span class="hint" id="admin-password-status"></span>
+        </div>
+      </div>
+
+      <h2 data-i18n="settings.aboutHeading">About</h2>
+      <div class="settings-card">
+        <p class="hint" style="margin:0" data-i18n="settings.aboutBody">Centinelo Phone 2.0 — shell build. Runs on this computer; nothing phones home.</p>
+      </div>
+
+      <!-- admin-lock gate: first-run "set a password" OR "unlock to edit" -->
+      <div class="lock-overlay" id="lock-overlay" hidden>
+        <div class="lock-card" id="lock-card-unlock" hidden>
+          <div class="lockhead">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>
+            <b data-i18n="settings.locked">Settings are locked</b>
+          </div>
+          <p data-i18n="settings.lockedBody">Enter the admin password to edit account, transport and advanced settings.</p>
+          <input id="unlock-password" type="password" placeholder="Admin password" autocomplete="current-password" data-i18n-placeholder="settings.adminPasswordPlaceholder">
+          <div class="err" id="unlock-error"></div>
+          <div class="btnrow">
+            <button class="primary" id="btn-unlock" data-i18n="settings.unlock">Unlock</button>
+            <button class="ghost" id="btn-cancel-unlock" data-i18n="settings.notNow">Not now</button>
+          </div>
+        </div>
+        <div class="lock-card" id="lock-card-firstrun" hidden>
+          <div class="lockhead">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>
+            <b data-i18n="settings.setAdminPassword">Set an admin password</b>
+          </div>
+          <p data-i18n="settings.setAdminPasswordBody">This protects your phone system settings. You'll only be asked once per app launch.</p>
+          <input id="firstrun-password" type="password" placeholder="At least 8 characters" autocomplete="off" data-i18n-placeholder="settings.adminNewPlaceholder">
+          <div class="err" id="firstrun-error"></div>
+          <div class="btnrow">
+            <button class="primary" id="btn-firstrun-set" data-i18n="settings.setPasswordContinue">Set password &amp; continue</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="save-bar">
+      <span class="status" id="save-status"></span>
+      <button class="ghost" id="btn-cancel-settings" data-i18n="settings.cancel">Cancel</button>
+      <button class="primary" id="btn-save-settings" data-i18n="settings.save">Save</button>
+    </div>
+  </div>
+
+  <!-- ================= transcript panel (F4 ola 2) =================
+       "The four lives of a call" (premium/design/mockups/transcript-panel.html,
+       plate 07): live while the call is up, writing right after hangup,
+       the full viewer once saved, or the calm folder-down card if the
+       final save failed. Structure/tokens ported verbatim; content is
+       rendered by ui/js/transcript-panel.js (js/app.js wires state into
+       it) - see that module's header comment for the model shape. Never
+       shown at all when transcription isn't licensed or no transcript
+       exists yet - "absent", not a disabled ghost, matching the mockup's
+       own free-tier specimen. -->
+  <div class="transcript-screen" id="screen-transcript" hidden>
+    <div class="transcript-header" data-tauri-drag-region>
+      <button class="back" id="transcript-back" aria-label="Back" data-i18n-aria-label="transcript.backAria">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 6l-6 6 6 6"/></svg>
+      </button>
+      <div class="th-id">
+        <span class="th-name" id="tr-peer-name" data-i18n="transcript.defaultTitle">Transcript</span>
+        <span class="th-state" id="tr-state-label"></span>
+      </div>
+    </div>
+    <div class="transcript-body" id="transcript-body"></div>
+  </div>
+
+  <!-- ================= dial confirmation (favorites + click-to-call + centinelo/tel deep links) =================
+       Shares the admin-lock overlay's visual language (icon + heading +
+       description + buttons) - see shell/README.md "Design fidelity notes"
+       for the project's precedent of new components in the same language
+       where the mockups don't cover a state. Sits above everything
+       (dial-confirm-overlay raises the shared .lock-overlay's z-index),
+       since a dial request can arrive at any time. -->
+  <div class="lock-overlay dial-confirm-overlay" id="dial-confirm-overlay" hidden>
+    <div class="lock-card">
+      <div class="lockhead">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6.8 10.6a13.8 13.8 0 0 0 6.6 6.6l2-2c.33-.33.8-.44 1.24-.3 1 .33 2.03.5 3.06.5.7 0 1.3.57 1.3 1.28v2.58c0 .7-.6 1.28-1.3 1.28C11 20.5 3.5 13 3.5 4.3c0-.7.58-1.3 1.28-1.3h2.58c.71 0 1.28.6 1.28 1.3 0 1.03.17 2.06.5 3.06.14.44.03.9-.3 1.24l-2.04 2z"/></svg>
+        <b data-i18n="dialConfirm.question">Call this number?</b>
+      </div>
+      <p id="dial-confirm-source" data-i18n="dialConfirm.fromBrowser">From your browser.</p>
+      <div class="plate" id="dial-confirm-number" style="font-size:15px;color:var(--text-1);letter-spacing:.04em">—</div>
+      <div class="btnrow">
+        <button class="primary" id="btn-dial-confirm-call" data-i18n="dialConfirm.call">Call</button>
+        <button class="ghost" id="btn-dial-confirm-cancel" data-i18n="dialConfirm.notNow">Not now</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ================= provisioning confirmation ================= -->
+  <!-- Auto-provisioning "step 2" (provisioning.rs): shown after a paste
+       (Connect) or a centinelo://provision deep link resolves - shared
+       shape for both entry paths, see ui/js/app.js's
+       showProvisioningConfirm. Deliberately shows host/extension/
+       transport only, never the secret - matches
+       provisioning::ProvisioningPreviewView on the Rust side, which
+       doesn't carry the secret at all (see that struct's doc). Reuses
+       .lock-overlay/.lock-card like #dial-confirm-overlay, same z-index
+       precedent: a provisioning request can also arrive at any time
+       (deep link while the app is already open). -->
+  <div class="lock-overlay dial-confirm-overlay" id="provision-confirm-overlay" hidden>
+    <div class="lock-card">
+      <div class="lockhead">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.5 13.5a4 4 0 0 0 5.7 0l3-3a4 4 0 1 0-5.7-5.7l-1.2 1.2"/><path d="M13.5 10.5a4 4 0 0 0-5.7 0l-3 3a4 4 0 1 0 5.7 5.7l1.2-1.2"/></svg>
+        <b data-i18n="provisioning.connectQuestion">Connect to this phone system?</b>
+      </div>
+      <p data-i18n="provisioning.willRegisterAs">Centinelo will register as:</p>
+      <div class="plate" id="prov-confirm-host" style="font-size:14px;color:var(--text-1);letter-spacing:.02em;text-transform:none">—</div>
+      <div class="plate" id="prov-confirm-ext" style="font-size:13px;color:var(--text-2);letter-spacing:.02em;text-transform:none">—</div>
+      <p class="hint" id="prov-confirm-transport"></p>
+      <p class="hint" data-i18n="provisioning.passwordNeverShown">The password is applied but never shown here.</p>
+      <div class="btnrow">
+        <button class="primary" id="btn-prov-confirm" data-i18n="provisioning.connect">Connect</button>
+        <button class="ghost" id="btn-prov-cancel" data-i18n="provisioning.cancel">Cancel</button>
+      </div>
+      <p class="err" id="prov-confirm-error" hidden></p>
+    </div>
+  </div>
+
+</div>
+<script type="module" src="js/app.js"></script>
+</body>
+</html>

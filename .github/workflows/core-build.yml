@@ -1,0 +1,283 @@
+name: core build (v2 engine spike)
+
+# Builds core/ (the native baresip/libre engine + ctrl_json) on the v2
+# branch. Scoped separately from build.yml (the v1 Electron app's
+# workflow, which only watches `main`) via branch + path filters, so
+# neither workflow fires on the other's changes.
+on:
+  push:
+    branches: [v2, v2-winci]
+    paths:
+      - 'core/**'
+      - '.github/workflows/core-build.yml'
+  pull_request:
+    branches: [v2, v2-winci]
+    paths:
+      - 'core/**'
+      - '.github/workflows/core-build.yml'
+
+jobs:
+  macos:
+    name: macOS (supported)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install toolchain
+        run: brew install cmake openssl
+
+      - name: Apply local re patches
+        run: |
+          git apply --directory=core/deps/re core/patches/0001-re-configurable-sip-ws-path.patch
+          git apply --directory=core/deps/re core/patches/0002-re-tls-fingerprint-pin.patch
+          git apply --directory=core/deps/re core/patches/0004-re-json-stdout-purity.patch
+
+      - name: Apply local baresip patches
+        run: |
+          git apply --directory=core/deps/baresip core/patches/0003-baresip-json-stdout-purity.patch
+
+      - name: Configure + build libre
+        run: |
+          cmake -S core/deps/re -B core/deps/re/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DOPENSSL_ROOT_DIR="$(brew --prefix openssl)"
+          cmake --build core/deps/re/build -j"$(sysctl -n hw.ncpu)"
+
+      - name: Configure + build baresip + ctrl_json
+        # MODULES (2026-07-16): added coreaudio - the real macOS audio
+        # backend (input/output device access via CoreAudio/AudioToolbox),
+        # analogous to the Windows job's wasapi addition. See
+        # core/BUILD.md "macOS media modules" for the full rationale.
+        run: |
+          set -o pipefail
+          cmake -S core/deps/baresip -B core/deps/baresip/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DOPENSSL_ROOT_DIR="$(brew --prefix openssl)" \
+            -DMODULES="account;g711;auconv;auresamp;ausine;aufile;ice;dtls_srtp;menu;coreaudio" \
+            -DAPP_MODULES="ctrl_json" \
+            -DAPP_MODULES_DIR="${{ github.workspace }}/core/modules" \
+            2>&1 | tee baresip-configure.log
+          cmake --build core/deps/baresip/build -j"$(sysctl -n hw.ncpu)"
+
+      - name: Sanity - binary + ctrl_json module exist
+        run: |
+          test -x core/deps/baresip/build/baresip
+          test -e core/deps/baresip/build/ctrl_json.so
+          test -e core/deps/baresip/build/coreaudio.so
+          # `baresip -h` deliberately exits non-zero (254 - -h's own
+          # usage() path, unrelated to any change in this repo, verified
+          # pre-existing: the very first CI run for this workflow, before
+          # any of core/'s F1 work, hit the exact same thing) - so check
+          # its actual output instead of trusting the exit code for this
+          # sanity check.
+          core/deps/baresip/build/baresip -h 2>&1 | grep -q "Usage: baresip"
+          # Assert every requested module actually got compiled in, not
+          # just requested: a module whose own CMakeLists.txt hits an
+          # early `return()` (e.g. an unsatisfied optional dependency, or
+          # - coreaudio's own case - a platform guard, `if(NOT Darwin)
+          # return()`, which should never trigger on macos-latest but is
+          # exactly the kind of silent-drop this check exists to catch)
+          # silently drops out of MODULES_DETECTED instead of failing
+          # configure. baresip's CMakeLists.txt prints
+          # `MODULES_DETECTED=...` unconditionally (`message(...)`, not
+          # `message(STATUS ...)`, so it's always in the tee'd log) right
+          # after the per-module add_subdirectory() loop. Same mechanism
+          # as the Windows job's own MODULES_DETECTED assertion (see that
+          # job below) - token-exact match against the `;`-separated
+          # list, not a substring check, for the same reason (a module
+          # whose name is a substring of another present module's name
+          # would otherwise wrongly pass).
+          detected_line="$(grep '^MODULES_DETECTED=' baresip-configure.log || true)"
+          echo "$detected_line"
+          if [ -z "$detected_line" ]; then
+            echo "error: MODULES_DETECTED line not found in baresip-configure.log" >&2
+            exit 1
+          fi
+          detected_tokens=";${detected_line#MODULES_DETECTED=};"
+          for mod in ausine aufile ice dtls_srtp coreaudio; do
+            case "$detected_tokens" in
+              *";$mod;"*) ;;
+              *)
+                echo "error: module '$mod' missing from MODULES_DETECTED - it was requested but silently dropped (check its CMakeLists.txt for an early return())" >&2
+                exit 1
+                ;;
+            esac
+          done
+          echo "OK: re + baresip(+ctrl_json, +ausine, +aufile, +ice, +dtls_srtp, +coreaudio) built on macOS"
+
+      - name: Configure + build + run ctrl_json unit tests (ASan)
+        # Standalone project (core/modules/ctrl_json/test/), not part of
+        # baresip's own CMake tree - see that dir's CMakeLists.txt for
+        # why. Links the just-built core/deps/re/build/libre.a, so this
+        # step must run after "Configure + build libre" above.
+        run: |
+          cmake -S core/modules/ctrl_json/test -B core/modules/ctrl_json/test/build \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DOPENSSL_ROOT_DIR="$(brew --prefix openssl)" \
+            -DCENT_ASAN=ON
+          cmake --build core/modules/ctrl_json/test/build
+          ctest --test-dir core/modules/ctrl_json/test/build --output-on-failure
+
+  windows:
+    name: Windows (experimental)
+    runs-on: windows-latest
+    # Gating (no longer continue-on-error): a green Windows run was confirmed on
+    # run 29459035249 (5be8dbf, OpenSSL discovery fix). See core/BUILD.md
+    # "Windows CI" for the path-detection rationale.
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install OpenSSL (Chocolatey)
+        run: choco install openssl -y --no-progress
+
+      - name: Locate OpenSSL install dir (choco deploy path varies by pkg version)
+        # The Chocolatey `openssl` package changed its deploy dir between
+        # versions: v3.x installs to C:\Program Files\OpenSSL-Win64, but v4.x
+        # (current, ships the OpenSSL 3.x library) installs to
+        # C:\Program Files\OpenSSL (no -Win64 suffix). Hardcoding either path
+        # breaks the moment the other version is installed (the previous run
+        # failed here: find_package(OpenSSL) -> "missing: OPENSSL_CRYPTO_LIBRARY
+        # OPENSSL_INCLUDE_DIR", which in turn left the re `retest` target
+        # referencing NOTFOUND LIB_EAY_LIBRARY/SSL_EAY_LIBRARY). So we detect
+        # which candidate actually holds include/openssl/ssl.h and export it via
+        # $GITHUB_ENV. This MUST NOT be a job-level env: (that would take
+        # precedence over $GITHUB_ENV and silently re-break detection).
+        # Subsequent steps read $OPENSSL_ROOT_DIR and forward it to
+        # -DOPENSSL_ROOT_DIR so find_package(OpenSSL) resolves the same
+        # headers/libs for both libre and baresip (baresip's configure pulls in
+        # core/deps/re/cmake/re-config.cmake, which re-runs find_package(OpenSSL)).
+        shell: pwsh
+        run: |
+          $candidates = @('C:\Program Files\OpenSSL', 'C:\Program Files\OpenSSL-Win64')
+          $root = $candidates | Where-Object { Test-Path "$_\include\openssl\ssl.h" } | Select-Object -First 1
+          if (-not $root) {
+            Write-Error "OpenSSL headers (include/openssl/ssl.h) not found under: $($candidates -join ', ')"
+            exit 1
+          }
+          "OPENSSL_ROOT_DIR=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "OPENSSL_ROOT_DIR=$root"
+
+      - name: Apply local re patches
+        shell: bash
+        run: |
+          git apply --directory=core/deps/re core/patches/0001-re-configurable-sip-ws-path.patch
+          git apply --directory=core/deps/re core/patches/0002-re-tls-fingerprint-pin.patch
+          git apply --directory=core/deps/re core/patches/0004-re-json-stdout-purity.patch
+
+      - name: Apply local baresip patches
+        shell: bash
+        run: |
+          git apply --directory=core/deps/baresip core/patches/0003-baresip-json-stdout-purity.patch
+
+      - name: Configure + build + install libre
+        # Build re STATIC-only (baresip is itself STATIC on Windows - see its
+        # `option(STATIC ... ON)` for WIN32) and `cmake --install` it. The
+        # install flattens MSVC's multi-config `Release/` subdir that
+        # baresip's cmake/FindRE.cmake never searches: FindRE.cmake's
+        # find_library HINTS are only ../re, ../re/build, ../re/build/Debug,
+        # but the .lib actually lands in ../re/build/Release - hence the raw
+        # build-tree lookup failed with "Could NOT find RE (missing:
+        # RE_LIBRARY)". The installed archive is handed to baresip explicitly
+        # via -DRE_LIBRARY in the next step.
+        shell: bash
+        run: |
+          set -o pipefail
+          RE_INSTALL="$(pwd -W)/re-install-prefix"
+          cmake -S core/deps/re -B core/deps/re/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$RE_INSTALL" \
+            -DLIBRE_BUILD_SHARED=OFF \
+            -DLIBRE_BUILD_STATIC=ON \
+            -DOPENSSL_ROOT_DIR="$OPENSSL_ROOT_DIR" \
+            2>&1 | tee re-configure.log
+          cmake --build core/deps/re/build --config Release 2>&1 | tee -a re-configure.log
+          cmake --install core/deps/re/build --config Release 2>&1 | tee -a re-configure.log
+
+      - name: Configure + build baresip + ctrl_json
+        # -DRE_LIBRARY / -DRE_INCLUDE_DIR satisfy baresip's MODULE-mode
+        # find_package(RE) (cmake/FindRE.cmake) directly, instead of relying
+        # on its (Windows-broken) build-tree HINTS. RE_INCLUDE_DIR points at
+        # the re *source* tree, where re.h lives (same ../re/include the macOS
+        # job resolves via FindRE.cmake); RE_LIBRARY at the just-installed
+        # static archive re-static.lib (OUTPUT_NAME re-static on MSVC).
+        #
+        # MODULES (2026-07-16): added ausine/aufile/ice/dtls_srtp/wasapi -
+        # see core/BUILD.md "Windows CI" > "Windows media modules" for the
+        # full rationale (why the previous, smaller list was a real
+        # functional gap, not just a smaller compile).
+        shell: bash
+        run: |
+          set -o pipefail
+          RE_INSTALL="$(pwd -W)/re-install-prefix"
+          cmake -S core/deps/baresip -B core/deps/baresip/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DRE_LIBRARY="$RE_INSTALL/lib/re-static.lib" \
+            -DRE_INCLUDE_DIR="$(pwd -W)/core/deps/re/include" \
+            -DOPENSSL_ROOT_DIR="$OPENSSL_ROOT_DIR" \
+            -DMODULES="account;g711;auconv;auresamp;ausine;aufile;ice;dtls_srtp;menu;wasapi" \
+            -DAPP_MODULES="ctrl_json" \
+            -DAPP_MODULES_DIR="$(pwd -W)/core/modules" \
+            2>&1 | tee baresip-configure.log
+          cmake --build core/deps/baresip/build --config Release 2>&1 | tee -a baresip-configure.log
+
+      - name: Sanity - baresip + ctrl_json built
+        # STATIC build (Windows default): there is no ctrl_json.dll - the
+        # module is compiled into the static baresip lib via the generated
+        # src/static.c exports table (a green *link* therefore implies
+        # ctrl_json compiled - static.c references exports_ctrl_json). We
+        # only confirm the artifacts exist; baresip.exe is not run, as the
+        # static build still links OpenSSL's import libs and would need the
+        # OpenSSL DLLs on PATH at runtime.
+        #
+        # Also assert every module actually requested got detected: a module
+        # whose own CMakeLists.txt hits an early `return()` (e.g. an
+        # unsatisfied optional dependency) silently drops out of
+        # MODULES_DETECTED instead of failing configure - baresip's
+        # CMakeLists.txt prints `MODULES_DETECTED=...` unconditionally
+        # (`message(...)`, not `message(STATUS ...)`, so it's always in the
+        # tee'd log) right after the per-module add_subdirectory() loop. A
+        # green build + link with a module silently missing from that line
+        # would otherwise look identical to a real success.
+        shell: bash
+        run: |
+          RE_INSTALL="$(pwd -W)/re-install-prefix"
+          test -x core/deps/baresip/build/Release/baresip.exe
+          test -f "$RE_INSTALL/lib/re-static.lib"
+          detected_line="$(grep '^MODULES_DETECTED=' baresip-configure.log || true)"
+          echo "$detected_line"
+          if [ -z "$detected_line" ]; then
+            echo "error: MODULES_DETECTED line not found in baresip-configure.log" >&2
+            exit 1
+          fi
+          # Token-exact match, not substring: CMake's own list separator is
+          # `;` (see MODULES_DETECTED's own `list(APPEND ...)` calls), so
+          # wrap both the haystack and each needle in `;` and match
+          # `;name;` - a plain `*"$mod"*` substring check would wrongly pass
+          # a module whose name is a substring of another present module
+          # (none collide today, but the check should not depend on that
+          # staying true).
+          detected_tokens=";${detected_line#MODULES_DETECTED=};"
+          for mod in ausine aufile ice dtls_srtp wasapi; do
+            case "$detected_tokens" in
+              *";$mod;"*) ;;
+              *)
+                echo "error: module '$mod' missing from MODULES_DETECTED - it was requested but silently dropped (check its CMakeLists.txt for an early return())" >&2
+                exit 1
+                ;;
+            esac
+          done
+          echo "OK: re + baresip(+ctrl_json, +ausine, +aufile, +ice, +dtls_srtp, +wasapi) built on Windows"
+
+      - name: Upload build logs (pass or fail)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-core-build-logs
+          path: |
+            re-configure.log
+            baresip-configure.log
+          if-no-files-found: warn

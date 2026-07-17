@@ -1,0 +1,50 @@
+diff --git a/src/sip/transp.c b/src/sip/transp.c
+index 78ea319..b6fbda4 100644
+--- a/src/sip/transp.c
++++ b/src/sip/transp.c
+@@ -4,6 +4,7 @@
+  * Copyright (C) 2010 Creytiv.com
+  */
+ #include <string.h>
++#include <stdlib.h>
+ #include <re_types.h>
+ #include <re_mem.h>
+ #include <re_mbuf.h>
+@@ -1061,23 +1062,35 @@ static int ws_conn_send(struct sip_connqent **qentp, struct sip *sip,
+ 
+ 	/* TODO: how to select ports of outbound SIP/WS proxy ?
+ 	 * TODO: http url path "test" is temp, add config
++	 *
++	 * Centinelo Phone v2 spike patch (core/patches/): the path was
++	 * unconditionally "/", which 404s against servers that mount their
++	 * SIP websocket elsewhere (e.g. Asterisk's default "/ws" - see
++	 * core/BUILD.md "Findings"). Until this has a real config path
++	 * upstream, honor CENT_WS_PATH so a caller can override it; default
++	 * stays "/" so behavior is unchanged when the env var is unset.
+ 	 */
++	{
++	const char *ws_path = getenv("CENT_WS_PATH");
++	if (!ws_path || !ws_path[0])
++		ws_path = "/";
+ 
+ 	/* Use port if specified, otherwise use default HTTP/HTTPS ports */
+ 	if (sa_port(dst)) {
+ 		if (re_snprintf(ws_uri, sizeof(ws_uri),
+-				"%s://%J/", prefix, dst) < 0) {
++				"%s://%J%s", prefix, dst, ws_path) < 0) {
+ 			err = ENOMEM;
+ 			goto out;
+ 		}
+ 	}
+ 	else {
+ 		if (re_snprintf(ws_uri, sizeof(ws_uri),
+-				"%s://%j/", prefix, dst) < 0) {
++				"%s://%j%s", prefix, dst, ws_path) < 0) {
+ 			err = ENOMEM;
+ 			goto out;
+ 		}
+ 	}
++	}
+ 
+ 	if (!transp->http_cli) {
+ 		err = http_client_alloc(&transp->http_cli, sip->dnsc);

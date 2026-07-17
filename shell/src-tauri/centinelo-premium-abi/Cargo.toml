@@ -1,0 +1,19 @@
+[package]
+name = "centinelo-premium-abi"
+description = "C ABI contract between Centinelo Phone's public shell and its private premium module. The socket, not the plug: no secrets, no feature logic, just the calling convention."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lib]
+name = "centinelo_premium_abi"
+path = "src/lib.rs"
+
+# Deliberately zero dependencies beyond std. This crate is dual-homed (see
+# the crate doc comment in src/lib.rs) - its source gets vendored verbatim
+# into the public `Centinelo-Phone` repo so the Community shell can compile
+# the loader without ever depending on anything private. Every dependency
+# added here is a dependency the public repo would need to accept too, so
+# the bar for adding one is high: prefer std.
+[dependencies]

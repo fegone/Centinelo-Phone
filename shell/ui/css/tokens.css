@@ -1,0 +1,59 @@
+/* == CENTINELO 2.0 — VIGILIA TOKENS ==================================== */
+/* Verbatim from centinelo-premium-design/design/TOKENS.md section 9.      */
+/* Do not hand-edit divergently from that file - it is the source of truth. */
+*,*::before,*::after{box-sizing:border-box}
+:root{
+  color-scheme:light dark;
+  /* surfaces */
+  --canvas:light-dark(#E9E7E0,#070A08);
+  --bg-0:light-dark(#F5F4EF,#0C110E);
+  --bg-1:light-dark(#FFFFFF,#121915);
+  --bg-2:light-dark(#EFEDE5,#171F1A);
+  --bg-3:light-dark(#E6E3D9,#1D2620);
+  /* ink */
+  --text-1:light-dark(#1C221E,#EDF1EC);
+  --text-2:light-dark(#4E574F,#A9B4AA);
+  --text-3:light-dark(#6E776E,#717C72);
+  --border-1:light-dark(#DCD9CE,#242E27);
+  --border-2:light-dark(#C9C5B8,#2F3B32);
+  /* lamplight */
+  --amber:light-dark(#8F5C00,#E8A33D);
+  --amber-fill:light-dark(#E7A233,#E8A33D);
+  --amber-soft:light-dark(#F7E9CC,#27200F);
+  --amber-glow:light-dark(rgba(231,162,51,.30),rgba(232,163,61,.22));
+  --on-amber:#211807;
+  /* call states */
+  --st-idle:light-dark(#1E7A4F,#57C28D);
+  --st-idle-fill:light-dark(#1F8354,#2FA36B);
+  --on-idle:light-dark(#FFFFFF,#0A140D);
+  --st-ring:var(--amber);
+  --st-busy:light-dark(#BE3E2C,#E4705C);
+  --on-busy:light-dark(#FFFFFF,#200B06);
+  --st-held:light-dark(#166F96,#6BB8DC);
+  --st-dnd:light-dark(#5C6660,#93A099);
+  --st-off:light-dark(#ABA79A,#3A463D);
+  /* transcript voices (ink, not light) */
+  --voice-you:light-dark(#2E3A33,#C9D3CA);
+  --voice-caller:light-dark(#9A9484,#55625A);
+  /* type */
+  --font-ui:-apple-system,BlinkMacSystemFont,"Segoe UI Variable Text","Segoe UI",system-ui,"Helvetica Neue",Arial,sans-serif;
+  --font-mono:ui-monospace,"SF Mono",SFMono-Regular,"Cascadia Code","Segoe UI Mono",Consolas,"Liberation Mono",monospace;
+  /* radii */
+  --r-1:6px;--r-2:10px;--r-3:14px;--r-pill:999px;
+  /* motion */
+  --t-fast:120ms;--t-med:180ms;--t-slow:260ms;
+  --ease:cubic-bezier(.2,0,0,1);
+  /* elevation */
+  --edge:inset 0 1px 0 light-dark(rgba(255,255,255,.65),rgba(255,255,255,.05));
+  --shadow-1:0 1px 2px light-dark(rgba(28,34,30,.07),rgba(0,0,0,.35));
+  --shadow-2:0 1px 2px light-dark(rgba(28,34,30,.05),rgba(0,0,0,.30)),
+             0 8px 20px -6px light-dark(rgba(28,34,30,.15),rgba(0,0,0,.50));
+  --shadow-win:0 0 0 1px light-dark(rgba(28,34,30,.10),rgba(0,0,0,.55)),
+               0 6px 16px -4px light-dark(rgba(28,34,30,.12),rgba(0,0,0,.50)),
+               0 32px 72px -20px light-dark(rgba(28,34,30,.28),rgba(0,0,0,.65));
+}
+:root[data-theme=light]{color-scheme:light}
+:root[data-theme=dark]{color-scheme:dark}
+@media (prefers-reduced-motion:reduce){
+  *,*::before,*::after{animation:none!important;transition:none!important}
+}

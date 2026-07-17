@@ -1,0 +1,88 @@
+[package]
+name = "centinelo-shell"
+version = "2.0.0"
+description = "Centinelo Phone 2.0 desktop shell (Tauri) - drives the core/ baresip sidecar"
+authors = ["Felix Gonzalez"]
+license = "MIT"
+repository = "https://github.com/fegone/Centinelo-Phone"
+edition = "2021"
+rust-version = "1.77.2"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+# This crate's own manifest is also the workspace root (a Cargo.toml can
+# be both) - needed for the vendored `centinelo-premium-abi` path
+# dependency below, whose manifest inherits `edition`/`version`/`publish`/
+# `license` via `.workspace = true` (see its `Cargo.toml` comment, "dual-
+# homed"): unmodified from the private premium repo on purpose (see
+# `centinelo-premium-abi/README.md` "Keeping it in sync later" - a plain
+# `cp -r` re-sync must keep working without hand-editing inherited-value
+# syntax back to literals every time). `centinelo-shell`'s own package
+# fields above are untouched literals, not `.workspace = true` - this
+# table only supplies the vendored crate's fallback values, nothing here
+# changes this crate's own metadata.
+[workspace]
+members = ["centinelo-premium-abi"]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+publish = false
+license = "UNLICENSED"
+
+[lib]
+name = "app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.6.3", features = [] }
+
+[dependencies]
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+log = "0.4"
+tauri = { version = "2.11.3", features = ["tray-icon", "image-png", "devtools"] }
+tauri-plugin-log = "2"
+argon2 = { version = "0.5", features = ["std"] }
+tauri-plugin-deep-link = "2"
+tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
+tiny_http = "0.12"
+form_urlencoded = "1"
+getrandom = "0.2"
+hex = "0.4"
+url = "2"
+percent-encoding = "2"
+# Premium module loader (see src/premium.rs and
+# centinelo-premium-abi/README.md, vendored below) - none of these three
+# are private-repo dependencies. centinelo-premium-abi's source is a
+# verbatim copy of the private premium repo's crates/centinelo-premium-abi
+# (see that crate's own doc comment, "dual-homed") - vendored, not a git
+# submodule or path-outside-this-repo dependency, so a Community build
+# from a plain `git clone` of this public repo has everything it needs
+# with no private repo on the dependency graph at any point.
+centinelo-premium-abi = { path = "centinelo-premium-abi" }
+libloading = "0.8"
+ed25519-dalek = "2"
+# Transcription (F4): local wall-clock/date formatting for the
+# storage_dir/YYYY/MM/DD layout (src/transcription.rs). Model download +
+# checksum verification is NOT reimplemented here - src/transcription.rs
+# shells out to `centinelo-transcribe ensure-model` (the one, real
+# checksum-pinned source - see that module's doc, "Consolidation, not
+# reimplementation", 2026-07-16 review finding M4) rather than pulling in
+# ureq/sha2 for a second copy of the same logic.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# Auto-provisioning (spec §5, src/provisioning.rs): fetches a small JSON
+# config from an https:// URL the operator pastes (or a
+# centinelo://provision?url=... deep link supplies) - an installer-hosted
+# provisioning file, unrelated to the model-download path the comment
+# above deliberately avoided reimplementing. `default-features = false` +
+# only the "tls" feature: rustls, not native-tls/openssl - sidesteps the
+# system-openssl path that already broke Windows CI once for a different
+# crate (see shell/README.md's Windows CI notes); no proxy/cookie/gzip
+# support needed for one small GET.
+ureq = { version = "2", default-features = false, features = ["tls"] }
+# Decodes the optional embedded `centinelo://provision?config=<base64>`
+# form (no network fetch at all - see provisioning.rs "two ways in").
+base64 = "0.22"
+# HID headsets (src/hid.rs) - hook switch answer/hangup, mute, LED mirror.
+hidapi = "2"
