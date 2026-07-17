@@ -80,6 +80,17 @@ on:
         type: boolean
         default: false
 
+# A PR from v2 into main fires push (on the head branch) AND pull_request
+# for the same commit - two redundant matrix runs (3 combos each, on
+# windows-latest - not cheap to duplicate). Group by workflow+ref so the
+# second dedupes against the first; cancel-in-progress only cancels a
+# STALE run of the SAME branch/ref (e.g. a superseded push to that PR or
+# an accidental double workflow_dispatch), never a run on a different
+# branch like main.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
 # 4R/RISK minor fix 2026-07-16: default token scope is read-only for
 # everything this workflow does (checkout public + private-via-PAT repos,
 # build, upload-artifact - none of those need `contents: write` or any

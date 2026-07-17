@@ -22,6 +22,15 @@ on:
       - 'core/**'
       - '.github/workflows/core-build.yml'
 
+# A PR from v2 (or v2-winci) into main fires push (on the head branch) AND
+# pull_request for the same commit - two redundant runs. Group by
+# workflow+ref so the second dedupes against the first; cancel-in-progress
+# only cancels a STALE run of the SAME branch/ref (e.g. a superseded push
+# to that PR), never a run on a different branch like main.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   macos:
     name: macOS (supported)
