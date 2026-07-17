@@ -24,6 +24,12 @@ use std::sync::Mutex;
 pub const SETTINGS_FILE: &str = "settings.json";
 pub const RECENTS_FILE: &str = "recents.json";
 pub const MAX_RECENTS: usize = 200;
+/// The license activation writes to (see `activation.rs`'s module doc,
+/// "The real gap this piece leaves open" - nothing reads this file back
+/// yet, but this is the established, documented path a future real
+/// consumer should read from). Sibling of `settings.json`, same app-data
+/// directory, same "0600, never logged" handling via `write_private_file`.
+pub const LICENSE_FILE: &str = "license.json";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -563,6 +569,21 @@ pub enum LocalePref {
     Es,
 }
 
+// ---- license activation (P3 of the activation-server plan) --------------
+//
+// Only the activation server URL is persisted here - the serial itself is
+// NEVER written to settings.json or anywhere else (see activation.rs's
+// module doc). Admin-gated in commands::activate_license, same "licencia"
+// entry the shell-tauri skill's own rule lists alongside account/
+// transport/transcription as sensitive. Default empty: no internal
+// hostname ships in this public repo, same rule the STT/provisioning
+// endpoints already follow.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LicenseSettings {
+    #[serde(default)]
+    pub activation_server_url: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AppSettings {
     #[serde(default)]
@@ -589,6 +610,8 @@ pub struct AppSettings {
     pub audio: AudioSettings,
     #[serde(default)]
     pub updater: UpdaterSettings,
+    #[serde(default)]
+    pub license: LicenseSettings,
 }
 
 fn default_favorites() -> Vec<FavoriteSlot> {
@@ -653,6 +676,13 @@ impl SettingsStore {
 
     pub fn recents_path(&self) -> &Path {
         &self.recents_path
+    }
+
+    /// `license.json`, sibling of `settings.json` - see `LICENSE_FILE`'s
+    /// own doc comment and `activation.rs`'s module doc for why nothing
+    /// reads this back yet.
+    pub fn license_path(&self) -> PathBuf {
+        self.path.with_file_name(LICENSE_FILE)
     }
 
     fn persist(&self, settings: &AppSettings) -> std::io::Result<()> {
@@ -742,6 +772,19 @@ impl SettingsStore {
     pub fn update_updater_check_on_startup(&self, check_on_startup: bool) -> std::io::Result<()> {
         let mut guard = self.inner.lock_or_recover();
         guard.updater.check_on_startup = check_on_startup;
+        self.persist(&guard)
+    }
+
+    /// Persists the activation server URL an operator typed - called
+    /// whenever `commands::activate_license` receives a URL that passes
+    /// `activation::validate_server_url`, regardless of whether that
+    /// particular activation attempt then succeeds (a network hiccup
+    /// shouldn't force retyping a real endpoint - same "don't lose what
+    /// was typed" discipline `provisioning_apply`'s own `peek()`-not-
+    /// `take()` comment documents elsewhere in this codebase).
+    pub fn update_license_server_url(&self, activation_server_url: String) -> std::io::Result<()> {
+        let mut guard = self.inner.lock_or_recover();
+        guard.license.activation_server_url = activation_server_url;
         self.persist(&guard)
     }
 
