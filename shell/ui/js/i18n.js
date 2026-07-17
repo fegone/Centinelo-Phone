@@ -388,6 +388,7 @@ const ENTRIES = [
     "Centinelo Phone 2.0 — build do shell. Roda neste computador; nada é enviado para fora.",
     "Centinelo Phone 2.0 — build del shell. Funciona en este equipo; nada se envía afuera.",
   ],
+  ["settings.updaterCheckOnStartupLabel", "Check for updates automatically", "Verificar atualizações automaticamente", "Buscar actualizaciones automáticamente"],
   ["settings.locked", "Settings are locked", "As configurações estão bloqueadas", "La configuración está bloqueada"],
   [
     "settings.lockedBody",
@@ -416,6 +417,56 @@ const ENTRIES = [
     "Account saved; transcription NOT saved: {reason}",
     "Conta salva; transcrição NÃO salva: {reason}",
     "Cuenta guardada; transcripción NO guardada: {reason}",
+  ],
+
+  // -- auto-updater (roadmap debt fix) -----------------------------------
+  // Settings > About status line (renderUpdaterAboutStatus, app.js) and the
+  // non-intrusive main-window banner (renderUpdateBanner, ui/js/updater.js)
+  // share this whole block - see updater.js's own header comment for why
+  // only a subset of these phases ever reach the banner.
+  ["updater.currentVersion", "Version {version}", "Versão {version}", "Versión {version}"],
+  ["updater.checkButton", "Check for updates", "Verificar atualizações", "Buscar actualizaciones"],
+  ["updater.checking", "Checking for updates…", "Verificando atualizações…", "Buscando actualizaciones…"],
+  ["updater.upToDate", "You're up to date.", "Você está atualizado.", "Estás actualizado."],
+  ["updater.aboutAvailable", "Update available — v{version}", "Atualização disponível — v{version}", "Actualización disponible — v{version}"],
+  [
+    "updater.aboutDownloading",
+    "Downloading update… {pct}%",
+    "Baixando atualização… {pct}%",
+    "Descargando actualización… {pct}%",
+  ],
+  ["updater.aboutDownloadingIndeterminate", "Downloading update…", "Baixando atualização…", "Descargando actualización…"],
+  ["updater.aboutReady", "Update ready — v{version}", "Atualização pronta — v{version}", "Actualización lista — v{version}"],
+  ["updater.installing", "Installing update…", "Instalando atualização…", "Instalando actualización…"],
+  ["updater.errorStatus", "Couldn't update: {message}", "Não foi possível atualizar: {message}", "No se pudo actualizar: {message}"],
+
+  ["updater.bannerAvailableTitle", "Update available", "Atualização disponível", "Actualización disponible"],
+  [
+    "updater.bannerAvailableDetail",
+    "Version {version} is ready to download.",
+    "A versão {version} está pronta para baixar.",
+    "La versión {version} está lista para descargar.",
+  ],
+  ["updater.bannerDownloadingTitle", "Downloading update…", "Baixando atualização…", "Descargando actualización…"],
+  ["updater.bannerReadyTitle", "Update ready", "Atualização pronta", "Actualización lista"],
+  [
+    "updater.bannerReadyDetail",
+    "Version {version} is ready to install.",
+    "A versão {version} está pronta para instalar.",
+    "La versión {version} está lista para instalar.",
+  ],
+  ["updater.bannerInstallingTitle", "Installing update…", "Instalando atualização…", "Instalando actualización…"],
+  ["updater.bannerErrorTitle", "Update failed", "Falha na atualização", "Error al actualizar"],
+
+  ["updater.download", "Download", "Baixar", "Descargar"],
+  ["updater.restartToUpdate", "Restart to update", "Reiniciar para atualizar", "Reiniciar para actualizar"],
+  ["updater.retry", "Retry", "Tentar novamente", "Reintentar"],
+  ["updater.later", "Later", "Mais tarde", "Más tarde"],
+  [
+    "updater.finishCallFirstTitle",
+    "Finish your call first.",
+    "Termine sua chamada primeiro.",
+    "Termina tu llamada primero.",
   ],
 
   // -- auto-provisioning ------------------------------------------------

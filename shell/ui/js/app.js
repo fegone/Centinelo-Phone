@@ -16,11 +16,34 @@ import {
   applyProgressEvent,
   isDownloadStalled,
   computeModelChipState,
+  computeDownloadPct,
 } from "./transcription-settings.js";
+import {
+  initialUpdaterState,
+  withChecking,
+  withUpToDate,
+  withAvailable,
+  withCheckError,
+  withDownloadStarted,
+  withDownloadProgress,
+  withDownloadError,
+  withReady,
+  withInstalling,
+  withInstallError,
+  withDismissed,
+  canStartInstall,
+  renderUpdateBanner,
+  renderUpdaterAboutStatus,
+} from "./updater.js";
 
-const { invoke } = window.__TAURI__.core;
+// `Channel` (updater download progress) and `Resource` both live on
+// window.__TAURI__.core alongside `invoke` - withGlobalTauri bundles the
+// WHOLE @tauri-apps/api/core module, not a curated subset (verified
+// against tauri's own scripts/bundle.global.js, 2.11.5).
+const { invoke, Channel } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 const { getCurrentWindow } = window.__TAURI__.window;
+const { getVersion } = window.__TAURI__.app;
 
 const win = getCurrentWindow();
 
@@ -59,6 +82,13 @@ const state = {
   // language switch (see refreshAllUiText) can re-render it in the new
   // locale's date/duration formatting without an extra round-trip.
   recents: [],
+  // ---- auto-updater (roadmap debt fix) -----------------------------------
+  // See ui/js/updater.js's header comment for the full state machine.
+  // check_on_startup mirrors the persisted setting, not part of the
+  // updater state machine itself (same "preference vs. resolved value"
+  // split theme/locale already use).
+  updater: initialUpdaterState(),
+  updaterCheckOnStartup: true,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -1159,6 +1189,203 @@ function handleModelDownloadSettled(payload, errorMessage) {
   refreshModelStatuses();
 }
 
+// ---------------------------------------------------------------------------
+// auto-updater (roadmap debt fix) - see ui/js/updater.js's header comment
+// for the full design. This block owns every @tauri-apps/plugin-updater /
+// @tauri-apps/plugin-process call - neither plugin's JS package can be
+// imported here (bare-specifier `import ... from "@tauri-apps/plugin-
+// updater"` can't resolve without a bundler, and this project deliberately
+// has none - see shell/README.md's opening line). Both plugins are thin
+// wrappers around `invoke("plugin:<name>|<command>", ...)` (confirmed
+// against their own dist-js source, tauri-plugin-updater 2.10.1 /
+// tauri-plugin-process 2.3.1) - these three functions replicate exactly
+// that, using the SAME `Channel` class the real plugin uses (`core.js`'s
+// export, available here via window.__TAURI__.core - see this file's own
+// top-of-file comment on that import).
+// ---------------------------------------------------------------------------
+
+/// `{ rid, currentVersion, version, date, body, rawJson }` from the last
+/// successful `check()` that found an update - `rid` is the resource
+/// download()/install() below need. Cleared (and its Rust-side resource
+/// closed) at the start of every fresh check, so a manual re-check never
+/// leaks one resource per click.
+let pendingUpdateMeta = null;
+/// The resource id `download()` hands back (the downloaded bytes) -
+/// `install()` needs both this and pendingUpdateMeta.rid.
+let pendingDownloadedBytesRid = null;
+/// Bytes downloaded so far this attempt - the plugin's Progress event
+/// carries a per-chunk delta (`chunkLength`), not a running total, so this
+/// module accumulates it the same way the real JS plugin wrapper would if
+/// it exposed one (it doesn't - callers are expected to do this
+/// themselves, per the official docs' own example).
+let downloadedSoFar = 0;
+
+async function pluginUpdaterCheck() {
+  return invoke("plugin:updater|check", {});
+}
+
+async function pluginUpdaterDownload(rid, onEvent) {
+  const channel = new Channel();
+  channel.onmessage = onEvent;
+  return invoke("plugin:updater|download", { rid, onEvent: channel });
+}
+
+async function pluginUpdaterInstall(updateRid, bytesRid) {
+  return invoke("plugin:updater|install", { updateRid, bytesRid });
+}
+
+async function pluginProcessRestart() {
+  return invoke("plugin:process|restart");
+}
+
+let updaterRefs = null;
+function getUpdaterRefs() {
+  if (updaterRefs) return updaterRefs;
+  updaterRefs = {
+    root: $("update-banner"),
+    title: $("update-banner-title"),
+    detail: $("update-banner-detail"),
+    actions: $("update-banner-actions"),
+    downloadBtn: $("btn-update-download"),
+    restartBtn: $("btn-update-restart"),
+    retryBtn: $("btn-update-retry"),
+    laterBtn: $("btn-update-later"),
+    progressWrap: $("update-banner-progress"),
+    progressFill: $("update-banner-dlbar-fill"),
+    progressPct: $("update-banner-dlpct"),
+  };
+  return updaterRefs;
+}
+
+function renderUpdaterUI() {
+  renderUpdateBanner(getUpdaterRefs(), state.updater, t, {
+    formatBytes: formatModelSize,
+    computeDownloadPct,
+    canInstallNow: () => canStartInstall(!!state.call),
+  });
+  renderUpdaterAboutStatus($("updater-settings-status"), $("btn-check-updates"), state.updater, t);
+  // Always-shown version line (separate from the check-status line above -
+  // see renderUpdaterAboutStatus's own doc for why the split).
+  $("updater-current-version").textContent = state.updater.currentVersion
+    ? t("updater.currentVersion", { version: state.updater.currentVersion })
+    : "";
+}
+
+/// Closes a previous pending update's Rust-side resource before starting a
+/// fresh check, so repeated manual "Check for updates" clicks don't leak
+/// one resource-table entry per click (a `close()` failure is swallowed -
+/// best-effort cleanup, same "don't let tidy-up itself become a new
+/// failure mode" shape settings.rs's own tmp-file cleanup documents).
+async function closePendingUpdateResource() {
+  // `plugin:resources|close` is the generic resource-table teardown command
+  // every `Resource` (core.js) goes through - not a per-plugin one; the
+  // real @tauri-apps/plugin-updater JS class's own `close()` calls exactly
+  // this (verified against its dist-js source), just via `super.close()`
+  // instead of a raw invoke.
+  if (pendingUpdateMeta) {
+    invoke("plugin:resources|close", { rid: pendingUpdateMeta.rid }).catch(() => {});
+  }
+  pendingUpdateMeta = null;
+  pendingDownloadedBytesRid = null;
+}
+
+/// Reentrancy guard - a manual "Check for updates" click landing while a
+/// download/install is already in flight (or another check is already
+/// running) would otherwise race it: closePendingUpdateResource() below
+/// would null out pendingUpdateMeta/pendingDownloadedBytesRid out from
+/// under the in-flight download()/install() call, whose own `.then`
+/// continuation (still holding the OLD rid captured at its own call time)
+/// would then overwrite whatever this fresh check just found once IT
+/// resolves. renderUpdaterAboutStatus already disables the Settings button
+/// for these phases (belt) - this is the suspenders, since
+/// maybeCheckForUpdatesOnStartup() can also call this directly, not only
+/// through that button.
+function updateCheckInFlight() {
+  return ["checking", "downloading", "installing"].includes(state.updater.phase);
+}
+
+async function performUpdateCheck() {
+  if (updateCheckInFlight()) return;
+  await closePendingUpdateResource();
+  state.updater = withChecking(state.updater);
+  renderUpdaterUI();
+  try {
+    const metadata = await pluginUpdaterCheck();
+    if (metadata) {
+      pendingUpdateMeta = metadata;
+      state.updater = withAvailable(state.updater, {
+        version: metadata.version,
+        notes: metadata.body,
+        pubDate: metadata.date,
+      });
+    } else {
+      state.updater = withUpToDate(state.updater);
+    }
+  } catch (e) {
+    state.updater = withCheckError(state.updater, String(e && e.message ? e.message : e));
+  }
+  renderUpdaterUI();
+}
+
+async function startUpdateDownload() {
+  if (!pendingUpdateMeta) return;
+  downloadedSoFar = 0;
+  state.updater = withDownloadStarted(state.updater);
+  renderUpdaterUI();
+  try {
+    const bytesRid = await pluginUpdaterDownload(pendingUpdateMeta.rid, (event) => {
+      if (event.event === "Progress") {
+        downloadedSoFar += event.data.chunkLength;
+        state.updater = withDownloadProgress(state.updater, { downloadedBytes: downloadedSoFar });
+      } else if (event.event === "Started") {
+        state.updater = withDownloadProgress(state.updater, { downloadedBytes: 0, totalBytes: event.data.contentLength });
+      }
+      renderUpdaterUI();
+    });
+    pendingDownloadedBytesRid = bytesRid;
+    state.updater = withReady(state.updater);
+  } catch (e) {
+    state.updater = withDownloadError(state.updater, String(e && e.message ? e.message : e));
+  }
+  renderUpdaterUI();
+}
+
+/// The one safety gate before the disruptive step - re-checked HERE,
+/// immediately before install(), not merely back when the update was
+/// first found (see updater.js's header comment for why this specific
+/// timing is what actually protects an active call, and the one race it
+/// still can't close).
+async function startUpdateInstall() {
+  if (!pendingUpdateMeta || pendingDownloadedBytesRid == null) return;
+  if (!canStartInstall(!!state.call)) {
+    renderUpdaterUI();
+    return;
+  }
+  state.updater = withInstalling(state.updater);
+  renderUpdaterUI();
+  try {
+    await pluginUpdaterInstall(pendingUpdateMeta.rid, pendingDownloadedBytesRid);
+    await pluginProcessRestart();
+    // pluginProcessRestart() tears the process down - nothing below this
+    // line runs on success. It's here only so a failure (should the OS
+    // itself refuse the relaunch) still surfaces instead of leaving the
+    // banner stuck on "Installing update…" forever.
+  } catch (e) {
+    state.updater = withInstallError(state.updater, String(e && e.message ? e.message : e));
+    renderUpdaterUI();
+  }
+}
+
+/// Fire-and-forget on purpose (task brief: "check_on_startup, default on")
+/// - boot() must not block the app becoming usable on a network round
+/// trip, and a startup check failing (offline laptop) must stay silent in
+/// the main window regardless (see updater.js's shouldShowBanner doc) -
+/// there is nothing for a caller to `await` a meaningful outcome from.
+function maybeCheckForUpdatesOnStartup() {
+  if (!state.updaterCheckOnStartup) return;
+  performUpdateCheck().catch((e) => console.error("startup update check failed", e));
+}
+
 function renderFavoritesFields(favorites) {
   const container = $("favorites-fields");
   container.innerHTML = "";
@@ -1234,11 +1461,13 @@ async function openSettings() {
     renderFavoritesFields(favorites);
     renderBridgeFields(bridge);
     await openTranscriptionSettingsSection();
+    setBoolRowUI("updater-check-on-startup-row", state.updaterCheckOnStartup);
     $("save-status").textContent = "";
     $("save-status").className = "status";
   } catch (e) {
     console.error("openSettings load failed", e);
   }
+  renderUpdaterUI();
   applyLockUI();
   $("screen-settings").hidden = false;
 }
@@ -1386,6 +1615,7 @@ function refreshAllUiText() {
     $("tr-peer-name").textContent = state.transcript ? extractUser(state.transcript.peer) || t("transcript.defaultTitle") : t("transcript.defaultTitle");
     renderTranscriptScreenBody();
   }
+  renderUpdaterUI();
 }
 
 /// Two independent backend calls make up one "Save": save_account_settings
@@ -1783,6 +2013,52 @@ function wireStaticHandlers() {
       }
     });
   });
+
+  // ---- auto-updater (roadmap debt fix) -------------------------------
+  // Settings > About's "Check for updates" button + the check_on_startup
+  // toggle (immediate-save, same shape as auto-dial-row/tel-handler-row
+  // just above) + the main-window banner's own buttons (available ->
+  // Download/Later, ready -> Restart/Later, error -> Retry/Later). See
+  // updater.js's header comment for the full flow these call into.
+  $("btn-check-updates").addEventListener("click", () => {
+    performUpdateCheck().catch((e) => console.error("manual update check failed", e));
+  });
+  document.querySelectorAll("#updater-check-on-startup-row button").forEach((b) => {
+    b.addEventListener("click", async () => {
+      const value = b.dataset.boolChoice === "true";
+      setBoolRowUI("updater-check-on-startup-row", value);
+      try {
+        await invoke("set_updater_check_on_startup", { check_on_startup: value });
+        state.updaterCheckOnStartup = value;
+      } catch (e) {
+        showBanner(String(e), "err");
+      }
+    });
+  });
+  $("btn-update-download").addEventListener("click", () => {
+    startUpdateDownload().catch((e) => console.error("update download failed", e));
+  });
+  $("btn-update-restart").addEventListener("click", () => {
+    startUpdateInstall().catch((e) => console.error("update install failed", e));
+  });
+  $("btn-update-retry").addEventListener("click", () => {
+    // "Retry" means different things depending on which step failed - a
+    // download error retries the download (pendingUpdateMeta is still
+    // valid, nothing to re-check), an install error retries the install
+    // (pendingDownloadedBytesRid is still valid too - no re-download
+    // needed). A check error is never reachable from this button
+    // (shouldShowBanner excludes it - see updater.js), so there's no third
+    // case to handle here.
+    if (pendingDownloadedBytesRid != null) {
+      startUpdateInstall().catch((e) => console.error("update install retry failed", e));
+    } else {
+      startUpdateDownload().catch((e) => console.error("update download retry failed", e));
+    }
+  });
+  $("btn-update-later").addEventListener("click", () => {
+    state.updater = withDismissed(state.updater);
+    renderUpdaterUI();
+  });
 }
 
 // Mirrors v1's `broadcast('dial-request', number)` origin story (the
@@ -1891,6 +2167,20 @@ async function boot() {
     console.error("boot load failed", e);
   }
 
+  // Auto-updater (roadmap debt fix) - version + the check_on_startup
+  // preference, both needed before the startup check itself can run.
+  // Best-effort/non-fatal like everything else in boot(): getVersion()
+  // failing (shouldn't, it's a trivial core:app command) just leaves the
+  // About section's version line blank rather than blocking boot.
+  try {
+    const [currentVersion, updaterSettings] = await Promise.all([getVersion(), invoke("get_updater_settings")]);
+    state.updater.currentVersion = currentVersion;
+    state.updaterCheckOnStartup = !!(updaterSettings && updaterSettings.check_on_startup);
+  } catch (e) {
+    console.error("updater boot load failed", e);
+  }
+  renderUpdaterUI();
+
   renderIdentity();
   renderDial();
   renderFavorites();
@@ -1921,6 +2211,11 @@ async function boot() {
   // backend-tracked independent of this window's own lifetime, so a
   // restart while a NAS was down, say, shouldn't lose visibility into it.
   if (state.transcription.unlocked) await refreshPendingRetriesList();
+
+  // Fire-and-forget, deliberately last and deliberately not awaited - see
+  // maybeCheckForUpdatesOnStartup's own doc for why boot() must not block
+  // on a network round trip here.
+  maybeCheckForUpdatesOnStartup();
 }
 
 boot();

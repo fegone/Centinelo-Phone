@@ -490,6 +490,39 @@ pub struct AudioSettings {
     pub output_device: Option<String>,
 }
 
+// ---- auto-updater (roadmap debt fix) -------------------------------------
+//
+// The only backend-persisted preference for the updater - everything else
+// (checking, downloading, installing, the version/notes/progress it shows)
+// is transient, session-only state owned entirely by `ui/js/updater.js` /
+// `app.js`, same split theme/locale already use (a stored *preference*
+// here, the *resolved*/*live* value lives client-side). Not admin-gated -
+// same reasoning `set_theme`/`set_locale` already document (settings.rs's
+// own comment on those): the ONE admin-lock enforcement point for
+// low-risk Settings controls is visual (`#lock-overlay` covering the
+// whole `#settings-body`), and this is exactly that class of control -
+// "did the operator want an automatic background network check" is not a
+// sensitive account/transport/advanced-path value the front desk
+// shouldn't casually flip.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpdaterSettings {
+    /// Whether `app.js`'s `boot()` fires a background `check()` on launch.
+    /// On by default - matches this task's own spec ("check_on_startup,
+    /// default on"). Turning it off only stops the *automatic* check; the
+    /// Settings > About "Check for updates" button always works regardless
+    /// (same "the manual path never depends on the automatic one's
+    /// setting" shape `settings.hid.enabled` has for HID auto-detect vs.
+    /// the plugged-in-device answer/hangup path).
+    #[serde(default = "default_true")]
+    pub check_on_startup: bool,
+}
+
+impl Default for UpdaterSettings {
+    fn default() -> Self {
+        Self { check_on_startup: true }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AdminSettings {
     /// Argon2 PHC hash string, e.g. "$argon2id$v=19$...". `None` until the
@@ -554,6 +587,8 @@ pub struct AppSettings {
     pub hid: HidSettings,
     #[serde(default)]
     pub audio: AudioSettings,
+    #[serde(default)]
+    pub updater: UpdaterSettings,
 }
 
 fn default_favorites() -> Vec<FavoriteSlot> {
@@ -701,6 +736,12 @@ impl SettingsStore {
     pub fn update_audio(&self, audio: AudioSettings) -> std::io::Result<()> {
         let mut guard = self.inner.lock_or_recover();
         guard.audio = audio;
+        self.persist(&guard)
+    }
+
+    pub fn update_updater_check_on_startup(&self, check_on_startup: bool) -> std::io::Result<()> {
+        let mut guard = self.inner.lock_or_recover();
+        guard.updater.check_on_startup = check_on_startup;
         self.persist(&guard)
     }
 
@@ -1203,5 +1244,38 @@ mod audio_settings_tests {
         let json = serde_json::to_string(&audio).unwrap();
         let back: AudioSettings = serde_json::from_str(&json).unwrap();
         assert_eq!(audio, back);
+    }
+}
+
+#[cfg(test)]
+mod updater_settings_tests {
+    use super::*;
+
+    #[test]
+    fn defaults_to_check_on_startup_enabled() {
+        // Task spec: "check_on_startup, default on" - same default-true
+        // shape as HidSettings::auto_detect (see that struct's own doc for
+        // why an opt-OUT default is right here: a beta tester who never
+        // opens Settings should still get notified of a new build).
+        assert!(UpdaterSettings::default().check_on_startup);
+    }
+
+    #[test]
+    fn app_settings_without_updater_key_defaults_gracefully() {
+        // Pre-this-feature settings.json (or hand-edited, missing the key)
+        // must still load - same #[serde(default)] discipline as every
+        // other AppSettings field (transcription/hid/audio above).
+        let json = r#"{"account":{"host":"pbx.example.test","ext":"9999","secret":"x"}}"#;
+        let app: AppSettings = serde_json::from_str(json).unwrap();
+        assert!(app.updater.check_on_startup);
+    }
+
+    #[test]
+    fn an_explicit_false_round_trips_through_json() {
+        let updater = UpdaterSettings { check_on_startup: false };
+        let json = serde_json::to_string(&updater).unwrap();
+        let back: UpdaterSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(updater, back);
+        assert!(!back.check_on_startup);
     }
 }

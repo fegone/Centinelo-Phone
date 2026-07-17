@@ -32,8 +32,11 @@ shell/
     js/app.js        all frontend logic (Tauri invoke/event wiring)
     js/transcript-panel.js  transcript panel rendering (pure - no Tauri dependency)
     js/transcript-panel.test.js  node:test coverage for the above (`npm test`)
+    js/updater.js    auto-updater state machine + rendering (pure - no Tauri dependency, see "Auto-updater")
+    js/updater.test.js  node:test coverage for the above (`npm test`)
   dev/           dev-only tooling, NEVER under ui/ so `frontendDist` never bundles it
     transcript-mock.html  standalone harness for screenshot verification (see "Transcript panel")
+    updater-mock.html  standalone harness for screenshot verification (see "Auto-updater")
 ```
 
 ## Architecture: shell <-> sidecar
@@ -546,6 +549,241 @@ any point (two-step `provisioning_resolve`/`provisioning_apply`, see that
 module's doc). QR is explicitly out of scope for this pass (webcam capture
 specifically) — see `PROVISIONING.md` "QR" for what's left for a future
 pass to build on.
+
+## Auto-updater (roadmap debt fix)
+
+Every build used to require a manual reinstall. `tauri-plugin-updater` +
+`tauri-plugin-process` close that gap: GitHub Releases' static
+`latest.json` as the sole endpoint (`plugins.updater.endpoints` in
+`tauri.conf.json`) — no server of our own, matching this app's existing
+"nothing phones home except what you explicitly configure" posture
+(README's own `settings.aboutBody` string).
+
+### Why the plugins aren't `import`ed like the docs show
+
+Tauri's official docs assume a bundler (`import { check } from
+"@tauri-apps/plugin-updater"`, resolved from `node_modules` by
+Vite/webpack/etc.). This project has neither — `ui/` is served verbatim as
+`frontendDist`, and `node_modules` isn't even inside it. `withGlobalTauri:
+true` only injects the **core** API onto `window.__TAURI__` (`.core`,
+`.event`, `.window`, `.app`, ...) — verified against `tauri`'s own
+`scripts/bundle.global.js` (2.11.5): its `__TAURI_IIFE__` object literally
+assigns `e.app=f, e.core=_, e.event=O, ...` with no `updater`/`process`
+entries anywhere in the bundle. Plugin JS packages are NOT part of that
+global — their own `dist-js/index.js` even `import`s `@tauri-apps/api/core`
+as a bare specifier internally, which would fail to resolve here too.
+
+So `ui/js/app.js`'s own "auto-updater" section calls `invoke("plugin:
+updater|check", ...)` / `|download` / `|install` and `invoke("plugin:
+process|restart")` directly — confirmed against both plugins' Rust
+`commands.rs` (exact argument names/casing) and JS `dist-js/index.js`
+(confirming these are the same wire calls the "real" `check()`/`download()`
+/`install()`/`relaunch()` functions make, just without the class wrapper).
+`window.__TAURI__.core.Channel` (download progress) and `.core.invoke`
+**are** part of the global bundle (same `core.js` module, not curated) —
+verified the same way. `ui/js/updater.js` itself stays Tauri-free (pure
+state machine + rendering, see its own header comment) — app.js is the
+only file that knows any of this.
+
+### Two-step download → install (not the plugin's combined `downloadAndInstall`)
+
+This is a softphone. `install()` restarts the process. The plugin's own
+combined `downloadAndInstall()` doesn't leave a pause point between
+"downloaded" and "installing" — this shell uses the separate `download()` /
+`install()` calls instead so there's a real "Update ready" phase where the
+operator decides when to restart, and `app.js`'s `startUpdateInstall()`
+re-checks `state.call` **immediately before** calling `install()`, not
+merely back when the update was first found. This closes most of the race
+between "an update is ready" and "a call is active," but not all of it — a
+call that starts in the few hundred milliseconds between that check and
+`install()` actually tearing the process down isn't caught. Documented, not
+silently accepted: closing it completely would need the Rust side itself to
+refuse `install()` while the sidecar reports an active call, which is out
+of scope for this pass (tracked as a follow-up, same as the F4 known-gaps
+list below).
+
+### Dev signing key — replace before a real release
+
+`tauri signer generate` needs a real keypair; the private half must never
+touch this repo or CI (same discipline `PROTOCOL.md`'s TLS pinning and
+`premium.rs`'s dev-vs-real ABI key already document). For **development**,
+a throwaway keypair was generated once (`CI=true npx tauri signer generate
+-w <path> -p "" --ci`) and only its **public** half is embedded in
+`tauri.conf.json`'s `plugins.updater.pubkey` — the private half was written
+to a scratch path outside this repo and is not recoverable from anything
+checked in here.
+
+**Before a real release, Felix replaces this dev key offline:**
+
+1. `npx tauri signer generate -w /somewhere/outside/any/repo/centinelo-updater.key`
+   (a real password recommended — `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` at
+   sign time, never committed).
+2. Copy the printed **public** key (a single base64 line, `dW50cnVzdGVk...`)
+   into `tauri.conf.json`'s `plugins.updater.pubkey`, replacing the dev
+   value below. This is the ONLY updater-related value that's real config,
+   not a secret — it's meant to be public (it's how every installed copy of
+   the app verifies a signature, the same direction TLS certs work).
+3. The **private** key + its password become release-ci's signing
+   secrets (`TAURI_SIGNING_PRIVATE_KEY` / `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`
+   env vars at `tauri build` time — see the contract below), stored the same
+   place the premium dylib's Ed25519 signing key already lives: offline
+   with Felix, injected into CI as a secret, never in this repo.
+4. Every install signed with the OLD (dev) key stops being able to verify
+   an update signed with the NEW key — expected, matches "public key change
+   = new trust root," not a bug to route around.
+
+`tauri.conf.json`'s current `pubkey` corresponds to a well-known,
+non-secret dev seed — anyone can regenerate the matching private key from
+this repo's own git history and sign a fake update with it. This is
+**exactly as safe as it sounds for a dev key** (same threat model
+`premium.rs`'s own dev pubkey doc already accepts for the premium loader) —
+it only matters once a real release actually ships with this pubkey still
+in place, which step 2 above prevents.
+
+### Windows: NSIS, not MSI, is the update artifact
+
+`tauri-plugin-updater`'s Windows installer step (`updater.rs`,
+`install_inner`) auto-detects NSIS vs. MSI from the downloaded bytes
+(`infer::archive::is_msi`) and can drive either — but only one file can sit
+behind `latest.json`'s `windows-x86_64.url`. **NSIS is the one this project
+publishes there**, not the MSI `windows-installer.yml` also produces:
+
+- `tauri.conf.json`'s `bundle.windows.nsis.installMode` is
+  `"currentUser"` — a fresh install needs no admin elevation. NSIS updates
+  keep that property; an MSI update can require elevation depending on how
+  the original install was scoped, which would turn "restart to update"
+  into a UAC prompt an operator didn't expect.
+- `plugins.updater.windows.installMode: "passive"` maps to NSIS's `/P /R`
+  flags (progress-bar-only, auto-restart-after-install) — the MSI path's
+  `msiexec /passive` shows a native Windows Installer progress dialog,
+  visually inconsistent with this app's own ink-toned, non-native chrome.
+- The MSI (`bundle/msi/*.msi`) keeps shipping as a GitHub Release asset
+  for anyone who explicitly wants Windows-Installer-based deployment (IT
+  fleets, Group Policy) — it's just never referenced by `latest.json`, so
+  the in-app updater never touches it.
+
+### Contract for release-ci
+
+Everything below is what `ui/js/app.js`'s updater code and
+`tauri.conf.json`'s `plugins.updater.endpoints` already assume — the
+publish pipeline (a separate release-ci task) needs to produce exactly
+this, nothing here needs to change on the app side to match it.
+
+**Endpoint** (already set): `https://github.com/fegone/Centinelo-Phone/releases/latest/download/latest.json`
+— GitHub's "latest release" redirect, so this URL never changes across
+releases; only the release itself does.
+
+**`latest.json`** — uploaded as a release asset literally named
+`latest.json`, on every release:
+
+```json
+{
+  "version": "2.1.0",
+  "notes": "What changed in this release.",
+  "pub_date": "2026-08-01T12:00:00Z",
+  "platforms": {
+    "darwin-aarch64": {
+      "signature": "<contents of the .sig file next to the .app.tar.gz>",
+      "url": "https://github.com/fegone/Centinelo-Phone/releases/download/v2.1.0/Centinelo.Phone_2.1.0_aarch64.app.tar.gz"
+    },
+    "windows-x86_64": {
+      "signature": "<contents of the .sig file next to the NSIS .exe>",
+      "url": "https://github.com/fegone/Centinelo-Phone/releases/download/v2.1.0/Centinelo.Phone_2.1.0_x64-setup.exe"
+    }
+  }
+}
+```
+
+- `version` must be valid SemVer and greater than the previous release's
+  (`update.rs`'s default version comparator is a plain `>`, no downgrades).
+- `pub_date` is RFC 3339.
+- Only the platforms this release actually built need an entry — a build
+  that skipped Windows this round (Windows CI red, say) just omits
+  `windows-x86_64` rather than publishing a broken one; the app then
+  reports "up to date" instead of "found nothing" for that platform's
+  installs, matching `check()`'s own `Option<Metadata>` shape (see
+  `withUpToDate` in `ui/js/updater.js` — nothing distinguishes "genuinely
+  latest" from "no entry for this platform" today, a known, minor gap, not
+  a build blocker).
+- **macOS `darwin-x86_64`** isn't in the example above because
+  `shell-build.yml`/`core-build.yml` currently only run `macos-latest`
+  (Apple Silicon runners) — add it once an Intel or universal build exists.
+  `darwin-universal` is also a valid single key covering both if release-ci
+  moves to a universal build instead of two per-arch ones — either shape
+  works, this app doesn't care which.
+
+**Asset names**: don't hardcode an exact filename — `tauri build`'s own
+bundler names these (productName + version + arch, per `tauri-plugin-
+updater`'s own doc comment on `install_inner`: `[AppName]_[version]_x64-
+setup.exe`, `[AppName]_[version]_x64.msi`, `[AppName]_[version]_
+aarch64.app.tar.gz` are the documented *pattern* — confirm the exact
+strings against real build output, same "verify, don't assume" discipline
+`windows-installer.yml`'s own smoke test already applies via `Get-
+ChildItem *.exe`/`*.msi` globs rather than fixed names). What matters is
+only that:
+
+1. The Windows asset `latest.json` points to is the **NSIS** `.exe`
+   (`target/release/bundle/nsis/*.exe`), not the MSI.
+2. The macOS asset is the **`.app.tar.gz`**
+   (`target/release/bundle/macos/*.app.tar.gz`), not the `.dmg` — this is
+   the file `createUpdaterArtifacts: true` (now set in `tauri.conf.json`)
+   makes `tauri build` produce specifically for the updater; the `.dmg`
+   keeps shipping too, for first installs.
+3. Every asset `latest.json` references has a sibling `<same name>.sig`
+   file, ALSO uploaded as its own release asset (not read from — its
+   *contents*, a single base64 line, is what goes into `latest.json`'s
+   `signature` field). `tauri build` produces these `.sig` files
+   automatically, next to each updater artifact, the moment
+   `TAURI_SIGNING_PRIVATE_KEY` (+ `..._PASSWORD` if the key has one) is set
+   in the build environment — no separate signing step needed.
+
+**Signing**: `TAURI_SIGNING_PRIVATE_KEY_PATH` (or `_KEY` for the raw
+string) + `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` as CI secrets, injected only
+into the `tauri build` step, sourced from wherever Felix's real offline key
+ends up living (see "Dev signing key" above) — the same secret-handling
+discipline `premium/docs/loader-integration.md`'s signing key already
+follows, nothing new to invent here.
+
+### How this was verified this pass
+
+- `cargo build` / `cargo clippy --all-targets -- -D warnings` / `cargo
+  test` all green with both plugins wired in — this also doubles as
+  real verification that `capabilities/default.json`'s `updater:default`/
+  `process:allow-restart` and `tauri.conf.json`'s `plugins.updater` block
+  are valid: Tauri's build script validates capability identifiers and
+  plugin config shape against the linked plugins' own ACL manifests/
+  `Config` deserializer at compile time, not just at runtime.
+- `npm test` (`node --test ui/js/*.test.js`) — 91 passing assertions
+  across `updater.js`'s full state machine (`updater.test.js`, new this
+  pass): the happy path, every error origin (check/download/install) and
+  which ones reach the main-window banner vs. stay Settings-only, the
+  stale-progress-event guard, `canStartInstall`'s call-safety gate.
+- **`dev/updater-mock.html`** (new, same precedent as `dev/transcript-
+  mock.html`) — a standalone harness importing the real `renderUpdateBanner`/
+  `renderUpdaterAboutStatus` from `ui/js/updater.js` against 13 fabricated
+  states, verified via a headless Browser pane across light/dark and all 3
+  locales: idle, checking, up-to-date, a silent check error (banner absent,
+  Settings honest), available, downloading (both indeterminate and with a
+  real percentage), ready (both with and without an active call — confirms
+  the disabled "Restart to update" + tooltip render correctly), installing,
+  download/install errors, and dismissed-but-still-visible-in-Settings.
+  This is the sanctioned alternative to desktop GUI automation this project
+  already uses (`shell-tauri`'s own rule against automating the real app
+  window) — it verifies rendering, not the real network/IPC calls, which
+  only run inside an actual Tauri webview (see the "not `import`ed" section
+  above for why a plain browser tab can't reach `window.__TAURI__.updater`
+  at all — there is no such namespace to reach).
+- **Not verified this pass**: a real `check()` against a live mock HTTP
+  endpoint from inside the actual running desktop app — that needs a real
+  Tauri webview (WindowServer connection), which this sandboxed
+  environment doesn't have. The `latest.json` shape above and the
+  Rust-side plugin wiring are the two halves that check() actually depends
+  on, and both are verified independently (schema confirmed against the
+  plugin's own `Metadata`/config structs; the wiring via `cargo build`'s
+  ACL validation) — the one thing genuinely untested is the live network
+  round trip itself. Flagged as a real gap, not glossed over: qa-e2e or a
+  real machine run should confirm this once release-ci's pipeline produces
+  a real `latest.json` to point at.
 
 ## Known limitations (F2/F3/F4 scope)
 

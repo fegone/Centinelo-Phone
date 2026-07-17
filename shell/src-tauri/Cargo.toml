@@ -86,3 +86,15 @@ ureq = { version = "2", default-features = false, features = ["tls"] }
 base64 = "0.22"
 # HID headsets (src/hid.rs) - hook switch answer/hangup, mute, LED mirror.
 hidapi = "2"
+# Auto-updater (roadmap debt: every build used to require a manual
+# reinstall - see shell/README.md "Auto-updater"). GitHub Releases' static
+# latest.json as the sole endpoint (no server of our own) - the plugin's
+# default feature set already covers that (HTTPS fetch + minisign
+# signature verification), no extra features needed. Almost all of the
+# logic lives in the frontend (ui/js/updater.js talks to the plugin's own
+# JS API directly - check()/download()/install()) - the only Rust-side
+# addition is the `check_on_startup` preference (settings.rs/commands.rs,
+# same shape as theme/locale). `tauri-plugin-process` supplies
+# `relaunch()` for the one step after a successful install.
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"

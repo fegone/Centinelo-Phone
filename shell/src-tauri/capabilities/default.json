@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capabilities for the Centinelo Phone main window - custom titlebar controls + tray-driven show/hide.",
+  "description": "Capabilities for the Centinelo Phone main window - custom titlebar controls + tray-driven show/hide + the auto-updater (updater:default) and its post-install relaunch (process:allow-restart, see shell/README.md \"Auto-updater\").",
   "windows": [
     "main"
   ],
@@ -11,6 +11,8 @@
     "core:window:allow-hide",
     "core:window:allow-show",
     "core:window:allow-set-focus",
-    "core:window:allow-start-dragging"
+    "core:window:allow-start-dragging",
+    "updater:default",
+    "process:allow-restart"
   ]
 }

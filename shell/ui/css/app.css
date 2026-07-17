@@ -75,6 +75,24 @@ html[data-os="mac"] .titlebar #btn-close { display: none; }
 .pill em { font-style: normal; color: var(--text-3); font-weight: 500; }
 @keyframes ringPulseDot { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
 
+/* auto-updater banner (roadmap debt fix) - flow, not absolute, so it
+   pushes the identity card/dial pad down instead of covering them (task
+   brief: "no intrusivo"); same card language as .setup-prompt/
+   .privacy-note. Never amber - DIRECTION.md's "ringing owns the one glow"
+   rule, same discipline the transcription model-download row documents
+   for itself (app.css .modelrows comment). Progress reuses .dlwrap/.dlbar/
+   .dlpct verbatim (below) rather than a second bar implementation. */
+.update-banner { flex: none; display: flex; flex-direction: column; gap: 8px; background: var(--bg-1); border: 1px solid var(--border-1); border-radius: var(--r-2); box-shadow: var(--edge), var(--shadow-1); padding: 11px 12px; margin-bottom: 8px; text-align: left; animation: fadeSlide var(--t-fast) var(--ease) both; }
+.update-banner-row { display: flex; align-items: flex-start; gap: 9px; }
+.update-banner-row svg { flex: none; color: var(--text-2); margin-top: 1px; }
+.update-banner-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.update-banner-text b { font: 650 12.5px/1.3 var(--font-ui); }
+.update-banner-text span { font: 400 11px/1.4 var(--font-ui); color: var(--text-2); }
+.update-banner .dlwrap { padding-left: 25px; }
+.update-banner .dlbar { flex: 1; }
+.update-banner-actions { display: flex; gap: 8px; justify-content: flex-end; }
+.update-banner-actions .primary, .update-banner-actions .ghost { height: 30px; padding: 0 12px; font-size: 11.5px; }
+
 .setup-prompt { flex: none; display: flex; flex-direction: column; gap: 8px; background: var(--bg-1); border: 1px solid var(--border-1); border-radius: var(--r-2); box-shadow: var(--edge), var(--shadow-1); padding: 14px; text-align: left; }
 .setup-prompt b { font: 650 13.5px/1.3 var(--font-ui); }
 .setup-prompt p { margin: 0; font: 400 11.5px/1.5 var(--font-ui); color: var(--text-2); }
