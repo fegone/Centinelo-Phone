@@ -43,8 +43,12 @@ VERSION="$1"
 # Same SemVer shape release.yml's own preflight job already validates before
 # this script is ever called from CI — re-checked here too so this script is
 # safe to run standalone (local iteration), not just as a trusted CI-only
-# tool.
-if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+# tool. Each numeric component is `(0|[1-9][0-9]*)`, not a plain `[0-9]+`
+# (2026-07-17, 4R reliability fix) — SemVer forbids leading zeros in
+# major/minor/patch ("01.2.3" is not valid) and a plain `[0-9]+` silently
+# accepted them. Kept byte-for-byte identical to release.yml's own copy of
+# this pattern on purpose — see that file's matching comment.
+if ! [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
     echo "error: '$VERSION' is not a valid SemVer version (expected X.Y.Z, optionally -prerelease/+build, no leading 'v')" >&2
     exit 1
 fi
@@ -63,12 +67,34 @@ done
 command -v jq >/dev/null 2>&1 || { echo "error: jq is required (preinstalled on GitHub-hosted runners)" >&2; exit 1; }
 command -v python3 >/dev/null 2>&1 || { echo "error: python3 is required (preinstalled on GitHub-hosted runners)" >&2; exit 1; }
 
+# Both mktemp calls below reuse this one variable, one at a time (the first
+# tmp_json is already consumed by `mv` before the second is created), so a
+# single trap registered once here covers both — whichever temp file is
+# still the CURRENT value of $tmp_json at exit (success or failure) gets
+# removed. `${tmp_json:-}` guards against `set -u` erroring inside the trap
+# itself if the script fails before mktemp ever runs.
+trap 'rm -f "${tmp_json:-}"' EXIT
+
+# Each jq call is its own statement, not `jq ... > "$tmp_json" && mv ...`
+# (2026-07-17, verification pass while fixing the temp-file cleanup above):
+# under `set -e`, a failure in the FIRST command of an `&&` list does NOT
+# trigger the shell to exit — only a failure in the LAST command of the
+# list does (bash's own documented -e exemption for "&&/|| list" members
+# other than the final one). With the one-liner, a `jq` parse/query error
+# was silently swallowed — `mv` simply never ran, but the script kept
+# going and printed "OK: version stamped" with exit 0 regardless, verified
+# empirically by corrupting one target file to invalid JSON and observing
+# `set-release-version.sh` still exit 0 while leaving that file's version
+# unchanged. Splitting into two statements makes `jq`'s own failure the
+# last (and only) command on its line, so `set -e` catches it correctly.
 tmp_json="$(mktemp)"
-jq --arg v "$VERSION" '.version = $v' "$TAURI_CONF" > "$tmp_json" && mv "$tmp_json" "$TAURI_CONF"
+jq --arg v "$VERSION" '.version = $v' "$TAURI_CONF" > "$tmp_json"
+mv "$tmp_json" "$TAURI_CONF"
 echo "-- shell/src-tauri/tauri.conf.json .version -> $VERSION"
 
 tmp_json="$(mktemp)"
-jq --arg v "$VERSION" '.version = $v' "$PACKAGE_JSON" > "$tmp_json" && mv "$tmp_json" "$PACKAGE_JSON"
+jq --arg v "$VERSION" '.version = $v' "$PACKAGE_JSON" > "$tmp_json"
+mv "$tmp_json" "$PACKAGE_JSON"
 echo "-- shell/package.json .version -> $VERSION"
 
 python3 - "$CARGO_TOML" "$VERSION" <<'PYEOF'

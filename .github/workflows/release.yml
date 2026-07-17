@@ -115,7 +115,14 @@ jobs:
             # own short name (e.g. "centinelo-v2.1.0"); strip the prefix.
             RAW="${PUSHED_REF_NAME#centinelo-v}"
           fi
-          if ! [[ "$RAW" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+          # Each numeric component is `(0|[1-9][0-9]*)`, not a plain
+          # `[0-9]+` (2026-07-17, 4R reliability fix): SemVer's own spec
+          # forbids leading zeros in major/minor/patch (e.g. "01.2.3" is
+          # not a valid version), and a plain `[0-9]+` silently accepted
+          # them - `scripts/set-release-version.sh` re-validates with this
+          # exact same pattern (kept identical between the two on purpose,
+          # see that script's own comment) so both reject the same inputs.
+          if ! [[ "$RAW" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
             echo "::error::'$RAW' is not a valid SemVer version (expected X.Y.Z, no leading 'v'). Trigger was $EVENT_NAME, ref '$PUSHED_REF_NAME'." >&2
             exit 1
           fi
@@ -198,6 +205,10 @@ jobs:
     name: macOS (aarch64)
     needs: preflight
     runs-on: macos-14
+    # core-build.yml's own macOS job (re + baresip + Tauri, same steps)
+    # typically finishes in 20-30min - 90 gives ~3x margin for a cold
+    # cache / noisy-neighbor runner without masking a genuinely hung build
+    # for an hour-plus.
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
@@ -293,6 +304,10 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
+          # Matches shell-build.yml's own node-version - kept in lockstep
+          # with that workflow rather than "whatever's current" so a Node
+          # upgrade is a deliberate, repo-wide change, not a per-workflow
+          # drift.
           node-version: 22
 
       - name: Install shell JS dependencies
@@ -396,6 +411,12 @@ jobs:
             shell/src-tauri/target/release/bundle/macos/*.app.tar.gz
             shell/src-tauri/target/release/bundle/macos/*.app.tar.gz.sig
           if-no-files-found: error
+          # These artifacts only ever exist to hand off to publish-release
+          # within THIS SAME workflow run - once published, the real,
+          # permanent copies live as GitHub Release assets. 5 days is just
+          # enough slack to re-run publish-release alone (workflow_dispatch
+          # re-run of a failed run) without recompiling, not a retention
+          # policy for the artifacts themselves.
           retention-days: 5
 
   # -------------------------------------------------------------------
@@ -409,11 +430,24 @@ jobs:
   # windows-installer.yml's own resources-mechanism-smoke-test job), so
   # the NSIS .exe + its .sig that come out are already correct - no
   # re-tar/re-sign wrinkle needed here the way macOS has above.
+  #
+  # NOTE: core-build steps intentionally duplicated across mac/windows jobs
+  # (reusable-workflow refactor deferred) - patch-apply / cmake configure /
+  # sanity-check steps mirror build-macos above almost line for line. A
+  # composite or reusable workflow could collapse the shared parts, but
+  # that's a refactor of an already-verified pipeline for a readability
+  # gain, not a correctness one - deferred rather than done as part of this
+  # 4R pass (2026-07-17).
   # -------------------------------------------------------------------
   build-windows:
     name: Windows (x86_64)
     needs: preflight
     runs-on: windows-latest
+    # Windows builds (choco OpenSSL install + MSVC re/baresip compile +
+    # Tauri NSIS/MSI bundling) run noticeably slower than the macOS job's
+    # equivalent steps on GitHub-hosted runners - core-build.yml's own
+    # Windows job (same core/ build) already needs more headroom than its
+    # macOS counterpart, and this job adds the Tauri/NSIS/MSI stage on top.
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
@@ -532,6 +566,8 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
+          # Kept identical to the macOS job's own node-version above and to
+          # shell-build.yml's - see that step's comment.
           node-version: 22
 
       - name: Stamp release version into tauri.conf.json / Cargo.toml / package.json
@@ -603,6 +639,9 @@ jobs:
             shell/src-tauri/target/release/bundle/nsis/*.exe.sig
             shell/src-tauri/target/release/bundle/msi/*.msi
           if-no-files-found: error
+          # Same rationale as the macOS job's own retention-days above -
+          # this is a handoff window to publish-release, not the artifacts'
+          # real retention policy.
           retention-days: 5
 
   # -------------------------------------------------------------------
@@ -663,6 +702,31 @@ jobs:
         # conflict this workflow refuses to silently overwrite or delete.
         # The underlying git tag itself is never touched either way (no
         # --cleanup-tag) - Felix pushed it, this pipeline doesn't own it.
+        #
+        # `if: always()` (2026-07-17, 4R resilience fix): this step used to
+        # inherit the job's default "only if every previous step succeeded"
+        # behavior, so if BOTH build-macos and build-windows failed, the
+        # "Refuse to publish an empty release" step above exits 1 and this
+        # cleanup was skipped entirely - the tag's orphaned draft (if any,
+        # from an earlier attempt that got further) then sits there and the
+        # NEXT re-run of this same tag fails opaquely on `gh release create`
+        # with "release already exists", no pointer back to "delete the
+        # draft first". The cleanup script itself already tolerates "no
+        # existing release" (`gh release view ... || true`) and already
+        # refuses to touch a genuinely PUBLISHED release, so running it
+        # unconditionally within this job is safe - it never blocks or
+        # alters the "nothing to publish, fail the job" outcome, it just
+        # also tidies up first. Deliberately still gated at the JOB level
+        # on `needs.preflight.result == 'success'` (not loosened further) -
+        # that's what guarantees TAG (this job's `needs.preflight.outputs.tag`)
+        # is a real, validated value and not an empty string from a
+        # preflight that failed before resolving it; a preflight failure
+        # (bad SemVer, dev pubkey, missing secrets) never itself creates an
+        # orphaned draft; only a publish-release run that got as far as
+        # creating one does, so gating cleanup on preflight succeeding
+        # rather than on the whole job's happy path is the correct,
+        # narrower fix, not a blanket "run no matter what".
+        if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.preflight.outputs.tag }}
@@ -725,7 +789,29 @@ jobs:
           [[ -d dist/macos ]] && ASSETS+=(dist/macos/*.dmg dist/macos/*.app.tar.gz dist/macos/*.app.tar.gz.sig)
           [[ -d dist/windows ]] && ASSETS+=(dist/windows/*.exe dist/windows/*.exe.sig dist/windows/*.msi)
 
-          gh release create "$TAG" \
+          # Retry with backoff (2026-07-17, 4R resilience fix): a transient
+          # GitHub API timeout here must not silently leave nothing
+          # published when it could instead just... work on attempt 2. Each
+          # of the 3 network calls in this job (create/upload/edit) defines
+          # its own copy of this helper - each `run:` block is its own
+          # shell process, nothing to share across steps. Still fails hard
+          # (non-zero, `set -e` propagates it) once attempts are exhausted -
+          # this is retry, not "swallow the failure".
+          retry_gh() {
+            local attempt=1 max=3 delay=5
+            until "$@"; do
+              if (( attempt >= max )); then
+                echo "::error::gh command failed after $max attempts: $*" >&2
+                return 1
+              fi
+              echo "-- attempt $attempt/$max failed ($*), retrying in ${delay}s..." >&2
+              sleep "$delay"
+              delay=$(( delay * 3 ))
+              attempt=$(( attempt + 1 ))
+            done
+          }
+
+          retry_gh gh release create "$TAG" \
             --repo fegone/Centinelo-Phone \
             --draft \
             --title "Centinelo Phone $VERSION" \
@@ -836,7 +922,30 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.preflight.outputs.tag }}
-        run: gh release upload "$TAG" --repo fegone/Centinelo-Phone dist/latest.json
+        run: |
+          set -euo pipefail
+          # Retry with backoff (2026-07-17, 4R resilience fix) - see the
+          # "Create the release as a DRAFT" step above for the full
+          # rationale. This one matters most: a Release that's published
+          # WITHOUT latest.json breaks the auto-updater for every installed
+          # client, and this upload happens after the draft already has the
+          # platform installers on it, so it's exactly the kind of
+          # mid-publish step a transient timeout must not be allowed to
+          # skip silently.
+          retry_gh() {
+            local attempt=1 max=3 delay=5
+            until "$@"; do
+              if (( attempt >= max )); then
+                echo "::error::gh command failed after $max attempts: $*" >&2
+                return 1
+              fi
+              echo "-- attempt $attempt/$max failed ($*), retrying in ${delay}s..." >&2
+              sleep "$delay"
+              delay=$(( delay * 3 ))
+              attempt=$(( attempt + 1 ))
+            done
+          }
+          retry_gh gh release upload "$TAG" --repo fegone/Centinelo-Phone dist/latest.json
 
       - name: Publish the release (flips it live - the one moment it becomes public)
         # Everything above ran against a DRAFT, invisible to the update
@@ -862,7 +971,26 @@ jobs:
             # because of tag/date ordering ambiguity.
             FLAGS+=(--latest)
           fi
-          gh release edit "$TAG" --repo fegone/Centinelo-Phone "${FLAGS[@]}"
+          # Retry with backoff (2026-07-17, 4R resilience fix) - see the
+          # "Create the release as a DRAFT" step above for the full
+          # rationale. This is the step that flips the release live; a
+          # transient failure HERE (after latest.json is already uploaded
+          # and verified) would otherwise leave a fully-populated but
+          # still-draft release sitting invisible to the update endpoint.
+          retry_gh() {
+            local attempt=1 max=3 delay=5
+            until "$@"; do
+              if (( attempt >= max )); then
+                echo "::error::gh command failed after $max attempts: $*" >&2
+                return 1
+              fi
+              echo "-- attempt $attempt/$max failed ($*), retrying in ${delay}s..." >&2
+              sleep "$delay"
+              delay=$(( delay * 3 ))
+              attempt=$(( attempt + 1 ))
+            done
+          }
+          retry_gh gh release edit "$TAG" --repo fegone/Centinelo-Phone "${FLAGS[@]}"
 
       - name: Job summary
         env:
