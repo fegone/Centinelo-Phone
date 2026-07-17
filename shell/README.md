@@ -752,12 +752,24 @@ week after a launch would otherwise go unnoticed indefinitely
 enough to just fix). `scheduleUpdatePeriodicRecheck()` (`app.js`, called
 once from `boot()`) re-runs the same check every 24h, gated by the exact
 same `check_on_startup` preference (one master switch for "does this app
-ever check on its own," not two settings for what's really one decision)
-and additionally skipped whenever anything is already pending
-(`available`/`downloading`/`ready`/`installing`/an unresolved error) so a
-silent background re-check can never clobber a download or a "restart to
-update" state the operator hasn't acted on yet — see `app.js`'s
-`backgroundRecheckIsSafeRightNow`.
+ever check on its own," not two settings for what's really one decision).
+
+The actual "is it safe to silently re-check right now" decision is
+`ui/js/updater.js`'s pure, unit-tested `canRunBackgroundRecheck` — true
+from `idle`/`up_to_date` **and from a check-origin error**, false from
+anything that has real pending state to protect
+(`available`/`downloading`/`ready`/`installing`, or a
+download/install/restart-origin error). The check-origin carve-out is a
+same-day 4R follow-up fix: the first version of this excluded every
+`"error"` phase, including `errorOrigin: "check"` — but the only way OUT
+of `"error"` is a successful check, and this timer is the only automatic
+path back to one, so a launch whose FIRST check happens to fail (the
+common case: `boot()` runs before the network is actually up) would have
+permanently disabled its own recheck for the rest of the process's
+life — defeating the exact "softphone sits in the tray for weeks" case
+this feature exists for. A check-origin error has no pending resource to
+protect (nothing was ever downloaded), unlike the other three error
+origins.
 
 ### Contract for release-ci
 
@@ -861,12 +873,14 @@ follows, nothing new to invent here.
   pure function — the authoritative state it reads,
   `sidecar.has_active_call()`, already has exhaustive coverage of its own
   in `sidecar.rs`'s `call_phase_tests`.
-- `npm test` (`node --test ui/js/*.test.js`) — 98 passing assertions
+- `npm test` (`node --test ui/js/*.test.js`) — 103 passing assertions
   across `updater.js`'s full state machine (`updater.test.js`): the happy
-  path, every error origin (check/download/install/**restart** — the
-  post-install-relaunch-failed case added this pass) and which ones reach
-  the main-window banner vs. stay Settings-only, the stale-progress-event
-  guard, `canStartInstall`'s call-safety gate, and
+  path, every error origin (check/download/install/restart — the
+  post-install-relaunch-failed case) and which ones reach the main-window
+  banner vs. stay Settings-only, the stale-progress-event guard,
+  `canStartInstall`'s call-safety gate, `canRunBackgroundRecheck`'s full
+  phase×errorOrigin matrix (same-day follow-up fix — see "Periodic
+  background re-check" above for the bug this closes), and
   `closePendingUpdateResources`' dependency-injected close-call contract
   (a counting mock `closeFn`, confirming BOTH the update-metadata AND the
   downloaded-bytes resource get closed, individually and together, and

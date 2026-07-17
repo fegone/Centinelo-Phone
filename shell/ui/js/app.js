@@ -33,6 +33,7 @@ import {
   withRestartError,
   withDismissed,
   canStartInstall,
+  canRunBackgroundRecheck,
   closePendingUpdateResources,
   renderUpdateBanner,
   renderUpdaterAboutStatus,
@@ -1478,24 +1479,16 @@ function maybeCheckForUpdatesOnStartup() {
 const UPDATE_RECHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
 /// Background re-checks must never clobber anything already on screen -
-/// unlike a manual "Check for updates" click (an explicit ask, always
-/// honored) or the one-shot startup check (state is always freshly
-/// "idle" at that point), a periodic check firing while `available`/
-/// `ready`/etc. is showing would silently reset a pending download or
-/// wipe `pendingDownloadedBytesRid` out from under an operator who just
-/// hasn't clicked "Restart to update" yet. Only "idle" (shouldn't happen
-/// once boot() has run, but harmless) and "up_to_date" are safe entry
-/// points - `updateCheckInFlight()` already covers checking/downloading/
-/// installing for performUpdateCheck's own reentrancy guard, but doesn't
-/// cover available/ready/error, which this needs to additionally skip.
-function backgroundRecheckIsSafeRightNow() {
-  return state.updater.phase === "idle" || state.updater.phase === "up_to_date";
-}
-
+/// the actual "is it safe right now" decision (which phases are OK to
+/// silently re-check from) is `updater.js`'s `canRunBackgroundRecheck`,
+/// pure and unit-tested there (see its own doc for the exact matrix, and
+/// the 2026-07-17 4R re-review finding it fixes - a check-origin error
+/// must stay re-checkable, or a launch with no network yet permanently
+/// disables its own recheck).
 function scheduleUpdatePeriodicRecheck() {
   setInterval(() => {
     if (!state.updaterCheckOnStartup) return;
-    if (!backgroundRecheckIsSafeRightNow()) return;
+    if (!canRunBackgroundRecheck(state.updater)) return;
     performUpdateCheck().catch((e) => console.error("periodic update check failed", e));
   }, UPDATE_RECHECK_INTERVAL_MS);
 }

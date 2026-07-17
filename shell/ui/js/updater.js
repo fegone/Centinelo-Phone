@@ -17,14 +17,20 @@
 // limitation: this is a softphone, and installing an update restarts the
 // process. `download()` alone never touches the running app or an active
 // call — always safe to kick off the moment an update is found.
-// `install()` is the one disruptive step, gated by `canStartInstall()`
-// below on there being no active call *at the moment the operator clicks
-// "Restart to update"* — app.js re-checks `state.call` right there,
-// immediately before calling `install()`, not merely when the update was
-// first found (a call can start or end in between). This closes most of
-// the race, though not all of it — see shell/README.md "Auto-updater" for
-// the one window this still can't close (a call starting during the
-// install() call itself) and why that's an accepted, documented gap
+// `install()` is the one disruptive step - `canStartInstall()` below is
+// UX ONLY (2026-07-17 4R re-review, RESILIENCE blocker): it disables the
+// "Restart to update" button so the common case never even starts a
+// round trip, but it reads `state.call`, this file's own client-side
+// mirror of call state, which `app.js`'s `beginTranscript` doc elsewhere
+// already documents as able to go stale mid-`await`. The REAL, only
+// authoritative gate is Rust-side - `src-tauri/src/updater.rs`'s
+// `updater_install` command checks `sidecar.has_active_call()` (the
+// call_id-tracked source hardened after the R4 provisioning bug) before
+// touching any resource, and refuses on its own even if this file's
+// mirror were ever wrong. See `shell/README.md` "Auto-updater" for the
+// one race window even that Rust-side check can't close (a call starting
+// in the gap between its own check and `Update::install()` actually
+// tearing the process down) and why that's an accepted, documented gap
 // rather than a silent one.
 //
 // state shape:
@@ -189,14 +195,46 @@ export async function closePendingUpdateResources(pendingUpdateMeta, pendingDown
   );
 }
 
-/// The one safety gate before the disruptive step (`install()` + relaunch)
-/// — see this module's header comment for the full reasoning. Pure and
-/// trivial on purpose: the actual "is there a call right now" read lives
-/// in app.js's `state.call`, this function only names the decision so it
-/// has one documented, tested definition instead of an inline `if` at the
-/// call site.
+/// A UX-only pre-check before the disruptive step (`install()` +
+/// relaunch) — see this module's header comment for why this is NOT the
+/// real safety gate (that's `sidecar.has_active_call()`, read inside
+/// `src-tauri/src/updater.rs`'s `updater_install` command, not here).
+/// This function only saves a round trip in the common case by disabling
+/// the button early; the actual "is there a call right now" read lives in
+/// app.js's `state.call`, which is itself just this file's own mirror of
+/// something Rust already tracks authoritatively. Pure and trivial on
+/// purpose: named so the decision has one documented, tested definition
+/// instead of an inline `if` at the call site.
 export function canStartInstall(hasActiveCall) {
   return !hasActiveCall;
+}
+
+/// Whether a periodic BACKGROUND re-check (app.js's
+/// `scheduleUpdatePeriodicRecheck`) is safe to run right now, without
+/// clobbering anything already on screen. Distinct from a manual "Check
+/// for updates" click or the one-shot startup check (both explicit/
+/// one-time asks, always honored regardless of phase) — this only governs
+/// the recurring, unattended timer.
+///
+/// 2026-07-17 4R re-review (RELIABILITY, same-day follow-up to the
+/// feature that introduced the timer): the first version of this only
+/// allowed `"idle"`/`"up_to_date"`, excluding EVERY `"error"` phase —
+/// including `errorOrigin: "check"`. Since the only way OUT of `"error"`
+/// is a successful check, and this periodic timer is the only automatic
+/// path back to one, a launch whose FIRST check happens to fail (the
+/// common case: boot() runs before the network is actually up) would
+/// permanently disable its own recheck for the rest of the process's
+/// life — defeating the exact "softphone sits in the tray for weeks"
+/// case this feature exists for. A check-origin error has no pending
+/// resource to protect (nothing was ever downloaded) — unlike
+/// download/install/restart errors, which DO carry state worth not
+/// silently discarding (a download in progress, bytes already fetched,
+/// an update already installed waiting on a manual restart), a
+/// check-origin error is safe to just try again.
+export function canRunBackgroundRecheck(state) {
+  if (state.phase === "idle" || state.phase === "up_to_date") return true;
+  if (state.phase === "error") return state.errorOrigin === "check";
+  return false; // available/downloading/ready/installing, or a download/install/restart error - something's pending
 }
 
 /// Which phases are worth surfacing in the main window, outside Settings.

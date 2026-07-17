@@ -22,6 +22,7 @@ import {
   withRestartError,
   withDismissed,
   canStartInstall,
+  canRunBackgroundRecheck,
   shouldShowBanner,
   closePendingUpdateResources,
 } from "./updater.js";
@@ -331,4 +332,57 @@ test("canStartInstall: true only when there is no active call", () => {
   assert.equal(canStartInstall(true), false);
   assert.equal(canStartInstall(null), true); // falsy "no call object" reads as no active call
   assert.equal(canStartInstall(undefined), true);
+});
+
+// ---------------------------------------------------------------------
+// canRunBackgroundRecheck - 2026-07-17 4R re-review (same-day follow-up):
+// the periodic 24h timer must be able to recover from a check-origin
+// error (typical: boot() ran before the network was up) or it silently
+// disables itself for the rest of the process's life - the exact
+// "softphone sits in the tray for weeks and never hears about updates"
+// failure this whole feature exists to prevent. Must NOT recheck from
+// anything that has a real pending resource/state to protect
+// (available/downloading/ready/installing, or a download/install/restart
+// error - each of those carries something a silent background re-check
+// would clobber).
+// ---------------------------------------------------------------------
+
+test("canRunBackgroundRecheck: true from idle and up_to_date - nothing pending to protect", () => {
+  assert.equal(canRunBackgroundRecheck(initialUpdaterState()), true);
+  assert.equal(canRunBackgroundRecheck(withUpToDate(initialUpdaterState(), "2.0.0")), true);
+});
+
+test("canRunBackgroundRecheck: true from a check-origin error - THE bug this pass fixes", () => {
+  const s = withCheckError(withChecking(initialUpdaterState()), "offline");
+  assert.equal(s.errorOrigin, "check");
+  assert.equal(canRunBackgroundRecheck(s), true);
+});
+
+test("canRunBackgroundRecheck: false from download/install/restart-origin errors - each has real pending state", () => {
+  let s = withAvailable(initialUpdaterState(), { version: "2.1.0" });
+  s = withDownloadStarted(s);
+  const downloadErr = withDownloadError(s, "connection reset");
+  assert.equal(canRunBackgroundRecheck(downloadErr), false);
+
+  s = withReady(withDownloadStarted(withAvailable(initialUpdaterState(), { version: "2.1.0" })));
+  const installErr = withInstallError(withInstalling(s), "signature mismatch");
+  assert.equal(canRunBackgroundRecheck(installErr), false);
+
+  const restartErr = withRestartError(withInstalling(s), "the OS refused the relaunch");
+  assert.equal(canRunBackgroundRecheck(restartErr), false);
+});
+
+test("canRunBackgroundRecheck: false from available/downloading/ready/installing - all have something pending", () => {
+  let s = withAvailable(initialUpdaterState(), { version: "2.1.0" });
+  assert.equal(canRunBackgroundRecheck(s), false);
+  s = withDownloadStarted(s);
+  assert.equal(canRunBackgroundRecheck(s), false);
+  s = withReady(s);
+  assert.equal(canRunBackgroundRecheck(s), false);
+  s = withInstalling(s);
+  assert.equal(canRunBackgroundRecheck(s), false);
+});
+
+test("canRunBackgroundRecheck: false while a check is already in flight - checking is not idle", () => {
+  assert.equal(canRunBackgroundRecheck(withChecking(initialUpdaterState())), false);
 });
