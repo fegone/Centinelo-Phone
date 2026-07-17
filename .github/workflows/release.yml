@@ -1,0 +1,881 @@
+name: release
+
+# Builds the official Centinelo Phone 2.0 Community edition (core + shell,
+# this public repo only - no premium module, see "Community edition" in
+# .claude/skills/release-ci/SKILL.md and shell/README.md "Premium module
+# loader") for macOS (aarch64) + Windows (x86_64), signs the Tauri updater
+# artifacts, and publishes a GitHub Release with a latest.json manifest
+# matching shell/README.md's "Contract for release-ci" EXACTLY (that
+# section is the source of truth this workflow implements - read it before
+# changing anything here).
+#
+# ---------------------------------------------------------------------
+# Trigger design (2026-07-17, release-ci pass) - NOT a plain `tags: v*`
+# ---------------------------------------------------------------------
+# build.yml (v1 Electron, still live at this repo's root - package.json/
+# src/ - alongside v2's core/+shell/) already has `on.push.tags: ['v*']`
+# and runs `electron-builder --publish always` on that trigger, which
+# creates/updates a GitHub Release for the pushed tag and uploads v1
+# installers + electron-builder's own latest.yml to it. `v*` matches ANY
+# tag starting with the letter "v" - there is no v2-shaped semver tag
+# ("v2.1.0", "v2-2.1.0", etc.) that avoids that filter, since it has no
+# second-segment anchor. Two workflows racing to create/populate the SAME
+# GitHub Release (v1's Electron installers + v2's Tauri ones, mixed
+# together) is a real correctness bug, not a hypothetical one - v1.0.0 is
+# already tagged and published this way (see `gh release list`).
+#
+# Per CLAUDE.md / AGENT-PROTOCOL.md this repo's release-ci scope is
+# explicit: "No tocar main de phone/ salvo hotfix v1 explicitamente
+# pedido - y NO romper el build.yml de v1." Changing build.yml's own
+# trigger to carve out v2 tags would touch that file for a v2 concern,
+# which is exactly what that rule exists to prevent. The only change that
+# stays entirely on this workflow's own side of the fence is picking a
+# tag *namespace* that can never match `v*` in the first place - hence
+# `centinelo-v*` (e.g. `centinelo-v2.1.0`) instead of a bare `v*` tag.
+# The auto-updater endpoint itself doesn't care either way: it's GitHub's
+# `.../releases/latest/download/latest.json` alias (tauri.conf.json's
+# `plugins.updater.endpoints`), which resolves by "most recent non-
+# prerelease release", not by tag name shape - see "Create GitHub
+# Release" below for why this workflow still passes `--latest` explicitly
+# rather than relying on that default.
+on:
+  push:
+    tags:
+      - 'centinelo-v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: >-
+          Release version, bare SemVer, no leading 'v' (e.g. 2.1.0). The
+          git tag centinelo-v<version> MUST already exist and be pushed -
+          this input does not create a tag, it re-targets an existing one.
+          Use this to re-run a release after fixing THIS workflow file
+          itself (the workflow definition used is whatever ref you dispatch
+          from - e.g. main once the fix is merged there - while the actual
+          source built is always the tag's own commit, checked out
+          explicitly below) without having to move/re-push the tag, the
+          same problem .claude/skills/release-ci/SKILL.md's v1 lesson
+          ("un tag corre el workflow DE SU COMMIT") describes for plain tag
+          pushes.
+        required: true
+        type: string
+      prerelease:
+        description: 'Publish as a GitHub prerelease (not marked "Latest", won''t satisfy the update endpoint for the app''s own auto-updater).'
+        required: false
+        type: boolean
+        default: false
+
+# Release builds are expensive (a full core + shell compile per platform)
+# and their output is a public artifact - a superseded run must never be
+# silently cancelled mid-upload the way a routine CI re-push should be.
+# Group by the release identity (tag shape, normalized the same way for
+# both trigger types) so two attempts at the SAME release queue instead of
+# racing, but let each run to completion rather than cancelling it.
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && format('centinelo-v{0}', inputs.version) || github.ref_name }}
+  cancel-in-progress: false
+
+# Least privilege by default (matches windows-installer.yml's own
+# precedent): only the one job that actually creates the GitHub Release +
+# uploads assets (publish-release, below) elevates to `contents: write`.
+# Checkout/build/upload-artifact need no elevated scope at all - the
+# default GITHUB_TOKEN is read-only, which is exactly what those jobs need.
+permissions:
+  contents: read
+
+jobs:
+  # -------------------------------------------------------------------
+  # Resolves the release version from whichever trigger fired, checks out
+  # that exact tag, and refuses to go any further if either (a) the
+  # updater's signing pubkey is still the known dev value, or (b) the real
+  # signing secrets aren't configured. Cheap (ubuntu-latest, no compile) -
+  # runs before the two expensive platform builds so a missing secret
+  # fails in seconds, not after 60+ minutes of compiling core+shell twice.
+  # -------------------------------------------------------------------
+  preflight:
+    name: Preflight (version, pubkey guard, secrets guard)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.resolve-version.outputs.version }}
+      tag: ${{ steps.resolve-version.outputs.tag }}
+    steps:
+      - name: Resolve release version + tag from the trigger
+        id: resolve-version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_VERSION: ${{ inputs.version }}
+          PUSHED_REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            RAW="$DISPATCH_VERSION"
+          else
+            # push of a `centinelo-v*` tag - PUSHED_REF_NAME is the tag's
+            # own short name (e.g. "centinelo-v2.1.0"); strip the prefix.
+            RAW="${PUSHED_REF_NAME#centinelo-v}"
+          fi
+          if ! [[ "$RAW" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::'$RAW' is not a valid SemVer version (expected X.Y.Z, no leading 'v'). Trigger was $EVENT_NAME, ref '$PUSHED_REF_NAME'." >&2
+            exit 1
+          fi
+          {
+            echo "version=$RAW"
+            echo "tag=centinelo-v$RAW"
+          } >> "$GITHUB_OUTPUT"
+          echo "Resolved release version=$RAW tag=centinelo-v$RAW"
+
+      - name: Checkout the exact tagged commit
+        uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ steps.resolve-version.outputs.tag }}
+
+      - name: Guard - refuse to release with the known DEV updater pubkey
+        # shell/README.md "Dev signing key - replace before a real
+        # release" documents this exact value as a well-known, non-secret
+        # dev seed (its matching private half is regenerable from this
+        # repo's own git history) - safe for development, unsafe the
+        # moment a real release ships signed/verifiable under it, since
+        # anyone could forge an update that every installed copy would
+        # accept. This is a plain string compare, not a hash: the pubkey
+        # itself is not a secret (it's meant to be public - "how every
+        # installed copy verifies a signature"), so there is nothing to
+        # gain from obscuring the known-bad value being compared against,
+        # and a plain compare is directly auditable against the value
+        # documented in shell/README.md.
+        run: |
+          set -euo pipefail
+          DEV_PUBKEY='dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IENDNDk4N0VCQjc3N0RBRUIKUldUcjJuZTM2NGRKekpITkJNcjFDbUZQN25OcUxHZFY3aHFvODVSMWhTK1JDTHkrS0w3aVRCbUsK'
+          CURRENT_PUBKEY="$(jq -r '.plugins.updater.pubkey' shell/src-tauri/tauri.conf.json)"
+          if [[ "$CURRENT_PUBKEY" == "$DEV_PUBKEY" ]]; then
+            echo "::error::tauri.conf.json still has the well-known DEV updater pubkey (plugins.updater.pubkey). Its matching private half is a known dev seed documented in shell/README.md 'Dev signing key - replace before a real release' - anyone can forge a signed update against it. Refusing to publish a release signed under this key." >&2
+            echo "" >&2
+            echo "Before a real release, Felix replaces this key OFFLINE (never in CI):" >&2
+            echo "  1. npx tauri signer generate -w /somewhere/outside/any/repo/centinelo-updater.key" >&2
+            echo "  2. Copy the printed PUBLIC key into tauri.conf.json's" >&2
+            echo "     plugins.updater.pubkey (replacing the dev value) and commit that." >&2
+            echo "  3. Store the PRIVATE key's content as this repo's TAURI_SIGNING_PRIVATE_KEY" >&2
+            echo "     secret, and its password as TAURI_SIGNING_PRIVATE_KEY_PASSWORD." >&2
+            echo "Full runbook: shell/README.md, section 'Dev signing key - replace before a real release'." >&2
+            exit 1
+          fi
+          echo "OK: updater pubkey is not the known dev key."
+
+      - name: Guard - release signing secrets must be configured
+        # Never prints either secret's VALUE, only whether each is
+        # missing, by NAME - matches this repo's "secrets never in
+        # workflows/logs" rule while still giving Felix an actionable
+        # error instead of a build that fails 90 minutes later inside
+        # `tauri build` with a cryptic signing error.
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          missing=()
+          [[ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ]] || missing+=(TAURI_SIGNING_PRIVATE_KEY)
+          [[ -n "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}" ]] || missing+=(TAURI_SIGNING_PRIVATE_KEY_PASSWORD)
+          if [[ ${#missing[@]} -gt 0 ]]; then
+            echo "::error::Release signing secrets missing: ${missing[*]}. This pipeline refuses to build an unsigned release - tauri-plugin-updater can never verify an unsigned artifact on an installed copy (shell/README.md 'Contract for release-ci'). The private key lives OFFLINE with Felix (generated per shell/README.md's 'Dev signing key' runbook) and is added as a repo secret, never generated or stored by this workflow:" >&2
+            echo "  Repo Settings -> Secrets and variables -> Actions -> New repository secret" >&2
+            echo "    TAURI_SIGNING_PRIVATE_KEY           (the private key file's content)" >&2
+            echo "    TAURI_SIGNING_PRIVATE_KEY_PASSWORD  (the password chosen at generation)" >&2
+            exit 1
+          fi
+          echo "OK: both signing secrets are configured (values never printed)."
+
+  # -------------------------------------------------------------------
+  # macOS (aarch64): builds core/ exactly like core-build.yml's macOS job
+  # (same patches, same MODULES list, same OpenSSL discovery), then the
+  # Tauri shell with createUpdaterArtifacts, then stages the core engine
+  # binary into the built .app via package-official.sh (Community edition
+  # - no premium dylib/console assets, this is the public repo only) the
+  # same way F5's packaging pass already proved out. See the "Regenerate
+  # the updater artifact" step below for the one real wrinkle this adds
+  # on top of package-official.sh's existing, unmodified mac path.
+  # -------------------------------------------------------------------
+  build-macos:
+    name: macOS (aarch64)
+    needs: preflight
+    runs-on: macos-14
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ needs.preflight.outputs.tag }}
+          submodules: recursive
+
+      - name: Install toolchain
+        run: brew install cmake openssl
+
+      # --- core/: patches + build, mirrors core-build.yml's macOS job exactly ---
+
+      - name: Apply local re patches
+        run: |
+          git apply --directory=core/deps/re core/patches/0001-re-configurable-sip-ws-path.patch
+          git apply --directory=core/deps/re core/patches/0002-re-tls-fingerprint-pin.patch
+          git apply --directory=core/deps/re core/patches/0004-re-json-stdout-purity.patch
+
+      - name: Apply local baresip patches
+        run: |
+          git apply --directory=core/deps/baresip core/patches/0003-baresip-json-stdout-purity.patch
+          git apply --directory=core/deps/baresip core/patches/0005-baresip-transfer-subscription-error-event.patch
+
+      - name: Verify every core/patches/*.patch is applied in this job
+        # Same trip-wire as core-build.yml's own macOS job (see that
+        # file's comment for why this exists) - duplicated deliberately,
+        # not shared, since each job's own `git apply` steps above are
+        # this check's actual source of truth.
+        run: |
+          set -euo pipefail
+          applied=$(printf '%s\n' \
+            0001-re-configurable-sip-ws-path.patch \
+            0002-re-tls-fingerprint-pin.patch \
+            0003-baresip-json-stdout-purity.patch \
+            0004-re-json-stdout-purity.patch \
+            0005-baresip-transfer-subscription-error-event.patch \
+            | sort)
+          available=$(cd core/patches && ls -1 *.patch | sort)
+          if [ "$applied" != "$available" ]; then
+            echo "error: core/patches/*.patch does not match the patches this job applies" >&2
+            echo "--- available in core/patches/ ---" >&2
+            echo "$available" >&2
+            echo "--- applied by this job's git apply steps ---" >&2
+            echo "$applied" >&2
+            exit 1
+          fi
+          echo "OK: this job applies exactly the $(echo "$available" | wc -l | tr -d ' ') patch(es) in core/patches/"
+
+      - name: Configure + build libre
+        run: |
+          cmake -S core/deps/re -B core/deps/re/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DOPENSSL_ROOT_DIR="$(brew --prefix openssl)"
+          cmake --build core/deps/re/build -j"$(sysctl -n hw.ncpu)"
+
+      - name: Configure + build baresip + ctrl_json
+        run: |
+          set -o pipefail
+          cmake -S core/deps/baresip -B core/deps/baresip/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DOPENSSL_ROOT_DIR="$(brew --prefix openssl)" \
+            -DMODULES="account;g711;auconv;auresamp;ausine;aufile;ice;dtls_srtp;menu;coreaudio" \
+            -DAPP_MODULES="ctrl_json" \
+            -DAPP_MODULES_DIR="${{ github.workspace }}/core/modules" \
+            2>&1 | tee baresip-configure.log
+          cmake --build core/deps/baresip/build -j"$(sysctl -n hw.ncpu)"
+
+      - name: Sanity - binary + ctrl_json + coreaudio modules exist
+        run: |
+          set -euo pipefail
+          test -x core/deps/baresip/build/baresip
+          test -e core/deps/baresip/build/ctrl_json.so
+          test -e core/deps/baresip/build/coreaudio.so
+          core/deps/baresip/build/baresip -h 2>&1 | grep -q "Usage: baresip"
+          detected_line="$(grep '^MODULES_DETECTED=' baresip-configure.log || true)"
+          if [ -z "$detected_line" ]; then
+            echo "error: MODULES_DETECTED line not found in baresip-configure.log" >&2
+            exit 1
+          fi
+          detected_tokens=";${detected_line#MODULES_DETECTED=};"
+          for mod in ausine aufile ice dtls_srtp coreaudio; do
+            case "$detected_tokens" in
+              *";$mod;"*) ;;
+              *)
+                echo "error: module '$mod' missing from MODULES_DETECTED" >&2
+                exit 1
+                ;;
+            esac
+          done
+          echo "OK: re + baresip(+ctrl_json, +ausine, +aufile, +ice, +dtls_srtp, +coreaudio) built on macOS"
+
+      # --- shell/: version stamp + Tauri build + core-engine injection ---
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install shell JS dependencies
+        working-directory: shell
+        run: npm ci
+
+      - name: Stamp release version into tauri.conf.json / Cargo.toml / package.json
+        run: bash scripts/set-release-version.sh "${{ needs.preflight.outputs.version }}"
+
+      - name: cargo check (fast compile-time sanity)
+        working-directory: shell/src-tauri
+        run: cargo check --all-targets
+
+      - name: cargo clippy
+        working-directory: shell/src-tauri
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build the Tauri app (.app + .dmg + updater .app.tar.gz/.sig)
+        working-directory: shell
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npx tauri build --bundles app,dmg
+
+      - name: Stage core engine binary into the built .app (Community edition)
+        # No --premium-dylib/--premium-sig/--premium-console-assets given -
+        # package-official.sh's own documented, intentional "Community
+        # edition" mode (see that script's usage() / step 2 comment): the
+        # premium module is private-repo-only and never built here. Only
+        # --skip-core-build (already built above, same job) and
+        # --skip-shell-build (already built above too) are passed, so this
+        # invocation does nothing but steps 5-8: locate the just-built
+        # .app and copy the core engine binary + modules beside its
+        # executable (Contents/MacOS/core-engine/).
+        run: bash scripts/package-official.sh --target macos --skip-core-build --skip-shell-build
+
+      - name: Regenerate the updater artifact (.app.tar.gz + .sig) after core-engine injection
+        # `tauri build` above already produced a `.app.tar.gz` + `.sig`
+        # pair as part of the SAME command that built the plain `.app` -
+        # i.e. BEFORE the previous step copied the core engine binary +
+        # modules into Contents/MacOS/. package-official.sh's macOS path
+        # copies there (not through Tauri's own `bundle.resources`,
+        # unlike the Windows job below) because that mechanism places
+        # files under Contents/Resources/ on macOS, not beside the
+        # executable the way centinelo-premium-abi::expected_library_path
+        # and this app's own sidecar.rs both require - so a manual
+        # post-build copy is the only way to get "beside the executable"
+        # on macOS, and there is no earlier point in the build to inject
+        # it instead. Whether that ordering makes the FIRST .app.tar.gz
+        # genuinely stale (missing the core engine) was not confirmed by
+        # reading tauri-bundler's own source this pass (unlike this
+        # repo's usual "read the source, don't infer" bar - see
+        # shell/README.md's own citations for that standard) - so this
+        # step does not depend on the answer either way: it always
+        # re-tars the NOW-core-engine-complete .app and re-signs it with
+        # `tauri signer sign`, the exact public CLI `tauri build` uses
+        # internally, against the same signing secrets. Cheap (seconds)
+        # and idempotent, so "maybe unnecessary" costs nothing next to
+        # "maybe ships an updater artifact silently missing the engine".
+        working-directory: shell
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          BUNDLE_DIR="src-tauri/target/release/bundle/macos"
+          APP_DIR="$(find "$BUNDLE_DIR" -maxdepth 1 -name '*.app' | head -n1)"
+          [[ -n "$APP_DIR" ]] || { echo "error: no .app bundle found under $BUNDLE_DIR" >&2; exit 1; }
+          TARBALL="$(find "$BUNDLE_DIR" -maxdepth 1 -name '*.app.tar.gz' | head -n1)"
+          [[ -n "$TARBALL" ]] || { echo "error: no .app.tar.gz found under $BUNDLE_DIR (createUpdaterArtifacts should have produced one at build time)" >&2; exit 1; }
+          echo "-- re-tarring $(basename "$APP_DIR") -> $(basename "$TARBALL") (post core-engine injection)"
+          tar -czf "$TARBALL" -C "$BUNDLE_DIR" "$(basename "$APP_DIR")"
+          rm -f "$TARBALL.sig"
+          npx tauri signer sign -f "$TARBALL"
+          [[ -f "$TARBALL.sig" ]] || { echo "error: tauri signer sign did not produce $TARBALL.sig" >&2; exit 1; }
+          echo "OK: regenerated $(basename "$TARBALL") + .sig"
+
+      - name: Verify bundle artifacts before upload
+        run: |
+          set -euo pipefail
+          BUNDLE_DIR="shell/src-tauri/target/release/bundle/macos"
+          for pattern in '*.dmg' '*.app.tar.gz' '*.app.tar.gz.sig'; do
+            count=0
+            while IFS= read -r -d '' f; do
+              [[ -s "$f" ]] || { echo "error: $f exists but is zero bytes" >&2; exit 1; }
+              count=$((count + 1))
+            done < <(find "$BUNDLE_DIR" -maxdepth 1 -name "$pattern" -print0)
+            if [[ "$count" -eq 0 ]]; then
+              echo "error: no file matching $pattern in $BUNDLE_DIR - refusing to upload" >&2
+              exit 1
+            fi
+          done
+          echo "OK: dmg + app.tar.gz + app.tar.gz.sig all present and non-empty"
+
+      - name: Upload macOS release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-macos
+          path: |
+            shell/src-tauri/target/release/bundle/macos/*.dmg
+            shell/src-tauri/target/release/bundle/macos/*.app.tar.gz
+            shell/src-tauri/target/release/bundle/macos/*.app.tar.gz.sig
+          if-no-files-found: error
+          retention-days: 5
+
+  # -------------------------------------------------------------------
+  # Windows (x86_64): builds core/ exactly like core-build.yml's Windows
+  # job (same re-install-prefix dance, same MODULES list including
+  # wasapi, same OpenSSL choco discovery), then delegates the ENTIRE
+  # staging + NSIS/MSI build to package-official.sh --target windows -
+  # unlike macOS, that script's Windows path already stages core-engine +
+  # OpenSSL DLLs into shell/dist-injected/ BEFORE calling `tauri build`
+  # (Tauri's own `bundle.resources` manifest mechanism, proven by
+  # windows-installer.yml's own resources-mechanism-smoke-test job), so
+  # the NSIS .exe + its .sig that come out are already correct - no
+  # re-tar/re-sign wrinkle needed here the way macOS has above.
+  # -------------------------------------------------------------------
+  build-windows:
+    name: Windows (x86_64)
+    needs: preflight
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ needs.preflight.outputs.tag }}
+          submodules: recursive
+
+      - name: Install OpenSSL (Chocolatey)
+        run: choco install openssl -y --no-progress
+
+      - name: Locate OpenSSL install dir (choco deploy path varies by pkg version)
+        # Identical to core-build.yml's Windows job - see that file's own
+        # comment on this step for the v3-vs-v4 Chocolatey path rationale.
+        shell: pwsh
+        run: |
+          $candidates = @('C:\Program Files\OpenSSL', 'C:\Program Files\OpenSSL-Win64')
+          $root = $candidates | Where-Object { Test-Path "$_\include\openssl\ssl.h" } | Select-Object -First 1
+          if (-not $root) {
+            Write-Error "OpenSSL headers (include/openssl/ssl.h) not found under: $($candidates -join ', ')"
+            exit 1
+          }
+          "OPENSSL_ROOT_DIR=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "OPENSSL_ROOT_DIR=$root"
+
+      - name: Apply local re patches
+        shell: bash
+        run: |
+          git apply --directory=core/deps/re core/patches/0001-re-configurable-sip-ws-path.patch
+          git apply --directory=core/deps/re core/patches/0002-re-tls-fingerprint-pin.patch
+          git apply --directory=core/deps/re core/patches/0004-re-json-stdout-purity.patch
+
+      - name: Apply local baresip patches
+        shell: bash
+        run: |
+          git apply --directory=core/deps/baresip core/patches/0003-baresip-json-stdout-purity.patch
+          git apply --directory=core/deps/baresip core/patches/0005-baresip-transfer-subscription-error-event.patch
+
+      - name: Verify every core/patches/*.patch is applied in this job
+        shell: bash
+        run: |
+          set -euo pipefail
+          applied=$(printf '%s\n' \
+            0001-re-configurable-sip-ws-path.patch \
+            0002-re-tls-fingerprint-pin.patch \
+            0003-baresip-json-stdout-purity.patch \
+            0004-re-json-stdout-purity.patch \
+            0005-baresip-transfer-subscription-error-event.patch \
+            | sort)
+          available=$(cd core/patches && ls -1 *.patch | sort)
+          if [ "$applied" != "$available" ]; then
+            echo "error: core/patches/*.patch does not match the patches this job applies" >&2
+            echo "--- available in core/patches/ ---" >&2
+            echo "$available" >&2
+            echo "--- applied by this job's git apply steps ---" >&2
+            echo "$applied" >&2
+            exit 1
+          fi
+          echo "OK: this job applies exactly the $(echo "$available" | wc -l | tr -d ' ') patch(es) in core/patches/"
+
+      - name: Configure + build + install libre
+        # Identical to core-build.yml's Windows job - static-only build,
+        # installed to flatten MSVC's multi-config Release/ subdir. See
+        # that file's own comment for why.
+        shell: bash
+        run: |
+          set -o pipefail
+          RE_INSTALL="$(pwd -W)/re-install-prefix"
+          cmake -S core/deps/re -B core/deps/re/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$RE_INSTALL" \
+            -DLIBRE_BUILD_SHARED=OFF \
+            -DLIBRE_BUILD_STATIC=ON \
+            -DOPENSSL_ROOT_DIR="$OPENSSL_ROOT_DIR" \
+            2>&1 | tee re-configure.log
+          cmake --build core/deps/re/build --config Release 2>&1 | tee -a re-configure.log
+          cmake --install core/deps/re/build --config Release 2>&1 | tee -a re-configure.log
+
+      - name: Configure + build baresip + ctrl_json
+        shell: bash
+        run: |
+          set -o pipefail
+          RE_INSTALL="$(pwd -W)/re-install-prefix"
+          cmake -S core/deps/baresip -B core/deps/baresip/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DRE_LIBRARY="$RE_INSTALL/lib/re-static.lib" \
+            -DRE_INCLUDE_DIR="$(pwd -W)/core/deps/re/include" \
+            -DOPENSSL_ROOT_DIR="$OPENSSL_ROOT_DIR" \
+            -DMODULES="account;g711;auconv;auresamp;ausine;aufile;ice;dtls_srtp;menu;wasapi" \
+            -DAPP_MODULES="ctrl_json" \
+            -DAPP_MODULES_DIR="$(pwd -W)/core/modules" \
+            2>&1 | tee baresip-configure.log
+          cmake --build core/deps/baresip/build --config Release 2>&1 | tee -a baresip-configure.log
+
+      - name: Sanity - baresip + ctrl_json built
+        shell: bash
+        run: |
+          RE_INSTALL="$(pwd -W)/re-install-prefix"
+          test -x core/deps/baresip/build/Release/baresip.exe
+          test -f "$RE_INSTALL/lib/re-static.lib"
+          detected_line="$(grep '^MODULES_DETECTED=' baresip-configure.log || true)"
+          if [ -z "$detected_line" ]; then
+            echo "error: MODULES_DETECTED line not found in baresip-configure.log" >&2
+            exit 1
+          fi
+          detected_tokens=";${detected_line#MODULES_DETECTED=};"
+          for mod in ausine aufile ice dtls_srtp wasapi; do
+            case "$detected_tokens" in
+              *";$mod;"*) ;;
+              *)
+                echo "error: module '$mod' missing from MODULES_DETECTED" >&2
+                exit 1
+                ;;
+            esac
+          done
+          echo "OK: re + baresip(+ctrl_json, +ausine, +aufile, +ice, +dtls_srtp, +wasapi) built on Windows"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Stamp release version into tauri.conf.json / Cargo.toml / package.json
+        shell: bash
+        run: bash scripts/set-release-version.sh "${{ needs.preflight.outputs.version }}"
+
+      - name: Package official Windows installer (core + OpenSSL DLLs, Community edition)
+        # package-official.sh's own Windows path does everything from here:
+        # stages the just-built baresip.exe + OpenSSL runtime DLLs into
+        # shell/dist-injected/core-engine/, generates a filtered
+        # tauri.official.generated.json (no premium entries - Community
+        # edition, same as the macOS job above), then runs
+        # `tauri build --config ... --bundles nsis,msi` itself. No
+        # --premium-* flags given, matching the macOS job.
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          bash scripts/package-official.sh --target windows --skip-core-build \
+            --openssl-dll-dir "$OPENSSL_ROOT_DIR/bin"
+
+      - name: Verify installer + updater artifacts before upload
+        shell: pwsh
+        run: |
+          $nsisExe = Get-ChildItem "shell\src-tauri\target\release\bundle\nsis\*.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          $nsisSig = Get-ChildItem "shell\src-tauri\target\release\bundle\nsis\*.exe.sig" -ErrorAction SilentlyContinue | Select-Object -First 1
+          $msi = Get-ChildItem "shell\src-tauri\target\release\bundle\msi\*.msi" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $nsisExe) { Write-Error "no NSIS .exe under bundle/nsis/ - refusing to upload"; exit 1 }
+          if (-not $nsisSig) { Write-Error "no NSIS .exe.sig under bundle/nsis/ - the updater artifact is unsigned, refusing to upload"; exit 1 }
+          if (-not $msi) { Write-Error "no .msi under bundle/msi/ - refusing to upload"; exit 1 }
+          foreach ($f in @($nsisExe, $nsisSig, $msi)) {
+            if ($f.Length -eq 0) { Write-Error "$($f.FullName) exists but is zero bytes"; exit 1 }
+          }
+          Write-Host "OK: NSIS .exe + .sig + MSI all present and non-empty"
+
+          # Extract the MSI (admin install, no real install) and prove the
+          # core engine + OpenSSL DLLs actually rode into it beside each
+          # other - same check windows-installer.yml's own smoke-test job
+          # already runs against SYNTHETIC fixtures; this is the first
+          # time it runs against a REAL core-win build + real Chocolatey
+          # OpenSSL DLLs.
+          $extractDir = "$PWD\msi-extracted"
+          $p = Start-Process -FilePath "msiexec.exe" -ArgumentList @('/a', "`"$($msi.FullName)`"", '/qn', "TARGETDIR=`"$extractDir`"") -PassThru -Wait
+          if ($p.ExitCode -ne 0) { Write-Error "msiexec /a exited with code $($p.ExitCode)"; exit 1 }
+
+          $baresipExe = Get-ChildItem -Recurse "$extractDir" -Filter "baresip.exe" | Select-Object -First 1
+          if (-not $baresipExe) { Write-Error "baresip.exe not found in extracted MSI"; exit 1 }
+          $libssl = Get-ChildItem -Recurse "$extractDir" -Filter "libssl-*.dll" | Select-Object -First 1
+          $libcrypto = Get-ChildItem -Recurse "$extractDir" -Filter "libcrypto-*.dll" | Select-Object -First 1
+          if (-not $libssl) { Write-Error "no libssl-*.dll found in extracted MSI - core.exe would fail to start on a clean machine"; exit 1 }
+          if (-not $libcrypto) { Write-Error "no libcrypto-*.dll found in extracted MSI - core.exe would fail to start on a clean machine"; exit 1 }
+          if ($baresipExe.DirectoryName -ne $libssl.DirectoryName -or $baresipExe.DirectoryName -ne $libcrypto.DirectoryName) {
+            Write-Error "OpenSSL DLLs are NOT beside baresip.exe: baresip.exe in $($baresipExe.DirectoryName), libssl in $($libssl.DirectoryName), libcrypto in $($libcrypto.DirectoryName)"
+            exit 1
+          }
+          Write-Host "OK: baresip.exe + libssl-*.dll + libcrypto-*.dll all beside each other at $($baresipExe.DirectoryName)"
+
+          $premiumDll = Get-ChildItem -Recurse "$extractDir" -Filter "centinelo_premium.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($premiumDll) { Write-Error "Community edition build shipped centinelo_premium.dll - the resources filter leaked a premium artifact into a public-repo release"; exit 1 }
+          Write-Host "OK: Community edition correctly ships no centinelo_premium.dll"
+
+      - name: Upload Windows release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-windows
+          path: |
+            shell/src-tauri/target/release/bundle/nsis/*.exe
+            shell/src-tauri/target/release/bundle/nsis/*.exe.sig
+            shell/src-tauri/target/release/bundle/msi/*.msi
+          if-no-files-found: error
+          retention-days: 5
+
+  # -------------------------------------------------------------------
+  # Assembles latest.json from the REAL .sig contents each platform job
+  # produced, verifies it against the actual uploaded assets, and
+  # publishes the GitHub Release. Runs even if one platform build failed -
+  # shell/README.md's own contract explicitly allows a release that
+  # "just omits windows-x86_64 rather than publishing a broken one" - but
+  # never runs if BOTH failed (nothing to publish), and never runs at all
+  # if preflight itself failed (missing secrets / dev pubkey).
+  # -------------------------------------------------------------------
+  publish-release:
+    name: Publish GitHub Release
+    needs: [preflight, build-macos, build-windows]
+    if: ${{ always() && needs.preflight.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ needs.preflight.outputs.tag }}
+
+      - name: Download macOS release assets
+        if: ${{ needs.build-macos.result == 'success' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: release-assets-macos
+          path: dist/macos
+
+      - name: Download Windows release assets
+        if: ${{ needs.build-windows.result == 'success' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: release-assets-windows
+          path: dist/windows
+
+      - name: Refuse to publish an empty release
+        env:
+          MACOS_RESULT: ${{ needs.build-macos.result }}
+          WINDOWS_RESULT: ${{ needs.build-windows.result }}
+        run: |
+          set -euo pipefail
+          if [[ ! -d dist/macos && ! -d dist/windows ]]; then
+            echo "::error::Neither platform produced assets (build-macos=$MACOS_RESULT, build-windows=$WINDOWS_RESULT) - refusing to publish an empty release." >&2
+            exit 1
+          fi
+
+      - name: Clean up a leftover DRAFT from a previous failed attempt at this tag
+        # A run that failed somewhere between "create the draft" and
+        # "publish it" (network blip, a bad signature, etc.) leaves an
+        # orphaned draft behind - harmless (invisible to the update
+        # endpoint and the public releases page) but would make a retry's
+        # own `gh release create` fail with "release already exists".
+        # Only ever deletes a DRAFT, and only for THIS exact tag - a
+        # PUBLISHED release already sitting on this tag is a genuine
+        # conflict this workflow refuses to silently overwrite or delete.
+        # The underlying git tag itself is never touched either way (no
+        # --cleanup-tag) - Felix pushed it, this pipeline doesn't own it.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+        run: |
+          set -euo pipefail
+          EXISTING_JSON="$(gh release view "$TAG" --repo fegone/Centinelo-Phone --json isDraft 2>/dev/null || true)"
+          if [[ -z "$EXISTING_JSON" ]]; then
+            echo "OK: no existing release for $TAG"
+          elif [[ "$(jq -r .isDraft <<<"$EXISTING_JSON")" == "true" ]]; then
+            echo "-- found a leftover DRAFT release for $TAG (from a previous failed/retried attempt) - deleting it before creating a fresh one"
+            gh release delete "$TAG" --repo fegone/Centinelo-Phone --yes
+          else
+            echo "::error::A PUBLISHED (non-draft) release already exists for tag $TAG. This pipeline never overwrites or deletes a published release - if this is genuinely an intentional re-run, delete the existing release manually first (gh release delete $TAG), or use a new version." >&2
+            exit 1
+          fi
+
+      - name: Prepare release notes
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+
+          # Notes: prefer the matching CHANGELOG.md section if one exists
+          # for this version (none exists in this repo today - this repo
+          # has no CHANGELOG.md yet, per the task's own "si existe" -
+          # wired for the day one is added rather than skipped). Falls
+          # back to a minimal, honest placeholder Felix can edit on the
+          # release page afterward (`gh release edit`) - never blocks
+          # publishing on notes content.
+          if [[ -f CHANGELOG.md ]] && grep -q "^## \[\{0,1\}$VERSION" CHANGELOG.md; then
+            awk -v ver="$VERSION" '
+              BEGIN { printing = 0 }
+              /^## / { if (printing) exit; if (index($0, ver) > 0) { printing = 1; next } }
+              printing { print }
+            ' CHANGELOG.md > dist/release-notes.txt
+          fi
+          if [[ ! -s dist/release-notes.txt ]]; then
+            echo "Centinelo Phone $VERSION." > dist/release-notes.txt
+          fi
+          echo "-- dist/release-notes.txt --"
+          cat dist/release-notes.txt
+
+      - name: Create the release as a DRAFT with platform assets (not latest.json yet)
+        # Draft, not published: GitHub's "latest release" alias
+        # (tauri.conf.json's plugins.updater.endpoints - the ONLY thing
+        # every installed app's auto-updater ever queries) never considers
+        # draft releases, so this can never be picked up mid-construction
+        # no matter how long the remaining steps take. latest.json is
+        # deliberately NOT uploaded here yet - see the next step for why
+        # (its asset URLs depend on knowing what GitHub actually named
+        # these files, which is only knowable AFTER upload).
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+        run: |
+          set -euo pipefail
+          ASSETS=()
+          [[ -d dist/macos ]] && ASSETS+=(dist/macos/*.dmg dist/macos/*.app.tar.gz dist/macos/*.app.tar.gz.sig)
+          [[ -d dist/windows ]] && ASSETS+=(dist/windows/*.exe dist/windows/*.exe.sig dist/windows/*.msi)
+
+          gh release create "$TAG" \
+            --repo fegone/Centinelo-Phone \
+            --draft \
+            --title "Centinelo Phone $VERSION" \
+            --notes-file dist/release-notes.txt \
+            "${ASSETS[@]}"
+
+      - name: Resolve real asset URLs from GitHub and build latest.json
+        # GitHub silently replaces spaces in uploaded asset filenames with
+        # periods (confirmed empirically against this repo, 2026-07-17 -
+        # a probe draft release uploaded "Test File_1.0.0_aarch64.app.tar.gz"
+        # and GitHub served it back as "Test.File_1.0.0_aarch64.app.tar.gz").
+        # tauri.conf.json's productName is "Centinelo Phone" - WITH a space
+        # - so every asset this pipeline produces hits this exact
+        # transform. Building latest.json's URLs by string-concatenating
+        # the LOCAL file's basename (this workflow's first draft did
+        # exactly that) would have shipped a manifest whose URLs 404 for
+        # every real install. Querying the draft's own asset list back
+        # from the GitHub API and matching by the stable part of each
+        # name (the file extension, which the mangling never touches -
+        # confirmed by the same probe: ".app.tar.gz" survived intact)
+        # sidesteps re-implementing GitHub's undocumented transform at all.
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release view "$TAG" --repo fegone/Centinelo-Phone --json assets \
+            --jq '.assets[] | "\(.name)\t\(.url)"' > dist/real-asset-urls.tsv
+          echo "-- real asset URLs GitHub assigned --"
+          cat dist/real-asset-urls.tsv
+
+          find_real_url() {
+            # $1: regex suffix to match against the NAME column
+            # (case-sensitive, matches this repo's own asset naming).
+            # Fails on zero OR more-than-one match - a duplicate match
+            # would otherwise silently concatenate two URLs into one
+            # multi-line jq --arg value below, producing a syntactically
+            # "valid" but garbage latest.json instead of a clean failure.
+            awk -F'\t' -v suffix="$1" '$1 ~ (suffix "$"){print $2; n++} END{exit (n == 1) ? 0 : 1}' dist/real-asset-urls.tsv
+          }
+
+          PLATFORMS='{}'
+
+          if [[ -d dist/macos ]]; then
+            SIG="$(find dist/macos -maxdepth 1 -name '*.app.tar.gz.sig' | head -n1)"
+            [[ -n "$SIG" ]] || { echo "::error::macOS assets downloaded but .app.tar.gz.sig missing locally" >&2; exit 1; }
+            SIGNATURE="$(cat "$SIG")"
+            URL="$(find_real_url '\.app\.tar\.gz')" || { echo "::error::no uploaded release asset ends with .app.tar.gz - macOS updater artifact did not actually upload" >&2; exit 1; }
+            PLATFORMS="$(jq --arg sig "$SIGNATURE" --arg url "$URL" '. + {"darwin-aarch64": {signature: $sig, url: $url}}' <<<"$PLATFORMS")"
+            echo "-- darwin-aarch64 -> $URL"
+          fi
+
+          if [[ -d dist/windows ]]; then
+            SIG="$(find dist/windows -maxdepth 1 -name '*.exe.sig' | head -n1)"
+            [[ -n "$SIG" ]] || { echo "::error::Windows assets downloaded but NSIS .exe.sig missing locally" >&2; exit 1; }
+            SIGNATURE="$(cat "$SIG")"
+            # `.exe` alone would also match `.exe.sig`'s own name (which
+            # ends in .sig, not .exe, so it actually would NOT match -
+            # but excluding it explicitly keeps this immune to a future
+            # sig-naming change instead of relying on that distinction).
+            URL="$(awk -F'\t' '$1 ~ /\.exe$/ && $1 !~ /\.exe\.sig$/{print $2; n++} END{exit (n == 1) ? 0 : 1}' dist/real-asset-urls.tsv)" || { echo "::error::no uploaded release asset ends with .exe (excluding .exe.sig), or more than one did - Windows updater artifact did not actually upload cleanly" >&2; exit 1; }
+            PLATFORMS="$(jq --arg sig "$SIGNATURE" --arg url "$URL" '. + {"windows-x86_64": {signature: $sig, url: $url}}' <<<"$PLATFORMS")"
+            echo "-- windows-x86_64 -> $URL"
+          fi
+
+          if [[ "$PLATFORMS" == "{}" ]]; then
+            echo "::error::No platform produced a valid signature+asset pair - refusing to publish latest.json with an empty platforms map." >&2
+            exit 1
+          fi
+
+          NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          jq -n \
+            --arg version "$VERSION" \
+            --arg notes "$(cat dist/release-notes.txt)" \
+            --arg pub_date "$NOW" \
+            --argjson platforms "$PLATFORMS" \
+            '{version: $version, notes: $notes, pub_date: $pub_date, platforms: $platforms}' \
+            > dist/latest.json
+
+          echo "-- dist/latest.json --"
+          cat dist/latest.json
+          jq -e . dist/latest.json >/dev/null
+
+      - name: Verify latest.json's signatures match the real local .sig files exactly
+        # Belt-and-suspenders re-check, independent of the jq logic above:
+        # each platform's signature field, byte for byte, must equal the
+        # matching .sig file this job downloaded from build-macos/
+        # build-windows - not a re-derivation, a literal re-comparison
+        # against the same source of truth, so a jq quoting/escaping bug
+        # in the step above would surface here rather than silently
+        # shipping a manifest with a mismatched or truncated signature.
+        run: |
+          set -euo pipefail
+          if [[ -d dist/macos ]]; then
+            LOCAL_SIG="$(cat "$(find dist/macos -maxdepth 1 -name '*.app.tar.gz.sig' | head -n1)")"
+            MANIFEST_SIG="$(jq -r '.platforms["darwin-aarch64"].signature' dist/latest.json)"
+            [[ "$LOCAL_SIG" == "$MANIFEST_SIG" ]] || { echo "::error::darwin-aarch64 signature in latest.json does not match the local .sig file" >&2; exit 1; }
+            echo "OK: darwin-aarch64 signature matches"
+          fi
+          if [[ -d dist/windows ]]; then
+            LOCAL_SIG="$(cat "$(find dist/windows -maxdepth 1 -name '*.exe.sig' | head -n1)")"
+            MANIFEST_SIG="$(jq -r '.platforms["windows-x86_64"].signature' dist/latest.json)"
+            [[ "$LOCAL_SIG" == "$MANIFEST_SIG" ]] || { echo "::error::windows-x86_64 signature in latest.json does not match the local .sig file" >&2; exit 1; }
+            echo "OK: windows-x86_64 signature matches"
+          fi
+
+      - name: Upload latest.json to the draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+        run: gh release upload "$TAG" --repo fegone/Centinelo-Phone dist/latest.json
+
+      - name: Publish the release (flips it live - the one moment it becomes public)
+        # Everything above ran against a DRAFT, invisible to the update
+        # endpoint and the public releases page alike. This is the single
+        # step that makes it real - only reached once every asset,
+        # signature, and the manifest itself have all been verified.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          set -euo pipefail
+          FLAGS=(--draft=false)
+          if [[ "$PRERELEASE" == "true" ]]; then
+            FLAGS+=(--prerelease)
+          else
+            # --latest: the app's own auto-updater endpoint is GitHub's
+            # "latest release" alias - explicit here rather than relying
+            # on gh's "automatic based on date and version" default,
+            # since this repo's existing v1.0.0 release (a DIFFERENT,
+            # older product line, still tagged/published from build.yml)
+            # must not keep shadowing v2 releases as "Latest" just
+            # because of tag/date ordering ambiguity.
+            FLAGS+=(--latest)
+          fi
+          gh release edit "$TAG" --repo fegone/Centinelo-Phone "${FLAGS[@]}"
+
+      - name: Job summary
+        env:
+          TAG: ${{ needs.preflight.outputs.tag }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          {
+            echo "## Release $TAG (Centinelo Phone $VERSION)"
+            echo
+            echo "| platform | shipped |"
+            echo "|---|---|"
+            echo "| macOS (darwin-aarch64) | $([[ -d dist/macos ]] && echo yes || echo 'NO - build-macos did not succeed') |"
+            echo "| Windows (windows-x86_64) | $([[ -d dist/windows ]] && echo yes || echo 'NO - build-windows did not succeed') |"
+            echo
+            echo "https://github.com/fegone/Centinelo-Phone/releases/tag/$TAG"
+          } >> "$GITHUB_STEP_SUMMARY"
