@@ -13,6 +13,7 @@
 //! The admin password is never stored in any recoverable form: only its
 //! Argon2 hash (see `hash_password`/`verify_password`).
 
+use crate::sync_ext::PoisonRecover;
 use argon2::password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;
 use serde::{Deserialize, Serialize};
@@ -612,7 +613,7 @@ impl SettingsStore {
     }
 
     pub fn snapshot(&self) -> AppSettings {
-        self.inner.lock().expect("settings mutex poisoned").clone()
+        self.inner.lock_or_recover().clone()
     }
 
     pub fn recents_path(&self) -> &Path {
@@ -639,7 +640,7 @@ impl SettingsStore {
     /// other `update_*` methods sharing this shape are pre-existing and
     /// out of this diff's scope; flagged as a follow-up.
     pub fn update_account(&self, account: AccountSettings) -> std::io::Result<()> {
-        let mut guard = self.inner.lock().expect("settings mutex poisoned");
+        let mut guard = self.inner.lock_or_recover();
         let previous = guard.account.clone();
         guard.account = account;
         if let Err(e) = self.persist(&guard) {
@@ -650,72 +651,67 @@ impl SettingsStore {
     }
 
     pub fn update_core_binary_path(&self, path: Option<String>) -> std::io::Result<()> {
-        let mut guard = self.inner.lock().expect("settings mutex poisoned");
+        let mut guard = self.inner.lock_or_recover();
         guard.core_binary_path = path;
         self.persist(&guard)
     }
 
     pub fn update_theme(&self, theme: ThemePref) -> std::io::Result<()> {
-        let mut guard = self.inner.lock().expect("settings mutex poisoned");
+        let mut guard = self.inner.lock_or_recover();
         guard.theme = theme;
         self.persist(&guard)
     }
 
     pub fn update_locale(&self, locale: LocalePref) -> std::io::Result<()> {
-        let mut guard = self.inner.lock().expect("settings mutex poisoned");
+        let mut guard = self.inner.lock_or_recover();
         guard.locale = locale;
         self.persist(&guard)
     }
 
     pub fn update_favorites(&self, favorites: Vec<FavoriteSlot>) -> std::io::Result<()> {
-        let mut guard = self.inner.lock().expect("settings mutex poisoned");
+        let mut guard = self.inner.lock_or_recover();
         guard.favorites = normalize_favorites(favorites);
         self.persist(&guard)
     }
 
     pub fn update_bridge_auto_dial(&self, auto_dial: bool) -> std::io::Result<()> {
-        let mut guard = self.inner.lock().expect("settings mutex poisoned");
+        let mut guard = self.inner.lock_or_recover();
         guard.bridge.auto_dial = auto_dial;
         self.persist(&guard)
     }
 
     pub fn update_bridge_register_tel(&self, register: bool) -> std::io::Result<()> {
-        let mut guard = self.inner.lock().expect("settings mutex poisoned");
+        let mut guard = self.inner.lock_or_recover();
         guard.bridge.register_tel_handler = register;
         self.persist(&guard)
     }
 
     pub fn update_transcription(&self, transcription: TranscriptionSettings) -> std::io::Result<()> {
-        let mut guard = self.inner.lock().expect("settings mutex poisoned");
+        let mut guard = self.inner.lock_or_recover();
         guard.transcription = transcription;
         self.persist(&guard)
     }
 
     pub fn update_hid(&self, hid: HidSettings) -> std::io::Result<()> {
-        let mut guard = self.inner.lock().expect("settings mutex poisoned");
+        let mut guard = self.inner.lock_or_recover();
         guard.hid = hid;
         self.persist(&guard)
     }
 
     pub fn update_audio(&self, audio: AudioSettings) -> std::io::Result<()> {
-        let mut guard = self.inner.lock().expect("settings mutex poisoned");
+        let mut guard = self.inner.lock_or_recover();
         guard.audio = audio;
         self.persist(&guard)
     }
 
     pub fn set_admin_password_hash(&self, hash: String) -> std::io::Result<()> {
-        let mut guard = self.inner.lock().expect("settings mutex poisoned");
+        let mut guard = self.inner.lock_or_recover();
         guard.admin.password_hash = Some(hash);
         self.persist(&guard)
     }
 
     pub fn admin_password_hash(&self) -> Option<String> {
-        self.inner
-            .lock()
-            .expect("settings mutex poisoned")
-            .admin
-            .password_hash
-            .clone()
+        self.inner.lock_or_recover().admin.password_hash.clone()
     }
 }
 
@@ -741,10 +737,10 @@ fn tmp_sibling_path(path: &Path) -> PathBuf {
 /// the old complete contents or the new complete contents, never a
 /// partial write, regardless of when a crash/power-loss happens.
 #[cfg(unix)]
-fn write_private_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_private_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     let tmp_path = tmp_sibling_path(path);
-    {
+    let write_result: std::io::Result<()> = (|| {
         let mut f = fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -753,16 +749,141 @@ fn write_private_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
             .open(&tmp_path)?;
         use std::io::Write;
         f.write_all(contents)?;
-        f.sync_all()?; // durable on disk before the rename makes it visible
+        f.sync_all() // durable on disk before the rename makes it visible
+    })();
+    if let Err(e) = write_result {
+        // Best-effort cleanup (2026-07-16 4R re-review, RESILIENCE minor):
+        // if `write_all` or `sync_all` itself fails partway - disk full
+        // mid-write, a flaky filesystem choking on the fsync, ... - the
+        // tmp file would otherwise be left orphaned next to the real one
+        // forever (never reached by the rename below, and nothing else
+        // ever cleans up a `.tmp.<pid>` sibling). Never touched on the
+        // success path, where the rename consumes the tmp file instead.
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+    fs::rename(&tmp_path, path)?;
+    // Best-effort fsync of the containing directory too (deuda fix,
+    // 2026-07-16): the file's own `sync_all()` above only guarantees its
+    // *contents* survive a crash - on ext4/APFS/etc the directory-entry
+    // change the rename itself made is a separate piece of durable state
+    // (some filesystems can lose a rename, leaving either the old file or
+    // neither visible, across a crash right after `rename` returns unless
+    // that's flushed too). Best-effort, not `?`: this directory is always
+    // openable in practice (it's the app-data dir this process just wrote
+    // into), but if some future caller ever points `path` somewhere
+    // stranger, a failure to open/sync *the directory* shouldn't turn an
+    // already-successful, already-renamed file write into an error.
+    if let Some(dir) = path.parent() {
+        if let Ok(d) = fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+    }
+    Ok(())
+}
+
+/// Windows sibling of the unix path above - same write-then-rename shape,
+/// same `sync_all()` before the rename (deuda fix: the atomic rename alone
+/// only protects against a *torn* write, not against the new file's bytes
+/// still sitting in the OS page cache, unflushed to disk, when a power cut
+/// hits right after `rename` returns but before the OS gets around to
+/// flushing - `sync_all()` forces that flush first, so the rename is only
+/// ever visible once the new contents are actually durable). No `.mode()`
+/// call - Windows has no unix permission bits; this file's contents (the
+/// SIP secret) rely on the app-data directory's own OS-level ACLs instead,
+/// same as every other file this app writes there. A `File::sync_all()` on
+/// the *directory* (to also fsync the rename itself) isn't reachable from
+/// safe std on Windows - flushing the file's own contents before the
+/// rename is the durability guarantee actually available on this OS.
+#[cfg(not(unix))]
+pub(crate) fn write_private_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let tmp_path = tmp_sibling_path(path);
+    let write_result: std::io::Result<()> = (|| {
+        let mut f = fs::OpenOptions::new().write(true).create(true).truncate(true).open(&tmp_path)?;
+        use std::io::Write;
+        f.write_all(contents)?;
+        f.sync_all()
+    })();
+    if let Err(e) = write_result {
+        // Same orphaned-tmp-file cleanup as the unix branch above - see
+        // its comment.
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e);
     }
     fs::rename(&tmp_path, path)
 }
 
-#[cfg(not(unix))]
-fn write_private_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    let tmp_path = tmp_sibling_path(path);
-    fs::write(&tmp_path, contents)?;
-    fs::rename(&tmp_path, path)
+#[cfg(test)]
+mod write_private_file_tests {
+    use super::*;
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("centinelo-settings-test.{name}.{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn writes_the_exact_contents_and_leaves_no_tmp_sibling_behind() {
+        let dir = scratch_dir("roundtrip");
+        let path = dir.join("settings.json");
+        write_private_file(&path, b"{\"a\":1}").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"{\"a\":1}");
+        // tmp_sibling_path's own file must not survive a successful write -
+        // the rename either consumes it or the write never leaves a stray
+        // partial file lying around next to the real settings.json.
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn overwrites_existing_contents_atomically() {
+        let dir = scratch_dir("overwrite");
+        let path = dir.join("settings.json");
+        write_private_file(&path, b"old").unwrap();
+        write_private_file(&path, b"much longer new contents").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"much longer new contents");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unix_file_is_mode_0600_not_world_or_group_readable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch_dir("mode");
+        let path = dir.join("settings.json");
+        write_private_file(&path, b"secret").unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "SIP secret file must not be group/world readable");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn removes_the_orphaned_tmp_file_when_the_write_step_fails() {
+        // 4R re-review, RESILIENCE minor: if opening/writing/fsyncing the
+        // tmp file fails partway, it must not linger forever next to the
+        // real settings file. Pre-create the tmp sibling read-only so
+        // `write_private_file`'s own `OpenOptions::write(true)...open()`
+        // deterministically fails with EACCES - a portable, no-full-disk-
+        // needed way to exercise the same "the write step failed" cleanup
+        // path a real disk-full/flaky-fsync failure would take.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch_dir("cleanup-on-write-failure");
+        let path = dir.join("settings.json");
+        let tmp_path = tmp_sibling_path(&path);
+        fs::write(&tmp_path, b"stale").unwrap();
+        fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o400)).unwrap();
+
+        let result = write_private_file(&path, b"new contents");
+
+        assert!(result.is_err());
+        assert!(!tmp_path.exists(), "the orphaned tmp file must be cleaned up on a failed write, not left behind forever");
+        assert!(!path.exists(), "a failed write must never leave the real settings file created either");
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
 
 /// Session-only admin unlock flag. Deliberately NOT persisted - a fresh app

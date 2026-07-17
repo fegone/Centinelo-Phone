@@ -47,12 +47,14 @@ mod mapping;
 
 use crate::settings::SettingsStore;
 use crate::sidecar::SidecarHandle;
+use crate::sync_ext::PoisonRecover;
 use descriptor::ParsedDescriptor;
 use device::DeviceSummary;
 use hidapi::{HidApi, HidDevice};
 use led::LedState;
 use mapping::{CallPhase, HidAction, TelephonyInputState};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Listener};
@@ -84,6 +86,32 @@ const PRESENCE_RECHECK: Duration = Duration::from_secs(2);
 /// help here. 400ms is comfortably above any real human button-press
 /// cadence (even a fast double-tap) while still feeling instant.
 const MIN_ACTION_INTERVAL: Duration = Duration::from_millis(400);
+
+/// Debounce bucket for `dispatch_action`'s rate limit - deliberately
+/// coarser than `HidAction` (`MuteOn`/`MuteOff` share one bucket) so a
+/// genuine toggle still debounces against itself, but distinct per
+/// call-control primitive so a *global* single timestamp can't make one
+/// action starve an unrelated one. Fixes a real deuda: an operator
+/// answering and immediately muting inside 400ms (a completely normal
+/// "pick up, go quiet" motion at a call center) used to have the `mute`
+/// silently dropped because `answer` had just reset the one shared
+/// timestamp - see this fix's task report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ActionKind {
+    Answer,
+    Hangup,
+    Mute,
+}
+
+impl From<HidAction> for ActionKind {
+    fn from(action: HidAction) -> Self {
+        match action {
+            HidAction::Answer => ActionKind::Answer,
+            HidAction::Hangup => ActionKind::Hangup,
+            HidAction::MuteOn | HidAction::MuteOff => ActionKind::Mute,
+        }
+    }
+}
 
 /// What the frontend (`hid_status` command) sees. Deliberately does not
 /// distinguish "no device plugged in" from "feature not enabled but would
@@ -120,10 +148,12 @@ struct Shared {
     /// tick, not just when device input arrives (4R review finding A2 -
     /// see `poll_once`'s doc).
     led: Mutex<LedState>,
-    /// When the last HID-triggered action actually dispatched - rate-limit
-    /// state for `dispatch_action`'s debounce (4R review finding M1, see
-    /// `MIN_ACTION_INTERVAL`'s doc).
-    last_dispatch: Mutex<Option<Instant>>,
+    /// When each `ActionKind` last actually dispatched - rate-limit state
+    /// for `dispatch_action`'s debounce (4R review finding M1, see
+    /// `MIN_ACTION_INTERVAL`'s doc), keyed per-kind (see `ActionKind`'s doc)
+    /// rather than one shared timestamp so unrelated actions never debounce
+    /// each other.
+    last_dispatch: Mutex<HashMap<ActionKind, Instant>>,
 }
 
 /// Cloneable handle, managed as Tauri state - same shape as
@@ -145,7 +175,7 @@ impl HidHandle {
             sidecar,
             status: Mutex::new(HidStatus::Disabled),
             led: Mutex::new(LedState::default()),
-            last_dispatch: Mutex::new(None),
+            last_dispatch: Mutex::new(HashMap::new()),
         });
         let handle = Self(shared.clone());
         handle.listen_call_events();
@@ -171,7 +201,7 @@ impl HidHandle {
             if name != "call_state" {
                 return; // tap_state / blf / stats / ... - no LED-relevant meaning here
             }
-            let mut led = shared.led.lock().expect("poisoned");
+            let mut led = shared.led.lock_or_recover();
             match value.get("state").and_then(|v| v.as_str()) {
                 Some("incoming") => led.ring = true,
                 Some("established") => {
@@ -193,7 +223,7 @@ impl HidHandle {
     }
 
     pub fn status(&self) -> HidStatus {
-        self.0.status.lock().expect("poisoned").clone()
+        self.0.status.lock_or_recover().clone()
     }
 
     /// Fresh enumeration for the frontend's device picker. Never panics -
@@ -212,7 +242,7 @@ impl HidHandle {
 }
 
 fn set_status(shared: &Shared, status: HidStatus) {
-    let mut guard = shared.status.lock().expect("poisoned");
+    let mut guard = shared.status.lock_or_recover();
     if *guard != status {
         log::info!("hid: status -> {status:?}");
         *guard = status;
@@ -340,7 +370,7 @@ fn poll_loop(shared: Arc<Shared>) {
             }
         }
 
-        let led_now = *shared.led.lock().expect("poisoned");
+        let led_now = *shared.led.lock_or_recover();
         let phase = CallPhase::from_ping_state(shared.sidecar.ping_state());
         match poll_once(dev, prev_state, led_now, phase, |action| dispatch_action(&shared, action)) {
             PollOutcome::Continue(new_state) => prev_state = new_state,
@@ -506,20 +536,40 @@ fn should_dispatch(elapsed_since_last: Option<Duration>) -> bool {
     }
 }
 
+/// Per-`ActionKind` debounce gate: looks up (and, if allowed, stamps) only
+/// *this* action's bucket in `last_dispatch`, so `dispatch_action`'s lock
+/// holder never has to reason about other kinds. Takes the map directly
+/// (rather than the whole `Shared`) so a test can exercise the real
+/// `HashMap`/`Instant` bookkeeping without needing a `Shared` (which needs
+/// a live `AppHandle`/`SidecarHandle` this module has no fake for) - only
+/// `should_dispatch` above needed that treatment for `dispatch_action`
+/// itself, this is the same idea one level up.
+fn gate(last_dispatch: &mut HashMap<ActionKind, Instant>, action: HidAction) -> bool {
+    let kind = ActionKind::from(action);
+    let elapsed = last_dispatch.get(&kind).map(|t: &Instant| t.elapsed());
+    if !should_dispatch(elapsed) {
+        return false;
+    }
+    last_dispatch.insert(kind, Instant::now());
+    true
+}
+
 fn dispatch_action(shared: &Shared, action: HidAction) {
     {
-        let mut last = shared.last_dispatch.lock().expect("poisoned");
-        let elapsed = last.map(|t: Instant| t.elapsed());
-        if !should_dispatch(elapsed) {
+        let mut last = shared.last_dispatch.lock_or_recover();
+        if !gate(&mut last, action) {
             // 4R review finding M1: rate-limit, not just edge-trigger - a
             // device (buggy firmware or a deliberately hostile USB
             // peripheral) resending reports faster than any human could
             // press a button must not be able to replay answer/hangup/mute
-            // against a real call at bus speed.
-            log::warn!("hid: rate-limiting {action:?} - another HID action dispatched less than {MIN_ACTION_INTERVAL:?} ago");
+            // against a real call at bus speed. Per-`ActionKind` (see its
+            // doc) so a genuine answer-then-mute inside 400ms isn't dropped.
+            log::warn!(
+                "hid: rate-limiting {action:?} - another {:?} action dispatched less than {MIN_ACTION_INTERVAL:?} ago",
+                ActionKind::from(action)
+            );
             return;
         }
-        *last = Some(Instant::now());
     }
     log::info!("hid: dispatching {action:?}");
     let cmd = match action {
@@ -590,6 +640,50 @@ mod tests {
     fn should_dispatch_true_at_or_beyond_the_minimum_interval() {
         assert!(should_dispatch(Some(MIN_ACTION_INTERVAL)));
         assert!(should_dispatch(Some(Duration::from_secs(5))));
+    }
+
+    // ---- gate (per-ActionKind debounce, fixes global-debounce deuda) ------
+
+    #[test]
+    fn gate_allows_a_different_action_kind_within_the_debounce_window() {
+        // The bug this fixes: answer, then mute <400ms later - a completely
+        // normal "pick up, go quiet" motion - used to have the mute
+        // silently dropped because `answer` had just reset the one shared
+        // timestamp. Answer and Mute are different `ActionKind`s, so both
+        // must go through even back-to-back.
+        let mut last_dispatch = HashMap::new();
+        assert!(gate(&mut last_dispatch, HidAction::Answer));
+        assert!(gate(&mut last_dispatch, HidAction::MuteOn));
+    }
+
+    #[test]
+    fn gate_still_rate_limits_the_same_action_kind() {
+        let mut last_dispatch = HashMap::new();
+        assert!(gate(&mut last_dispatch, HidAction::Answer));
+        // Immediately repeating the *same* kind must still be rejected -
+        // per-kind debounce isn't a way to disable the M1 rate limit.
+        assert!(!gate(&mut last_dispatch, HidAction::Answer));
+    }
+
+    #[test]
+    fn gate_treats_mute_on_and_mute_off_as_the_same_bucket() {
+        // MuteOn/MuteOff share one ActionKind::Mute bucket (see its doc) -
+        // a genuine on/off toggle inside the debounce window is exactly
+        // the "resending faster than a human could" shape M1 guards
+        // against, so it debounces same as two Answers in a row would.
+        let mut last_dispatch = HashMap::new();
+        assert!(gate(&mut last_dispatch, HidAction::MuteOn));
+        assert!(!gate(&mut last_dispatch, HidAction::MuteOff));
+    }
+
+    #[test]
+    fn gate_allows_the_same_kind_again_once_the_window_has_passed() {
+        let mut last_dispatch = HashMap::new();
+        // Backdate as if the last Answer dispatched just past the window -
+        // Instant subtraction is the standard way to simulate elapsed time
+        // in these tests without a mockable clock.
+        last_dispatch.insert(ActionKind::Answer, Instant::now() - MIN_ACTION_INTERVAL - Duration::from_millis(1));
+        assert!(gate(&mut last_dispatch, HidAction::Answer));
     }
 }
 

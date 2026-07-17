@@ -14,7 +14,8 @@
 //! delete-on-stop scratch `accounts` file - the same sanctioned exception
 //! `run-spike.sh` itself documents - never anywhere else.
 
-use crate::settings::{AccountSettings, AudioSettings, SettingsStore, TransportPriority};
+use crate::settings::{write_private_file, AccountSettings, AudioSettings, SettingsStore, TransportPriority};
+use crate::sync_ext::PoisonRecover;
 use crate::transcription::TranscriptionHandle;
 use serde::Serialize;
 use serde_json::Value;
@@ -88,6 +89,51 @@ enum CallPhase {
     InCall,
 }
 
+/// Defensive cap on `Shared::call_phases` (deuda fix, 2026-07-16): in
+/// normal operation every `incoming`/`ringing`/`established` for a
+/// call_id is paired with a later `closed` (this map is what makes that
+/// pairing correct in the first place - see `CallPhase`'s doc), so its
+/// size is bounded by however many legs are genuinely in flight at once
+/// (attended-transfer's original-plus-consultation legs is the realistic
+/// worst case - never more than a handful). This cap is pure
+/// defense-in-depth against a misbehaving engine or a crafted/malformed
+/// ctrl_json event stream that sends new call_ids without ever closing
+/// old ones: without it, such a stream would grow this process's memory
+/// without bound for as long as the sidecar stays up. 64 is generous
+/// headroom over any real workload while still being a hard ceiling.
+const MAX_TRACKED_CALL_PHASES: usize = 64;
+
+/// Inserts into `phases`, *rejecting* the insert (leaving every existing
+/// entry untouched) if `call_id` is new and the map is already at
+/// [`MAX_TRACKED_CALL_PHASES`]. Deliberately never evicts an existing
+/// entry to make room (2026-07-16 4R re-review, RESILIENCE blocker): an
+/// earlier version of this function evicted an arbitrary existing entry
+/// (`phases.keys().next()`) to make room for a new one, which could evict
+/// the one entry that's a genuine live `InCall` leg - a flood of
+/// anomalous call_ids filling the map could push the real call's own
+/// entry out, and once the flood's own (fake) entries later close, the
+/// map would end up *empty* with a real call still in progress, which is
+/// exactly R4's `has_active_call()` -> `false` -> `provisioning_apply`
+/// bug all over again, just reached through this cap instead of the
+/// original global-flag bug. Rejecting the N+1th new call_id instead
+/// means the shell may briefly fail to *track* a call_id beyond the cap,
+/// but every call_id it *is* already tracking - including the real one -
+/// stays tracked for its entire lifetime. Preserving already-tracked
+/// calls matters more than accepting every single call_id an anomalous
+/// stream throws at it.
+fn insert_bounded(phases: &mut HashMap<String, CallPhase>, call_id: &str, phase: CallPhase) {
+    if !phases.contains_key(call_id) && phases.len() >= MAX_TRACKED_CALL_PHASES {
+        log::warn!(
+            "sidecar: call_phases at its {MAX_TRACKED_CALL_PHASES}-entry cap - refusing to track new call_id {call_id}; \
+             every already-tracked call_id (including any real in-progress call) is left untouched. This should never \
+             happen in normal operation (every call_id should eventually get a matching `closed`); likely an engine bug \
+             or malformed event stream never closing old legs."
+        );
+        return;
+    }
+    phases.insert(call_id.to_string(), phase);
+}
+
 /// Applies one `call_state` transition to `phases`, scoped to `call_id` -
 /// pulled out as a free function (not inlined in the stdout-reader match)
 /// specifically so it's unit-testable without spinning up a `Shared`/
@@ -100,7 +146,7 @@ fn apply_call_state_transition(
 ) {
     match call_state {
         "incoming" => {
-            phases.insert(call_id.to_string(), CallPhase::Incoming);
+            insert_bounded(phases, call_id, CallPhase::Incoming);
         }
         "ringing" => {
             // Don't downgrade an already-incoming call_id to Calling - a
@@ -108,11 +154,11 @@ fn apply_call_state_transition(
             // vocabulary even if the far end's own signaling also fires a
             // `ringing` transition for the same call_id.
             if phases.get(call_id) != Some(&CallPhase::Incoming) {
-                phases.insert(call_id.to_string(), CallPhase::Calling);
+                insert_bounded(phases, call_id, CallPhase::Calling);
             }
         }
         "established" => {
-            phases.insert(call_id.to_string(), CallPhase::InCall);
+            insert_bounded(phases, call_id, CallPhase::InCall);
         }
         "closed" => {
             phases.remove(call_id);
@@ -227,6 +273,88 @@ mod call_phase_tests {
     fn dominant_phase_is_none_when_no_calls_tracked() {
         let phases: HashMap<String, CallPhase> = HashMap::new();
         assert_eq!(dominant_call_phase(&phases), None);
+    }
+
+    // ---- call_phases cap (defense-in-depth deuda fix) ----------------
+
+    #[test]
+    fn flooding_past_the_cap_rejects_new_call_ids_and_keeps_every_existing_one() {
+        // A misbehaving engine/malformed event stream that never sends
+        // `closed` for any call_id must not grow this map without bound -
+        // one flood of MAX_TRACKED_CALL_PHASES + 50 never-closed call_ids
+        // must leave the map at exactly the cap. Rejection-based (not
+        // eviction-based, see `insert_bounded`'s doc for the blocker this
+        // fixed): the first MAX_TRACKED_CALL_PHASES call_ids fill the map
+        // and are still all present afterward - only call_ids that arrive
+        // *after* the cap was already full get rejected.
+        let mut phases = HashMap::new();
+        for i in 0..(MAX_TRACKED_CALL_PHASES + 50) {
+            apply_call_state_transition(&mut phases, &format!("flood-{i}"), "incoming");
+        }
+        assert_eq!(phases.len(), MAX_TRACKED_CALL_PHASES);
+        assert!(phases.contains_key("flood-0"), "an early call_id must never be evicted to make room for a later one");
+        assert!(
+            !phases.contains_key(&format!("flood-{}", MAX_TRACKED_CALL_PHASES + 10)),
+            "a call_id arriving after the cap was already full must be rejected, not tracked"
+        );
+    }
+
+    #[test]
+    fn a_real_incall_leg_at_the_cap_survives_a_flood_of_new_call_ids() {
+        // The exact blocker this fixed (2026-07-16 4R re-review,
+        // RESILIENCE): the previous eviction-based cap could evict the one
+        // entry that was a genuine live call to make room for an
+        // anomalous flood's next call_id - once the flood's own (fake)
+        // entries later closed, the map would end up empty with a real
+        // call still in progress, reopening R4's exact
+        // has_active_call()->false->provisioning_apply bug. Filling every
+        // remaining slot with a flood, then trying to track one more new
+        // call_id, must never touch the one entry that's actually InCall.
+        let mut phases = HashMap::new();
+        apply_call_state_transition(&mut phases, "real-call", "established");
+        for i in 0..(MAX_TRACKED_CALL_PHASES - 1) {
+            apply_call_state_transition(&mut phases, &format!("flood-{i}"), "incoming");
+        }
+        assert_eq!(phases.len(), MAX_TRACKED_CALL_PHASES);
+
+        // One more new call_id arriving at the cap: rejected, not making
+        // room by evicting anything.
+        apply_call_state_transition(&mut phases, "flood-overflow", "incoming");
+
+        assert_eq!(phases.len(), MAX_TRACKED_CALL_PHASES);
+        assert!(!phases.contains_key("flood-overflow"), "the overflow call_id must be rejected, not tracked");
+        assert_eq!(phases.get("real-call"), Some(&CallPhase::InCall), "the real call must never be evicted to make room");
+        // has_active_call() (SidecarHandle) is exactly `!call_phases.is_empty()`
+        // - this is the property that actually matters end to end.
+        assert!(!phases.is_empty(), "has_active_call() must stay true while the real call is still tracked");
+    }
+
+    #[test]
+    fn a_known_call_id_can_still_transition_at_the_cap_without_growing_it() {
+        // Updating an *existing* tracked call_id (e.g. incoming ->
+        // established) must never be rejected - only a genuinely new
+        // call_id competes for the capped headroom.
+        let mut phases = HashMap::new();
+        for i in 0..MAX_TRACKED_CALL_PHASES {
+            apply_call_state_transition(&mut phases, &format!("flood-{i}"), "incoming");
+        }
+        assert_eq!(phases.len(), MAX_TRACKED_CALL_PHASES);
+        apply_call_state_transition(&mut phases, "flood-0", "established");
+        assert_eq!(phases.len(), MAX_TRACKED_CALL_PHASES);
+        assert_eq!(phases.get("flood-0"), Some(&CallPhase::InCall));
+    }
+
+    #[test]
+    fn real_calls_well_under_the_cap_are_unaffected() {
+        // Sanity check the cap doesn't interfere with any realistic
+        // workload (a couple of concurrent legs, same shape as the
+        // attended-transfer test above).
+        let mut phases = HashMap::new();
+        apply_call_state_transition(&mut phases, "original", "established");
+        apply_call_state_transition(&mut phases, "consult", "ringing");
+        assert_eq!(phases.len(), 2);
+        assert_eq!(phases.get("original"), Some(&CallPhase::InCall));
+        assert_eq!(phases.get("consult"), Some(&CallPhase::Calling));
     }
 }
 
@@ -362,18 +490,18 @@ impl SidecarHandle {
     /// `PremiumHandle::load` for the sibling "handles get wired together
     /// in `.setup()`, not all at once" pattern this follows.
     pub fn attach_transcription(&self, transcription: TranscriptionHandle) {
-        *self.0.transcription.lock().expect("poisoned") = Some(transcription);
+        *self.0.transcription.lock_or_recover() = Some(transcription);
     }
 
     /// Snapshot of every extension's last-known BLF state (see `Shared::blf_states`).
     pub fn blf_states(&self) -> HashMap<String, String> {
-        self.0.blf_states.lock().expect("poisoned").clone()
+        self.0.blf_states.lock_or_recover().clone()
     }
 
     /// Last known status, for the frontend's initial paint (before its event
     /// listener would otherwise catch the next transition).
     pub fn status(&self) -> StatusPayload {
-        self.0.last_status.lock().expect("poisoned").clone()
+        self.0.last_status.lock_or_recover().clone()
     }
 
     /// Coarse call/registration state for the click-to-call bridge's
@@ -393,7 +521,7 @@ impl SidecarHandle {
     /// True iff *any* call_id currently has a tracked phase - see
     /// `CallPhase`'s doc for the per-call_id rationale.
     pub fn has_active_call(&self) -> bool {
-        !self.0.call_phases.lock().expect("poisoned").is_empty()
+        !self.0.call_phases.lock_or_recover().is_empty()
     }
 
     /// `/ping` (bridge.rs) - see `CallPhase`'s doc comment for the
@@ -410,7 +538,7 @@ impl SidecarHandle {
                 if !self.0.registered.load(Ordering::SeqCst) {
                     "connecting"
                 } else {
-                    match dominant_call_phase(&self.0.call_phases.lock().expect("poisoned")) {
+                    match dominant_call_phase(&self.0.call_phases.lock_or_recover()) {
                         None => "registered",
                         Some(CallPhase::Incoming) => "ringing",
                         Some(CallPhase::Calling) => "calling",
@@ -424,7 +552,7 @@ impl SidecarHandle {
     /// Start supervision if it isn't already running. No-op if a supervisor
     /// thread is already alive (use `restart_now` to force a respawn).
     pub fn start(&self) {
-        let mut alive = self.0.thread_alive.lock().expect("poisoned");
+        let mut alive = self.0.thread_alive.lock_or_recover();
         if *alive {
             return;
         }
@@ -432,9 +560,9 @@ impl SidecarHandle {
         drop(alive);
 
         self.0.auto_fallback_used.store(false, Ordering::SeqCst);
-        *self.0.pending_transport_override.lock().expect("poisoned") = None;
+        *self.0.pending_transport_override.lock_or_recover() = None;
         self.0.attempts.store(0, Ordering::SeqCst);
-        *self.0.control.lock().expect("poisoned") = ControlSignal::None;
+        *self.0.control.lock_or_recover() = ControlSignal::None;
 
         let shared = self.0.clone();
         std::thread::spawn(move || supervisor_loop(shared));
@@ -444,9 +572,9 @@ impl SidecarHandle {
     /// the UI's manual "retry" action, and internally by the wss->udp auto
     /// fallback. Does not count against the crash-backoff budget.
     pub fn restart_now(&self) {
-        *self.0.control.lock().expect("poisoned") = ControlSignal::RestartNow;
+        *self.0.control.lock_or_recover() = ControlSignal::RestartNow;
         self.close_stdin();
-        if *self.0.thread_alive.lock().expect("poisoned") {
+        if *self.0.thread_alive.lock_or_recover() {
             self.arm_force_kill_watchdog();
         } else {
             // Supervisor thread already exited (terminal Failed/Stopped) -
@@ -462,14 +590,14 @@ impl SidecarHandle {
     /// respawn. The watchdog force-kills after a grace period if the child
     /// doesn't cooperate (e.g. truly hung).
     pub fn stop(&self) {
-        *self.0.control.lock().expect("poisoned") = ControlSignal::Stop;
+        *self.0.control.lock_or_recover() = ControlSignal::Stop;
         self.close_stdin();
         self.arm_force_kill_watchdog();
     }
 
     fn close_stdin(&self) {
         // Dropping the ChildStdin closes the write end of the pipe.
-        let _ = self.0.stdin.lock().expect("poisoned").take();
+        let _ = self.0.stdin.lock_or_recover().take();
     }
 
     fn arm_force_kill_watchdog(&self) {
@@ -478,7 +606,7 @@ impl SidecarHandle {
         std::thread::spawn(move || {
             std::thread::sleep(STOP_GRACE);
             if !shared.exited_flag.load(Ordering::SeqCst) {
-                if let Some(pid) = *shared.current_pid.lock().expect("poisoned") {
+                if let Some(pid) = *shared.current_pid.lock_or_recover() {
                     log::warn!("sidecar: pid {pid} did not exit within {STOP_GRACE:?}, force-killing");
                     force_kill(pid);
                 }
@@ -535,7 +663,7 @@ impl SidecarHandle {
 /// a `SidecarHandle` wrapper (same reason `send_cmd_raw` is a free
 /// function - see that function's own doc).
 fn blf_subscribe_raw(shared: &Shared, ext: &str) -> Result<(), String> {
-    let mut subscribed = shared.subscribed_exts.lock().expect("poisoned");
+    let mut subscribed = shared.subscribed_exts.lock_or_recover();
     if !subscribed.insert(ext.to_string()) {
         return Ok(()); // already watching it - nothing to do
     }
@@ -546,13 +674,13 @@ fn blf_subscribe_raw(shared: &Shared, ext: &str) -> Result<(), String> {
         // leave it marked subscribed, or a later real subscribe attempt
         // (e.g. once the sidecar comes back up) would be silently
         // swallowed by this same idempotency check.
-        shared.subscribed_exts.lock().expect("poisoned").remove(ext);
+        shared.subscribed_exts.lock_or_recover().remove(ext);
     }
     result
 }
 
 fn blf_unsubscribe_raw(shared: &Shared, ext: &str) -> Result<(), String> {
-    let mut subscribed = shared.subscribed_exts.lock().expect("poisoned");
+    let mut subscribed = shared.subscribed_exts.lock_or_recover();
     if !subscribed.remove(ext) {
         return Ok(()); // not currently watching it - nothing to do
     }
@@ -582,7 +710,7 @@ fn emit_shell_notice(shared: &Shared, message: &str) {
 /// commands (used for the BLF auto-subscribe below) without constructing a
 /// throwaway wrapper.
 fn send_cmd_raw(shared: &Shared, value: Value) -> Result<(), String> {
-    let mut guard = shared.stdin.lock().expect("poisoned");
+    let mut guard = shared.stdin.lock_or_recover();
     match guard.as_mut() {
         Some(stdin) => {
             let mut line = serde_json::to_string(&value).map_err(|e| e.to_string())?;
@@ -611,7 +739,7 @@ fn supervisor_loop(shared: Arc<Shared>) {
         let account = shared.settings.snapshot().account;
         if !account.is_configured() {
             shared.emit_status_from_thread(StatusPayload::Idle);
-            *shared.thread_alive.lock().expect("poisoned") = false;
+            *shared.thread_alive.lock_or_recover() = false;
             return;
         }
 
@@ -619,7 +747,7 @@ fn supervisor_loop(shared: Arc<Shared>) {
         // Snapshot before build() (2026-07-16 4R re-review, resilience) -
         // see SpawnPlan::build's doc for why the cache lives on Shared but
         // gets passed in as a plain value here.
-        let known_devices_snapshot = shared.known_devices.lock().expect("poisoned").clone();
+        let known_devices_snapshot = shared.known_devices.lock_or_recover().clone();
         let plan = match SpawnPlan::build(&shared.settings, &account, transport, known_devices_snapshot.as_ref()) {
             Ok(p) => p,
             Err(e) => {
@@ -631,7 +759,7 @@ fn supervisor_loop(shared: Arc<Shared>) {
                     message: e.clone(),
                 });
                 if attempt >= MAX_ATTEMPTS {
-                    *shared.thread_alive.lock().expect("poisoned") = false;
+                    *shared.thread_alive.lock_or_recover() = false;
                     return;
                 }
                 continue;
@@ -681,18 +809,18 @@ fn supervisor_loop(shared: Arc<Shared>) {
                     message: format!("Couldn't start the core engine ({e}). Check the binary path in Settings > Advanced."),
                 });
                 if attempt >= MAX_ATTEMPTS || !wait_out_backoff_or_stop(&shared, attempt) {
-                    *shared.thread_alive.lock().expect("poisoned") = false;
+                    *shared.thread_alive.lock_or_recover() = false;
                     return;
                 }
                 continue;
             }
         };
 
-        *shared.current_pid.lock().expect("poisoned") = child.id().into();
+        *shared.current_pid.lock_or_recover() = child.id().into();
         shared.exited_flag.store(false, Ordering::SeqCst);
 
         let stdin = child.stdin.take();
-        *shared.stdin.lock().expect("poisoned") = stdin;
+        *shared.stdin.lock_or_recover() = stdin;
         let stdout = child.stdout.take().expect("piped");
         let stderr = child.stderr.take().expect("piped");
 
@@ -704,27 +832,27 @@ fn supervisor_loop(shared: Arc<Shared>) {
         // stop()/restart_now() close stdin (ctrl_json quits on stdin EOF).
         let exit = wait_child(&mut child);
         shared.exited_flag.store(true, Ordering::SeqCst);
-        *shared.stdin.lock().expect("poisoned") = None;
-        *shared.current_pid.lock().expect("poisoned") = None;
+        *shared.stdin.lock_or_recover() = None;
+        *shared.current_pid.lock_or_recover() = None;
         // The engine (and every subscription/call it held) is gone with the
         // process - a stale "registered"/"in-call" ping_state() would be a
         // straightforward lie to the click-to-call bridge.
         shared.registered.store(false, Ordering::SeqCst);
-        shared.call_phases.lock().expect("poisoned").clear();
-        shared.blf_states.lock().expect("poisoned").clear();
+        shared.call_phases.lock_or_recover().clear();
+        shared.blf_states.lock_or_recover().clear();
         // A fresh process starts with no subscriptions either - matches
         // blf_states being cleared above, and lets a respawned process's
         // favorites auto-subscribe (and any console still open across the
         // respawn) re-subscribe for real instead of blf_subscribe_raw's
         // idempotency check silently swallowing it as "already watching".
-        shared.subscribed_exts.lock().expect("poisoned").clear();
+        shared.subscribed_exts.lock_or_recover().clear();
         let _ = std::fs::remove_dir_all(&plan.scratch_dir);
 
-        let signal = std::mem::replace(&mut *shared.control.lock().expect("poisoned"), ControlSignal::None);
+        let signal = std::mem::replace(&mut *shared.control.lock_or_recover(), ControlSignal::None);
         match signal {
             ControlSignal::Stop => {
                 shared.emit_status_from_thread(StatusPayload::Stopped);
-                *shared.thread_alive.lock().expect("poisoned") = false;
+                *shared.thread_alive.lock_or_recover() = false;
                 return;
             }
             ControlSignal::RestartNow => {
@@ -749,7 +877,7 @@ fn supervisor_loop(shared: Arc<Shared>) {
                             "The core engine crashed {MAX_ATTEMPTS} times in a row and Centinelo stopped retrying. Last exit: {exit_desc}."
                         ),
                     });
-                    *shared.thread_alive.lock().expect("poisoned") = false;
+                    *shared.thread_alive.lock_or_recover() = false;
                     return;
                 }
                 if !wait_out_backoff_or_stop(&shared, attempt) {
@@ -763,7 +891,7 @@ fn supervisor_loop(shared: Arc<Shared>) {
 
 impl Shared {
     fn emit_status_from_thread(self: &Arc<Self>, payload: StatusPayload) {
-        *self.last_status.lock().expect("poisoned") = payload.clone();
+        *self.last_status.lock_or_recover() = payload.clone();
         let _ = self.app.emit(EVENT_STATUS, payload);
     }
 }
@@ -782,7 +910,7 @@ fn wait_out_backoff_or_stop(shared: &Arc<Shared>, attempt: u32) -> bool {
     let ticks = (Duration::from_secs(delay_secs).as_millis() / POLL_TICK.as_millis()).max(1);
     for _ in 0..ticks {
         std::thread::sleep(POLL_TICK);
-        match &*shared.control.lock().expect("poisoned") {
+        match &*shared.control.lock_or_recover() {
             ControlSignal::Stop => return false,
             ControlSignal::RestartNow => return true, // stop waiting, respawn now
             ControlSignal::None => {}
@@ -796,7 +924,7 @@ fn wait_child(child: &mut Child) -> Option<std::process::ExitStatus> {
 }
 
 fn choose_transport(account: &AccountSettings, shared: &Arc<Shared>) -> &'static str {
-    if let Some(t) = *shared.pending_transport_override.lock().expect("poisoned") {
+    if let Some(t) = *shared.pending_transport_override.lock_or_recover() {
         return t;
     }
     match account.transport_priority {
@@ -894,11 +1022,11 @@ fn spawn_stdout_reader(
                         && !shared.auto_fallback_used.swap(true, Ordering::SeqCst)
                     {
                         log::info!("sidecar: wss registration failed, falling back to classic udp (auto transport)");
-                        *shared.pending_transport_override.lock().expect("poisoned") = Some("udp");
-                        *shared.control.lock().expect("poisoned") = ControlSignal::RestartNow;
+                        *shared.pending_transport_override.lock_or_recover() = Some("udp");
+                        *shared.control.lock_or_recover() = ControlSignal::RestartNow;
                         // Close stdin from here too, in case the owning thread's
                         // wait() is what's blocking (same trick as restart_now()).
-                        let _ = shared.stdin.lock().expect("poisoned").take();
+                        let _ = shared.stdin.lock_or_recover().take();
                     }
                 }
             } else if event_name == "call_state" {
@@ -913,7 +1041,7 @@ fn spawn_stdout_reader(
                 // still-established call's state.
                 let call_state = value.get("state").and_then(Value::as_str).unwrap_or("");
                 if let Some(call_id) = value.get("call_id").and_then(Value::as_str) {
-                    let mut phases = shared.call_phases.lock().expect("poisoned");
+                    let mut phases = shared.call_phases.lock_or_recover();
                     apply_call_state_transition(&mut phases, call_id, call_state);
                 } else {
                     // Silently dropping this would be R4 all over again via
@@ -926,13 +1054,13 @@ fn spawn_stdout_reader(
                     // reintroducing this class of bug.
                     log::warn!("sidecar: call_state event missing call_id, phase not updated: {value}");
                 }
-                if let Some(t) = shared.transcription.lock().expect("poisoned").as_ref() {
+                if let Some(t) = shared.transcription.lock_or_recover().as_ref() {
                     t.on_call_state(&value);
                 }
             } else if event_name == "tap_state" {
                 // F4 audio tap (core/PROTOCOL.md v1.2) - forwarded straight
                 // to transcription orchestration, nothing tracked here.
-                if let Some(t) = shared.transcription.lock().expect("poisoned").as_ref() {
+                if let Some(t) = shared.transcription.lock_or_recover().as_ref() {
                     t.on_tap_state(&value);
                 }
             } else if event_name == "blf" {
@@ -942,8 +1070,7 @@ fn spawn_stdout_reader(
                 ) {
                     shared
                         .blf_states
-                        .lock()
-                        .expect("poisoned")
+                        .lock_or_recover()
                         .insert(ext.to_string(), blf_state.to_string());
                 }
             } else if event_name == "devices" {
@@ -967,7 +1094,7 @@ fn spawn_stdout_reader(
                         })
                         .unwrap_or_default()
                 }
-                *shared.known_devices.lock().expect("poisoned") = Some(KnownDevices {
+                *shared.known_devices.lock_or_recover() = Some(KnownDevices {
                     input: extract_names(value.get("input")),
                     output: extract_names(value.get("output")),
                 });
@@ -1089,7 +1216,13 @@ fn write_accounts_file(
         ";auth_pass={secret};mediaenc=dtls_srtp;medianat=ice;rtcp_mux=yes;audio_codecs=pcmu,pcma;regint=120;outbound=\"sip:{host}:{port};transport={transport}\""
     );
     let contents = format!("{uri}{params}\n");
-    write_private_file(&scratch_dir.join("accounts"), contents.as_bytes())
+    // Reuses settings.rs's hardened write-then-rename-with-fsync
+    // `write_private_file` (2026-07-16 dedup: this file used to carry its
+    // own second, weaker copy - truncate-in-place, no fsync, no atomic
+    // rename - of the exact same "write a 0600 file" logic) rather than
+    // maintaining a second implementation of the same durability contract
+    // for the account credentials file.
+    write_private_file(&scratch_dir.join("accounts"), contents.as_bytes()).map_err(|e| e.to_string())
 }
 
 /// Env var that forces the synthetic `ausine`/`aufile` audio pair
@@ -1654,23 +1787,6 @@ fn merge_notice(a: Option<String>, b: Option<String>) -> Option<String> {
         (Some(a), None) | (None, Some(a)) => Some(a),
         (None, None) => None,
     }
-}
-
-#[cfg(unix)]
-fn write_private_file(path: &Path, contents: &[u8]) -> Result<(), String> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|e| e.to_string())?;
-    f.write_all(contents).map_err(|e| e.to_string())
-}
-#[cfg(not(unix))]
-fn write_private_file(path: &Path, contents: &[u8]) -> Result<(), String> {
-    std::fs::write(path, contents).map_err(|e| e.to_string())
 }
 
 /// Resolves the core binary: explicit setting override first, then

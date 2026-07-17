@@ -9,6 +9,7 @@ mod premium;
 mod provisioning;
 mod settings;
 mod sidecar;
+mod sync_ext;
 mod tray;
 mod transcription;
 
