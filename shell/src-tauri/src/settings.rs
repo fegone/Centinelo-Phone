@@ -13,11 +13,11 @@
 //! The admin password is never stored in any recoverable form: only its
 //! Argon2 hash (see `hash_password`/`verify_password`).
 
+use crate::sync_ext::PoisonRecover;
 use argon2::password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use crate::sync_ext::PoisonRecover;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -740,7 +740,7 @@ fn tmp_sibling_path(path: &Path) -> PathBuf {
 pub(crate) fn write_private_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     let tmp_path = tmp_sibling_path(path);
-    {
+    let write_result: std::io::Result<()> = (|| {
         let mut f = fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -749,7 +749,18 @@ pub(crate) fn write_private_file(path: &Path, contents: &[u8]) -> std::io::Resul
             .open(&tmp_path)?;
         use std::io::Write;
         f.write_all(contents)?;
-        f.sync_all()?; // durable on disk before the rename makes it visible
+        f.sync_all() // durable on disk before the rename makes it visible
+    })();
+    if let Err(e) = write_result {
+        // Best-effort cleanup (2026-07-16 4R re-review, RESILIENCE minor):
+        // if `write_all` or `sync_all` itself fails partway - disk full
+        // mid-write, a flaky filesystem choking on the fsync, ... - the
+        // tmp file would otherwise be left orphaned next to the real one
+        // forever (never reached by the rename below, and nothing else
+        // ever cleans up a `.tmp.<pid>` sibling). Never touched on the
+        // success path, where the rename consumes the tmp file instead.
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e);
     }
     fs::rename(&tmp_path, path)?;
     // Best-effort fsync of the containing directory too (deuda fix,
@@ -787,11 +798,17 @@ pub(crate) fn write_private_file(path: &Path, contents: &[u8]) -> std::io::Resul
 #[cfg(not(unix))]
 pub(crate) fn write_private_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     let tmp_path = tmp_sibling_path(path);
-    {
+    let write_result: std::io::Result<()> = (|| {
         let mut f = fs::OpenOptions::new().write(true).create(true).truncate(true).open(&tmp_path)?;
         use std::io::Write;
         f.write_all(contents)?;
-        f.sync_all()?;
+        f.sync_all()
+    })();
+    if let Err(e) = write_result {
+        // Same orphaned-tmp-file cleanup as the unix branch above - see
+        // its comment.
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e);
     }
     fs::rename(&tmp_path, path)
 }
@@ -840,6 +857,31 @@ mod write_private_file_tests {
         write_private_file(&path, b"secret").unwrap();
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "SIP secret file must not be group/world readable");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn removes_the_orphaned_tmp_file_when_the_write_step_fails() {
+        // 4R re-review, RESILIENCE minor: if opening/writing/fsyncing the
+        // tmp file fails partway, it must not linger forever next to the
+        // real settings file. Pre-create the tmp sibling read-only so
+        // `write_private_file`'s own `OpenOptions::write(true)...open()`
+        // deterministically fails with EACCES - a portable, no-full-disk-
+        // needed way to exercise the same "the write step failed" cleanup
+        // path a real disk-full/flaky-fsync failure would take.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch_dir("cleanup-on-write-failure");
+        let path = dir.join("settings.json");
+        let tmp_path = tmp_sibling_path(&path);
+        fs::write(&tmp_path, b"stale").unwrap();
+        fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o400)).unwrap();
+
+        let result = write_private_file(&path, b"new contents");
+
+        assert!(result.is_err());
+        assert!(!tmp_path.exists(), "the orphaned tmp file must be cleaned up on a failed write, not left behind forever");
+        assert!(!path.exists(), "a failed write must never leave the real settings file created either");
         let _ = fs::remove_dir_all(&dir);
     }
 }

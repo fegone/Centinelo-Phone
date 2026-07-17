@@ -103,24 +103,33 @@ enum CallPhase {
 /// headroom over any real workload while still being a hard ceiling.
 const MAX_TRACKED_CALL_PHASES: usize = 64;
 
-/// Inserts into `phases`, evicting one existing entry first if `call_id`
-/// is new and the map is already at [`MAX_TRACKED_CALL_PHASES`]. Not a
-/// precise LRU - `HashMap` has no ordering to evict "the oldest" by, and
-/// reaching for one (e.g. an extra `Vec` tracking insertion order) would
-/// be complexity this defense-in-depth path doesn't earn: hitting this
-/// branch at all already means something upstream stopped sending
-/// `closed` events as expected, which is itself the anomaly worth a log
-/// line, not "which exact entry gets evicted".
+/// Inserts into `phases`, *rejecting* the insert (leaving every existing
+/// entry untouched) if `call_id` is new and the map is already at
+/// [`MAX_TRACKED_CALL_PHASES`]. Deliberately never evicts an existing
+/// entry to make room (2026-07-16 4R re-review, RESILIENCE blocker): an
+/// earlier version of this function evicted an arbitrary existing entry
+/// (`phases.keys().next()`) to make room for a new one, which could evict
+/// the one entry that's a genuine live `InCall` leg - a flood of
+/// anomalous call_ids filling the map could push the real call's own
+/// entry out, and once the flood's own (fake) entries later close, the
+/// map would end up *empty* with a real call still in progress, which is
+/// exactly R4's `has_active_call()` -> `false` -> `provisioning_apply`
+/// bug all over again, just reached through this cap instead of the
+/// original global-flag bug. Rejecting the N+1th new call_id instead
+/// means the shell may briefly fail to *track* a call_id beyond the cap,
+/// but every call_id it *is* already tracking - including the real one -
+/// stays tracked for its entire lifetime. Preserving already-tracked
+/// calls matters more than accepting every single call_id an anomalous
+/// stream throws at it.
 fn insert_bounded(phases: &mut HashMap<String, CallPhase>, call_id: &str, phase: CallPhase) {
     if !phases.contains_key(call_id) && phases.len() >= MAX_TRACKED_CALL_PHASES {
-        if let Some(evicted) = phases.keys().next().cloned() {
-            log::warn!(
-                "sidecar: call_phases hit its {MAX_TRACKED_CALL_PHASES}-entry cap - evicting call_id {evicted} to track {call_id}. \
-                 This should never happen in normal operation (every call_id should eventually get a matching `closed`); \
-                 likely an engine bug or malformed event stream never closing old legs."
-            );
-            phases.remove(&evicted);
-        }
+        log::warn!(
+            "sidecar: call_phases at its {MAX_TRACKED_CALL_PHASES}-entry cap - refusing to track new call_id {call_id}; \
+             every already-tracked call_id (including any real in-progress call) is left untouched. This should never \
+             happen in normal operation (every call_id should eventually get a matching `closed`); likely an engine bug \
+             or malformed event stream never closing old legs."
+        );
+        return;
     }
     phases.insert(call_id.to_string(), phase);
 }
@@ -269,22 +278,61 @@ mod call_phase_tests {
     // ---- call_phases cap (defense-in-depth deuda fix) ----------------
 
     #[test]
-    fn tracking_stays_at_the_cap_when_call_ids_never_close() {
+    fn flooding_past_the_cap_rejects_new_call_ids_and_keeps_every_existing_one() {
         // A misbehaving engine/malformed event stream that never sends
         // `closed` for any call_id must not grow this map without bound -
-        // one flood of MAX_TRACKED_CALL_PHASES + 50 never-closed
-        // call_ids must still leave the map at exactly the cap.
+        // one flood of MAX_TRACKED_CALL_PHASES + 50 never-closed call_ids
+        // must leave the map at exactly the cap. Rejection-based (not
+        // eviction-based, see `insert_bounded`'s doc for the blocker this
+        // fixed): the first MAX_TRACKED_CALL_PHASES call_ids fill the map
+        // and are still all present afterward - only call_ids that arrive
+        // *after* the cap was already full get rejected.
         let mut phases = HashMap::new();
         for i in 0..(MAX_TRACKED_CALL_PHASES + 50) {
             apply_call_state_transition(&mut phases, &format!("flood-{i}"), "incoming");
         }
         assert_eq!(phases.len(), MAX_TRACKED_CALL_PHASES);
+        assert!(phases.contains_key("flood-0"), "an early call_id must never be evicted to make room for a later one");
+        assert!(
+            !phases.contains_key(&format!("flood-{}", MAX_TRACKED_CALL_PHASES + 10)),
+            "a call_id arriving after the cap was already full must be rejected, not tracked"
+        );
+    }
+
+    #[test]
+    fn a_real_incall_leg_at_the_cap_survives_a_flood_of_new_call_ids() {
+        // The exact blocker this fixed (2026-07-16 4R re-review,
+        // RESILIENCE): the previous eviction-based cap could evict the one
+        // entry that was a genuine live call to make room for an
+        // anomalous flood's next call_id - once the flood's own (fake)
+        // entries later closed, the map would end up empty with a real
+        // call still in progress, reopening R4's exact
+        // has_active_call()->false->provisioning_apply bug. Filling every
+        // remaining slot with a flood, then trying to track one more new
+        // call_id, must never touch the one entry that's actually InCall.
+        let mut phases = HashMap::new();
+        apply_call_state_transition(&mut phases, "real-call", "established");
+        for i in 0..(MAX_TRACKED_CALL_PHASES - 1) {
+            apply_call_state_transition(&mut phases, &format!("flood-{i}"), "incoming");
+        }
+        assert_eq!(phases.len(), MAX_TRACKED_CALL_PHASES);
+
+        // One more new call_id arriving at the cap: rejected, not making
+        // room by evicting anything.
+        apply_call_state_transition(&mut phases, "flood-overflow", "incoming");
+
+        assert_eq!(phases.len(), MAX_TRACKED_CALL_PHASES);
+        assert!(!phases.contains_key("flood-overflow"), "the overflow call_id must be rejected, not tracked");
+        assert_eq!(phases.get("real-call"), Some(&CallPhase::InCall), "the real call must never be evicted to make room");
+        // has_active_call() (SidecarHandle) is exactly `!call_phases.is_empty()`
+        // - this is the property that actually matters end to end.
+        assert!(!phases.is_empty(), "has_active_call() must stay true while the real call is still tracked");
     }
 
     #[test]
     fn a_known_call_id_can_still_transition_at_the_cap_without_growing_it() {
         // Updating an *existing* tracked call_id (e.g. incoming ->
-        // established) must never trigger eviction - only a genuinely new
+        // established) must never be rejected - only a genuinely new
         // call_id competes for the capped headroom.
         let mut phases = HashMap::new();
         for i in 0..MAX_TRACKED_CALL_PHASES {
