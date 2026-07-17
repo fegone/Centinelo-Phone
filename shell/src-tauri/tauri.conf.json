@@ -29,6 +29,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "createUpdaterArtifacts": true,
     "publisher": "Centinelo",
     "copyright": "Copyright (c) 2026 Centinelo",
     "shortDescription": "SIP softphone with live BLF console and local transcription",
@@ -60,6 +61,15 @@
       "desktop": {
         "schemes": ["centinelo", "tel"]
       }
+    },
+    "updater": {
+      "endpoints": [
+        "https://github.com/fegone/Centinelo-Phone/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      },
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IENDNDk4N0VCQjc3N0RBRUIKUldUcjJuZTM2NGRKekpITkJNcjFDbUZQN25OcUxHZFY3aHFvODVSMWhTK1JDTHkrS0w3aVRCbUsK"
     }
   }
 }

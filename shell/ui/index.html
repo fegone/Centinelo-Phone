@@ -50,6 +50,36 @@
 
     <div id="banner-slot"></div>
 
+    <!-- ================= auto-updater banner =================
+         Non-intrusive, non-timed (unlike #banner-slot's transient
+         .banner) - only appears for phases worth interrupting the main
+         window for (see ui/js/updater.js's shouldShowBanner doc): a
+         silent background check on launch never pops this. Flow, not an
+         absolute overlay, so it never covers the identity card/dial pad -
+         it just pushes them down a little while relevant, same "no
+         intrusivo" requirement the task brief names explicitly. Never
+         amber (DIRECTION.md's "ringing owns the one glow" rule) - styled
+         like .setup-prompt/.privacy-note, plain ink. -->
+    <div class="update-banner" id="update-banner" hidden>
+      <div class="update-banner-row">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"/><path d="M7 10l5 5 5-5"/><path d="M5 19h14"/></svg>
+        <div class="update-banner-text">
+          <b id="update-banner-title"></b>
+          <span id="update-banner-detail"></span>
+        </div>
+      </div>
+      <div class="dlwrap" id="update-banner-progress" hidden>
+        <div class="dlbar"><i id="update-banner-dlbar-fill"></i></div>
+        <span class="dlpct" id="update-banner-dlpct"></span>
+      </div>
+      <div class="update-banner-actions" id="update-banner-actions">
+        <button class="ghost" id="btn-update-later" data-i18n="updater.later">Later</button>
+        <button class="ghost" id="btn-update-retry" data-i18n="updater.retry" hidden>Retry</button>
+        <button class="primary" id="btn-update-download" data-i18n="updater.download" hidden>Download</button>
+        <button class="primary" id="btn-update-restart" data-i18n="updater.restartToUpdate" hidden>Restart to update</button>
+      </div>
+    </div>
+
     <!-- shown only when no SIP account has been configured yet. Auto-
          provisioning (spec §5, provisioning.rs): paste a link here instead
          of typing host/extension/secret by hand in Settings - modeled on
@@ -445,7 +475,27 @@
 
       <h2 data-i18n="settings.aboutHeading">About</h2>
       <div class="settings-card">
-        <p class="hint" style="margin:0" data-i18n="settings.aboutBody">Centinelo Phone 2.0 — shell build. Runs on this computer; nothing phones home.</p>
+        <p class="hint" style="margin:0 0 10px" data-i18n="settings.aboutBody">Centinelo Phone 2.0 — shell build. Runs on this computer; nothing phones home.</p>
+        <!-- Auto-updater (roadmap debt fix, shell/README.md "Auto-
+             updater"): version + manual check live here; the actual
+             download/restart controls live in #update-banner on the main
+             window, not duplicated here - see updater.js's header
+             comment. check_on_startup is a low-risk operational
+             preference, not admin-gated (same reasoning as the theme/
+             language rows above). -->
+        <div class="field" style="margin-bottom:8px">
+          <span class="hint" id="updater-current-version"></span>
+        </div>
+        <div class="field">
+          <label data-i18n="settings.updaterCheckOnStartupLabel">Check for updates automatically</label>
+          <div class="themerow" role="radiogroup" aria-label="Check for updates automatically" id="updater-check-on-startup-row" data-i18n-aria-label="settings.updaterCheckOnStartupLabel">
+            <button data-bool-choice="false" data-i18n="settings.boolOff">Off</button><button data-bool-choice="true" class="on" data-i18n="settings.boolOn">On</button>
+          </div>
+        </div>
+        <div class="btnrow">
+          <button class="ghost" id="btn-check-updates" data-i18n="updater.checkButton">Check for updates</button>
+          <span class="hint" id="updater-settings-status"></span>
+        </div>
       </div>
 
       <!-- admin-lock gate: first-run "set a password" OR "unlock to edit" -->

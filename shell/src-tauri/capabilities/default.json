@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capabilities for the Centinelo Phone main window - custom titlebar controls + tray-driven show/hide.",
+  "description": "Capabilities for the Centinelo Phone main window - custom titlebar controls + tray-driven show/hide + the auto-updater's read-only check (updater:allow-check) and its post-install relaunch (process:allow-restart). Download/install are this app's OWN commands (src/updater.rs), not plugin commands, so they need no ACL entry here - see shell/README.md \"Auto-updater\" for why (2026-07-17 4R re-review: the plugin's own plugin:updater|install has no way to gate itself on an active call, so this app never grants it at all - only allow-check, the read-only half, stays a plugin permission).",
   "windows": [
     "main"
   ],
@@ -11,6 +11,8 @@
     "core:window:allow-hide",
     "core:window:allow-show",
     "core:window:allow-set-focus",
-    "core:window:allow-start-dragging"
+    "core:window:allow-start-dragging",
+    "updater:allow-check",
+    "process:allow-restart"
   ]
 }

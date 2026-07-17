@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Centinelo — auto-updater dev harness</title>
+<link rel="stylesheet" href="../ui/css/tokens.css">
+<link rel="stylesheet" href="../ui/css/app.css">
+<style>
+  /* Harness-only chrome (never shipped/loaded by the real app - this file
+     is not referenced from index.html, same precedent as transcript-
+     mock.html sitting outside ui/). Puts the real #update-banner + About
+     card markup inside a fixed 380px frame matching the app's actual main
+     window (tauri.conf.json), so screenshots are representative of what
+     the real window shows. Exercises ui/js/updater.js's real
+     renderUpdateBanner/renderUpdaterAboutStatus against fabricated state -
+     no window.__TAURI__ exists in a plain browser tab, so this can only
+     ever cover the pure state-machine + rendering half, never the real
+     @tauri-apps/plugin-updater IPC calls (app.js owns those exclusively -
+     see that file's own "auto-updater" section header comment). */
+  html, body { margin: 0; background: var(--canvas); }
+  body { min-height: 100vh; display: flex; align-items: flex-start; justify-content: center; gap: 24px; padding: 32px; font-family: var(--font-ui); }
+  .frame { width: 380px; border-radius: 10px; overflow: hidden; box-shadow: var(--shadow-win); position: relative; background: var(--bg-0); padding: 14px 12px; }
+  .settings-frame { width: 380px; border-radius: 10px; box-shadow: var(--shadow-win); position: relative; background: var(--bg-0); padding: 14px 16px; }
+  .controls { display: flex; flex-direction: column; gap: 8px; }
+  .controls button { display: block; width: 240px; text-align: left; height: 32px; padding: 0 10px; border-radius: 8px; border: 1px solid var(--border-1); background: var(--bg-1); color: var(--text-2); font: 500 12px/1 var(--font-ui); cursor: pointer; }
+  .controls button.on { background: var(--amber-soft); color: var(--amber); border-color: var(--amber-fill); }
+  .controls h2 { font: 700 10px/1 var(--font-mono); letter-spacing: .12em; color: var(--text-3); text-transform: uppercase; margin: 10px 0 2px; }
+  .label { font: 700 10px/1 var(--font-mono); letter-spacing: .12em; color: var(--text-3); text-transform: uppercase; margin: 0 0 8px; }
+</style>
+</head>
+<body>
+
+<div class="controls" role="group" aria-label="Scenario picker">
+  <h2>Phase</h2>
+  <button data-scenario="idle" class="on">00 Idle (never checked)</button>
+  <button data-scenario="checking">01 Checking</button>
+  <button data-scenario="up_to_date">02 Up to date</button>
+  <button data-scenario="check_error">03 Check error (Settings only)</button>
+  <button data-scenario="available">04 Available</button>
+  <button data-scenario="downloading_indeterminate">05 Downloading (indeterminate)</button>
+  <button data-scenario="downloading_progress">06 Downloading (62%)</button>
+  <button data-scenario="ready">07 Ready</button>
+  <button data-scenario="ready_call_active">08 Ready, call active (Restart disabled)</button>
+  <button data-scenario="installing">09 Installing</button>
+  <button data-scenario="download_error">10 Download error</button>
+  <button data-scenario="install_error">11 Install error</button>
+  <button data-scenario="restart_error">12 Installed, restart failed</button>
+  <button data-scenario="restart_error_call_active">13 Installed, restart failed, call active</button>
+  <button data-scenario="dismissed">14 Available, dismissed (no banner)</button>
+  <h2>Theme</h2>
+  <button data-theme="auto" class="on">Auto</button>
+  <button data-theme="light">Light</button>
+  <button data-theme="dark">Dark</button>
+  <h2>Language</h2>
+  <button data-locale="en" class="on">EN</button>
+  <button data-locale="pt-BR">PT-BR</button>
+  <button data-locale="es">ES</button>
+</div>
+
+<div>
+  <p class="label">Main window banner</p>
+  <div class="frame">
+    <div class="update-banner" id="update-banner" hidden>
+      <div class="update-banner-row">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"/><path d="M7 10l5 5 5-5"/><path d="M5 19h14"/></svg>
+        <div class="update-banner-text">
+          <b id="update-banner-title"></b>
+          <span id="update-banner-detail"></span>
+        </div>
+      </div>
+      <div class="dlwrap" id="update-banner-progress" hidden>
+        <div class="dlbar"><i id="update-banner-dlbar-fill"></i></div>
+        <span class="dlpct" id="update-banner-dlpct"></span>
+      </div>
+      <div class="update-banner-actions" id="update-banner-actions">
+        <button class="ghost" id="btn-update-later">Later</button>
+        <button class="ghost" id="btn-update-retry" hidden>Retry</button>
+        <button class="primary" id="btn-update-download" hidden>Download</button>
+        <button class="primary" id="btn-update-restart" hidden>Restart to update</button>
+      </div>
+    </div>
+    <p style="font:400 11px/1.5 var(--font-ui);color:var(--text-3);margin:8px 4px 0">(rest of the main window omitted - the banner sits above the identity card, see index.html)</p>
+  </div>
+
+  <p class="label" style="margin-top:20px">Settings &gt; About</p>
+  <div class="settings-frame">
+    <h2 style="margin:2px 0 4px;font:700 10px/1 var(--font-mono);letter-spacing:.16em;color:var(--text-3);text-transform:uppercase">About</h2>
+    <div class="settings-card">
+      <p class="hint" style="margin:0 0 10px">Centinelo Phone 2.0 — shell build. Runs on this computer; nothing phones home.</p>
+      <div class="field" style="margin-bottom:8px">
+        <span class="hint" id="updater-current-version"></span>
+      </div>
+      <div class="field">
+        <label>Check for updates automatically</label>
+        <div class="themerow" role="radiogroup" id="updater-check-on-startup-row">
+          <button data-bool-choice="false">Off</button><button data-bool-choice="true" class="on">On</button>
+        </div>
+      </div>
+      <div class="btnrow">
+        <button class="ghost" id="btn-check-updates">Check for updates</button>
+        <span class="hint" id="updater-settings-status"></span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script type="module">
+import { t, setLocale } from "../ui/js/i18n.js";
+import { computeDownloadPct, formatModelSize } from "../ui/js/transcription-settings.js";
+import {
+  initialUpdaterState,
+  withChecking,
+  withUpToDate,
+  withAvailable,
+  withCheckError,
+  withDownloadStarted,
+  withDownloadProgress,
+  withDownloadError,
+  withReady,
+  withInstalling,
+  withInstallError,
+  withRestartError,
+  withDismissed,
+  renderUpdateBanner,
+  renderUpdaterAboutStatus,
+} from "../ui/js/updater.js";
+
+setLocale("en");
+
+const refs = {
+  root: document.getElementById("update-banner"),
+  title: document.getElementById("update-banner-title"),
+  detail: document.getElementById("update-banner-detail"),
+  actions: document.getElementById("update-banner-actions"),
+  downloadBtn: document.getElementById("btn-update-download"),
+  restartBtn: document.getElementById("btn-update-restart"),
+  retryBtn: document.getElementById("btn-update-retry"),
+  laterBtn: document.getElementById("btn-update-later"),
+  progressWrap: document.getElementById("update-banner-progress"),
+  progressFill: document.getElementById("update-banner-dlbar-fill"),
+  progressPct: document.getElementById("update-banner-dlpct"),
+};
+
+function buildState(scenarioKey) {
+  let s = initialUpdaterState();
+  s.currentVersion = "2.0.0";
+  switch (scenarioKey) {
+    case "idle":
+      return s;
+    case "checking":
+      return withChecking(s);
+    case "up_to_date":
+      return withUpToDate(withChecking(s), "2.0.0");
+    case "check_error":
+      return withCheckError(withChecking(s), "couldn't reach github.com (offline)");
+    case "available":
+      return withAvailable(s, { version: "2.1.0", notes: "Auto-updater, i18n fixes.", pubDate: "2026-07-17T00:00:00Z" });
+    case "downloading_indeterminate":
+      return withDownloadStarted(withAvailable(s, { version: "2.1.0" }));
+    case "downloading_progress": {
+      let d = withDownloadStarted(withAvailable(s, { version: "2.1.0" }));
+      return withDownloadProgress(d, { downloadedBytes: 12_400_000, totalBytes: 20_000_000 });
+    }
+    case "ready":
+      return withReady(withDownloadStarted(withAvailable(s, { version: "2.1.0" })));
+    case "ready_call_active":
+      return withReady(withDownloadStarted(withAvailable(s, { version: "2.1.0" })));
+    case "installing":
+      return withInstalling(withReady(withDownloadStarted(withAvailable(s, { version: "2.1.0" }))));
+    case "download_error":
+      return withDownloadError(withDownloadStarted(withAvailable(s, { version: "2.1.0" })), "connection reset while downloading");
+    case "install_error":
+      return withInstallError(withInstalling(withReady(withDownloadStarted(withAvailable(s, { version: "2.1.0" })))), "signature verification failed");
+    case "restart_error":
+    case "restart_error_call_active":
+      return withRestartError(withInstalling(withReady(withDownloadStarted(withAvailable(s, { version: "2.1.0" })))), "the OS refused the relaunch request");
+    case "dismissed":
+      return withDismissed(withAvailable(s, { version: "2.1.0" }));
+    default:
+      return s;
+  }
+}
+
+let currentScenario = "idle";
+
+function render(scenarioKey) {
+  currentScenario = scenarioKey;
+  const state = buildState(scenarioKey);
+  renderUpdateBanner(refs, state, t, {
+    formatBytes: formatModelSize,
+    computeDownloadPct,
+    canInstallNow: () => scenarioKey !== "ready_call_active" && scenarioKey !== "restart_error_call_active",
+  });
+  renderUpdaterAboutStatus(document.getElementById("updater-settings-status"), document.getElementById("btn-check-updates"), state, t, { computeDownloadPct });
+  document.getElementById("updater-current-version").textContent = state.currentVersion ? t("updater.currentVersion", { version: state.currentVersion }) : "";
+}
+
+document.querySelectorAll(".controls button[data-scenario]").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".controls button[data-scenario]").forEach((b) => b.classList.remove("on"));
+    btn.classList.add("on");
+    render(btn.dataset.scenario);
+  });
+});
+document.querySelectorAll(".controls button[data-theme]").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".controls button[data-theme]").forEach((b) => b.classList.remove("on"));
+    btn.classList.add("on");
+    const v = btn.dataset.theme;
+    if (v === "auto") document.documentElement.removeAttribute("data-theme");
+    else document.documentElement.setAttribute("data-theme", v);
+  });
+});
+document.querySelectorAll(".controls button[data-locale]").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".controls button[data-locale]").forEach((b) => b.classList.remove("on"));
+    btn.classList.add("on");
+    setLocale(btn.dataset.locale);
+    document.documentElement.lang = btn.dataset.locale;
+    render(currentScenario);
+  });
+});
+
+render("idle");
+</script>
+</body>
+</html>

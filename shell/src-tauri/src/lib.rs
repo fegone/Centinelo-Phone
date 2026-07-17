@@ -12,6 +12,7 @@ mod sidecar;
 mod sync_ext;
 mod tray;
 mod transcription;
+mod updater;
 
 use premium::PremiumHandle;
 use settings::{AdminSession, SettingsStore};
@@ -37,6 +38,15 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_log::Builder::default().build())
+        // Auto-updater (roadmap debt fix, see shell/README.md
+        // "Auto-updater") - endpoint/pubkey come from tauri.conf.json's
+        // own `plugins.updater` block, nothing to configure here.
+        // tauri-plugin-process supplies relaunch() for the one step after
+        // a successful install (ui/js/updater.js calls it directly via
+        // @tauri-apps/plugin-process, no Rust-side glue needed for either
+        // plugin beyond registering them).
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         // Serves the premium console UI (console-ui package) to the
         // "console" webview window - see console.rs's module doc for why
         // a custom protocol instead of a bundled frontendDist path (short
@@ -141,6 +151,10 @@ pub fn run() {
             commands::set_theme,
             commands::get_locale,
             commands::set_locale,
+            commands::get_updater_settings,
+            commands::set_updater_check_on_startup,
+            updater::updater_download,
+            updater::updater_install,
             commands::admin_status,
             commands::admin_set_password,
             commands::admin_unlock,

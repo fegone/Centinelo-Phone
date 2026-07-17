@@ -16,11 +16,37 @@ import {
   applyProgressEvent,
   isDownloadStalled,
   computeModelChipState,
+  computeDownloadPct,
 } from "./transcription-settings.js";
+import {
+  initialUpdaterState,
+  withChecking,
+  withUpToDate,
+  withAvailable,
+  withCheckError,
+  withDownloadStarted,
+  withDownloadProgress,
+  withDownloadError,
+  withReady,
+  withInstalling,
+  withInstallError,
+  withRestartError,
+  withDismissed,
+  canStartInstall,
+  canRunBackgroundRecheck,
+  closePendingUpdateResources,
+  renderUpdateBanner,
+  renderUpdaterAboutStatus,
+} from "./updater.js";
 
-const { invoke } = window.__TAURI__.core;
+// `Channel` (updater download progress) and `Resource` both live on
+// window.__TAURI__.core alongside `invoke` - withGlobalTauri bundles the
+// WHOLE @tauri-apps/api/core module, not a curated subset (verified
+// against tauri's own scripts/bundle.global.js, 2.11.5).
+const { invoke, Channel } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 const { getCurrentWindow } = window.__TAURI__.window;
+const { getVersion } = window.__TAURI__.app;
 
 const win = getCurrentWindow();
 
@@ -59,6 +85,13 @@ const state = {
   // language switch (see refreshAllUiText) can re-render it in the new
   // locale's date/duration formatting without an extra round-trip.
   recents: [],
+  // ---- auto-updater (roadmap debt fix) -----------------------------------
+  // See ui/js/updater.js's header comment for the full state machine.
+  // check_on_startup mirrors the persisted setting, not part of the
+  // updater state machine itself (same "preference vs. resolved value"
+  // split theme/locale already use).
+  updater: initialUpdaterState(),
+  updaterCheckOnStartup: true,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -1159,6 +1192,307 @@ function handleModelDownloadSettled(payload, errorMessage) {
   refreshModelStatuses();
 }
 
+// ---------------------------------------------------------------------------
+// auto-updater (roadmap debt fix) - see ui/js/updater.js's header comment
+// for the full design. This block owns every @tauri-apps/plugin-updater /
+// @tauri-apps/plugin-process call - neither plugin's JS package can be
+// imported here (bare-specifier `import ... from "@tauri-apps/plugin-
+// updater"` can't resolve without a bundler, and this project deliberately
+// has none - see shell/README.md's opening line).
+//
+// check() still calls the plugin's own `plugin:updater|check` directly
+// (read-only, no call-safety concern - confirmed against its dist-js
+// source). download()/install() do NOT (2026-07-17 4R re-review,
+// RESILIENCE blocker): the plugin's own `plugin:updater|install` has no
+// way to refuse while a call is active - the ONLY guard available to it
+// would have to live in THIS file, reading `state.call`, which
+// `beginTranscript`'s own doc elsewhere in this file documents as
+// exactly the kind of client-side mirror that can already be stale by
+// the time an await resolves (a `call_state:"closed"` racing it). Since
+// installing an update kills the ENTIRE process, that's not an acceptable
+// place for the real decision to live - `src-tauri/src/updater.rs`'s
+// `updater_install` command is this app's OWN command instead, which
+// checks `sidecar.has_active_call()` (the authoritative, call_id-tracked
+// source hardened after the R4 provisioning bug - see that Rust module's
+// own doc) immediately before calling the plugin's `Update::install()`
+// directly. `canStartInstall` below stays as UX ONLY (disables the
+// button before the round trip even starts) - the Rust command is what
+// actually decides, and refuses on its own even if this file's guard
+// were ever wrong or bypassed (e.g. via devtools).
+// ---------------------------------------------------------------------------
+
+/// `{ rid, currentVersion, version, date, body, rawJson }` from the last
+/// successful `check()` that found an update - `rid` is the resource
+/// `updater_download`/`updater_install` (src-tauri/src/updater.rs) below
+/// need. Cleared (and its Rust-side resource closed) at the start of
+/// every fresh check, so a manual re-check never leaks one resource per
+/// click.
+let pendingUpdateMeta = null;
+/// The resource id `updater_download` hands back (the downloaded bytes,
+/// this app's OWN resource type Rust-side - NOT the plugin's own private
+/// one, see updater.rs's header comment for why) - `updater_install`
+/// needs both this and pendingUpdateMeta.rid.
+let pendingDownloadedBytesRid = null;
+/// Bytes downloaded so far this attempt - the Progress event carries a
+/// per-chunk delta (`chunkLength`), not a running total, so this module
+/// accumulates it the same way the real plugin's own JS wrapper would if
+/// it exposed one (it doesn't - callers are expected to do this
+/// themselves, per the official docs' own example - and this app's own
+/// `updater_download` command mirrors that same event shape on purpose,
+/// see updater.rs).
+let downloadedSoFar = 0;
+
+async function pluginUpdaterCheck() {
+  return invoke("plugin:updater|check", {});
+}
+
+/// `updater_download` (src-tauri/src/updater.rs), not `plugin:updater|
+/// download` - see this section's header comment.
+async function updaterDownload(updateRid, onEvent) {
+  const channel = new Channel();
+  channel.onmessage = onEvent;
+  return invoke("updater_download", { update_rid: updateRid, on_event: channel });
+}
+
+/// `updater_install` (src-tauri/src/updater.rs), not `plugin:updater|
+/// install` - this is the command that actually gates on
+/// `sidecar.has_active_call()`, see this section's header comment.
+async function updaterInstall(updateRid, bytesRid) {
+  return invoke("updater_install", { update_rid: updateRid, bytes_rid: bytesRid });
+}
+
+async function pluginProcessRestart() {
+  return invoke("plugin:process|restart");
+}
+
+let updaterRefs = null;
+function getUpdaterRefs() {
+  if (updaterRefs) return updaterRefs;
+  updaterRefs = {
+    root: $("update-banner"),
+    title: $("update-banner-title"),
+    detail: $("update-banner-detail"),
+    actions: $("update-banner-actions"),
+    downloadBtn: $("btn-update-download"),
+    restartBtn: $("btn-update-restart"),
+    retryBtn: $("btn-update-retry"),
+    laterBtn: $("btn-update-later"),
+    progressWrap: $("update-banner-progress"),
+    progressFill: $("update-banner-dlbar-fill"),
+    progressPct: $("update-banner-dlpct"),
+  };
+  return updaterRefs;
+}
+
+function renderUpdaterUI() {
+  renderUpdateBanner(getUpdaterRefs(), state.updater, t, {
+    formatBytes: formatModelSize,
+    computeDownloadPct,
+    canInstallNow: () => canStartInstall(!!state.call),
+  });
+  renderUpdaterAboutStatus($("updater-settings-status"), $("btn-check-updates"), state.updater, t, { computeDownloadPct });
+  // Always-shown version line (separate from the check-status line above -
+  // see renderUpdaterAboutStatus's own doc for why the split).
+  $("updater-current-version").textContent = state.updater.currentVersion
+    ? t("updater.currentVersion", { version: state.updater.currentVersion })
+    : "";
+}
+
+/// Closes ANY pending update resource - both the update-metadata rid AND
+/// (2026-07-17 4R re-review, RELIABILITY M2 - previously only the former
+/// was ever closed here, leaking the downloaded-bytes resource on every
+/// download-then-abandon/download-then-recheck cycle) the downloaded-bytes
+/// rid, if one exists - before starting a fresh check, so repeated manual
+/// "Check for updates" clicks don't accumulate resource-table entries.
+/// `plugin:resources|close` is the generic resource-table teardown command
+/// every `Resource` (core.js) goes through, not a per-plugin one - works
+/// identically for `updater.rs`'s own `DownloadedUpdateBytes` type as for
+/// the plugin's `Update`. The actual "which ids, in what order, tolerate
+/// individual failures" contract lives in `updater.js`'s
+/// `closePendingUpdateResources` (unit-tested there with a counting mock)
+/// - this is just that function wired to the real `invoke`.
+async function closePendingUpdateResource() {
+  await closePendingUpdateResources(pendingUpdateMeta, pendingDownloadedBytesRid, (rid) => invoke("plugin:resources|close", { rid }));
+  pendingUpdateMeta = null;
+  pendingDownloadedBytesRid = null;
+}
+
+/// Reentrancy guard - a manual "Check for updates" click landing while a
+/// download/install is already in flight (or another check is already
+/// running) would otherwise race it: closePendingUpdateResource() below
+/// would null out pendingUpdateMeta/pendingDownloadedBytesRid out from
+/// under the in-flight download()/install() call, whose own `.then`
+/// continuation (still holding the OLD rid captured at its own call time)
+/// would then overwrite whatever this fresh check just found once IT
+/// resolves. renderUpdaterAboutStatus already disables the Settings button
+/// for these phases (belt) - this is the suspenders, since
+/// maybeCheckForUpdatesOnStartup() can also call this directly, not only
+/// through that button.
+function updateCheckInFlight() {
+  return ["checking", "downloading", "installing"].includes(state.updater.phase);
+}
+
+async function performUpdateCheck() {
+  if (updateCheckInFlight()) return;
+  await closePendingUpdateResource();
+  state.updater = withChecking(state.updater);
+  renderUpdaterUI();
+  try {
+    const metadata = await pluginUpdaterCheck();
+    if (metadata) {
+      pendingUpdateMeta = metadata;
+      state.updater = withAvailable(state.updater, {
+        version: metadata.version,
+        notes: metadata.body,
+        pubDate: metadata.date,
+      });
+    } else {
+      state.updater = withUpToDate(state.updater);
+    }
+  } catch (e) {
+    state.updater = withCheckError(state.updater, String(e && e.message ? e.message : e));
+  }
+  renderUpdaterUI();
+}
+
+async function startUpdateDownload() {
+  if (!pendingUpdateMeta) return;
+  downloadedSoFar = 0;
+  state.updater = withDownloadStarted(state.updater);
+  renderUpdaterUI();
+  try {
+    const bytesRid = await updaterDownload(pendingUpdateMeta.rid, (event) => {
+      if (event.event === "Progress") {
+        downloadedSoFar += event.data.chunkLength;
+        state.updater = withDownloadProgress(state.updater, { downloadedBytes: downloadedSoFar });
+      } else if (event.event === "Started") {
+        state.updater = withDownloadProgress(state.updater, { downloadedBytes: 0, totalBytes: event.data.contentLength });
+      }
+      renderUpdaterUI();
+    });
+    pendingDownloadedBytesRid = bytesRid;
+    state.updater = withReady(state.updater);
+  } catch (e) {
+    state.updater = withDownloadError(state.updater, String(e && e.message ? e.message : e));
+  }
+  renderUpdaterUI();
+}
+
+/// The one safety gate before the disruptive step, client-side - re-
+/// checked HERE, immediately before calling `updaterInstall`, not merely
+/// back when the update was first found. This is UX only, though
+/// (2026-07-17 4R re-review, RESILIENCE blocker): the REAL decision is
+/// `src-tauri/src/updater.rs`'s own `sidecar.has_active_call()` check
+/// inside the `updater_install` command itself, which is authoritative
+/// (call_id-tracked, hardened after the R4 provisioning bug) where
+/// `state.call` here is just this file's own client-side mirror - the
+/// same kind `beginTranscript`'s doc elsewhere in this file already notes
+/// can go stale mid-`await` (a `call_state:"closed"` racing it). This
+/// check only saves a round trip for the common case; it can never be the
+/// only thing standing between an update install and a live call.
+///
+/// **Windows-specific gap** (2026-07-17 4R re-review, RESILIENCE #4,
+/// documented rather than silently accepted - see shell/README.md
+/// "Auto-updater" for the full writeup): on Windows, the plugin's own
+/// `Update::install()` hands off to the OS installer via `ShellExecuteW`
+/// and calls `std::process::exit(0)` unconditionally right after,
+/// discarding `ShellExecuteW`'s own return value - if the handoff itself
+/// fails (UAC declined, SmartScreen, AV, permissions), the app still
+/// exits with NO error and NO chance for anything below to run at all.
+/// The `catch` block below is real and does work - but only on macOS/
+/// Linux, where `install()` can actually return an error instead of the
+/// whole process vanishing first. This is a real, unclosed gap in the
+/// plugin's own Windows install path, not something this file's error
+/// handling failed to cover.
+async function startUpdateInstall() {
+  if (!pendingUpdateMeta || pendingDownloadedBytesRid == null) return;
+  if (!canStartInstall(!!state.call)) {
+    renderUpdaterUI();
+    return;
+  }
+  state.updater = withInstalling(state.updater);
+  renderUpdaterUI();
+  try {
+    await updaterInstall(pendingUpdateMeta.rid, pendingDownloadedBytesRid);
+  } catch (e) {
+    state.updater = withInstallError(state.updater, String(e && e.message ? e.message : e));
+    renderUpdaterUI();
+    return;
+  }
+  // install() succeeded - the update is safely on disk, and
+  // src-tauri/src/updater.rs's updater_install already closed
+  // pendingDownloadedBytesRid server-side on this same success path.
+  // Clearing this app's own copy too (2026-07-17 4R re-review,
+  // RELIABILITY M3) means a later retry can never resend an id the Rust
+  // side has already forgotten - see retryRestartOnly's own doc for what
+  // happens next and why a relaunch failure from here on is a DIFFERENT,
+  // less alarming state than an install failure.
+  pendingDownloadedBytesRid = null;
+  await retryRestartOnly();
+}
+
+/// The step after a successful `install()`: relaunch the (now-updated)
+/// app. Split out from `startUpdateInstall` (2026-07-17 4R re-review,
+/// RELIABILITY M3) specifically so a relaunch failure lands in
+/// `withRestartError`, never `withInstallError` - by this point the
+/// update is already installed; re-calling `updaterInstall` (what the
+/// OLD single try/catch's Retry button would have done) would fail
+/// instantly against an already-closed bytes resource AND, worse, imply
+/// the update itself never took effect when it actually did. Also the
+/// entry point for the "Restart to update" button in the `errorOrigin:
+/// "restart"` banner state (`app.js` wireStaticHandlers) - clicking it
+/// there re-attempts ONLY this step, nothing upstream of it.
+async function retryRestartOnly() {
+  try {
+    await pluginProcessRestart();
+    // Tears the process down - nothing below this line runs on success.
+  } catch (e) {
+    state.updater = withRestartError(state.updater, String(e && e.message ? e.message : e));
+    renderUpdaterUI();
+  }
+}
+
+/// Fire-and-forget on purpose (task brief: "check_on_startup, default on")
+/// - boot() must not block the app becoming usable on a network round
+/// trip, and a startup check failing (offline laptop) must stay silent in
+/// the main window regardless (see updater.js's shouldShowBanner doc) -
+/// there is nothing for a caller to `await` a meaningful outcome from.
+function maybeCheckForUpdatesOnStartup() {
+  if (!state.updaterCheckOnStartup) return;
+  performUpdateCheck().catch((e) => console.error("startup update check failed", e));
+}
+
+/// Periodic background re-check (2026-07-17 4R re-review, RESILIENCE #3,
+/// non-blocking finding, decided rather than left unaddressed): boot()'s
+/// own check only ever runs once per launch, and this is a softphone that
+/// can sit minimized in the tray for weeks - a build shipped the week
+/// after a launch would otherwise go unnoticed indefinitely. Cheap to add
+/// (one `setInterval`, no new backend surface), so implemented rather than
+/// just flagged. `check_on_startup` doubles as the master switch here too,
+/// per the review's own suggestion - one preference, not two, for "does
+/// this app ever check on its own."
+///
+/// 24h, not shorter: an update is at most ~1 build old by the time this
+/// would notice it even in the worst case (checked right after boot,
+/// missed the interval by a second) - frequent enough for a product this
+/// size, without hammering GitHub's static latest.json on every install.
+const UPDATE_RECHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
+
+/// Background re-checks must never clobber anything already on screen -
+/// the actual "is it safe right now" decision (which phases are OK to
+/// silently re-check from) is `updater.js`'s `canRunBackgroundRecheck`,
+/// pure and unit-tested there (see its own doc for the exact matrix, and
+/// the 2026-07-17 4R re-review finding it fixes - a check-origin error
+/// must stay re-checkable, or a launch with no network yet permanently
+/// disables its own recheck).
+function scheduleUpdatePeriodicRecheck() {
+  setInterval(() => {
+    if (!state.updaterCheckOnStartup) return;
+    if (!canRunBackgroundRecheck(state.updater)) return;
+    performUpdateCheck().catch((e) => console.error("periodic update check failed", e));
+  }, UPDATE_RECHECK_INTERVAL_MS);
+}
+
 function renderFavoritesFields(favorites) {
   const container = $("favorites-fields");
   container.innerHTML = "";
@@ -1234,11 +1568,13 @@ async function openSettings() {
     renderFavoritesFields(favorites);
     renderBridgeFields(bridge);
     await openTranscriptionSettingsSection();
+    setBoolRowUI("updater-check-on-startup-row", state.updaterCheckOnStartup);
     $("save-status").textContent = "";
     $("save-status").className = "status";
   } catch (e) {
     console.error("openSettings load failed", e);
   }
+  renderUpdaterUI();
   applyLockUI();
   $("screen-settings").hidden = false;
 }
@@ -1386,6 +1722,7 @@ function refreshAllUiText() {
     $("tr-peer-name").textContent = state.transcript ? extractUser(state.transcript.peer) || t("transcript.defaultTitle") : t("transcript.defaultTitle");
     renderTranscriptScreenBody();
   }
+  renderUpdaterUI();
 }
 
 /// Two independent backend calls make up one "Save": save_account_settings
@@ -1783,6 +2120,62 @@ function wireStaticHandlers() {
       }
     });
   });
+
+  // ---- auto-updater (roadmap debt fix) -------------------------------
+  // Settings > About's "Check for updates" button + the check_on_startup
+  // toggle (immediate-save, same shape as auto-dial-row/tel-handler-row
+  // just above) + the main-window banner's own buttons (available ->
+  // Download/Later, ready -> Restart/Later, error -> Retry/Later). See
+  // updater.js's header comment for the full flow these call into.
+  $("btn-check-updates").addEventListener("click", () => {
+    performUpdateCheck().catch((e) => console.error("manual update check failed", e));
+  });
+  document.querySelectorAll("#updater-check-on-startup-row button").forEach((b) => {
+    b.addEventListener("click", async () => {
+      const value = b.dataset.boolChoice === "true";
+      setBoolRowUI("updater-check-on-startup-row", value);
+      try {
+        await invoke("set_updater_check_on_startup", { check_on_startup: value });
+        state.updaterCheckOnStartup = value;
+      } catch (e) {
+        showBanner(String(e), "err");
+      }
+    });
+  });
+  $("btn-update-download").addEventListener("click", () => {
+    startUpdateDownload().catch((e) => console.error("update download failed", e));
+  });
+  // Shared by the `ready` phase's own "Restart to update" AND the
+  // `errorOrigin: "restart"` error state's same-labeled button
+  // (renderUpdateBanner shows exactly one of the two at a time) - the
+  // former is a fresh install attempt, the latter only retries the
+  // relaunch step (2026-07-17 4R re-review, RELIABILITY M3: install()
+  // already succeeded by the time errorOrigin is "restart", re-calling
+  // startUpdateInstall - which re-calls updaterInstall - would fail
+  // instantly against an already-closed bytes resource).
+  $("btn-update-restart").addEventListener("click", () => {
+    if (state.updater.phase === "error" && state.updater.errorOrigin === "restart") {
+      retryRestartOnly().catch((e) => console.error("relaunch retry failed", e));
+    } else {
+      startUpdateInstall().catch((e) => console.error("update install failed", e));
+    }
+  });
+  $("btn-update-retry").addEventListener("click", () => {
+    // Only ever visible for errorOrigin "download" or "install"
+    // (renderUpdateBanner routes "restart" to the restart button above
+    // instead, with its own honest copy - see updater.js's header
+    // comment) - branch on the real origin rather than inferring it from
+    // pendingDownloadedBytesRid's presence, more direct and correct.
+    if (state.updater.errorOrigin === "install") {
+      startUpdateInstall().catch((e) => console.error("update install retry failed", e));
+    } else {
+      startUpdateDownload().catch((e) => console.error("update download retry failed", e));
+    }
+  });
+  $("btn-update-later").addEventListener("click", () => {
+    state.updater = withDismissed(state.updater);
+    renderUpdaterUI();
+  });
 }
 
 // Mirrors v1's `broadcast('dial-request', number)` origin story (the
@@ -1891,6 +2284,20 @@ async function boot() {
     console.error("boot load failed", e);
   }
 
+  // Auto-updater (roadmap debt fix) - version + the check_on_startup
+  // preference, both needed before the startup check itself can run.
+  // Best-effort/non-fatal like everything else in boot(): getVersion()
+  // failing (shouldn't, it's a trivial core:app command) just leaves the
+  // About section's version line blank rather than blocking boot.
+  try {
+    const [currentVersion, updaterSettings] = await Promise.all([getVersion(), invoke("get_updater_settings")]);
+    state.updater.currentVersion = currentVersion;
+    state.updaterCheckOnStartup = !!(updaterSettings && updaterSettings.check_on_startup);
+  } catch (e) {
+    console.error("updater boot load failed", e);
+  }
+  renderUpdaterUI();
+
   renderIdentity();
   renderDial();
   renderFavorites();
@@ -1921,6 +2328,12 @@ async function boot() {
   // backend-tracked independent of this window's own lifetime, so a
   // restart while a NAS was down, say, shouldn't lose visibility into it.
   if (state.transcription.unlocked) await refreshPendingRetriesList();
+
+  // Fire-and-forget, deliberately last and deliberately not awaited - see
+  // maybeCheckForUpdatesOnStartup's own doc for why boot() must not block
+  // on a network round trip here.
+  maybeCheckForUpdatesOnStartup();
+  scheduleUpdatePeriodicRecheck();
 }
 
 boot();

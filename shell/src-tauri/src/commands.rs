@@ -492,6 +492,29 @@ pub fn set_locale(settings: State<Arc<SettingsStore>>, locale: LocalePref) -> Re
     settings.update_locale(locale).map_err(|e| e.to_string())
 }
 
+// ---- auto-updater (roadmap debt fix) --------------------------------------
+// Only the persisted preference lives here - checking/downloading/
+// installing itself goes straight from ui/js/updater.js to
+// @tauri-apps/plugin-updater's own auto-registered commands (`updater:
+// default` in capabilities/default.json), never through this file. Not
+// admin-gated, same reasoning as get_theme/set_theme/get_locale/set_locale
+// immediately above (see settings.rs UpdaterSettings's own doc).
+
+#[derive(Serialize)]
+pub struct UpdaterSettingsView {
+    pub check_on_startup: bool,
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn get_updater_settings(settings: State<Arc<SettingsStore>>) -> UpdaterSettingsView {
+    UpdaterSettingsView { check_on_startup: settings.snapshot().updater.check_on_startup }
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn set_updater_check_on_startup(settings: State<Arc<SettingsStore>>, check_on_startup: bool) -> Result<(), String> {
+    settings.update_updater_check_on_startup(check_on_startup).map_err(|e| e.to_string())
+}
+
 // ---- admin lock ------------------------------------------------------
 
 #[derive(Serialize)]
