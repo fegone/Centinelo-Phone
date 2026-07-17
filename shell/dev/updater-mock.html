@@ -45,7 +45,9 @@
   <button data-scenario="installing">09 Installing</button>
   <button data-scenario="download_error">10 Download error</button>
   <button data-scenario="install_error">11 Install error</button>
-  <button data-scenario="dismissed">12 Available, dismissed (no banner)</button>
+  <button data-scenario="restart_error">12 Installed, restart failed</button>
+  <button data-scenario="restart_error_call_active">13 Installed, restart failed, call active</button>
+  <button data-scenario="dismissed">14 Available, dismissed (no banner)</button>
   <h2>Theme</h2>
   <button data-theme="auto" class="on">Auto</button>
   <button data-theme="light">Light</button>
@@ -118,6 +120,7 @@ import {
   withReady,
   withInstalling,
   withInstallError,
+  withRestartError,
   withDismissed,
   renderUpdateBanner,
   renderUpdaterAboutStatus,
@@ -169,6 +172,9 @@ function buildState(scenarioKey) {
       return withDownloadError(withDownloadStarted(withAvailable(s, { version: "2.1.0" })), "connection reset while downloading");
     case "install_error":
       return withInstallError(withInstalling(withReady(withDownloadStarted(withAvailable(s, { version: "2.1.0" })))), "signature verification failed");
+    case "restart_error":
+    case "restart_error_call_active":
+      return withRestartError(withInstalling(withReady(withDownloadStarted(withAvailable(s, { version: "2.1.0" })))), "the OS refused the relaunch request");
     case "dismissed":
       return withDismissed(withAvailable(s, { version: "2.1.0" }));
     default:
@@ -184,9 +190,9 @@ function render(scenarioKey) {
   renderUpdateBanner(refs, state, t, {
     formatBytes: formatModelSize,
     computeDownloadPct,
-    canInstallNow: () => scenarioKey !== "ready_call_active",
+    canInstallNow: () => scenarioKey !== "ready_call_active" && scenarioKey !== "restart_error_call_active",
   });
-  renderUpdaterAboutStatus(document.getElementById("updater-settings-status"), document.getElementById("btn-check-updates"), state, t);
+  renderUpdaterAboutStatus(document.getElementById("updater-settings-status"), document.getElementById("btn-check-updates"), state, t, { computeDownloadPct });
   document.getElementById("updater-current-version").textContent = state.currentVersion ? t("updater.currentVersion", { version: state.currentVersion }) : "";
 }
 

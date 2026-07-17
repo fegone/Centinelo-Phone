@@ -23,6 +23,7 @@ shell/
       premium.rs   premium module loader (F4, see "Premium module loader")
       console.rs   premium console window (F4, see "Premium console window")
       transcription.rs  local transcription orchestration (F4, tap->transcribe->save)
+      updater.rs   auto-updater download/install commands - the has_active_call() gate (see "Auto-updater")
       e2e.rs       debug-only scripted e2e driver (see "e2e verification")
   ui/            static frontend, served directly as `frontendDist` (bundled into every build - see "dev/" below for why the mock harness deliberately lives OUTSIDE this directory)
     index.html     single-page app: main window + settings + call overlay + transcript panel
@@ -574,33 +575,77 @@ global — their own `dist-js/index.js` even `import`s `@tauri-apps/api/core`
 as a bare specifier internally, which would fail to resolve here too.
 
 So `ui/js/app.js`'s own "auto-updater" section calls `invoke("plugin:
-updater|check", ...)` / `|download` / `|install` and `invoke("plugin:
-process|restart")` directly — confirmed against both plugins' Rust
-`commands.rs` (exact argument names/casing) and JS `dist-js/index.js`
-(confirming these are the same wire calls the "real" `check()`/`download()`
-/`install()`/`relaunch()` functions make, just without the class wrapper).
-`window.__TAURI__.core.Channel` (download progress) and `.core.invoke`
-**are** part of the global bundle (same `core.js` module, not curated) —
-verified the same way. `ui/js/updater.js` itself stays Tauri-free (pure
-state machine + rendering, see its own header comment) — app.js is the
-only file that knows any of this.
+updater|check", ...)` directly for the read-only check — confirmed against
+the plugin's Rust `commands.rs` (exact argument names/casing) and JS
+`dist-js/index.js`. `window.__TAURI__.core.Channel` (download progress) and
+`.core.invoke` **are** part of the global bundle (same `core.js` module,
+not curated) — verified the same way.
 
-### Two-step download → install (not the plugin's combined `downloadAndInstall`)
+Download and install do **not** go through the plugin's own
+`plugin:updater|download`/`|install` commands (2026-07-17 4R re-review,
+RESILIENCE blocker — see the next section for why) — `src-tauri/src/
+updater.rs`'s own `updater_download`/`updater_install` commands do,
+calling the plugin's public `Update::download()`/`Update::install()`
+Rust methods directly. `ui/js/updater.js` itself stays Tauri-free either
+way (pure state machine + rendering, see its own header comment) — app.js
+is the only file that knows any of this.
 
-This is a softphone. `install()` restarts the process. The plugin's own
-combined `downloadAndInstall()` doesn't leave a pause point between
-"downloaded" and "installing" — this shell uses the separate `download()` /
-`install()` calls instead so there's a real "Update ready" phase where the
-operator decides when to restart, and `app.js`'s `startUpdateInstall()`
-re-checks `state.call` **immediately before** calling `install()`, not
-merely back when the update was first found. This closes most of the race
-between "an update is ready" and "a call is active," but not all of it — a
-call that starts in the few hundred milliseconds between that check and
-`install()` actually tearing the process down isn't caught. Documented, not
-silently accepted: closing it completely would need the Rust side itself to
-refuse `install()` while the sidecar reports an active call, which is out
-of scope for this pass (tracked as a follow-up, same as the F4 known-gaps
-list below).
+### Two-step download → install, and why install() is this app's OWN Rust command
+
+This is a softphone. `install()` restarts the process — it must never fire
+out from under an active call. The plugin's own combined
+`downloadAndInstall()` doesn't leave a pause point between "downloaded" and
+"installing" either way, so this shell always used the separate
+`download()`/`install()` shape for a real "Update ready" phase where the
+operator decides when to restart.
+
+The FIRST version of this (shipped, then caught in the same-day 4R
+re-review) gated that decision with `app.js` reading `state.call` —
+`ui/js/app.js`'s own client-side mirror of call state, the SAME kind
+`beginTranscript`'s doc elsewhere in that file already documents as able
+to go stale mid-`await` (a `call_state:"closed"` racing it). That's an
+acceptable risk for a UI affordance (a manual-transcribe button that's
+merely disabled a beat late); it is not acceptable for the one action that
+kills the entire process. `commands::provisioning_apply` had already hit
+this exact bug class once (the R4 bug: a provisioning deep link racing an
+active call, fixed by checking `sidecar.has_active_call()` — the
+authoritative, call_id-tracked source — inside the Rust command itself,
+not the frontend). The updater now follows the same shape:
+`src-tauri/src/updater.rs`'s `updater_install` command checks
+`sidecar.has_active_call()` as the very first thing it does, before even
+looking up the update/bytes resources, and refuses with a clear message if
+a call is active. `ui/js/updater.js`'s `canStartInstall` (reading
+`state.call`) stays as UX only — it disables the button and saves a round
+trip in the common case, but the Rust check is what actually decides, and
+it isn't reachable to bypass from devtools the way a JS-only guard would
+be.
+
+**Why this couldn't be a thin wrapper around the plugin's own
+`plugin:updater|install`**: that command (and the private resource type a
+`bytes_rid` from `plugin:updater|download` actually points at,
+`DownloadedBytes`) lives inside `tauri-plugin-updater`'s private `mod
+commands` — not `pub mod`, and `lib.rs`'s `pub use updater::*` never
+re-exports it. There is no type this crate could name to even resolve a
+`bytes_rid` the plugin's own command minted, let alone forward to
+`install()` with a check bolted on. What IS public is
+`tauri_plugin_updater::Update` itself (`#[derive(Clone)] pub struct
+Update`, `impl Resource for Update {}`, `pub async fn download`/`pub fn
+install`, confirmed in 2.10.1's `updater.rs`) — the same object the
+plugin's own commands call these exact methods on internally.
+`updater_download`/`updater_install` call them directly instead, storing
+the downloaded bytes under **this crate's own** resource type
+(`DownloadedUpdateBytes`) so both commands agree on a type this crate
+actually owns end to end. `Update::download()` verifies the update's
+signature before ever returning bytes — not something either command
+re-implements or could accidentally skip.
+
+This closes most of the race between "an update is ready" and "a call is
+active," but not all of it — a call that starts in the exact window
+between `has_active_call()` returning `false` and `Update::install()`
+actually tearing the process down isn't caught (there's no lock spanning
+both). Documented, not silently accepted: see "Known limitations" in this
+section for the two gaps this pass leaves open (this one, and the
+Windows-specific one below).
 
 ### Dev signing key — replace before a real release
 
@@ -661,6 +706,58 @@ publishes there**, not the MSI `windows-installer.yml` also produces:
   for anyone who explicitly wants Windows-Installer-based deployment (IT
   fleets, Group Policy) — it's just never referenced by `latest.json`, so
   the in-app updater never touches it.
+
+### Known limitations (this feature's own, distinct from the shell-wide list at the bottom of this file)
+
+Two gaps this pass leaves open, documented rather than glossed over
+(2026-07-17 4R re-review, RESILIENCE):
+
+1. **The has_active_call → install() race window.** `updater_install`
+   checks `sidecar.has_active_call()` before doing anything else, which
+   closes the window this feature's FIRST version left wide open (a
+   client-side-only `state.call` check) — but a call that starts in the
+   exact gap between that check returning `false` and `Update::install()`
+   actually tearing the process down still isn't caught; there's no lock
+   spanning both. Narrow (milliseconds) but real. Closing it fully would
+   need the sidecar itself to refuse a new INVITE while an install is in
+   flight, which is out of scope for this pass.
+
+2. **On Windows, a failed installer handoff is silent — no error, no
+   retry, the app just closes.** `tauri-plugin-updater` 2.10.1's Windows
+   `install_inner` (`updater.rs`) calls `ShellExecuteW(...)` to launch the
+   NSIS/MSI installer, **discards its return value** (no `let result =
+   ...`, just a bare statement), and follows it **unconditionally** with
+   `std::process::exit(0)`. If the handoff itself fails — UAC declined,
+   SmartScreen or an AV quarantining the installer, a permissions issue —
+   the app still exits immediately, with nothing surfaced to the operator
+   and no retry path, because the whole process is gone before anything
+   in `ui/js/app.js`'s own `catch` block (or even the Rust side of
+   `updater_install`, mid-await) gets a chance to run. This is a real gap
+   in the PLUGIN's own Windows install path (confirmed by reading
+   `install_inner`'s source directly, not inferred) — not something this
+   app's error handling failed to cover; there is nothing on this side of
+   the IPC boundary that could intercept it. `startUpdateInstall`'s own
+   doc comment (`ui/js/app.js`) flags this same limitation at the call
+   site, specifically so a future edit doesn't reintroduce a comment
+   implying Windows failures always surface (an earlier draft of that
+   comment claimed exactly that, incorrectly — fixed in the same pass
+   this README section was added).
+
+### Periodic background re-check
+
+`maybeCheckForUpdatesOnStartup()` only ever fires once, at launch — a
+softphone can sit minimized in the tray for weeks, so a build shipped the
+week after a launch would otherwise go unnoticed indefinitely
+(2026-07-17 4R re-review, RESILIENCE #3, flagged as non-blocking but cheap
+enough to just fix). `scheduleUpdatePeriodicRecheck()` (`app.js`, called
+once from `boot()`) re-runs the same check every 24h, gated by the exact
+same `check_on_startup` preference (one master switch for "does this app
+ever check on its own," not two settings for what's really one decision)
+and additionally skipped whenever anything is already pending
+(`available`/`downloading`/`ready`/`installing`/an unresolved error) so a
+silent background re-check can never clobber a download or a "restart to
+update" state the operator hasn't acted on yet — see `app.js`'s
+`backgroundRecheckIsSafeRightNow`.
 
 ### Contract for release-ci
 
@@ -747,43 +844,69 @@ follows, nothing new to invent here.
 ### How this was verified this pass
 
 - `cargo build` / `cargo clippy --all-targets -- -D warnings` / `cargo
-  test` all green with both plugins wired in — this also doubles as
-  real verification that `capabilities/default.json`'s `updater:default`/
+  test` all green with both plugins wired in, plus `src-tauri/src/
+  updater.rs` (new, 2026-07-17 4R fix pass). This doubles as real
+  verification that `capabilities/default.json`'s `updater:allow-check`/
   `process:allow-restart` and `tauri.conf.json`'s `plugins.updater` block
   are valid: Tauri's build script validates capability identifiers and
   plugin config shape against the linked plugins' own ACL manifests/
-  `Config` deserializer at compile time, not just at runtime.
-- `npm test` (`node --test ui/js/*.test.js`) — 91 passing assertions
-  across `updater.js`'s full state machine (`updater.test.js`, new this
-  pass): the happy path, every error origin (check/download/install) and
-  which ones reach the main-window banner vs. stay Settings-only, the
-  stale-progress-event guard, `canStartInstall`'s call-safety gate.
-- **`dev/updater-mock.html`** (new, same precedent as `dev/transcript-
+  `Config` deserializer at compile time, not just at runtime — and that
+  `updater.rs` actually compiles against the plugin's PUBLIC API surface
+  only (`tauri_plugin_updater::Update`, `impl Resource for Update`), which
+  is the whole point of that module (see its own header comment) — if
+  `Update`/its methods had stopped being public in some future plugin
+  version, this build would fail loudly here, not silently at runtime.
+  `updater::refuse_install_while_on_a_call_tests` (2 tests) pins the exact
+  gate decision (refuses while a call is active, allows otherwise) as a
+  pure function — the authoritative state it reads,
+  `sidecar.has_active_call()`, already has exhaustive coverage of its own
+  in `sidecar.rs`'s `call_phase_tests`.
+- `npm test` (`node --test ui/js/*.test.js`) — 98 passing assertions
+  across `updater.js`'s full state machine (`updater.test.js`): the happy
+  path, every error origin (check/download/install/**restart** — the
+  post-install-relaunch-failed case added this pass) and which ones reach
+  the main-window banner vs. stay Settings-only, the stale-progress-event
+  guard, `canStartInstall`'s call-safety gate, and
+  `closePendingUpdateResources`' dependency-injected close-call contract
+  (a counting mock `closeFn`, confirming BOTH the update-metadata AND the
+  downloaded-bytes resource get closed, individually and together, and
+  that one failing never stops the other — this is the regression test for
+  the leak the same review pass caught: the previous inline version only
+  ever closed the first one).
+- **`dev/updater-mock.html`** (same precedent as `dev/transcript-
   mock.html`) — a standalone harness importing the real `renderUpdateBanner`/
-  `renderUpdaterAboutStatus` from `ui/js/updater.js` against 13 fabricated
-  states, verified via a headless Browser pane across light/dark and all 3
-  locales: idle, checking, up-to-date, a silent check error (banner absent,
-  Settings honest), available, downloading (both indeterminate and with a
-  real percentage), ready (both with and without an active call — confirms
-  the disabled "Restart to update" + tooltip render correctly), installing,
-  download/install errors, and dismissed-but-still-visible-in-Settings.
-  This is the sanctioned alternative to desktop GUI automation this project
-  already uses (`shell-tauri`'s own rule against automating the real app
-  window) — it verifies rendering, not the real network/IPC calls, which
-  only run inside an actual Tauri webview (see the "not `import`ed" section
-  above for why a plain browser tab can't reach `window.__TAURI__.updater`
-  at all — there is no such namespace to reach).
-- **Not verified this pass**: a real `check()` against a live mock HTTP
-  endpoint from inside the actual running desktop app — that needs a real
-  Tauri webview (WindowServer connection), which this sandboxed
-  environment doesn't have. The `latest.json` shape above and the
-  Rust-side plugin wiring are the two halves that check() actually depends
-  on, and both are verified independently (schema confirmed against the
-  plugin's own `Metadata`/config structs; the wiring via `cargo build`'s
-  ACL validation) — the one thing genuinely untested is the live network
-  round trip itself. Flagged as a real gap, not glossed over: qa-e2e or a
-  real machine run should confirm this once release-ci's pipeline produces
-  a real `latest.json` to point at.
+  `renderUpdaterAboutStatus` from `ui/js/updater.js` against 15 fabricated
+  states (13 from the first pass + 2 new: "installed, restart failed" with
+  and without an active call), verified via a headless Browser pane across
+  light/dark and all 3 locales — including, this pass, confirming the
+  restart-failed state renders "Update installed" (never "failed") with a
+  "Restart to update" button (never "Retry"), that the button disables the
+  same way the `ready` phase's own does when a call is active, and that
+  Settings' downloading status now shows a real percentage
+  (`updater.aboutDownloading`, previously a dead i18n string never wired
+  to anything — 4R minor #5). This is the sanctioned alternative to
+  desktop GUI automation this project already uses (`shell-tauri`'s own
+  rule against automating the real app window) — it verifies rendering,
+  not the real network/IPC calls, which only run inside an actual Tauri
+  webview (see "Why the plugins aren't `import`ed" above for why a plain
+  browser tab can't reach `window.__TAURI__.updater` at all — there is no
+  such namespace to reach, and this app's own `updater_download`/
+  `updater_install` commands are equally unreachable from outside a real
+  Tauri IPC context).
+- **Not verified this pass**: a real `check()`/`download()`/`install()`
+  round trip against a live mock HTTP endpoint from inside the actual
+  running desktop app, and a real end-to-end proof that
+  `updater_install` genuinely refuses while a live call is up (as opposed
+  to the pure-function gate logic, which is verified). Both need a real
+  Tauri webview (WindowServer connection) or a `tauri::test::mock_app`-
+  style harness, neither of which this sandboxed environment has. What
+  IS verified independently: the `latest.json` shape (against the
+  plugin's own `Metadata`/config structs), the Rust-side plugin wiring
+  (via `cargo build`'s ACL/config validation), and the gate's own decision
+  logic (unit-tested). Flagged as a real gap, not glossed over: qa-e2e or
+  a real machine run should confirm the live network round trip AND the
+  has_active_call() refusal against an actual call once release-ci's
+  pipeline produces a real `latest.json` to point at.
 
 ## Known limitations (F2/F3/F4 scope)
 

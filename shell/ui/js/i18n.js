@@ -457,6 +457,22 @@ const ENTRIES = [
   ],
   ["updater.bannerInstallingTitle", "Installing update…", "Instalando atualização…", "Instalando actualización…"],
   ["updater.bannerErrorTitle", "Update failed", "Falha na atualização", "Error al actualizar"],
+  // install() itself succeeded - only the automatic restart afterward
+  // failed. Deliberately NOT "failed"/"error" language - the update is
+  // already safely on disk (see updater.js's "errorOrigin: restart" doc).
+  ["updater.bannerRestartFailedTitle", "Update installed", "Atualização instalada", "Actualización instalada"],
+  [
+    "updater.bannerRestartFailedDetail",
+    "Version {version} is installed — restart to finish.",
+    "A versão {version} está instalada — reinicie para concluir.",
+    "La versión {version} está instalada — reinicia para terminar.",
+  ],
+  [
+    "updater.restartFailedStatus",
+    "Update installed — v{version}. Restart to finish.",
+    "Atualização instalada — v{version}. Reinicie para concluir.",
+    "Actualización instalada — v{version}. Reinicia para terminar.",
+  ],
 
   ["updater.download", "Download", "Baixar", "Descargar"],
   ["updater.restartToUpdate", "Restart to update", "Reiniciar para atualizar", "Reiniciar para actualizar"],

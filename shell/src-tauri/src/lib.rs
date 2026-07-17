@@ -12,6 +12,7 @@ mod sidecar;
 mod sync_ext;
 mod tray;
 mod transcription;
+mod updater;
 
 use premium::PremiumHandle;
 use settings::{AdminSession, SettingsStore};
@@ -152,6 +153,8 @@ pub fn run() {
             commands::set_locale,
             commands::get_updater_settings,
             commands::set_updater_check_on_startup,
+            updater::updater_download,
+            updater::updater_install,
             commands::admin_status,
             commands::admin_set_password,
             commands::admin_unlock,

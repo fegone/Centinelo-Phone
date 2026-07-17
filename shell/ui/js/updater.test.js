@@ -19,9 +19,11 @@ import {
   withReady,
   withInstalling,
   withInstallError,
+  withRestartError,
   withDismissed,
   canStartInstall,
   shouldShowBanner,
+  closePendingUpdateResources,
 } from "./updater.js";
 
 // ---------------------------------------------------------------------
@@ -172,6 +174,27 @@ test("withInstallError: tags errorOrigin 'install'", () => {
   assert.equal(s.errorOrigin, "install");
 });
 
+// 2026-07-17 4R re-review, RELIABILITY M3: install() succeeding but the
+// FOLLOW-UP relaunch() failing must land in a distinct origin from a real
+// install failure - see updater.js's header comment ("errorOrigin:
+// restart") for why conflating the two is a real bug (a dead-resource
+// retry, and a scary "failed" message for an update that actually
+// succeeded).
+test("withRestartError: tags errorOrigin 'restart' - distinct from 'install', reachable only after install() itself already succeeded", () => {
+  let s = initialUpdaterState();
+  s = withAvailable(s, { version: "2.1.0" });
+  s = withDownloadStarted(s);
+  s = withReady(s);
+  s = withInstalling(s);
+  s = withRestartError(s, "the OS refused the relaunch");
+  assert.equal(s.phase, "error");
+  assert.equal(s.errorOrigin, "restart");
+  assert.notEqual(s.errorOrigin, "install");
+  // version survives - the "Update installed — v2.1.0, restart to
+  // finish" copy needs it (renderUpdateBanner/renderUpdaterAboutStatus).
+  assert.equal(s.version, "2.1.0");
+});
+
 test("a missing/empty error message never throws, becomes an empty string", () => {
   let s = withCheckError(initialUpdaterState(), undefined);
   assert.equal(s.errorMessage, "");
@@ -226,6 +249,75 @@ test("shouldShowBanner: dismissed always wins, regardless of phase", () => {
   assert.equal(shouldShowBanner(s), true);
   s = withDismissed(s);
   assert.equal(shouldShowBanner(s), false);
+});
+
+test("shouldShowBanner: true for a restart (post-install relaunch) error too - the operator already opted in", () => {
+  let s = withAvailable(initialUpdaterState(), { version: "2.1.0" });
+  s = withDownloadStarted(s);
+  s = withReady(s);
+  s = withInstalling(s);
+  s = withRestartError(s, "the OS refused the relaunch");
+  assert.equal(shouldShowBanner(s), true);
+});
+
+// ---------------------------------------------------------------------
+// closePendingUpdateResources - 2026-07-17 4R re-review, RELIABILITY M2:
+// the previous inline version of this cleanup only ever closed
+// pendingUpdateMeta's own rid, silently leaking the downloaded-bytes
+// resource (tens of MB) on every download-then-abandon or download-then-
+// recheck cycle. `closeFn` is dependency-injected specifically so this is
+// testable with a counting mock instead of a real `invoke`.
+// ---------------------------------------------------------------------
+
+test("closePendingUpdateResources: closes BOTH the update metadata and the downloaded-bytes resource when both are pending", async () => {
+  const closed = [];
+  await closePendingUpdateResources({ rid: 7 }, 12, (rid) => {
+    closed.push(rid);
+  });
+  assert.deepEqual(closed.sort((a, b) => a - b), [7, 12]);
+});
+
+test("closePendingUpdateResources: closes only what's actually pending, never invents a call", async () => {
+  let closed = [];
+  await closePendingUpdateResources(null, null, (rid) => closed.push(rid));
+  assert.deepEqual(closed, []);
+
+  closed = [];
+  await closePendingUpdateResources({ rid: 3 }, null, (rid) => closed.push(rid));
+  assert.deepEqual(closed, [3]);
+
+  closed = [];
+  await closePendingUpdateResources(null, 9, (rid) => closed.push(rid));
+  assert.deepEqual(closed, [9]);
+});
+
+test("closePendingUpdateResources: a bytesRid of 0 is a real resource id, not treated as falsy/absent", () => {
+  // ResourceId 0 is a perfectly valid id (Tauri's resource table starts
+  // counting from 0/1 depending on version) - this function must check
+  // `!= null`, never plain truthiness, or the very first download of a
+  // session could silently never get closed.
+  const closed = [];
+  return closePendingUpdateResources(null, 0, (rid) => closed.push(rid)).then(() => {
+    assert.deepEqual(closed, [0]);
+  });
+});
+
+test("closePendingUpdateResources: one close failing never stops the other from being attempted", async () => {
+  const closed = [];
+  await closePendingUpdateResources({ rid: 1 }, 2, (rid) => {
+    closed.push(rid);
+    if (rid === 1) throw new Error("already closed");
+  });
+  assert.deepEqual(closed.sort((a, b) => a - b), [1, 2]);
+});
+
+test("closePendingUpdateResources: also tolerates closeFn returning a rejected promise, not just a throw", async () => {
+  const closed = [];
+  await closePendingUpdateResources({ rid: 1 }, 2, (rid) => {
+    closed.push(rid);
+    return rid === 1 ? Promise.reject(new Error("boom")) : Promise.resolve();
+  });
+  assert.deepEqual(closed.sort((a, b) => a - b), [1, 2]);
 });
 
 // ---------------------------------------------------------------------

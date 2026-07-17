@@ -38,9 +38,23 @@
 //   downloadedBytes: number,
 //   totalBytes: number | null,    // null = indeterminate progress
 //   errorMessage: string | null,
-//   errorOrigin: "check" | "download" | "install" | null,
+//   errorOrigin: "check" | "download" | "install" | "restart" | null,
 //   dismissed: boolean,           // banner hidden (Settings status is unaffected)
 // }
+//
+// `errorOrigin: "restart"` (2026-07-17 4R re-review, RELIABILITY M3) is
+// deliberately distinct from `"install"`: on macOS/Linux, `install()`
+// itself can succeed (the update IS on disk, safely) and it's the
+// FOLLOW-UP `relaunch()` call that fails - a real, if rare, possibility
+// (OS refuses the relaunch, race with something else quitting the app,
+// ...). Reaching that point with plain `"install"` would (a) show a
+// scary "Update failed" when the update actually succeeded, and (b) let
+// Retry re-call `install()` with an already-closed bytes resource
+// (app.js's `updaterInstall`/Rust's `updater_install` close it on
+// success) - an instant, confusing failure on an update that's already
+// done. `withRestartError` keeps the honest "installed, just restart"
+// language and app.js's own retry handler for this origin only ever
+// re-attempts the relaunch step, never `install()` again.
 
 export function initialUpdaterState() {
   return {
@@ -136,8 +150,43 @@ export function withInstallError(state, message) {
   return { ...state, phase: "error", errorMessage: message || "", errorOrigin: "install" };
 }
 
+/// See this module's header comment ("errorOrigin: restart") for why this
+/// is a separate transition from `withInstallError` - reached only AFTER
+/// `install()` itself has already succeeded, when the follow-up
+/// `relaunch()` call is what failed.
+export function withRestartError(state, message) {
+  return { ...state, phase: "error", errorMessage: message || "", errorOrigin: "restart" };
+}
+
 export function withDismissed(state) {
   return { ...state, dismissed: true };
+}
+
+/// Which resource ids need closing given the current pending-update
+/// bookkeeping, and actually closes them via the injected `closeFn`
+/// (real caller: `(rid) => invoke("plugin:resources|close", {rid})`) -
+/// dependency-injected specifically so this contract is unit-testable
+/// with a counting mock (2026-07-17 4R re-review, RELIABILITY M2): the
+/// previous version of this cleanup (app.js, inline) only ever closed
+/// `pendingUpdateMeta`'s own resource, silently leaking the downloaded-
+/// bytes resource (tens of MB) on every download-then-abandon ("Later"
+/// after a download finished) or download-then-recheck cycle, for the
+/// life of the process. Each close is attempted independently - one
+/// failing (already closed, e.g.) never stops the other from being
+/// attempted, matching this codebase's existing "best-effort cleanup
+/// shouldn't itself become a new failure mode" convention (see
+/// settings.rs's orphaned-tmp-file cleanup).
+export async function closePendingUpdateResources(pendingUpdateMeta, pendingDownloadedBytesRid, closeFn) {
+  const ids = [];
+  if (pendingUpdateMeta && pendingUpdateMeta.rid != null) ids.push(pendingUpdateMeta.rid);
+  if (pendingDownloadedBytesRid != null) ids.push(pendingDownloadedBytesRid);
+  await Promise.all(
+    ids.map((rid) =>
+      Promise.resolve()
+        .then(() => closeFn(rid))
+        .catch(() => {})
+    )
+  );
 }
 
 /// The one safety gate before the disruptive step (`install()` + relaunch)
@@ -227,6 +276,20 @@ export function renderUpdateBanner(refs, state, t, { formatBytes, computeDownloa
     refs.title.textContent = t("updater.bannerInstallingTitle");
     refs.detail.textContent = "";
     refs.actions.hidden = true;
+  } else if (state.phase === "error" && state.errorOrigin === "restart") {
+    // The update itself is already safely installed - only the automatic
+    // relaunch failed. Honest, calm copy (never "Update failed") + the
+    // SAME "Restart to update" action as the `ready` phase, not "Retry" -
+    // there's nothing to retry-download-or-reinstall, just restart. See
+    // this module's header comment ("errorOrigin: restart").
+    refs.title.textContent = t("updater.bannerRestartFailedTitle");
+    refs.detail.textContent = t("updater.bannerRestartFailedDetail", { version: state.version || "" });
+    refs.restartBtn.hidden = false;
+    const canInstall = typeof canInstallNow === "function" ? canInstallNow() : true;
+    if (!canInstall) {
+      refs.restartBtn.disabled = true;
+      refs.restartBtn.title = t("updater.finishCallFirstTitle");
+    }
   } else if (state.phase === "error") {
     refs.title.textContent = t("updater.bannerErrorTitle");
     refs.detail.textContent = state.errorMessage || "";
@@ -260,7 +323,7 @@ function renderProgress(refs, state, formatBytes, computeDownloadPct) {
 /// blank rather than duplicating that line here.
 const CHECK_BUTTON_BUSY_PHASES = new Set(["checking", "downloading", "installing"]);
 
-export function renderUpdaterAboutStatus(statusEl, checkBtn, state, t) {
+export function renderUpdaterAboutStatus(statusEl, checkBtn, state, t, { computeDownloadPct } = {}) {
   // Disabled for the same phases app.js's own updateCheckInFlight() reentrancy
   // guard checks - a re-check must never race an in-flight download/install
   // (see that function's doc for the exact failure mode this prevents).
@@ -278,13 +341,14 @@ export function renderUpdaterAboutStatus(statusEl, checkBtn, state, t) {
       statusEl.textContent = t("updater.aboutAvailable", { version: state.version || "" });
       break;
     case "downloading": {
-      // pct computation left to the caller normally, but Settings' status
-      // line only needs the coarse text - app.js passes the same
-      // computeDownloadPct-derived percentage in via state if it wants
-      // one; kept indeterminate here to avoid a second pct computation
-      // path (app.js's renderUpdaterAboutStatus call site passes state as-
-      // is, no extra plumbing needed for this line to stay correct).
-      statusEl.textContent = t("updater.aboutDownloadingIndeterminate");
+      // Wired to the real percentage when known (2026-07-17 4R re-review,
+      // minor #5 - `updater.aboutDownloading`'s {pct} placeholder used to
+      // be dead, never referenced from anywhere). `computeDownloadPct` is
+      // injected the same way `renderUpdateBanner` already takes it - this
+      // function has no import of its own (kept Tauri/format-library-free,
+      // same reasoning as this whole module's header comment).
+      const pct = computeDownloadPct ? computeDownloadPct({ downloadedBytes: state.downloadedBytes, totalBytes: state.totalBytes }) : null;
+      statusEl.textContent = pct != null ? t("updater.aboutDownloading", { pct }) : t("updater.aboutDownloadingIndeterminate");
       break;
     }
     case "ready":
@@ -294,7 +358,14 @@ export function renderUpdaterAboutStatus(statusEl, checkBtn, state, t) {
       statusEl.textContent = t("updater.installing");
       break;
     case "error":
-      statusEl.textContent = t("updater.errorStatus", { message: state.errorMessage || "" });
+      // See this module's header comment ("errorOrigin: restart") - the
+      // update is already installed, only the relaunch failed, so this
+      // reads "installed, restart to finish" rather than "couldn't
+      // update" for that one origin specifically.
+      statusEl.textContent =
+        state.errorOrigin === "restart"
+          ? t("updater.restartFailedStatus", { version: state.version || "" })
+          : t("updater.errorStatus", { message: state.errorMessage || "" });
       break;
     default:
       statusEl.textContent = "";
