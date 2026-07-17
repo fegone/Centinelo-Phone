@@ -1,17 +1,23 @@
 name: core build (v2 engine spike)
 
-# Builds core/ (the native baresip/libre engine + ctrl_json) on the v2
-# branch. Scoped separately from build.yml (the v1 Electron app's
-# workflow, which only watches `main`) via branch + path filters, so
-# neither workflow fires on the other's changes.
+# Builds core/ (the native baresip/libre engine + ctrl_json). Runs on
+# `main` (2026-07-16: main now IS v2 — v2 was merged into main via phone
+# PR #2 — so this is what actually gates merges there) plus `v2`/
+# `v2-winci` while those integration branches still exist. Scoped by the
+# `core/**` path filter, not by branch alone: build.yml (the v1 Electron
+# app's workflow) also watches `main` with no path filter of its own, so
+# both workflows legitimately fire together on a `core/**` push to
+# `main` — that's expected, not a collision, since they build unrelated
+# artifacts (Electron app vs native engine) and neither depends on the
+# other's result.
 on:
   push:
-    branches: [v2, v2-winci]
+    branches: [main, v2, v2-winci]
     paths:
       - 'core/**'
       - '.github/workflows/core-build.yml'
   pull_request:
-    branches: [v2, v2-winci]
+    branches: [main, v2, v2-winci]
     paths:
       - 'core/**'
       - '.github/workflows/core-build.yml'
