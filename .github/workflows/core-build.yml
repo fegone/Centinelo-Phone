@@ -37,6 +37,38 @@ jobs:
       - name: Apply local baresip patches
         run: |
           git apply --directory=core/deps/baresip core/patches/0003-baresip-json-stdout-purity.patch
+          git apply --directory=core/deps/baresip core/patches/0005-baresip-transfer-subscription-error-event.patch
+
+      - name: Verify every core/patches/*.patch is applied in this job
+        # Cheap trip-wire (RELIABILITY finding, 2026-07-16): a new patch
+        # file dropped in core/patches/ with no matching `git apply` line
+        # above builds green and silently ships without it - exactly what
+        # happened with patch 0005 itself before this check existed. The
+        # list below is this job's own record of what it applies (both
+        # "Apply local re patches" and "Apply local baresip patches"
+        # steps above, combined) - compared against the real directory
+        # listing, not against the other job's list, so a future patch
+        # added to only one of the two `git apply` steps here still fails
+        # loudly instead of quietly compiling the core without it.
+        run: |
+          set -euo pipefail
+          applied=$(printf '%s\n' \
+            0001-re-configurable-sip-ws-path.patch \
+            0002-re-tls-fingerprint-pin.patch \
+            0003-baresip-json-stdout-purity.patch \
+            0004-re-json-stdout-purity.patch \
+            0005-baresip-transfer-subscription-error-event.patch \
+            | sort)
+          available=$(cd core/patches && ls -1 *.patch | sort)
+          if [ "$applied" != "$available" ]; then
+            echo "error: core/patches/*.patch does not match the patches this job applies" >&2
+            echo "--- available in core/patches/ ---" >&2
+            echo "$available" >&2
+            echo "--- applied by this job's git apply steps ---" >&2
+            echo "$applied" >&2
+            exit 1
+          fi
+          echo "OK: this job applies exactly the $(echo "$available" | wc -l | tr -d ' ') patch(es) in core/patches/"
 
       - name: Configure + build libre
         run: |
@@ -172,6 +204,34 @@ jobs:
         shell: bash
         run: |
           git apply --directory=core/deps/baresip core/patches/0003-baresip-json-stdout-purity.patch
+          git apply --directory=core/deps/baresip core/patches/0005-baresip-transfer-subscription-error-event.patch
+
+      - name: Verify every core/patches/*.patch is applied in this job
+        # Same trip-wire as the macOS job above - see its comment for why.
+        # Duplicated (not shared) on purpose: each job's own git apply
+        # steps are the actual source of truth this check protects, and a
+        # shared script would still need per-job wiring to know which
+        # patches that specific job claims to apply.
+        shell: bash
+        run: |
+          set -euo pipefail
+          applied=$(printf '%s\n' \
+            0001-re-configurable-sip-ws-path.patch \
+            0002-re-tls-fingerprint-pin.patch \
+            0003-baresip-json-stdout-purity.patch \
+            0004-re-json-stdout-purity.patch \
+            0005-baresip-transfer-subscription-error-event.patch \
+            | sort)
+          available=$(cd core/patches && ls -1 *.patch | sort)
+          if [ "$applied" != "$available" ]; then
+            echo "error: core/patches/*.patch does not match the patches this job applies" >&2
+            echo "--- available in core/patches/ ---" >&2
+            echo "$available" >&2
+            echo "--- applied by this job's git apply steps ---" >&2
+            echo "$applied" >&2
+            exit 1
+          fi
+          echo "OK: this job applies exactly the $(echo "$available" | wc -l | tr -d ' ') patch(es) in core/patches/"
 
       - name: Configure + build + install libre
         # Build re STATIC-only (baresip is itself STATIC on Windows - see its

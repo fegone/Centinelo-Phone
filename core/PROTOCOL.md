@@ -120,7 +120,7 @@ for the full changelog and `core/E2E-F1.md` for anything added there:
   `-s`. **New, more precise finding, real e2e evidence both ways**: the
   `EDESTADDRREQ` failure this file's own v1.3 status paragraph above
   documents is **wss-transport-specific** — re-running the *exact* same
-  dual-contact-1100-into-`Park()` scenario over plain `udp` (this
+  dual-contact-1000-into-`Park()` scenario over plain `udp` (this
   session, real test PBX, full `-s` SIP trace captured) shows the REFER
   genuinely reaching the wire, a `202 Accepted`, and a final `NOTIFY`
   sipfrag body of `SIP/2.0 200 OK` — **`park` works end-to-end over
@@ -530,7 +530,7 @@ already worked" writeup and the real e2e evidence behind both:
   `error` events with `"transfer failed: "` in `message` now also
   catches this failure mode, where before it saw nothing at all for it.
   Real e2e evidence both directions (this session, real test PBX, `-s`
-  SIP trace, dual-contact 1100 into pilot ext `70`): over **wss**, the
+  SIP trace, dual-contact 1000 into pilot ext `700`): over **wss**, the
   `EDESTADDRREQ` failure reproduces and now correctly emits
   `{"event":"error","message":"transfer failed: Destination address
   required [39]"}`, with the original call confirmed still up/untouched
