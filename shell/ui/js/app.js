@@ -1539,15 +1539,48 @@ function renderBridgeFields(bridge) {
   setBoolRowUI("tel-handler-row", !!bridge.register_tel_handler);
 }
 
+/// The serial is deliberately never round-tripped from the backend (see
+/// activation.rs's module doc: "the serial itself is not persisted") -
+/// #in-license-serial always starts blank, same as #in-secret's
+/// "unchanged placeholder" convention but with no placeholder text either
+/// (there is nothing to keep unchanged; every activation attempt sends
+/// whatever is currently typed). Only the activation server URL and the
+/// "is a license file already saved here" status round-trip.
+function renderLicenseFields(license) {
+  $("in-license-serial").value = "";
+  $("in-license-server-url").value = license.activation_server_url || "";
+  $("license-status-hint").textContent = license.license_present
+    ? t("settings.licenseAlreadyPresentHint")
+    : t("settings.licenseNotActivatedHint");
+  $("license-activate-status").textContent = "";
+  $("license-activate-status").className = "hint";
+}
+
+/// Maps an `activate_license` error back to displayed copy. Backend
+/// errors cross the Tauri command boundary as short codes (see
+/// activation.rs's own doc) except for the admin-lock check shared with
+/// every other gated Settings command (`require_unlocked`'s own English
+/// prose, e.g. "Settings are locked...") - `t()` returns the key itself
+/// on a miss (i18n.js's own documented fallback), so an unmapped code
+/// (that prose, or any future code this UI hasn't caught up with yet)
+/// falls back to showing the raw backend string rather than a broken
+/// "activation.error.<code>" literal.
+function activationErrorText(code) {
+  const key = `activation.error.${code}`;
+  const translated = t(key);
+  return translated === key ? String(code) : translated;
+}
+
 async function openSettings() {
   try {
-    const [account, theme, corePath, adminStatus, favorites, bridge] = await Promise.all([
+    const [account, theme, corePath, adminStatus, favorites, bridge, license] = await Promise.all([
       invoke("get_account_settings"),
       invoke("get_theme"),
       invoke("get_core_binary_path"),
       invoke("admin_status"),
       invoke("get_favorites"),
       invoke("get_bridge_settings"),
+      invoke("get_license_settings"),
     ]);
     state.account = { ...state.account, ...account };
     state.adminConfigured = adminStatus.configured;
@@ -1567,6 +1600,7 @@ async function openSettings() {
     });
     renderFavoritesFields(favorites);
     renderBridgeFields(bridge);
+    renderLicenseFields(license);
     await openTranscriptionSettingsSection();
     setBoolRowUI("updater-check-on-startup-row", state.updaterCheckOnStartup);
     $("save-status").textContent = "";
@@ -1959,6 +1993,33 @@ function wireStaticHandlers() {
   $("btn-restart-engine").addEventListener("click", () => {
     invoke("sidecar_restart");
     showBanner(t("settings.restarting"), "info");
+  });
+
+  $("btn-activate-license").addEventListener("click", async () => {
+    const serial = $("in-license-serial").value.trim();
+    const serverUrl = $("in-license-server-url").value.trim();
+    const statusEl = $("license-activate-status");
+    const btn = $("btn-activate-license");
+    if (!serial) {
+      statusEl.textContent = t("settings.licenseSerialRequired");
+      statusEl.className = "hint err";
+      return;
+    }
+    btn.disabled = true;
+    statusEl.textContent = t("settings.licenseActivating");
+    statusEl.className = "hint";
+    try {
+      const outcome = await invoke("activate_license", { serial, server_url: serverUrl });
+      $("in-license-serial").value = "";
+      statusEl.textContent = t("settings.licenseActivatedStatus", { customer: outcome.customer });
+      statusEl.className = "hint ok";
+      $("license-status-hint").textContent = t("settings.licenseAlreadyPresentHint");
+    } catch (e) {
+      statusEl.textContent = activationErrorText(e);
+      statusEl.className = "hint err";
+    } finally {
+      btn.disabled = false;
+    }
   });
 
   $("btn-unlock").addEventListener("click", async () => {

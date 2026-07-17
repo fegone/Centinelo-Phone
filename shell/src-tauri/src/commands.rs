@@ -752,6 +752,77 @@ pub fn provisioning_cancel(provisioning: State<crate::provisioning::Provisioning
     provisioning.clear();
 }
 
+// ---- license activation (P3 of the activation-server plan) --------------
+//
+// All logic lives in `activation.rs` - this command is thin plumbing
+// (admin-lock + Result mapping), matching this file's own module doc
+// ("validation + admin-lock enforcement here, actual work delegated").
+// See `activation.rs`'s module doc for why the serial is never persisted,
+// why errors cross this boundary as short codes (not the ES prose the
+// P3 task brief specifies - that lives in `ui/js/i18n.js` instead), and
+// "The real gap this piece leaves open" (activating writes a verified
+// `license.json`, but nothing reads it back yet - a licensing/premium
+// follow-up, out of this crate's scope).
+
+#[derive(Serialize)]
+pub struct LicenseSettingsView {
+    pub activation_server_url: String,
+    /// Whether `license.json` currently exists on disk - lets the UI show
+    /// "already activated on this machine" without needing to re-parse or
+    /// re-verify it (that parsing only ever happens inside
+    /// `activation::activate_and_persist`, right before a fresh write).
+    pub license_present: bool,
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn get_license_settings(settings: State<Arc<SettingsStore>>) -> LicenseSettingsView {
+    let snapshot = settings.snapshot();
+    LicenseSettingsView {
+        activation_server_url: snapshot.license.activation_server_url,
+        license_present: settings.license_path().is_file(),
+    }
+}
+
+#[derive(Serialize)]
+pub struct ActivationOutcomeView {
+    pub customer: String,
+    pub features: Vec<String>,
+    pub seats: u32,
+    pub expiry: Option<String>,
+}
+
+impl From<crate::activation::ActivationResult> for ActivationOutcomeView {
+    fn from(r: crate::activation::ActivationResult) -> Self {
+        Self { customer: r.customer, features: r.features, seats: r.seats, expiry: r.expiry }
+    }
+}
+
+/// Admin-gated - "licencia" is explicitly one of the sensitive settings
+/// classes this shell locks behind the admin password (shell-tauri
+/// skill's own rule, alongside account/transport/transcription). Returns
+/// `Err(String)` where the string is a short error CODE (see
+/// `activation::ActivationError::code`), not displayed prose - the
+/// frontend maps it through `t("activation.error." + code)`.
+#[tauri::command(rename_all = "snake_case")]
+pub fn activate_license(
+    settings: State<Arc<SettingsStore>>,
+    admin: State<AdminSession>,
+    serial: String,
+    server_url: String,
+) -> Result<ActivationOutcomeView, String> {
+    require_unlocked(&admin)?;
+    let validated_url = crate::activation::validate_server_url(&server_url).map_err(|e| e.code().to_string())?;
+    // Persisted as soon as the URL is well-formed, regardless of whether
+    // this particular activation attempt then succeeds - see
+    // `SettingsStore::update_license_server_url`'s own doc. Best-effort:
+    // a failure to persist the URL preference is not a reason to abandon
+    // an activation attempt that might otherwise succeed.
+    let _ = settings.update_license_server_url(validated_url.clone());
+    crate::activation::activate_and_persist(&settings.license_path(), &validated_url, &serial)
+        .map(ActivationOutcomeView::from)
+        .map_err(|e| e.code().to_string())
+}
+
 // ---- premium ---------------------------------------------------------
 //
 // No admin-lock check here (contrast the settings/account commands above)

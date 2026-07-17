@@ -460,6 +460,36 @@
         </div>
       </div>
 
+      <!-- ================= license activation (P3, activation-server plan) =================
+           Admin-gated like account/transport/advanced above - "licencia" is
+           explicitly one of the sensitive settings classes this shell locks
+           (shell-tauri skill's own rule). The serial field is paste-only
+           (never round-tripped back from the backend, mirroring
+           #in-secret's "never shows the real value back" convention) and
+           is never remembered across a Settings visit - only the
+           activation server URL persists (see activation.rs's module
+           doc). No mockup exists for this screen yet (a brand-new P3
+           surface, same "no plate to adapt" situation
+           #lock-overlay/#admin-password-status was in) - built in the
+           same .settings-card/.field/.btnrow/.hint language every other
+           section on this screen already uses, no new classes. -->
+      <h2 data-i18n="settings.licenseHeading">License</h2>
+      <div class="settings-card">
+        <p class="hint" style="margin:0 0 10px" id="license-status-hint"></p>
+        <div class="field">
+          <label for="in-license-serial" data-i18n="settings.licenseSerialLabel">Serial</label>
+          <input id="in-license-serial" type="text" placeholder="CENT1-…" autocomplete="off" style="font-family:var(--font-mono)" data-i18n-placeholder="settings.licenseSerialPlaceholder">
+        </div>
+        <div class="field">
+          <label for="in-license-server-url" data-i18n="settings.licenseServerUrlLabel">Activation server</label>
+          <input id="in-license-server-url" type="text" placeholder="https://" autocomplete="off" style="font-family:var(--font-mono)" data-i18n-placeholder="settings.licenseServerUrlPlaceholder">
+        </div>
+        <div class="btnrow">
+          <button class="primary" id="btn-activate-license" data-i18n="settings.licenseActivate">Activate</button>
+          <span class="hint" id="license-activate-status"></span>
+        </div>
+      </div>
+
       <h2 data-i18n="settings.adminHeading">Admin password</h2>
       <div class="settings-card">
         <p class="hint" id="admin-password-hint" style="margin:0 0 8px" data-i18n="settings.adminHint">Protects account, transport and advanced settings from casual changes at the front desk.</p>

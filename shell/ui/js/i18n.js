@@ -369,6 +369,52 @@ const ENTRIES = [
   ],
   ["settings.restartEngine", "Restart engine", "Reiniciar motor", "Reiniciar motor"],
   ["settings.restarting", "Restarting the phone engine…", "Reiniciando o motor do telefone…", "Reiniciando el motor del teléfono…"],
+
+  // ---- license activation (P3 of the activation-server plan) ----------
+  // Backend errors cross the Tauri command boundary as short codes (see
+  // activation.rs's own doc, "Error codes, not prose") - the
+  // "activation.error.*" keys below are what the codes actually render
+  // as, in all three of this product's real languages, same as every
+  // other user-facing string on this screen.
+  ["settings.licenseHeading", "License", "Licença", "Licencia"],
+  ["settings.licenseSerialLabel", "Serial", "Serial", "Serial"],
+  ["settings.licenseSerialPlaceholder", "CENT1-…", "CENT1-…", "CENT1-…"],
+  ["settings.licenseServerUrlLabel", "Activation server", "Servidor de ativação", "Servidor de activación"],
+  ["settings.licenseServerUrlPlaceholder", "https://", "https://", "https://"],
+  ["settings.licenseActivate", "Activate", "Ativar", "Activar"],
+  ["settings.licenseActivating", "Activating…", "Ativando…", "Activando…"],
+  ["settings.licenseSerialRequired", "Enter a serial first.", "Digite um serial primeiro.", "Ingresa un serial primero."],
+  [
+    "settings.licenseActivatedStatus",
+    "License saved for {customer}.",
+    "Licença salva para {customer}.",
+    "Licencia guardada para {customer}.",
+  ],
+  [
+    "settings.licenseAlreadyPresentHint",
+    "A license is already saved on this machine. Activating again replaces it.",
+    "Uma licença já está salva neste computador. Ativar novamente a substitui.",
+    "Ya hay una licencia guardada en este equipo. Activar de nuevo la reemplaza.",
+  ],
+  [
+    "settings.licenseNotActivatedHint",
+    "No license saved on this machine yet.",
+    "Nenhuma licença salva neste computador ainda.",
+    "Todavía no hay una licencia guardada en este equipo.",
+  ],
+  ["activation.error.bad_url", "That doesn't look like a valid activation server URL.", "Isso não parece uma URL válida do servidor de ativação.", "Esa URL del servidor de activación no es válida."],
+  ["activation.error.invalid_serial", "Invalid serial.", "Serial inválido.", "Serial inválido."],
+  ["activation.error.expired_serial", "Serial expired.", "Serial expirado.", "Serial expirado."],
+  ["activation.error.bad_fingerprint", "Couldn't identify this machine.", "Não foi possível identificar este computador.", "No se pudo identificar este equipo."],
+  ["activation.error.seats_exhausted", "No seats available on this serial.", "Sem vagas disponíveis neste serial.", "Sin asientos disponibles en este serial."],
+  ["activation.error.serial_revoked", "Serial revoked.", "Serial revogado.", "Serial revocado."],
+  ["activation.error.rate_limited", "Too many attempts — try again in a moment.", "Muitas tentativas — tente novamente em instantes.", "Demasiados intentos. Intenta de nuevo en un momento."],
+  ["activation.error.network", "Couldn't reach the activation server.", "Não foi possível contatar o servidor de ativação.", "No se pudo contactar el servidor de activación."],
+  ["activation.error.server_error", "The activation server returned an unexpected error.", "O servidor de ativação retornou um erro inesperado.", "El servidor de activación devolvió un error inesperado."],
+  ["activation.error.local_verify_failed", "The license we received couldn't be verified.", "A licença recebida não pôde ser verificada.", "La licencia recibida no pudo verificarse."],
+  ["activation.error.fingerprint_unavailable", "Couldn't identify this machine.", "Não foi possível identificar este computador.", "No se pudo identificar este equipo."],
+  ["activation.error.io_error", "Couldn't save the license on this machine.", "Não foi possível salvar a licença neste computador.", "No se pudo guardar la licencia en este equipo."],
+
   ["settings.adminHeading", "Admin password", "Senha de administrador", "Contraseña de administrador"],
   [
     "settings.adminHint",
