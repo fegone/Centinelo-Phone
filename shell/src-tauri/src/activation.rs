@@ -25,26 +25,27 @@
 //! shell requests binds to the same fingerprint a future real consumer of
 //! `license.json` would compute for the same machine).
 //!
-//! # The real gap this piece leaves open
+//! # Where the file this piece writes actually gets read
 //!
 //! `activate_and_persist` below writes a verified `license.json` next to
-//! `settings.json` (see `settings::SettingsStore::license_path`) - but
-//! nothing in this shell, and nothing in `centinelo-premium` today
-//! (confirmed by reading `premium/crates/centinelo-premium/src/
-//! license.rs`, read-only, this repo's own scope never includes editing
-//! it), actually reads that file. `active_license()` there is
-//! `founder_license().or_else(license_from_override_env)` - a dev/test-only
-//! env-var escape hatch (`CENTINELO_PREMIUM_LICENSE_PATH`), explicitly
-//! documented in that file as "not yet a real app-data-dir file read...
-//! out of scope for the v0 loader mechanism this crate implements". This
-//! piece is code-complete and tested end to end up to the point of a
-//! correctly-verified `license.json` landing on disk; making an activated
-//! license actually change what `premium_capability_status` reports needs
-//! a follow-up in `centinelo-premium` (licensing agent's ambit, not this
-//! one) to read from this shell's real app-data-dir path instead of only
-//! the override env var. Flagged to Mario/licensing, not silently
-//! papered over with a UI claim ("restart to apply") this shell can't
-//! back up yet.
+//! `settings.json` (see `settings::SettingsStore::license_path`).
+//! `centinelo-premium`'s own `src/license.rs` (private repo, read-only
+//! reference, this repo's own scope never includes editing it) now has a
+//! `load_and_verify_license_from_disk()` that reads exactly that file and
+//! re-verifies it against the same dual-pubkey rule this module's own
+//! `verify_container` already uses locally before writing (founder/release
+//! pubkey first, activation pubkey second - either one accepting is
+//! enough). `active_license()` there is
+//! `load_and_verify_license_from_disk().unwrap_or_else(founder_license)`:
+//! any failure at any step (no file, corrupt JSON, bad signature against
+//! both pubkeys, expired, wrong machine) collapses to the founder license,
+//! never a panic - same graceful-degradation contract a missing license
+//! file already had. This piece's own job stops at a correctly-verified
+//! `license.json` landing on disk; whether that file is actually being
+//! consumed on a given build depends on which `centinelo-premium` revision
+//! it's linked against (licensing agent's ambit, not this one) - not
+//! independently re-verified from this side beyond reading that crate's
+//! source.
 //!
 //! # Error codes, not prose, cross the Tauri command boundary
 //!
@@ -851,10 +852,24 @@ mod tests {
     }
 
     // ---- tiny per-test temp dir (no extra dev-dependency) --------------
-
+    //
+    // Uniqueness must not rely on the nanosecond timestamp alone: under
+    // parallel `cargo test` execution (the default) two threads can call
+    // `tempdir()` close enough together that a low-resolution system clock
+    // returns the same `SystemTime::now()` value for both, colliding on
+    // the same directory (QA/Ornith 4R, 2026-07-17: observed 1/9 runs -
+    // one test's `settings.json` write made a sibling test's "must not
+    // exist" assertion fail). A per-process `AtomicU64` counter is
+    // guaranteed unique across every call in this process regardless of
+    // clock resolution; `process::id()` is kept alongside it so two
+    // separate `cargo test` processes (e.g. a stray leftover from a prior
+    // run) still can't collide either.
     fn tempdir() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
         let mut dir = std::env::temp_dir();
-        let unique = format!("centinelo-activation-test-{}-{}", std::process::id(), rand_suffix());
+        let unique = format!("centinelo-activation-test-{}-{}-{}", std::process::id(), seq, rand_suffix());
         dir.push(unique);
         std::fs::create_dir_all(&dir).unwrap();
         dir
