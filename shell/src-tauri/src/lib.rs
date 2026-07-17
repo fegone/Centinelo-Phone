@@ -1,3 +1,4 @@
+mod activation;
 mod bridge;
 mod commands;
 mod console;
@@ -190,6 +191,8 @@ pub fn run() {
             commands::provisioning_pending_preview,
             commands::provisioning_apply,
             commands::provisioning_cancel,
+            commands::get_license_settings,
+            commands::activate_license,
             hid::commands::hid_status,
             hid::commands::hid_list_devices,
             hid::commands::get_hid_settings,

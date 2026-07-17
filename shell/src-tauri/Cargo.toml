@@ -80,7 +80,11 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # system-openssl path that already broke Windows CI once for a different
 # crate (see shell/README.md's Windows CI notes); no proxy/cookie/gzip
 # support needed for one small GET.
-ureq = { version = "2", default-features = false, features = ["tls"] }
+# "json" (activation.rs, P3): send_json()/serde_json response parsing for
+# the activate_license flow - same crate, just one more of its own
+# feature flags (serde_json is already a direct dependency of this crate
+# regardless), not a new HTTP client.
+ureq = { version = "2", default-features = false, features = ["tls", "json"] }
 # Decodes the optional embedded `centinelo://provision?config=<base64>`
 # form (no network fetch at all - see provisioning.rs "two ways in").
 base64 = "0.22"
@@ -98,3 +102,25 @@ hidapi = "2"
 # `relaunch()` for the one step after a successful install.
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
+# License activation (src/activation.rs, P3 of the activation-server plan
+# - see premium/docs/SPEC-2026-07-17-activation-server-design.md, private
+# repo, read-only reference). This crate never depends on the private
+# `centinelo-license` crate (see premium.rs's own doc, "Where the license
+# check actually happens" - a public/forkable shell must never be the one
+# deciding what's licensed) - the small pieces this feature needs from it
+# (the signed-container envelope shape, the machine-fingerprint algorithm)
+# are duplicated here by hand instead, same precedent
+# `centinelo-premium-abi/src/capability.rs` already sets for the
+# `FEATURE_*` name strings (that file's own doc: "can't share the
+# constant... so the string is duplicated here by hand"). sha2 is already
+# a transitive dependency (via ed25519-dalek/argon2, see Cargo.lock) -
+# promoted to direct here because activation.rs needs to hash the local
+# machine fingerprint with the exact same algorithm
+# centinelo-license::machine_fingerprint uses, for byte-identical output.
+sha2 = "0.10"
+
+[target.'cfg(windows)'.dependencies]
+# Windows half of activation.rs's machine-fingerprint duplication (reads
+# HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid) - same crate/version
+# centinelo-license's own Cargo.toml uses for the function this mirrors.
+winreg = "0.56.0"
