@@ -896,6 +896,182 @@ function applyLockUI() {
   saveBtn.disabled = !state.adminUnlocked;
 }
 
+// ---------------------------------------------------------------------------
+// transcription settings (Plate 08 - Settings → Transcription)
+//
+// Absent, not disabled, until state.transcription.unlocked (set by
+// applyTranscriptionUI at boot/on call events - reused here rather than
+// re-querying premium_capability_status a second time) - matches every
+// other premium-gated entry point in this shell. Mirrors the deferred-save
+// shape #in-core-path/#favorites-fields already use (collected into one
+// payload, sent together with account settings on the "Save" button) since
+// the backend only has one save_transcription_settings call that takes the
+// whole TranscriptionSettings struct at once - there's no per-field
+// command to invoke immediately the way #theme-row/#locale-row have.
+// ---------------------------------------------------------------------------
+let selectedTranscriptionMode = "off";
+let selectedTranscriptionActivation = "all_calls";
+let selectedModelTier = "accurate";
+let selectedTranscriptionLanguage = "auto";
+let transcriptionKeepAudio = false;
+let transcriptionViewOnly = false;
+
+// tier -> {present, sizeBytes} | null (not yet loaded from
+// transcription_model_status) for modelStatus. tier -> {downloadedBytes,
+// totalBytes} | null (no download in flight) for modelDownload - a failed
+// download clears back to null rather than latching an error shape (see
+// startModelDownload/handleModelDownloadSettled - the failure itself is a
+// transient banner, not a stuck chip).
+const modelStatus = { accurate: null, light: null };
+const modelDownload = { accurate: null, light: null };
+
+/// `transcription_model_status`/`download_transcription_model` speak the
+/// `ModelTier` enum's own serde name ("accurate"/"light" - what this file
+/// uses as its keys everywhere), but the `transcription://model-download-*`
+/// EVENTS instead carry `tier_cli_name(tier)` - the real whisper.cpp model
+/// filename tier (`transcription.rs` relays `centinelo-transcribe`'s own
+/// stdout protocol lines verbatim, which speak in CLI tier names, not the
+/// shell's settings enum). Translate back at the one place events arrive
+/// rather than let two different "tier" vocabularies leak into every
+/// caller here.
+const MODEL_CLI_TIER_TO_SETTINGS_TIER = { "large-v3-turbo-q5_0": "accurate", "small-q5_1": "light" };
+
+function setTranscriptionModeUI(mode) {
+  selectedTranscriptionMode = mode;
+  document.querySelectorAll("#transcription-mode-choice .tcard").forEach((card) => {
+    card.classList.toggle("sel", card.dataset.transcriptionMode === mode);
+  });
+}
+
+function setTranscriptionActivationUI(activation) {
+  selectedTranscriptionActivation = activation;
+  document.querySelectorAll("#transcription-activation-choice .tcard").forEach((card) => {
+    card.classList.toggle("sel", card.dataset.transcriptionActivation === activation);
+  });
+}
+
+function setTranscriptionLanguageUI(lang) {
+  selectedTranscriptionLanguage = lang;
+  document.querySelectorAll("#transcription-language-row button").forEach((b) => {
+    b.classList.toggle("on", b.dataset.languageChoice === lang);
+  });
+}
+
+function setModelTierUI(tier) {
+  selectedModelTier = tier;
+  document.querySelectorAll("#transcription-model-choice .modelrow").forEach((row) => {
+    const sel = row.dataset.modelTier === tier;
+    row.classList.toggle("sel", sel);
+    row.setAttribute("aria-checked", String(sel));
+  });
+}
+
+/// `1.0 GB`/`547 MB` - the plate's own mono chip register (TOKENS.md
+/// "Numbers are facts"). GB only once it's actually ≥1000 MB; every model
+/// this app ships today (large-v3-turbo-q5_0, small-q5_1) is well under
+/// 2 GB, so one decimal place of GB is enough precision to stay honest
+/// without turning into "1.04857 GB".
+function formatModelSize(bytes) {
+  if (typeof bytes !== "number" || !Number.isFinite(bytes)) return "";
+  if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(1)} GB`;
+  return `${Math.round(bytes / 1e6)} MB`;
+}
+
+/// Rebuilds the one `.mrstatus` chip for `tier` from whatever's currently
+/// known: an in-flight download (progress bar or the indeterminate
+/// "Downloading…" label before the first progress event arrives), a failed
+/// one, an installed model's size, or a "Download" button when neither.
+/// Ink-only throughout (--text-3/--st-idle, no amber) - REVIEW.md §4b's
+/// "no amber, nothing glows here" rule for this pane's download UI.
+function renderModelStatusChip(tier) {
+  const el = $(`model-status-${tier}`);
+  if (!el) return;
+  const dl = modelDownload[tier];
+  if (dl) {
+    const pct = dl.totalBytes ? Math.min(100, Math.round((dl.downloadedBytes / dl.totalBytes) * 100)) : null;
+    el.innerHTML = `<span class="dlwrap"><span class="dlbar" aria-hidden="true"><i style="width:${pct === null ? 0 : pct}%"></i></span><span class="dlpct">${
+      pct === null ? escapeHtml(t("settings.transcriptionModelDownloading")) : `${pct}%`
+    }</span></span>`;
+    return;
+  }
+  const status = modelStatus[tier];
+  if (status && status.present) {
+    const sizeText = status.sizeBytes != null ? ` · ${formatModelSize(status.sizeBytes)}` : "";
+    el.innerHTML = `<span class="modelchip ok">${escapeHtml(t("settings.transcriptionModelInstalled"))}${escapeHtml(sizeText)}</span>`;
+    return;
+  }
+  if (status) {
+    // Loaded and confirmed absent - offer the real download this app can
+    // actually perform (download_transcription_model), not a dead button.
+    el.innerHTML = `<button type="button" class="modelchip btn" data-download-tier="${escapeAttr(tier)}">${escapeHtml(t("settings.transcriptionModelDownload"))}</button>`;
+  } else {
+    el.innerHTML = "";
+  }
+}
+
+/// Fetches `transcription_model_status` for both tiers and renders their
+/// chips - called when Settings opens and again after a download settles
+/// (handleModelDownloadSettled), so "Installed · N MB" always reflects
+/// what's actually on disk rather than an assumption from the download
+/// event alone.
+async function refreshModelStatuses() {
+  for (const tier of ["accurate", "light"]) {
+    try {
+      const status = await invoke("transcription_model_status", { tier });
+      modelStatus[tier] = { present: status.present, sizeBytes: status.size_bytes };
+    } catch (e) {
+      console.error(`transcription_model_status(${tier}) failed`, e);
+      modelStatus[tier] = { present: false, sizeBytes: null };
+    }
+    renderModelStatusChip(tier);
+  }
+}
+
+async function startModelDownload(tier) {
+  if (modelDownload[tier]) return; // already downloading
+  modelDownload[tier] = { downloadedBytes: 0, totalBytes: null };
+  renderModelStatusChip(tier);
+  try {
+    // `download_transcription_model` only rejects synchronously for an
+    // immediate precondition (not licensed) - a download that starts and
+    // later fails mid-transfer instead settles via the
+    // transcription://model-download-error event, handled by
+    // handleModelDownloadSettled. Either way, don't leave the chip stuck
+    // on a dead "failed" state forever: clear modelDownload[tier] back to
+    // null so the row offers "Download" again, and say what happened as
+    // a transient banner instead (this pane's one existing error surface
+    // - #save-status is Settings' own, not this chip's).
+    await invoke("download_transcription_model", { tier });
+  } catch (e) {
+    modelDownload[tier] = null;
+    renderModelStatusChip(tier);
+    showBanner(String(e), "err");
+  }
+}
+
+function handleModelDownloadProgress(payload) {
+  if (!payload || !payload.tier) return;
+  const tier = MODEL_CLI_TIER_TO_SETTINGS_TIER[payload.tier];
+  if (!tier || !(tier in modelDownload)) return;
+  modelDownload[tier] = { downloadedBytes: payload.downloaded_bytes || 0, totalBytes: payload.total_bytes || null };
+  renderModelStatusChip(tier);
+}
+
+/// Shared tail for both `transcription://model-download-done` and
+/// `-error` - either way the download is no longer "in flight", and the
+/// real answer to "is it installed now" is always transcription_model_status
+/// (disk truth), not an inference from which event fired.
+function handleModelDownloadSettled(payload, errorMessage) {
+  if (!payload || !payload.tier) return;
+  const tier = MODEL_CLI_TIER_TO_SETTINGS_TIER[payload.tier];
+  if (!tier || !(tier in modelDownload)) return;
+  modelDownload[tier] = null;
+  if (errorMessage) {
+    showBanner(errorMessage, "err");
+  }
+  refreshModelStatuses();
+}
+
 function renderFavoritesFields(favorites) {
   const container = $("favorites-fields");
   container.innerHTML = "";
@@ -970,6 +1146,7 @@ async function openSettings() {
     });
     renderFavoritesFields(favorites);
     renderBridgeFields(bridge);
+    await openTranscriptionSettingsSection();
     $("save-status").textContent = "";
     $("save-status").className = "status";
   } catch (e) {
@@ -977,6 +1154,48 @@ async function openSettings() {
   }
   applyLockUI();
   $("screen-settings").hidden = false;
+}
+
+/// Populates and reveals #transcription-section, or keeps it absent - see
+/// that element's own comment in index.html for why "absent, hidden
+/// attribute" rather than "present but greyed out" is this shell's
+/// convention for an unlicensed premium surface. state.transcription.unlocked
+/// is set by applyTranscriptionUI (boot + call-state events); re-read here
+/// rather than re-querying premium_capability_status a second time.
+async function openTranscriptionSettingsSection() {
+  const section = $("transcription-section");
+  if (!state.transcription.unlocked) {
+    section.hidden = true;
+    return;
+  }
+  let settings = null;
+  try {
+    settings = await invoke("get_transcription_settings");
+  } catch (e) {
+    console.error("get_transcription_settings failed", e);
+  }
+  if (!settings) {
+    // License check raced/changed between applyTranscriptionUI and here
+    // (e.g. dylib removed mid-session) - stay honest, don't show a stale
+    // or half-populated section.
+    section.hidden = true;
+    return;
+  }
+  section.hidden = false;
+  setTranscriptionModeUI(settings.mode);
+  setTranscriptionActivationUI(settings.activation);
+  setModelTierUI(settings.model_tier);
+  setTranscriptionLanguageUI(settings.language);
+  transcriptionKeepAudio = !!settings.keep_audio;
+  transcriptionViewOnly = !!settings.view_only;
+  setBoolRowUI("transcription-keep-audio-row", transcriptionKeepAudio);
+  setBoolRowUI("transcription-view-only-row", transcriptionViewOnly);
+  $("in-transcription-storage-dir").value = settings.storage_dir || "";
+  modelStatus.accurate = null;
+  modelStatus.light = null;
+  renderModelStatusChip("accurate");
+  renderModelStatusChip("light");
+  await refreshModelStatuses();
 }
 
 function closeSettings() {
@@ -1054,6 +1273,13 @@ function refreshAllUiText() {
   // actually open - closed, #favorites-fields has nothing to relabel.
   if (!$("screen-settings").hidden) {
     renderFavoritesFields(collectFavoritesFields());
+    // Same staleness class as the favorites fields above: the model
+    // status chips are built in JS via t() ("Installed"/"Download"/
+    // "Downloading…"), not static [data-i18n*] markup.
+    if (!$("transcription-section").hidden) {
+      renderModelStatusChip("accurate");
+      renderModelStatusChip("light");
+    }
   }
   if (!$("screen-transcript").hidden) {
     $("tr-peer-name").textContent = state.transcript ? extractUser(state.transcript.peer) || t("transcript.defaultTitle") : t("transcript.defaultTitle");
@@ -1084,6 +1310,26 @@ async function saveAccountSettings() {
     const favorites = await invoke("save_favorites", { favorites: collectFavoritesFields() });
     state.favorites = favorites;
     renderFavorites();
+    if (!$("transcription-section").hidden) {
+      await invoke("save_transcription_settings", {
+        input: {
+          mode: selectedTranscriptionMode,
+          activation: selectedTranscriptionActivation,
+          keep_audio: transcriptionKeepAudio,
+          storage_dir: $("in-transcription-storage-dir").value.trim(),
+          view_only: transcriptionViewOnly,
+          model_tier: selectedModelTier,
+          language: selectedTranscriptionLanguage,
+        },
+      });
+      // mode/activation feed maybeAutoStartTranscript/renderManualTranscribeButton
+      // on the main window - keep state.transcription in sync with what was
+      // just saved rather than waiting for the next applyTranscriptionUI
+      // call (boot/call-state events only).
+      state.transcription.mode = selectedTranscriptionMode;
+      state.transcription.activation = selectedTranscriptionActivation;
+      renderManualTranscribeButton();
+    }
     statusEl.textContent = t("settings.savedReconnecting");
     statusEl.className = "status ok";
     const account = await invoke("get_account_settings");
@@ -1156,6 +1402,50 @@ function wireStaticHandlers() {
   document.querySelectorAll("#transport-choice .tcard").forEach((card) => {
     card.addEventListener("click", () => setTransportUI(card.dataset.transport));
   });
+
+  // ---- transcription settings (Plate 08) - all deferred to the "Save"
+  // button except the model download, which is its own real backend action
+  // (download_transcription_model), not a settings mutation - fires the
+  // moment a not-yet-installed tier is picked, same "act immediately"
+  // reasoning as #btn-restart-engine below. ----------------------------
+  document.querySelectorAll("#transcription-mode-choice .tcard").forEach((card) => {
+    card.addEventListener("click", () => setTranscriptionModeUI(card.dataset.transcriptionMode));
+  });
+  document.querySelectorAll("#transcription-activation-choice .tcard").forEach((card) => {
+    card.addEventListener("click", () => setTranscriptionActivationUI(card.dataset.transcriptionActivation));
+  });
+  document.querySelectorAll("#transcription-language-row button").forEach((b) => {
+    b.addEventListener("click", () => setTranscriptionLanguageUI(b.dataset.languageChoice));
+  });
+  document.querySelectorAll("#transcription-keep-audio-row button").forEach((b) => {
+    b.addEventListener("click", () => {
+      transcriptionKeepAudio = b.dataset.boolChoice === "true";
+      setBoolRowUI("transcription-keep-audio-row", transcriptionKeepAudio);
+    });
+  });
+  document.querySelectorAll("#transcription-view-only-row button").forEach((b) => {
+    b.addEventListener("click", () => {
+      transcriptionViewOnly = b.dataset.boolChoice === "true";
+      setBoolRowUI("transcription-view-only-row", transcriptionViewOnly);
+    });
+  });
+  $("transcription-model-choice").addEventListener("click", (e) => {
+    const downloadBtn = e.target.closest("[data-download-tier]");
+    if (downloadBtn) {
+      startModelDownload(downloadBtn.dataset.downloadTier);
+      return; // don't also treat this as a row-selection click
+    }
+    const row = e.target.closest(".modelrow");
+    if (row) setModelTierUI(row.dataset.modelTier);
+  });
+  $("transcription-model-choice").addEventListener("keydown", (e) => {
+    if (e.key !== "Enter" && e.key !== " ") return;
+    const row = e.target.closest(".modelrow");
+    if (!row) return;
+    e.preventDefault();
+    setModelTierUI(row.dataset.modelTier);
+  });
+
   document.querySelectorAll("#theme-row button").forEach((b) => {
     b.addEventListener("click", async () => {
       setThemeUI(b.dataset.themeChoice);
@@ -1377,6 +1667,15 @@ async function attachTauriListeners() {
   await listen("transcription://segment", (e) => handleTranscriptSegment(e.payload));
   await listen("transcription://done", (e) => handleTranscriptDone(e.payload));
   await listen("transcription://error", (e) => handleTranscriptError(e.payload));
+  // Model manager (Settings → Transcription's model rows) - see
+  // `openSettings`/`startModelDownload`. Wired unconditionally like every
+  // other listener here (not gated on Settings being open): a download
+  // kicked off just before Settings was closed should still finish and
+  // update `modelDownload`/`modelStatus` quietly, ready to render
+  // correctly the next time Settings opens.
+  await listen("transcription://model-download-progress", (e) => handleModelDownloadProgress(e.payload));
+  await listen("transcription://model-download-done", (e) => handleModelDownloadSettled(e.payload, null));
+  await listen("transcription://model-download-error", (e) => handleModelDownloadSettled(e.payload, e.payload && e.payload.message));
   // Auto-provisioning deep link (provisioning.rs handle_deep_link, wired
   // from deeplink.rs) - same preview shape provisioning_resolve returns
   // directly for the paste flow, so one confirmation screen serves both.

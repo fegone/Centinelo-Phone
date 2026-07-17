@@ -285,6 +285,134 @@
         </div>
       </div>
 
+      <!-- ================= transcription settings (Plate 08) =================
+           Absent, not disabled, until the `transcription` premium capability
+           is licensed - same "entry absent" gating as #btn-console/
+           #btn-transcript above (see their comments). Adapted from
+           premium/design/mockups/settings-transcription.html the way the
+           rest of this screen adapts settings.html (see README "Design
+           fidelity notes"): single-column drill-down instead of the
+           plate's 940x886 2-pane nav window, and this screen's one shared
+           #lock-overlay instead of the plate's own per-pane
+           "Admin · unlocked/locked" chip - there's only ever one settings
+           surface in this shell, already admin-gated as a whole.
+           Two controls the plate draws have no real backend behind them
+           here and are left out rather than shipped dead: the NAS
+           "Reachable · SMB" check and a folder-browse dialog (no
+           tauri-plugin-dialog wired into this app - storage folder is a
+           typed path, same as #in-core-path below). A remote STT API tier
+           isn't on this plate at all (transcribe-engine ships it only as
+           a stub - HANDOFF.md's known gap), so there's nothing to grey out
+           for it either. -->
+      <div id="transcription-section" hidden>
+        <h2 data-i18n="settings.transcriptionHeading">Transcription</h2>
+        <div class="settings-card">
+          <p class="hint" style="margin:0 0 10px" data-i18n="settings.transcriptionTrustLine">Calls are transcribed on this computer — nothing is sent anywhere.</p>
+
+          <div class="field">
+            <label data-i18n="settings.transcriptionModeLabel">When to transcribe</label>
+            <div class="transports" role="radiogroup" aria-label="When to transcribe" id="transcription-mode-choice" data-i18n-aria-label="settings.transcriptionModeLabel">
+              <button class="tcard" role="radio" data-transcription-mode="off">
+                <span class="row1"><span class="radio" aria-hidden="true"></span><b data-i18n="settings.transcriptionModeOffName">Off</b></span>
+                <p data-i18n="settings.transcriptionModeOffDesc">Calls are not transcribed.</p>
+              </button>
+              <button class="tcard" role="radio" data-transcription-mode="live">
+                <span class="row1"><span class="radio" aria-hidden="true"></span><b data-i18n="settings.transcriptionModeLiveName">Live</b></span>
+                <p data-i18n="settings.transcriptionModeLiveDesc">A panel follows the conversation during the call, a few seconds behind.</p>
+              </button>
+              <button class="tcard" role="radio" data-transcription-mode="post_call">
+                <span class="row1"><span class="radio" aria-hidden="true"></span><b data-i18n="settings.transcriptionModePostCallName">After the call</b></span>
+                <p data-i18n="settings.transcriptionModePostCallDesc">The transcript is written once the call ends. Easier on slower computers.</p>
+              </button>
+            </div>
+          </div>
+
+          <div class="field">
+            <label data-i18n="settings.transcriptionActivationLabel">Which calls</label>
+            <div class="transports" role="radiogroup" aria-label="Which calls are transcribed" id="transcription-activation-choice" data-i18n-aria-label="settings.transcriptionActivationLabel">
+              <button class="tcard" role="radio" data-transcription-activation="all_calls">
+                <span class="row1"><span class="radio" aria-hidden="true"></span><b data-i18n="settings.transcriptionActivationAllName">Every call</b></span>
+                <p data-i18n="settings.transcriptionActivationAllDesc">Each answered call is transcribed automatically.</p>
+              </button>
+              <button class="tcard" role="radio" data-transcription-activation="manual">
+                <span class="row1"><span class="radio" aria-hidden="true"></span><b data-i18n="settings.transcriptionActivationManualName">Only when turned on</b></span>
+                <p data-i18n="settings.transcriptionActivationManualDesc">Nothing is transcribed unless someone starts it for that call — a "Transcribe this call" button joins the call controls.</p>
+              </button>
+            </div>
+          </div>
+
+          <div class="field">
+            <label for="in-transcription-storage-dir" data-i18n="settings.transcriptionStorageDirLabel">Storage folder</label>
+            <input id="in-transcription-storage-dir" type="text" placeholder="//archive/front-desk/calls" autocomplete="off" style="font-family:var(--font-mono)" data-i18n-placeholder="settings.transcriptionStorageDirPlaceholder">
+            <span class="hint" data-i18n="settings.transcriptionStorageDirHint">A local path or a mounted network folder. Point it at this computer and nothing ever leaves it.</span>
+          </div>
+
+          <div class="field">
+            <label data-i18n="settings.transcriptionKeepAudioLabel">Keep the audio recordings</label>
+            <div class="themerow" role="radiogroup" aria-label="Keep the audio recordings" id="transcription-keep-audio-row" data-i18n-aria-label="settings.transcriptionKeepAudioLabel">
+              <button data-bool-choice="false" class="on" data-i18n="settings.boolOff">Off</button><button data-bool-choice="true" data-i18n="settings.boolOn">On</button>
+            </div>
+            <span class="hint" data-i18n="settings.transcriptionKeepAudioHint">Audio files stay next to their transcripts. Off deletes the audio once its transcript is written.</span>
+          </div>
+
+          <div class="field">
+            <label data-i18n="settings.transcriptionViewOnlyLabel">View only</label>
+            <div class="themerow" role="radiogroup" aria-label="View only" id="transcription-view-only-row" data-i18n-aria-label="settings.transcriptionViewOnlyLabel">
+              <button data-bool-choice="false" class="on" data-i18n="settings.boolOff">Off</button><button data-bool-choice="true" data-i18n="settings.boolOn">On</button>
+            </div>
+            <span class="hint" data-i18n="settings.transcriptionViewOnlyHint">This computer reads transcripts from the folder but never writes new ones — for a manager's desk.</span>
+          </div>
+        </div>
+
+        <div class="settings-card" style="margin-top:10px">
+          <div class="field" style="margin-bottom:6px">
+            <label data-i18n="settings.transcriptionModelLabel">The model — runs on this computer</label>
+          </div>
+          <!-- role="radio" divs, not buttons: .mrstatus below can hold a
+               real <button> (the "Download" action) once a tier isn't
+               present on disk - a <button> can never nest inside another
+               <button> (invalid HTML), which is exactly the bug
+               REVIEW.md §4b's pass 1 already caught and fixed in the
+               mockup's own download row. Selection is still keyboard-
+               operable (see wireStaticHandlers' keydown handler on this
+               container). -->
+          <div class="modelrows" id="transcription-model-choice" role="radiogroup" aria-label="Transcription model">
+            <div class="modelrow" role="radio" tabindex="0" data-model-tier="accurate">
+              <span class="radio" aria-hidden="true"></span>
+              <span class="mrx">
+                <b data-i18n="settings.transcriptionModelAccurateName">Accurate</b>
+                <span data-i18n="settings.transcriptionModelAccurateDesc">The best transcripts. Uses about 1 GB of memory while a call is being written.</span>
+              </span>
+              <span class="mrstatus" id="model-status-accurate"></span>
+            </div>
+            <div class="modelrow" role="radio" tabindex="0" data-model-tier="light">
+              <span class="radio" aria-hidden="true"></span>
+              <span class="mrx">
+                <b data-i18n="settings.transcriptionModelLightName">Light</b>
+                <span data-i18n="settings.transcriptionModelLightDesc">Good transcripts on modest computers — about half the memory.</span>
+              </span>
+              <span class="mrstatus" id="model-status-light"></span>
+            </div>
+          </div>
+
+          <div class="field" style="margin-top:10px">
+            <label data-i18n="settings.transcriptionLanguageLabel">Language</label>
+            <div class="themerow" role="radiogroup" aria-label="Transcription language" id="transcription-language-row" data-i18n-aria-label="settings.transcriptionLanguageLabel">
+              <button data-language-choice="auto" class="on" data-i18n="settings.transcriptionLangAuto">Auto</button>
+              <button data-language-choice="en" data-i18n="settings.transcriptionLangEn">EN</button>
+              <button data-language-choice="es" data-i18n="settings.transcriptionLangEs">ES</button>
+              <button data-language-choice="pt" data-i18n="settings.transcriptionLangPt">PT</button>
+            </div>
+            <span class="hint" data-i18n="settings.transcriptionLanguageHint">Auto-detect picks the language per call.</span>
+          </div>
+        </div>
+
+        <div class="privacy-note">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l7 3v5c0 4.5-3 8-7 10-4-2-7-5.5-7-10V6l7-3z"/><path d="M9 11.5l2.2 2.2 4.3-4.2"/></svg>
+          <p data-i18n="settings.transcriptionPrivacyNote">Everything above happens on this machine. Audio and transcripts are written only to the folder you chose.</p>
+        </div>
+      </div>
+
       <h2 data-i18n="settings.advancedHeading">Advanced</h2>
       <div class="settings-card">
         <div class="field">
