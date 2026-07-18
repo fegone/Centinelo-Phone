@@ -73,6 +73,9 @@ const state = {
   bridge: null, // BridgeSettingsView from the backend (click-to-call + deep links)
   regState: "unregistered", // unregistered|registering|registered|failed
   regReason: null, // last SIP failure reason text (only meaningful when regState === "failed")
+  // Set by saveAccountSettings while awaiting the next terminal reg_state after a
+  // Save; cleared/resolved by handleSidecarEvent. { resolve, timer } | null.
+  pendingRegResult: null,
   transport: null,
   sidecarStatus: { status: "idle" },
   call: null, // { direction, state, peer, callId, createdAt, establishedAt }
@@ -848,6 +851,16 @@ function handleSidecarEvent(evt) {
       state.regState = evt.state || "unregistered";
       state.transport = evt.transport || state.transport;
       state.regReason = evt.reason || null;
+      // If a Settings Save is awaiting the real registration outcome, settle it
+      // on a terminal state (registered/failed). "registering"/"unregistered"
+      // are in-flight, not a result, so we keep waiting (and let the timeout in
+      // awaitRegResult be the only other way out).
+      if (state.pendingRegResult && (evt.state === "registered" || evt.state === "failed")) {
+        const pending = state.pendingRegResult;
+        state.pendingRegResult = null;
+        clearTimeout(pending.timer);
+        pending.resolve({ state: evt.state, reason: evt.reason });
+      }
       renderAll();
       break;
     case "call_state":
@@ -1857,6 +1870,39 @@ function refreshAllUiText() {
   renderUpdaterUI();
 }
 
+/// How long saveAccountSettings waits for a terminal reg_state
+/// ("registered" / "failed") after a successful Save before giving up on the
+/// inline connect-status feedback. The engine re-registers on save, so a
+/// reg_state almost always follows; this just bounds the wait so the
+/// "Connecting…" message can never hang forever if one doesn't arrive.
+const REG_RESULT_TIMEOUT_MS = 10000;
+
+/// Resolves with the real registration outcome the next time
+/// handleSidecarEvent sees a terminal reg_state ({ state, reason }), or with
+/// { timedOut: true } after REG_RESULT_TIMEOUT_MS. state.pendingRegResult is
+/// the handshake: saveAccountSettings sets it, the reg_state handler clears +
+/// resolves it. If the user clicks Save again while one is already pending,
+/// the previous wait is settled (timedOut) first so its stale timer can't
+/// fire into the new wait.
+function awaitRegResult() {
+  if (state.pendingRegResult) {
+    const stale = state.pendingRegResult;
+    state.pendingRegResult = null;
+    clearTimeout(stale.timer);
+    stale.resolve({ timedOut: true });
+  }
+  return new Promise((resolve) => {
+    const entry = { resolve, timer: 0 };
+    entry.timer = setTimeout(() => {
+      if (state.pendingRegResult === entry) {
+        state.pendingRegResult = null;
+        resolve({ timedOut: true });
+      }
+    }, REG_RESULT_TIMEOUT_MS);
+    state.pendingRegResult = entry;
+  });
+}
+
 /// Two independent backend calls make up one "Save": save_account_settings
 /// (+ set_core_binary_path + save_favorites, which all live or die
 /// together with it) always runs first and reconnects the engine on
@@ -1960,12 +2006,42 @@ async function saveAccountSettings() {
     }
   }
 
-  if (transcriptionError) {
-    statusEl.textContent = t("settings.savedAccountTranscriptionFailed", { reason: transcriptionError });
+  // Reflect the REAL registration result inline (was a hardcoded optimistic
+  // "Saved — reconnecting…" that gave no signal about whether the SIP account
+  // actually registered). Save triggers an engine re-register, so a terminal
+  // reg_state ("registered"/"failed") follows shortly — awaitRegResult
+  // resolves on it via handleSidecarEvent, or times out after
+  // REG_RESULT_TIMEOUT_MS. Neutral while connecting; green on success; red +
+  // the real SIP reason (e.g. 401 Unauthorized / 408 Timeout) on failure.
+  statusEl.className = "status";
+  statusEl.textContent = t("regStatus.connecting");
+  const result = await awaitRegResult();
+  let regOk = false;
+  if (result.timedOut) {
+    // No terminal reg_state arrived — the engine is still working. Leave the
+    // neutral "Connecting…" (the live reg-pill keeps showing the true state)
+    // rather than hanging or falsely claiming success/failure.
+    statusEl.textContent = t("regStatus.connecting");
+  } else if (result.state === "registered") {
+    statusEl.textContent = t("regStatus.connected");
+    statusEl.className = "status ok";
+    regOk = true;
+  } else if (result.state === "failed") {
+    statusEl.textContent = t("regStatus.failedReason", {
+      reason: result.reason || t("regStatus.unknownReason"),
+    });
     statusEl.className = "status err";
   } else {
-    statusEl.textContent = t("settings.savedReconnecting");
-    statusEl.className = "status ok";
+    // Defensive: the handler only resolves on terminal states, so this is
+    // unreachable today — keep "Connecting…" rather than guessing.
+    statusEl.textContent = t("regStatus.connecting");
+  }
+  // A transcription-only failure is secondary to the SIP outcome: surface it
+  // only when registration itself succeeded, so a real connect failure stays
+  // the headline when both go wrong (matches the two-nested-try split above).
+  if (transcriptionError && regOk) {
+    statusEl.textContent = t("settings.savedAccountTranscriptionFailed", { reason: transcriptionError });
+    statusEl.className = "status err";
   }
 }
 
