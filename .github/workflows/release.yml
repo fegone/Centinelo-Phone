@@ -574,11 +574,38 @@ jobs:
           TARBALL="$(find "$BUNDLE_DIR" -maxdepth 1 -name '*.app.tar.gz' | head -n1)"
           [[ -n "$TARBALL" ]] || { echo "error: no .app.tar.gz found under $BUNDLE_DIR (createUpdaterArtifacts should have produced one at build time)" >&2; exit 1; }
           echo "-- re-tarring $(basename "$APP_DIR") -> $(basename "$TARBALL") (post core-engine injection)"
-          tar -czf "$TARBALL" -C "$BUNDLE_DIR" "$(basename "$APP_DIR")"
+          # COPYFILE_DISABLE=1 keeps macOS bsdtar from writing `._` AppleDouble
+          # sidecars (extended-attribute carriers) into the archive, matching the
+          # metadata-free tar that tauri-bundler's Rust `tar` crate produces at
+          # build time and that tauri-plugin-updater expects to extract - so the
+          # .app.tar.gz stays in the exact format the updater knows how to untar.
+          COPYFILE_DISABLE=1 tar -czf "$TARBALL" -C "$BUNDLE_DIR" "$(basename "$APP_DIR")"
           rm -f "$TARBALL.sig"
           npx tauri signer sign -f "$TARBALL"
           [[ -f "$TARBALL.sig" ]] || { echo "error: tauri signer sign did not produce $TARBALL.sig" >&2; exit 1; }
-          echo "OK: regenerated $(basename "$TARBALL") + .sig"
+          # The auto-updater downloads THIS tarball and REPLACES the installed
+          # .app with its contents, so the Developer ID signature + notarization
+          # staple must survive the tar/untar round-trip. The standalone "Verify"
+          # step below only checks the LOOSE .app/.dmg - it never re-checks what
+          # the updater actually ships. So extract to a temp dir and re-run the
+          # same checks here: a hardened-runtime binary whose seal did not
+          # survive re-tar is rejected by the kernel and would not launch after
+          # the update - we must catch that before publishing, not in the field.
+          echo "-- verifying signature + staple survive the tar round-trip"
+          VERIFY_DIR="$(mktemp -d)"
+          tar -xzf "$TARBALL" -C "$VERIFY_DIR"
+          EXTRACTED_APP="$(find "$VERIFY_DIR" -maxdepth 1 -name '*.app' | head -n1)"
+          [[ -n "$EXTRACTED_APP" ]] || { echo "error: extracted updater tarball contained no .app" >&2; exit 1; }
+          codesign --verify --deep --strict --verbose=2 "$EXTRACTED_APP" || {
+            echo "::error::codesign verify FAILED on the .app extracted from the regenerated updater tarball - the Developer ID signature did NOT survive the tar/untar round-trip; refusing to publish an updater artifact the auto-updater would install and the kernel would reject." >&2
+            exit 1
+          }
+          xcrun stapler validate "$EXTRACTED_APP" || {
+            echo "::error::stapler validate FAILED on the .app extracted from the regenerated updater tarball - the notarization ticket did NOT survive the tar/untar round-trip." >&2
+            exit 1
+          }
+          rm -rf "$VERIFY_DIR"
+          echo "OK: regenerated $(basename "$TARBALL") + .sig; signature + staple survived the re-tar round-trip"
 
       - name: Verify codesign, Gatekeeper, and notarization staple
         # Last gate before upload. codesign --verify --deep is the SUPPORTED
