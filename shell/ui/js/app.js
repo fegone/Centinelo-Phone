@@ -72,6 +72,7 @@ const state = {
   consoleUnlocked: false,
   bridge: null, // BridgeSettingsView from the backend (click-to-call + deep links)
   regState: "unregistered", // unregistered|registering|registered|failed
+  regReason: null, // last SIP failure reason text (only meaningful when regState === "failed")
   transport: null,
   sidecarStatus: { status: "idle" },
   call: null, // { direction, state, peer, callId, createdAt, establishedAt }
@@ -207,7 +208,9 @@ function renderRegPill() {
     state.regState === "registered"
       ? t("regPill.registeredTitle", { transport: transportText })
       : state.regState === "failed"
-        ? t("regPill.failedTitle")
+        ? state.regReason
+          ? t("regPill.failedReason", { reason: state.regReason })
+          : t("regPill.failedTitle")
         : t("regPill.notRegisteredTitle");
 }
 
@@ -844,6 +847,7 @@ function handleSidecarEvent(evt) {
     case "reg_state":
       state.regState = evt.state || "unregistered";
       state.transport = evt.transport || state.transport;
+      state.regReason = evt.reason || null;
       renderAll();
       break;
     case "call_state":
