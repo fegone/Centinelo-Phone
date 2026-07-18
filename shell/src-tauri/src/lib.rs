@@ -14,6 +14,7 @@ mod sync_ext;
 mod tray;
 mod transcription;
 mod updater;
+mod url_policy;
 
 use premium::PremiumHandle;
 use settings::{AdminSession, SettingsStore};
