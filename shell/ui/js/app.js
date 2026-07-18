@@ -38,6 +38,7 @@ import {
   renderUpdateBanner,
   renderUpdaterAboutStatus,
 } from "./updater.js";
+import { computeBlfUiHidden, BLF_UI_TARGETS } from "./blf-ui.js";
 
 // `Channel` (updater download progress) and `Resource` both live on
 // window.__TAURI__.core alongside `invoke` - withGlobalTauri bundles the
@@ -58,6 +59,16 @@ const state = {
   account: null, // AccountSettingsView from the backend
   favorites: [],
   blf: {}, // ext (string) -> "idle"|"ringing"|"busy"|"offline", from sidecar "blf" events
+  // ---- BLF master switch (P5) ----------------------------------------
+  // blfEnabled mirrors settings.blf.enabled (read via get_blf_enabled in
+  // boot). false = the favorites grid + heading are hidden and the console
+  // entry is absent from view (see renderBlfUi). Defaults to true to keep
+  // the shipped cold-boot appearance until the value resolves.
+  blfEnabled: true,
+  // consoleUnlocked is set by applyPremiumUI (premium_capability_status for
+  // blf_console); renderBlfUi ANDs it with blfEnabled so BLF off hides the
+  // console regardless of its own license gate.
+  consoleUnlocked: false,
   bridge: null, // BridgeSettingsView from the backend (click-to-call + deep links)
   regState: "unregistered", // unregistered|registering|registered|failed
   transport: null,
@@ -2297,15 +2308,32 @@ async function attachTauriListeners() {
 // actual answer for a licensed capability, counts here); "not_licensed"/
 // "unavailable" (no dylib, tampered signature, FFI error) hide it -
 // mirrors tray.rs's own gating exactly, so both surfaces agree.
+/// Applies the BLF master switch to the DOM. Pure policy lives in
+/// computeBlfUiHidden (blf-ui.js): with blfEnabled === false the favorites grid
+/// + heading disappear and the console entry is absent from view, REGARDLESS of
+/// its own license gate. Called both from boot() (after get_blf_enabled) and
+/// applyPremiumUI() (when the console's own license gate resolves), so either
+/// signal re-evaluates both surfaces. id names come from BLF_UI_TARGETS so the
+/// contract is pinned in one testable place.
+function renderBlfUi() {
+  const hidden = computeBlfUiHidden({ blfEnabled: state.blfEnabled, consoleUnlocked: state.consoleUnlocked });
+  $(BLF_UI_TARGETS.favoritesHeading).hidden = hidden.favoritesHeading;
+  $(BLF_UI_TARGETS.favoritesGrid).hidden = hidden.favoritesGrid;
+  $(BLF_UI_TARGETS.console).hidden = hidden.console;
+}
+
 async function applyPremiumUI() {
   try {
     const status = await invoke("premium_capability_status", { capability: "blf_console" });
-    const unlocked = status === "available" || status === "not_implemented";
-    $("btn-console").hidden = !unlocked;
+    state.consoleUnlocked = status === "available" || status === "not_implemented";
   } catch (e) {
     console.error("premium_capability_status failed", e);
-    $("btn-console").hidden = true;
+    state.consoleUnlocked = false;
   }
+  // Re-applied through renderBlfUi so the console respects BOTH its license
+  // gate (state.consoleUnlocked) and the BLF master switch (state.blfEnabled):
+  // BLF off hides the console even when the license would clear it.
+  renderBlfUi();
 }
 
 async function boot() {
@@ -2329,17 +2357,23 @@ async function boot() {
   applyStaticI18n();
 
   try {
-    const [account, favorites, theme, sidecarStatus, blfStates] = await Promise.all([
+    const [account, favorites, theme, sidecarStatus, blfStates, blfEnabled] = await Promise.all([
       invoke("get_account_settings"),
       invoke("get_favorites"),
       invoke("get_theme"),
       invoke("sidecar_status"),
       invoke("get_blf_states"),
+      invoke("get_blf_enabled"),
     ]);
     state.account = account;
     state.favorites = favorites;
     state.sidecarStatus = sidecarStatus;
     state.blf = blfStates || {};
+    // P5 master switch: blfEnabled gates both the favorites grid/heading and the
+    // console entry (see renderBlfUi). Read here alongside the other boot reads
+    // so the gate applies on the first paint; applyPremiumUI re-applies it once
+    // the console's own license gate resolves further down boot().
+    state.blfEnabled = blfEnabled === true;
     applyTheme(theme || "auto");
   } catch (e) {
     console.error("boot load failed", e);
@@ -2362,6 +2396,10 @@ async function boot() {
   renderIdentity();
   renderDial();
   renderFavorites();
+  // Apply the BLF master switch to the DOM now that state.blfEnabled has been
+  // read; applyPremiumUI() below re-applies it once the console license gate
+  // resolves (both touch renderBlfUi, so order-independent).
+  renderBlfUi();
   renderAll();
   await loadRecents();
   await attachTauriListeners();
