@@ -191,6 +191,54 @@ jobs:
           fi
           echo "OK: both signing secrets are configured (values never printed)."
 
+      - name: Guard - Apple notarization secrets must be configured
+        # Mirrors the signing-secrets guard above: never prints any secret's
+        # VALUE, only whether each is missing, by NAME. macOS code signing +
+        # notarization are a hard release gate (Gatekeeper refuses an
+        # unsigned/un-notarized .app/.dmg for anyone who downloads it), so a
+        # missing APPLE_* secret fails the whole run in seconds here - before
+        # the 20-30min macOS compile starts - instead of failing deep inside
+        # codesign/notarytool. NOTE this guard lives in `preflight`, and BOTH
+        # downstream jobs - build-macos AND build-windows - declare
+        # `needs: preflight`, so a missing APPLE_* secret blocks the ENTIRE
+        # pipeline (Windows included), not just the macOS release. That is
+        # intentional: without an Apple signature there is no macOS asset, and
+        # publish-release refuses to publish a release missing a platform, so
+        # a half-signed release never ships. Felix has not yet obtained an
+        # Apple Developer Program membership (see shell/README.md "Apple code
+        # signing & notarization - configure before a real macOS release"), so
+        # this is expected to block ALL releases - Windows too - until those
+        # six secrets are configured; it is medium-blocked, not broken.
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          missing=()
+          [[ -n "${APPLE_CERTIFICATE:-}" ]] || missing+=(APPLE_CERTIFICATE)
+          [[ -n "${APPLE_CERTIFICATE_PASSWORD:-}" ]] || missing+=(APPLE_CERTIFICATE_PASSWORD)
+          [[ -n "${APPLE_SIGNING_IDENTITY:-}" ]] || missing+=(APPLE_SIGNING_IDENTITY)
+          [[ -n "${APPLE_ID:-}" ]] || missing+=(APPLE_ID)
+          [[ -n "${APPLE_PASSWORD:-}" ]] || missing+=(APPLE_PASSWORD)
+          [[ -n "${APPLE_TEAM_ID:-}" ]] || missing+=(APPLE_TEAM_ID)
+          if [[ ${#missing[@]} -gt 0 ]]; then
+            echo "::error::Apple notarization secrets missing: ${missing[*]}. Without a Developer ID Application certificate + notary credentials this pipeline cannot produce a macOS .app/.dmg Gatekeeper will open (codesign would fail, and notarytool cannot authenticate). Obtain the cert + app-specific password per the runbook and add these six repo secrets (values never printed here):" >&2
+            echo "  Repo Settings -> Secrets and variables -> Actions -> New repository secret" >&2
+            echo "    APPLE_CERTIFICATE           (Developer ID Application .p12, base64-encoded)" >&2
+            echo "    APPLE_CERTIFICATE_PASSWORD  (the .p12 export password)" >&2
+            echo "    APPLE_SIGNING_IDENTITY      ('Developer ID Application: Name (TEAMID)')" >&2
+            echo "    APPLE_ID                    (the notarizing Apple ID email)" >&2
+            echo "    APPLE_PASSWORD              (an app-specific password, NOT the account one)" >&2
+            echo "    APPLE_TEAM_ID               (10-char Team ID)" >&2
+            echo "Full runbook: shell/README.md, section 'Apple code signing & notarization - configure before a real macOS release'." >&2
+            exit 1
+          fi
+          echo "OK: all Apple notarization secrets are configured (values never printed)."
+
   # -------------------------------------------------------------------
   # macOS (aarch64): builds core/ exactly like core-build.yml's macOS job
   # (same patches, same MODULES list, same OpenSSL discovery), then the
@@ -325,12 +373,22 @@ jobs:
         working-directory: shell/src-tauri
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: Build the Tauri app (.app + .dmg + updater .app.tar.gz/.sig)
+      - name: Build the Tauri .app (app only - .dmg rebuilt post-sign, see below)
+        # `--bundles app` (NOT app,dmg): the .dmg is built LATER, from the
+        # signed+stapled .app, because package-official.sh injects core-engine
+        # into .app/Contents/MacOS/ AFTER this step - a .dmg built here would
+        # wrap a core-engine-less .app and ship an incomplete, unrunnable app.
+        # tauri.conf.json's bundle.macOS.signingIdentity is null on purpose,
+        # so Tauri does NOT sign at this point and never races the manual
+        # codesign step below (which has to run after the injection, since the
+        # injection invalidates any build-time signature). The updater
+        # .app.tar.gz + .sig that `--bundles app` still emits are regenerated
+        # again later, from the signed .app - see that step's comment.
         working-directory: shell
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: npx tauri build --bundles app,dmg
+        run: npx tauri build --bundles app
 
       - name: Stage core engine binary into the built .app (Community edition)
         # No --premium-dylib/--premium-sig/--premium-console-assets given -
@@ -343,6 +401,182 @@ jobs:
         # .app and copy the core engine binary + modules beside its
         # executable (Contents/MacOS/core-engine/).
         run: bash scripts/package-official.sh --target macos --skip-core-build --skip-shell-build
+
+      - name: Import Apple Developer ID certificate into a temporary keychain
+        # The .p12 (APPLE_CERTIFICATE, base64) is decoded and imported into a
+        # throwaway keychain created for THIS run, prepended to the user
+        # search list so codesign can resolve APPLE_SIGNING_IDENTITY, and
+        # deleted in the final cleanup step (if: always()). The cert never
+        # touches the runner's default/login keychain and never persists. No
+        # secret value is printed - only a count of identities found.
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KC_PATH="$RUNNER_TEMP/notarization.keychain-db"
+          KC_PW="$(uuidgen 2>/dev/null || openssl rand -hex 32)"
+          rm -f "$KC_PATH"
+          security create-keychain -p "$KC_PW" "$KC_PATH"
+          # Keep it unlocked for the lifetime of this job - auto-lock would
+          # make a later codesign prompt for the password and hang the run.
+          # 21600s = 6h, comfortably past this job's timeout-minutes (90m),
+          # so the keychain cannot relock mid-notarize.
+          security set-keychain-settings -lut 21600 "$KC_PATH"
+          security unlock-keychain -p "$KC_PW" "$KC_PATH"
+          P12="$RUNNER_TEMP/developer-id.p12"
+          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$P12"
+          security import "$P12" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KC_PATH"
+          # Prepend our keychain to the user search list so codesign finds the
+          # identity without it living in the runner's default keychain.
+          # shellcheck disable=SC2046  # word-splitting is intentional: each
+          # existing keychain path must be passed as a separate argument.
+          security list-keychains -d user -s "$KC_PATH" $(security list-keychains -d user | tr -d '"')
+          # Let apple-tool:/codesign use the imported key without a GUI prompt.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KC_PW" "$KC_PATH"
+          rm -f "$P12"
+          echo "APPLE_KEYCHAIN_PATH=$KC_PATH" >> "$GITHUB_ENV"
+          N="$(security find-identity -v -p codesigning "$KC_PATH" | grep -c 'Developer ID Application' || true)"
+          [[ "$N" -ge 1 ]] || { echo "::error::Developer ID Application identity not found in the temporary keychain after import" >&2; exit 1; }
+          echo "-- imported $N Developer ID Application identity(ies) into the temporary keychain"
+
+      - name: Codesign the .app in depth (inner-to-outer, hardened runtime)
+        # MANUAL signing, NOT Tauri's: package-official.sh injected core-engine
+        # + modules into .app/Contents/MacOS/ AFTER `tauri build`, which
+        # invalidates any build-time signature, so signing is the LAST
+        # structural step. bundle.macOS.signingIdentity is null in
+        # tauri.conf.json precisely so Tauri does NOT sign and race this step.
+        # We sign inner-to-outer - Apple's supported replacement for the
+        # deprecated `--deep` (which re-signs already-signed nested binaries
+        # and corrupts their seals): every embedded Mach-O first, then the
+        # .app bundle last. The same plist (entitlements.plist) is applied to
+        # the main executable and the baresip sidecar.
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          # First step that needs the just-built .app: define the bundle dir +
+          # .app path ONCE here and export ABSOLUTE paths to $GITHUB_ENV for
+          # every downstream step (notarytool, build-dmg, regenerate-updater,
+          # verify, upload). Absolute paths are correct whether or not a step
+          # sets working-directory (the regenerate step runs under
+          # working-directory: shell and would otherwise need a shell/-less
+          # relative path - the absolute path is identical either way).
+          BUNDLE_DIR="$GITHUB_WORKSPACE/shell/src-tauri/target/release/bundle/macos"
+          APP="$(find "$BUNDLE_DIR" -maxdepth 1 -name '*.app' | head -n1)"
+          [[ -n "$APP" ]] || { echo "error: no .app under $BUNDLE_DIR" >&2; exit 1; }
+          echo "MACOS_BUNDLE_DIR=$BUNDLE_DIR" >> "$GITHUB_ENV"
+          echo "MACOS_APP_PATH=$APP" >> "$GITHUB_ENV"
+          ENT="$GITHUB_WORKSPACE/shell/src-tauri/entitlements.plist"
+          [[ -f "$ENT" ]] || { echo "error: entitlements not found at $ENT" >&2; exit 1; }
+          ID="$APPLE_SIGNING_IDENTITY"
+          # 1) Embedded libraries (baresip .so modules + any premium .dylib):
+          #    hardened runtime only - entitlements do not apply to libraries.
+          find "$APP/Contents" -type f \( -name '*.so' -o -name '*.dylib' \) -print0 |
+            while IFS= read -r -d '' lib; do
+              echo "-- signing library: ${lib#"$APP/"}"
+              codesign --force --options runtime --timestamp -s "$ID" "$lib"
+            done
+          # 2) The baresip core-engine sidecar is a STANDALONE process that
+          #    opens the mic + a SIP socket itself, so under hardened runtime
+          #    it needs the SAME audio-input/network entitlements as the main
+          #    executable (entitlements are per-executable, NOT inherited by
+          #    a child process). Sign every extensionless Mach-O under
+          #    core-engine/ (file-type checked, so non-Mach-O data is skipped).
+          find "$APP/Contents/MacOS/core-engine" -maxdepth 1 -type f ! -name '*.so' ! -name '*.dylib' -print0 |
+            while IFS= read -r -d '' bin; do
+              if file -b "$bin" | grep -q -i 'Mach-O'; then
+                echo "-- signing executable: ${bin#"$APP/"}"
+                codesign --force --options runtime --entitlements "$ENT" --timestamp -s "$ID" "$bin"
+              fi
+            done
+          # 3) The .app bundle itself - signs its main executable and writes
+          #    the bundle seal. Signed LAST so it seals the already-signed
+          #    nested Mach-Os rather than overwriting them.
+          echo "-- signing .app bundle: $(basename "$APP")"
+          codesign --force --options runtime --entitlements "$ENT" --timestamp -s "$ID" "$APP"
+          echo "OK: .app signed inner-to-outer (hardened runtime)"
+
+      - name: Notarize + staple the .app
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          APP="${MACOS_APP_PATH:?MACOS_APP_PATH not exported by the codesign step}"
+          ZIP="$RUNNER_TEMP/$(basename "$APP").zip"
+          rm -f "$ZIP"
+          ditto -c -k --keepParent "$APP" "$ZIP"
+          echo "-- submitting $(basename "$ZIP") to notarytool (--wait)"
+          SUBMIT_LOG="$RUNNER_TEMP/notarytool-app-submit.log"
+          # On rejection, surface the WHY: capture the submission-id notarytool
+          # echoes and fetch its JSON log WITHOUT re-submitting. The old path
+          # only left a bare non-zero exit code in the Actions log.
+          if ! xcrun notarytool submit "$ZIP" \
+                --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" \
+                --wait 2>&1 | tee "$SUBMIT_LOG"; then
+            SUBMISSION_ID="$(grep -m1 -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' "$SUBMIT_LOG" || true)"
+            if [[ -n "${SUBMISSION_ID:-}" ]]; then
+              echo "-- notarytool rejected $ZIP (id $SUBMISSION_ID); fetching the rejection log"
+              xcrun notarytool log "$SUBMISSION_ID" \
+                --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" \
+                || echo "(notarytool log fetch itself failed; submission-id was $SUBMISSION_ID)" >&2
+            else
+              echo "::error::notarytool submit failed and no submission-id could be parsed; see output above" >&2
+            fi
+            exit 1
+          fi
+          echo "-- stapling the .app"
+          xcrun stapler staple "$APP"
+          echo "OK: .app notarized + stapled"
+
+      - name: Build, sign, notarize + staple the .dmg from the final signed .app
+        # The .dmg is built NOW from the signed+stapled .app (NOT by `tauri
+        # build`), because building it earlier would wrap a core-engine-less
+        # .app. A .dmg is its OWN notarization target, separate from the .app
+        # inside it, so it is signed + submitted + stapled independently.
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          BUNDLE_DIR="${MACOS_BUNDLE_DIR:?MACOS_BUNDLE_DIR not exported by the codesign step - is it still the first step that touches the bundle?}"
+          APP="${MACOS_APP_PATH:?MACOS_APP_PATH not exported by the codesign step}"
+          APP_BASE="$(basename "$APP" .app)"
+          STAGING="$RUNNER_TEMP/dmg-staging"
+          rm -rf "$STAGING"; mkdir -p "$STAGING"
+          cp -R "$APP" "$STAGING/"
+          ln -s /Applications "$STAGING/Applications"
+          DMG="$BUNDLE_DIR/${APP_BASE}_${VERSION}_aarch64.dmg"
+          rm -f "$DMG"
+          # UDZO (compressed, read-only) + HFS+ for broad notarytool/OS support.
+          hdiutil create -volname "$APP_BASE" -srcfolder "$STAGING" \
+            -fs HFS+ -format UDZO -imagekey zlib-level=9 "$DMG"
+          echo "-- signing the .dmg"
+          codesign --force --sign "$APPLE_SIGNING_IDENTITY" --timestamp "$DMG"
+          echo "-- submitting $(basename "$DMG") to notarytool (--wait)"
+          SUBMIT_LOG="$RUNNER_TEMP/notarytool-dmg-submit.log"
+          if ! xcrun notarytool submit "$DMG" \
+                --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" \
+                --wait 2>&1 | tee "$SUBMIT_LOG"; then
+            SUBMISSION_ID="$(grep -m1 -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' "$SUBMIT_LOG" || true)"
+            if [[ -n "${SUBMISSION_ID:-}" ]]; then
+              echo "-- notarytool rejected $DMG (id $SUBMISSION_ID); fetching the rejection log"
+              xcrun notarytool log "$SUBMISSION_ID" \
+                --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" \
+                || echo "(notarytool log fetch itself failed; submission-id was $SUBMISSION_ID)" >&2
+            else
+              echo "::error::notarytool submit failed and no submission-id could be parsed; see output above" >&2
+            fi
+            exit 1
+          fi
+          echo "-- stapling the .dmg"
+          xcrun stapler staple "$DMG"
+          echo "OK: .dmg built from signed .app, signed, notarized + stapled"
 
       - name: Regenerate the updater artifact (.app.tar.gz + .sig) after core-engine injection
         # `tauri build` above already produced a `.app.tar.gz` + `.sig`
@@ -373,22 +607,72 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           set -euo pipefail
-          BUNDLE_DIR="src-tauri/target/release/bundle/macos"
-          APP_DIR="$(find "$BUNDLE_DIR" -maxdepth 1 -name '*.app' | head -n1)"
-          [[ -n "$APP_DIR" ]] || { echo "error: no .app bundle found under $BUNDLE_DIR" >&2; exit 1; }
+          BUNDLE_DIR="${MACOS_BUNDLE_DIR:?MACOS_BUNDLE_DIR not exported by the codesign step - is it still the first step that touches the bundle?}"
+          APP_DIR="${MACOS_APP_PATH:?MACOS_APP_PATH not exported by the codesign step}"
+          [[ -d "$APP_DIR" ]] || { echo "error: no .app bundle found under $BUNDLE_DIR" >&2; exit 1; }
           TARBALL="$(find "$BUNDLE_DIR" -maxdepth 1 -name '*.app.tar.gz' | head -n1)"
           [[ -n "$TARBALL" ]] || { echo "error: no .app.tar.gz found under $BUNDLE_DIR (createUpdaterArtifacts should have produced one at build time)" >&2; exit 1; }
           echo "-- re-tarring $(basename "$APP_DIR") -> $(basename "$TARBALL") (post core-engine injection)"
-          tar -czf "$TARBALL" -C "$BUNDLE_DIR" "$(basename "$APP_DIR")"
+          # COPYFILE_DISABLE=1 keeps macOS bsdtar from writing `._` AppleDouble
+          # sidecars (extended-attribute carriers) into the archive, matching the
+          # metadata-free tar that tauri-bundler's Rust `tar` crate produces at
+          # build time and that tauri-plugin-updater expects to extract - so the
+          # .app.tar.gz stays in the exact format the updater knows how to untar.
+          COPYFILE_DISABLE=1 tar -czf "$TARBALL" -C "$BUNDLE_DIR" "$(basename "$APP_DIR")"
           rm -f "$TARBALL.sig"
           npx tauri signer sign -f "$TARBALL"
           [[ -f "$TARBALL.sig" ]] || { echo "error: tauri signer sign did not produce $TARBALL.sig" >&2; exit 1; }
-          echo "OK: regenerated $(basename "$TARBALL") + .sig"
+          # The auto-updater downloads THIS tarball and REPLACES the installed
+          # .app with its contents, so the Developer ID signature + notarization
+          # staple must survive the tar/untar round-trip. The standalone "Verify"
+          # step below only checks the LOOSE .app/.dmg - it never re-checks what
+          # the updater actually ships. So extract to a temp dir and re-run the
+          # same checks here: a hardened-runtime binary whose seal did not
+          # survive re-tar is rejected by the kernel and would not launch after
+          # the update - we must catch that before publishing, not in the field.
+          echo "-- verifying signature + staple survive the tar round-trip"
+          VERIFY_DIR="$(mktemp -d)"
+          tar -xzf "$TARBALL" -C "$VERIFY_DIR"
+          EXTRACTED_APP="$(find "$VERIFY_DIR" -maxdepth 1 -name '*.app' | head -n1)"
+          [[ -n "$EXTRACTED_APP" ]] || { echo "error: extracted updater tarball contained no .app" >&2; exit 1; }
+          codesign --verify --deep --strict --verbose=2 "$EXTRACTED_APP" || {
+            echo "::error::codesign verify FAILED on the .app extracted from the regenerated updater tarball - the Developer ID signature did NOT survive the tar/untar round-trip; refusing to publish an updater artifact the auto-updater would install and the kernel would reject." >&2
+            exit 1
+          }
+          xcrun stapler validate "$EXTRACTED_APP" || {
+            echo "::error::stapler validate FAILED on the .app extracted from the regenerated updater tarball - the notarization ticket did NOT survive the tar/untar round-trip." >&2
+            exit 1
+          }
+          rm -rf "$VERIFY_DIR"
+          echo "OK: regenerated $(basename "$TARBALL") + .sig; signature + staple survived the re-tar round-trip"
+
+      - name: Verify codesign, Gatekeeper, and notarization staple
+        # Last gate before upload. codesign --verify --deep is the SUPPORTED
+        # use of --deep (only `codesign --sign --deep` is deprecated);
+        # spctl assesses Gatekeeper's verdict on the notarized app; stapler
+        # validate confirms the notarization ticket is attached to BOTH the
+        # .app and the .dmg. A failure here blocks the upload below.
+        run: |
+          set -euo pipefail
+          BUNDLE_DIR="${MACOS_BUNDLE_DIR:?MACOS_BUNDLE_DIR not exported by the codesign step - is it still the first step that touches the bundle?}"
+          APP="${MACOS_APP_PATH:?MACOS_APP_PATH not exported by the codesign step}"
+          DMG="$(find "$BUNDLE_DIR" -maxdepth 1 -name '*.dmg' | head -n1)"
+          for f in "$APP" "$DMG"; do
+            [[ -n "$f" ]] || { echo "error: missing expected bundle under $BUNDLE_DIR ($f)" >&2; exit 1; }
+          done
+          echo "-- codesign --verify --deep --strict --verbose=2 on the .app"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          echo "-- spctl Gatekeeper assessment of the .app"
+          spctl -a -t exec -vv "$APP"
+          echo "-- stapler validate on .app and .dmg"
+          xcrun stapler validate "$APP"
+          xcrun stapler validate "$DMG"
+          echo "OK: codesign + Gatekeeper + notarization staple all verified"
 
       - name: Verify bundle artifacts before upload
         run: |
           set -euo pipefail
-          BUNDLE_DIR="shell/src-tauri/target/release/bundle/macos"
+          BUNDLE_DIR="${MACOS_BUNDLE_DIR:?MACOS_BUNDLE_DIR not exported by the codesign step - is it still the first step that touches the bundle?}"
           for pattern in '*.dmg' '*.app.tar.gz' '*.app.tar.gz.sig'; do
             count=0
             while IFS= read -r -d '' f; do
@@ -418,6 +702,22 @@ jobs:
           # re-run of a failed run) without recompiling, not a retention
           # policy for the artifacts themselves.
           retention-days: 5
+
+      - name: Cleanup temporary signing keychain
+        # `if: always()` so the cert's private key is removed even when a later
+        # step failed. Deletes the keychain this run created; a no-op (with a
+        # log line) if the import step never created one. The cert never
+        # persists on the runner either way.
+        if: always()
+        run: |
+          set -u
+          KC_PATH="${APPLE_KEYCHAIN_PATH:-$RUNNER_TEMP/notarization.keychain-db}"
+          if [[ -n "${KC_PATH:-}" ]] && security show-keychain-info "$KC_PATH" >/dev/null 2>&1; then
+            security delete-keychain "$KC_PATH" 2>/dev/null || true
+            echo "-- deleted temporary keychain $KC_PATH"
+          else
+            echo "-- no temporary keychain to delete"
+          fi
 
   # -------------------------------------------------------------------
   # Windows (x86_64): builds core/ exactly like core-build.yml's Windows
