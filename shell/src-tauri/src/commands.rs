@@ -272,13 +272,21 @@ pub fn get_blf_enabled(settings: State<Arc<SettingsStore>>) -> bool {
 /// transition it tears down every currently-tracked BLF subscription BEFORE
 /// persisting, so the frontend can never observe "the setting says off but
 /// live SUBSCRIBE (RFC 4235) traffic is still running" - SPEC §2's
-/// "gone, not hidden". The tracked-extensions source is `get_blf_states`'s
-/// keys (`sidecar.blf_states()`, the only already-exposed BLF-tracking
-/// surface); `SidecarHandle::blf_unsubscribe` is idempotent (see its doc), so
-/// an ext present in `blf_states` that isn't currently subscribed is a
-/// harmless no-op. Unsubscribe failures are warned-and-continued (best-effort
-/// teardown), then the value is persisted regardless so a half-flaky teardown
-/// never leaves the user stuck with BLF "on" after they asked for "off".
+/// "gone, not hidden". The teardown iterates `SidecarHandle::subscribed_exts`
+/// - the **authoritative** "we already sent `blf_subscribe` for this ext"
+/// source (populated when the command is enqueued, `sidecar.rs`
+/// `blf_subscribe_raw`) - NOT `blf_states`, which is a NOTIFY-derived cache
+/// that only gains an entry once the *first* `blf` event arrives. That
+/// distinction closes a real teardown race: if BLF is switched off in the
+/// window between "we sent `blf_subscribe` for X" and "the first NOTIFY for
+/// X landed", X is in `subscribed_exts` but NOT in `blf_states` - iterating
+/// the cache (the pre-fix behavior) would miss it and leave a live SIP
+/// SUBSCRIBE running with the master switch off. `SidecarHandle::blf_unsubscribe`
+/// is idempotent (see its doc), so an ext in `subscribed_exts` that has
+/// already been dropped by the engine is a harmless no-op. Unsubscribe
+/// failures are warned-and-continued (best-effort teardown), then the value
+/// is persisted regardless so a half-flaky teardown never leaves the user
+/// stuck with BLF "on" after they asked for "off".
 #[tauri::command(rename_all = "snake_case")]
 pub fn set_blf_enabled(
     settings: State<Arc<SettingsStore>>,
@@ -288,8 +296,8 @@ pub fn set_blf_enabled(
 ) -> Result<(), String> {
     require_unlocked(&admin)?;
     if !enabled {
-        for ext in sidecar.blf_states().keys() {
-            if let Err(e) = sidecar.blf_unsubscribe(ext) {
+        for ext in crate::sidecar::blf_teardown_targets(&sidecar.subscribed_exts()) {
+            if let Err(e) = sidecar.blf_unsubscribe(&ext) {
                 log::warn!("set_blf_enabled: blf_unsubscribe({ext}) failed: {e}");
             }
         }

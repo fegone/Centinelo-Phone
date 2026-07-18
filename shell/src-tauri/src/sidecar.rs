@@ -498,6 +498,25 @@ impl SidecarHandle {
         self.0.blf_states.lock_or_recover().clone()
     }
 
+    /// Snapshot of every extension this process has already sent
+    /// `blf_subscribe` for (see `Shared::subscribed_exts`). This is the
+    /// **authoritative** "is there a live SIP SUBSCRIBE for this ext on the
+    /// wire right now?" source, populated the moment `blf_subscribe_raw`
+    /// enqueues the command - as opposed to `blf_states`, a NOTIFY-derived
+    /// cache that only gains an entry once the *first* `blf` event for that
+    /// ext arrives. `set_blf_enabled`'s teardown iterates THIS set (not
+    /// `blf_states`) so an ext subscribed-but-not-yet-NOTIFY'd - e.g. BLF
+    /// toggled off in the window between "we sent blf_subscribe for X" and
+    /// "the first NOTIFY for X landed" - is still torn down, honoring SPEC
+    /// §2's "gone, not hidden" / engine-level-off guarantee. This accessor
+    /// itself can't be unit-tested directly (`SidecarHandle` needs a live
+    /// `AppHandle`, same wall every other accessor here hits) - see
+    /// `blf_teardown_targets_tests` for the divergent-source property this
+    /// exists to expose, tested at the pure-function seam instead.
+    pub fn subscribed_exts(&self) -> HashSet<String> {
+        self.0.subscribed_exts.lock_or_recover().clone()
+    }
+
     /// Last known status, for the frontend's initial paint (before its event
     /// listener would otherwise catch the next transition).
     pub fn status(&self) -> StatusPayload {
@@ -686,6 +705,67 @@ fn blf_unsubscribe_raw(shared: &Shared, ext: &str) -> Result<(), String> {
     }
     drop(subscribed);
     send_cmd_raw(shared, serde_json::json!({"cmd": "blf_unsubscribe", "ext": ext}))
+}
+
+/// Which already-sent `blf_subscribe` extensions a `true -> false` BLF master-
+/// switch transition (`commands::set_blf_enabled`) must tear down. Takes the
+/// **authoritative** source - `SidecarHandle::subscribed_exts`, populated the
+/// moment `blf_subscribe_raw` enqueues the command - deliberately NOT
+/// `blf_states` (a NOTIFY-derived cache that only gains an entry once the
+/// *first* `blf` event for that ext arrives). That distinction is the whole
+/// point: an ext subscribed-but-not-yet-NOTIFY'd sits in `subscribed_exts`
+/// but NOT in `blf_states`, so iterating the cache (the pre-fix behavior)
+/// would leak a live SIP `SUBSCRIBE` (RFC 4235) past an "engine-level off"
+/// transition, contradicting SPEC §2's "gone, not hidden". Returns a sorted
+/// vec so teardown is deterministic (and so the unit test can assert exactly).
+///
+/// Pure (takes a `&HashSet`, no `&Shared`/I/O) so the teardown's *source
+/// choice* is unit-testable without a running sidecar - `SidecarHandle`
+/// itself can't be instantiated in a unit test because its `app: AppHandle`
+/// needs a live Tauri runtime (the same wall QA hit on a full
+/// `set_blf_enabled` integration test), matching this file's
+/// `favorites_to_auto_subscribe`/`audio_config_lines` extract-pure-rule-for-
+/// testing convention.
+pub(crate) fn blf_teardown_targets(subscribed: &HashSet<String>) -> Vec<String> {
+    let mut exts: Vec<String> = subscribed.iter().cloned().collect();
+    exts.sort();
+    exts
+}
+
+#[cfg(test)]
+mod blf_teardown_targets_tests {
+    use super::*;
+
+    /// The property this seam exists to expose: teardown must be driven by
+    /// `subscribed_exts` (every ext a `blf_subscribe` was sent for), NOT
+    /// `blf_states` (only exts a NOTIFY has already landed for). A "sent the
+    /// SUBSCRIBE, NOTIFY hasn't arrived yet" ext is the exact race
+    /// `set_blf_enabled`'s doc describes - it must show up here even though
+    /// it would be ABSENT from a `blf_states`-keyed set.
+    #[test]
+    fn includes_an_ext_with_no_notify_yet() {
+        let subscribed: HashSet<String> = ["501", "502"].iter().map(|s| s.to_string()).collect();
+        // Simulates blf_states having only seen a NOTIFY for 501 - 502 is
+        // "sent, not yet NOTIFY'd". The old (pre-fix) call site iterated
+        // blf_states.keys() and would have silently skipped 502, leaving its
+        // SIP SUBSCRIBE alive past the master switch going off.
+        let blf_states_would_have_seen: HashSet<String> = ["501"].iter().map(|s| s.to_string()).collect();
+        assert!(!blf_states_would_have_seen.contains("502"));
+
+        let targets = blf_teardown_targets(&subscribed);
+        assert!(targets.contains(&"502".to_string()), "must tear down a subscribed-but-not-yet-NOTIFY'd ext, got {targets:?}");
+    }
+
+    #[test]
+    fn empty_set_yields_empty_targets() {
+        assert!(blf_teardown_targets(&HashSet::new()).is_empty());
+    }
+
+    #[test]
+    fn result_is_sorted_and_deduped() {
+        let subscribed: HashSet<String> = ["503", "501", "502", "501"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(blf_teardown_targets(&subscribed), vec!["501", "502", "503"]);
+    }
 }
 
 /// Decides which configured-favorite extensions to (re-)subscribe to on a
