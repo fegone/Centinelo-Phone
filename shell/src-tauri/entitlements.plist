@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  entitlements.plist — hardened-runtime entitlements for the Centinelo Phone
+  macOS .app. Applied by build-macos's MANUAL codesign step (the one that
+  runs AFTER package-official.sh injects core-engine into the .app, which is
+  why Tauri's own signing is disabled and we sign by hand - see
+  .github/workflows/release.yml's "Codesign the .app in depth" step and
+  shell/README.md "Apple code signing & notarization").
+
+  Minimal set for a SIP softphone under hardened runtime:
+    - device.audio-input : the mic (coreaudio captures audio for calls).
+    - network.client     : outbound SIP/RTP/WS to the PBX.
+    - network.server     : SIP listens on a local port (the baresip sidecar
+                           binds a UDP/TCP SIP socket).
+
+  NOTE on com.apple.security.cs.disable-library-validation: deliberately
+  ABSENT. Hardened runtime's Library Validation requires every loaded dylib
+  be signed by Apple or the SAME Team ID as the main executable. The
+  core-engine/baresip modules AND any premium dylib are all codesigned in
+  the same step with the SAME Developer ID Application certificate (same Team
+  ID), so library validation passes WITHOUT weakening it. If a future build
+  ever loaded a dylib signed by a DIFFERENT team, that entitlement would
+  become necessary - do not add it preemptively; it weakens the runtime.
+-->
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+    <key>com.apple.security.network.client</key>
+    <true/>
+    <key>com.apple.security.network.server</key>
+    <true/>
+</dict>
+</plist>
