@@ -1021,6 +1021,126 @@ follows, nothing new to invent here.
   has_active_call() refusal against an actual call once release-ci's
   pipeline produces a real `latest.json` to point at.
 
+## Apple code signing & notarization — configure before a real macOS release
+
+A real macOS release must be **codesigned with a Developer ID Application
+certificate and notarized through Apple's notary service**, or macOS
+Gatekeeper will refuse to open the `.app`/`.dmg` for anyone who downloads
+it: the default "downloaded from the internet" quarantine flag plus the
+hardened-runtime requirement make an unsigned build unlaunchable for end
+users. This is a hard gate in release-ci, not a nice-to-have.
+
+**This is `medium-blocked` right now:** Felix does not yet hold an Apple
+Developer Program membership, so the `APPLE_*` secrets are not configured.
+The `preflight` job has a dedicated guard (`Guard - Apple notarization
+secrets must be configured`) that fails the whole run in seconds — before
+any compile starts — listing exactly which of the six secrets are missing
+and pointing here, rather than failing 20 minutes into a build with a
+cryptic `codesign`/`notarytool` error. Once the secrets below are set, the
+guard passes and `build-macos` signs + notarizes automatically. No code
+change is needed at that point.
+
+### Getting the certificate and the six secrets
+
+An Apple Developer Program membership costs **$99/year** (individual or
+organization) at https://developer.apple.com/programs/. The certificate
+this app needs is a **Developer ID Application** certificate — NOT a
+"Developer ID Installer" one (the Installer cert is for `.pkg`s; the
+Application cert is for `.app`s and binaries). Once Felix has the account:
+
+1. **Create the certificate** in the Apple Developer portal (Certificates,
+   Identifiers & Profiles → Certificates → + → "Developer ID Application"),
+   or via Keychain Access → Certificate Assistant → Request a Certificate
+   from a Certificate Authority with a local CSR. Install it into Keychain
+   Access on a Mac.
+2. **Export it as a `.p12`** ("Personal Information Exchange") from
+   Keychain Access: select the *private key* under the certificate →
+   File → Export Items → save as `DeveloperID.p12`, choosing a strong
+   password (this becomes `APPLE_CERTIFICATE_PASSWORD`). The `.p12`
+   bundles the certificate + its private key into one portable file.
+3. **Base64-encode the `.p12`** so it can live in a GitHub secret with no
+   binary/escaping issues:
+   ```
+   base64 -i DeveloperID.p12 | pbcopy     # macOS: copies the base64 to the clipboard
+   # or:  base64 -w 0 DeveloperID.p12     # GNU base64 (Linux) — single line
+   ```
+   Paste the result (one long line) into a new repository secret named
+   **`APPLE_CERTIFICATE`**. The workflow decodes it back to a `.p12` at
+   build time before importing it into a throwaway keychain.
+4. The remaining five secrets are plain strings — add each as its own
+   repository secret (Repo → Settings → Secrets and variables → Actions →
+   New repository secret):
+   - **`APPLE_CERTIFICATE_PASSWORD`** — the password chosen at step 2.
+   - **`APPLE_SIGNING_IDENTITY`** — the certificate's Common Name exactly
+     as `security find-identity` prints it, e.g.
+     `"Developer ID Application: Felix Gonzalez (ABCD1234XY)"`. `codesign
+     -s "$APPLE_SIGNING_IDENTITY"` resolves by this name.
+   - **`APPLE_ID`** — the Apple ID (email) of the notarizing account.
+   - **`APPLE_PASSWORD`** — an **app-specific password** (NOT the account
+     password): create one at https://appleid.apple.com → Sign-In and
+     Security → App-Specific Passwords. `notarytool` authenticates with
+     this, never the account password.
+   - **`APPLE_TEAM_ID`** — the 10-char Team ID shown in the Developer
+     portal's Membership details (also the parenthesised suffix of the
+     signing identity above). `notarytool` needs it to disambiguate the
+     account.
+
+No `APPLE_*` secret's VALUE is ever printed by the workflow — the guard
+and the import/codesign/notarize steps only ever check *presence by name*
+or feed the value straight into `security`/`codesign`/`notarytool`.
+
+### What the build does with them (and why the order matters)
+
+`package-official.sh` copies the core engine binary + baresip modules into
+`.app/Contents/MacOS/` **after** `tauri build`, which would invalidate any
+signature Tauri applied at build time. So signing is the **manual, last**
+step in `build-macos`, in this exact order (see `.github/workflows/release.yml`,
+job `build-macos`):
+
+1. `tauri build --bundles app` builds the bare `.app` only (NOT the `.dmg` —
+   a `.dmg` built now would wrap a core-engine-less `.app` and ship
+   incomplete). `bundle.macOS.signingIdentity` is `null` so Tauri does
+   **not** sign and never races our manual `codesign`.
+2. `package-official.sh --target macos` injects `core-engine/` (baresip +
+   modules) beside the executable.
+3. The `.p12` is imported into a **temporary keychain** that is deleted
+   (`if: always()`) at the end of the job — the cert never touches the
+   runner's default keychain and never persists.
+4. **Manual codesign, inner-to-outer** (no `--deep`): each embedded Mach-O
+   is signed first — the `.so`/`.dylib` modules with hardened runtime, and
+   the `core-engine/baresip` sidecar (a standalone process that opens the
+   mic + SIP socket, so it gets the audio-input/network entitlements too) —
+   then the `.app` bundle itself is signed last with `--options runtime
+   --entitlements entitlements.plist` and a Developer ID timestamp.
+5. The signed `.app` is zipped and submitted to `notarytool submit --wait`,
+   then `stapler staple`d.
+6. The **final** `.dmg` is built with `hdiutil` from the now-signed +
+   stapled `.app`, then the `.dmg` itself is signed + notarized + stapled
+   (a `.dmg` is a separate notarization target from the `.app` inside it).
+7. The updater `.app.tar.gz` + `.sig` are regenerated from the signed
+   `.app` (re-tar + `tauri signer sign`), so the update payload matches
+   what ships inside the `.dmg`.
+8. `codesign --verify --deep --strict`, `spctl -a -t exec -vv`, and
+   `stapler validate` confirm the result before any asset is uploaded.
+
+### `com.apple.security.cs.disable-library-validation` — deliberately absent
+
+Hardened runtime's Library Validation requires every loaded dylib be
+signed by Apple or the **same Team ID** as the main executable. The
+core-engine/baresip modules and any premium dylib are all codesigned in
+step 4 with the **same** Developer ID Application certificate (same Team
+ID), so library validation passes *without* weakening it. The entitlement
+that disables it (`com.apple.security.cs.disable-library-validation`) is
+intentionally NOT in `entitlements.plist` — adding it preemptively weakens
+the runtime for no benefit. It would only become necessary if a future
+build loaded a dylib signed by a *different* team (e.g. a third-party
+plugin); that change must be documented here, in the plist, and in the
+codesign step at the same time.
+
+Full walkthrough: `.github/workflows/release.yml`, job `build-macos`,
+steps `Codesign the .app in depth` through `Verify codesign, Gatekeeper,
+and notarization`.
+
 ## Known limitations (F2/F3/F4 scope)
 
 - **License activation writes a verified `license.json`, but nothing
