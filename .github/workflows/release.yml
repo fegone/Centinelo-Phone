@@ -239,7 +239,6 @@ jobs:
           fi
           echo "OK: all Apple notarization secrets are configured (values never printed)."
 
-
   # -------------------------------------------------------------------
   # macOS (aarch64): builds core/ exactly like core-build.yml's macOS job
   # (same patches, same MODULES list, same OpenSSL discovery), then the
@@ -421,6 +420,8 @@ jobs:
           security create-keychain -p "$KC_PW" "$KC_PATH"
           # Keep it unlocked for the lifetime of this job - auto-lock would
           # make a later codesign prompt for the password and hang the run.
+          # 21600s = 6h, comfortably past this job's timeout-minutes (90m),
+          # so the keychain cannot relock mid-notarize.
           security set-keychain-settings -lut 21600 "$KC_PATH"
           security unlock-keychain -p "$KC_PW" "$KC_PATH"
           P12="$RUNNER_TEMP/developer-id.p12"
@@ -454,9 +455,18 @@ jobs:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
         run: |
           set -euo pipefail
-          BUNDLE_DIR="shell/src-tauri/target/release/bundle/macos"
+          # First step that needs the just-built .app: define the bundle dir +
+          # .app path ONCE here and export ABSOLUTE paths to $GITHUB_ENV for
+          # every downstream step (notarytool, build-dmg, regenerate-updater,
+          # verify, upload). Absolute paths are correct whether or not a step
+          # sets working-directory (the regenerate step runs under
+          # working-directory: shell and would otherwise need a shell/-less
+          # relative path - the absolute path is identical either way).
+          BUNDLE_DIR="$GITHUB_WORKSPACE/shell/src-tauri/target/release/bundle/macos"
           APP="$(find "$BUNDLE_DIR" -maxdepth 1 -name '*.app' | head -n1)"
           [[ -n "$APP" ]] || { echo "error: no .app under $BUNDLE_DIR" >&2; exit 1; }
+          echo "MACOS_BUNDLE_DIR=$BUNDLE_DIR" >> "$GITHUB_ENV"
+          echo "MACOS_APP_PATH=$APP" >> "$GITHUB_ENV"
           ENT="$GITHUB_WORKSPACE/shell/src-tauri/entitlements.plist"
           [[ -f "$ENT" ]] || { echo "error: entitlements not found at $ENT" >&2; exit 1; }
           ID="$APPLE_SIGNING_IDENTITY"
@@ -494,16 +504,29 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           set -euo pipefail
-          BUNDLE_DIR="shell/src-tauri/target/release/bundle/macos"
-          APP="$(find "$BUNDLE_DIR" -maxdepth 1 -name '*.app' | head -n1)"
-          [[ -n "$APP" ]] || { echo "error: no .app under $BUNDLE_DIR" >&2; exit 1; }
+          APP="${MACOS_APP_PATH:?MACOS_APP_PATH not exported by the codesign step}"
           ZIP="$RUNNER_TEMP/$(basename "$APP").zip"
           rm -f "$ZIP"
           ditto -c -k --keepParent "$APP" "$ZIP"
           echo "-- submitting $(basename "$ZIP") to notarytool (--wait)"
-          xcrun notarytool submit "$ZIP" \
-            --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" \
-            --wait
+          SUBMIT_LOG="$RUNNER_TEMP/notarytool-app-submit.log"
+          # On rejection, surface the WHY: capture the submission-id notarytool
+          # echoes and fetch its JSON log WITHOUT re-submitting. The old path
+          # only left a bare non-zero exit code in the Actions log.
+          if ! xcrun notarytool submit "$ZIP" \
+                --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" \
+                --wait 2>&1 | tee "$SUBMIT_LOG"; then
+            SUBMISSION_ID="$(grep -m1 -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' "$SUBMIT_LOG" || true)"
+            if [[ -n "${SUBMISSION_ID:-}" ]]; then
+              echo "-- notarytool rejected $ZIP (id $SUBMISSION_ID); fetching the rejection log"
+              xcrun notarytool log "$SUBMISSION_ID" \
+                --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" \
+                || echo "(notarytool log fetch itself failed; submission-id was $SUBMISSION_ID)" >&2
+            else
+              echo "::error::notarytool submit failed and no submission-id could be parsed; see output above" >&2
+            fi
+            exit 1
+          fi
           echo "-- stapling the .app"
           xcrun stapler staple "$APP"
           echo "OK: .app notarized + stapled"
@@ -521,9 +544,8 @@ jobs:
           VERSION: ${{ needs.preflight.outputs.version }}
         run: |
           set -euo pipefail
-          BUNDLE_DIR="shell/src-tauri/target/release/bundle/macos"
-          APP="$(find "$BUNDLE_DIR" -maxdepth 1 -name '*.app' | head -n1)"
-          [[ -n "$APP" ]] || { echo "error: no .app under $BUNDLE_DIR" >&2; exit 1; }
+          BUNDLE_DIR="${MACOS_BUNDLE_DIR:?MACOS_BUNDLE_DIR not exported by the codesign step - is it still the first step that touches the bundle?}"
+          APP="${MACOS_APP_PATH:?MACOS_APP_PATH not exported by the codesign step}"
           APP_BASE="$(basename "$APP" .app)"
           STAGING="$RUNNER_TEMP/dmg-staging"
           rm -rf "$STAGING"; mkdir -p "$STAGING"
@@ -537,13 +559,24 @@ jobs:
           echo "-- signing the .dmg"
           codesign --force --sign "$APPLE_SIGNING_IDENTITY" --timestamp "$DMG"
           echo "-- submitting $(basename "$DMG") to notarytool (--wait)"
-          xcrun notarytool submit "$DMG" \
-            --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" \
-            --wait
+          SUBMIT_LOG="$RUNNER_TEMP/notarytool-dmg-submit.log"
+          if ! xcrun notarytool submit "$DMG" \
+                --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" \
+                --wait 2>&1 | tee "$SUBMIT_LOG"; then
+            SUBMISSION_ID="$(grep -m1 -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' "$SUBMIT_LOG" || true)"
+            if [[ -n "${SUBMISSION_ID:-}" ]]; then
+              echo "-- notarytool rejected $DMG (id $SUBMISSION_ID); fetching the rejection log"
+              xcrun notarytool log "$SUBMISSION_ID" \
+                --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" \
+                || echo "(notarytool log fetch itself failed; submission-id was $SUBMISSION_ID)" >&2
+            else
+              echo "::error::notarytool submit failed and no submission-id could be parsed; see output above" >&2
+            fi
+            exit 1
+          fi
           echo "-- stapling the .dmg"
           xcrun stapler staple "$DMG"
           echo "OK: .dmg built from signed .app, signed, notarized + stapled"
-
 
       - name: Regenerate the updater artifact (.app.tar.gz + .sig) after core-engine injection
         # `tauri build` above already produced a `.app.tar.gz` + `.sig`
@@ -574,9 +607,9 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           set -euo pipefail
-          BUNDLE_DIR="src-tauri/target/release/bundle/macos"
-          APP_DIR="$(find "$BUNDLE_DIR" -maxdepth 1 -name '*.app' | head -n1)"
-          [[ -n "$APP_DIR" ]] || { echo "error: no .app bundle found under $BUNDLE_DIR" >&2; exit 1; }
+          BUNDLE_DIR="${MACOS_BUNDLE_DIR:?MACOS_BUNDLE_DIR not exported by the codesign step - is it still the first step that touches the bundle?}"
+          APP_DIR="${MACOS_APP_PATH:?MACOS_APP_PATH not exported by the codesign step}"
+          [[ -d "$APP_DIR" ]] || { echo "error: no .app bundle found under $BUNDLE_DIR" >&2; exit 1; }
           TARBALL="$(find "$BUNDLE_DIR" -maxdepth 1 -name '*.app.tar.gz' | head -n1)"
           [[ -n "$TARBALL" ]] || { echo "error: no .app.tar.gz found under $BUNDLE_DIR (createUpdaterArtifacts should have produced one at build time)" >&2; exit 1; }
           echo "-- re-tarring $(basename "$APP_DIR") -> $(basename "$TARBALL") (post core-engine injection)"
@@ -621,8 +654,8 @@ jobs:
         # .app and the .dmg. A failure here blocks the upload below.
         run: |
           set -euo pipefail
-          BUNDLE_DIR="shell/src-tauri/target/release/bundle/macos"
-          APP="$(find "$BUNDLE_DIR" -maxdepth 1 -name '*.app' | head -n1)"
+          BUNDLE_DIR="${MACOS_BUNDLE_DIR:?MACOS_BUNDLE_DIR not exported by the codesign step - is it still the first step that touches the bundle?}"
+          APP="${MACOS_APP_PATH:?MACOS_APP_PATH not exported by the codesign step}"
           DMG="$(find "$BUNDLE_DIR" -maxdepth 1 -name '*.dmg' | head -n1)"
           for f in "$APP" "$DMG"; do
             [[ -n "$f" ]] || { echo "error: missing expected bundle under $BUNDLE_DIR ($f)" >&2; exit 1; }
@@ -636,11 +669,10 @@ jobs:
           xcrun stapler validate "$DMG"
           echo "OK: codesign + Gatekeeper + notarization staple all verified"
 
-
       - name: Verify bundle artifacts before upload
         run: |
           set -euo pipefail
-          BUNDLE_DIR="shell/src-tauri/target/release/bundle/macos"
+          BUNDLE_DIR="${MACOS_BUNDLE_DIR:?MACOS_BUNDLE_DIR not exported by the codesign step - is it still the first step that touches the bundle?}"
           for pattern in '*.dmg' '*.app.tar.gz' '*.app.tar.gz.sig'; do
             count=0
             while IFS= read -r -d '' f; do
@@ -686,7 +718,6 @@ jobs:
           else
             echo "-- no temporary keychain to delete"
           fi
-
 
   # -------------------------------------------------------------------
   # Windows (x86_64): builds core/ exactly like core-build.yml's Windows

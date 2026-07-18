@@ -1139,7 +1139,7 @@ codesign step at the same time.
 
 Full walkthrough: `.github/workflows/release.yml`, job `build-macos`,
 steps `Codesign the .app in depth` through `Verify codesign, Gatekeeper,
-and notarization`.
+and notarization staple`.
 
 ## Known limitations (F2/F3/F4 scope)
 
