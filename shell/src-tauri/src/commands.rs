@@ -1138,6 +1138,15 @@ pub fn save_transcription_settings(
             return Err(format!("Remote STT URL is not valid: {e}"));
         }
     }
+    // `remote_api_key` is a secret that's never echoed back to the frontend
+    // (see `TranscriptionSettingsView`'s NOTE), so an untouched key field
+    // round-trips as empty on every unrelated Save (e.g. flipping
+    // `view_only`) - same shape the SIP account `secret` field already
+    // solves via `save_account_settings`'s "empty/omitted = keep the
+    // currently stored secret" contract. Without this, every Save that
+    // didn't explicitly re-type the key would silently wipe it.
+    let previous_remote_api_key = settings.snapshot().transcription.remote_api_key;
+    let remote_api_key = resolved_remote_api_key(&input.remote_api_key, &previous_remote_api_key);
     let updated = TranscriptionSettings {
         mode: input.mode,
         activation: input.activation,
@@ -1149,10 +1158,76 @@ pub fn save_transcription_settings(
         stt_mode: input.stt_mode,
         remote_backend: input.remote_backend,
         remote_url,
-        remote_api_key: input.remote_api_key.trim().to_string(),
+        remote_api_key,
         remote_model: input.remote_model.trim().to_string(),
     };
     settings.update_transcription(updated).map_err(|e| e.to_string())
+}
+
+/// "Empty/omitted = keep the currently stored key unchanged" for
+/// `remote_api_key`, mirroring `save_account_settings`'s identical contract
+/// for the SIP `secret` field. Checked against the *trimmed* value (a
+/// key field left blank in the UI, or one that's all whitespace, means "I
+/// didn't type anything") but a genuinely new key is stored AS SENT, NOT
+/// trimmed - a key may legitimately start/end with meaningful characters
+/// and is opaque to us (same reasoning `transcription-settings.js`'s
+/// `buildSaveTranscriptionInput` already documents on the frontend side for
+/// why it doesn't trim this one field either).
+fn resolved_remote_api_key(new_key: &str, previous_key: &str) -> String {
+    if new_key.trim().is_empty() {
+        previous_key.to_string()
+    } else {
+        new_key.to_string()
+    }
+}
+
+#[cfg(test)]
+mod resolved_remote_api_key_tests {
+    use super::*;
+
+    #[test]
+    fn empty_input_keeps_the_previous_key() {
+        assert_eq!(resolved_remote_api_key("", "sk-old"), "sk-old");
+    }
+
+    #[test]
+    fn whitespace_only_input_keeps_the_previous_key() {
+        assert_eq!(resolved_remote_api_key("   ", "sk-old"), "sk-old");
+    }
+
+    #[test]
+    fn non_empty_input_replaces_the_previous_key() {
+        assert_eq!(resolved_remote_api_key("sk-new", "sk-old"), "sk-new");
+    }
+
+    #[test]
+    fn non_empty_input_is_stored_untrimmed() {
+        // A key may legitimately carry meaningful leading/trailing
+        // characters - unlike storage_dir/remote_url/remote_model, this
+        // field is opaque to us and must round-trip exactly as typed.
+        assert_eq!(resolved_remote_api_key("  sk-new  ", "sk-old"), "  sk-new  ");
+    }
+
+    #[test]
+    fn both_empty_yields_empty() {
+        assert_eq!(resolved_remote_api_key("", ""), "");
+    }
+
+    /// The exact acceptance scenario this fix closes, chained end-to-end
+    /// through two saves: save an api_key, then save again with the field
+    /// left blank (e.g. the operator only changed an unrelated setting like
+    /// `view_only`) - the key must still be there afterward, not wiped.
+    #[test]
+    fn save_then_save_with_blank_field_preserves_the_key() {
+        let stored_after_first_save = resolved_remote_api_key("sk-test", "");
+        assert_eq!(stored_after_first_save, "sk-test");
+
+        let stored_after_second_save = resolved_remote_api_key("", &stored_after_first_save);
+        assert_eq!(
+            stored_after_second_save, "sk-test",
+            "a Save with a blank api_key field must not wipe the previously stored key"
+        );
+    }
 }
 
 // ---- remote STT connection probe (P6) ----------------------------------
