@@ -1159,6 +1159,7 @@ jobs:
         env:
           VERSION: ${{ needs.preflight.outputs.version }}
           TAG: ${{ needs.preflight.outputs.tag }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           gh release view "$TAG" --repo fegone/Centinelo-Phone --json assets \
