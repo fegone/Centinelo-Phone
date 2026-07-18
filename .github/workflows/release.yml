@@ -885,8 +885,18 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
+          set -euo pipefail
+          # $OPENSSL_ROOT_DIR is a WINDOWS path (e.g. "C:\Program Files\OpenSSL"),
+          # set by the pwsh "Locate OpenSSL install dir" step above. That is correct
+          # for the CMake/MSVC build steps (-DOPENSSL_ROOT_DIR=), which want a Windows
+          # path, but FATAL here: package-official.sh runs in git-bash, which treats
+          # "C:\..." as relative and prepends the workspace dir, producing
+          # "/d/a/.../C:\Program Files\OpenSSL/bin". cygpath -u converts it to a Unix
+          # path so the bash script resolves the absolute dir. See windows-installer.yml
+          # which already passes a Unix path ("$PWD/fake-openssl-dlls") to this script.
+          OPENSSL_DLL_DIR="$(cygpath -u "$OPENSSL_ROOT_DIR")/bin"
           bash scripts/package-official.sh --target windows --skip-core-build \
-            --openssl-dll-dir "$OPENSSL_ROOT_DIR/bin"
+            --openssl-dll-dir "$OPENSSL_DLL_DIR"
 
       - name: Verify installer + updater artifacts before upload
         shell: pwsh
