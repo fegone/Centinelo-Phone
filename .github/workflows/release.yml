@@ -198,11 +198,17 @@ jobs:
         # unsigned/un-notarized .app/.dmg for anyone who downloads it), so a
         # missing APPLE_* secret fails the whole run in seconds here - before
         # the 20-30min macOS compile starts - instead of failing deep inside
-        # codesign/notarytool. Felix has not yet obtained an Apple Developer
-        # Program membership (see shell/README.md "Apple code signing &
-        # notarization - configure before a real macOS release"), so this is
-        # expected to block real macOS releases until those six secrets are
-        # configured - it is medium-blocked, not broken.
+        # codesign/notarytool. NOTE this guard lives in `preflight`, and BOTH
+        # downstream jobs - build-macos AND build-windows - declare
+        # `needs: preflight`, so a missing APPLE_* secret blocks the ENTIRE
+        # pipeline (Windows included), not just the macOS release. That is
+        # intentional: without an Apple signature there is no macOS asset, and
+        # publish-release refuses to publish a release missing a platform, so
+        # a half-signed release never ships. Felix has not yet obtained an
+        # Apple Developer Program membership (see shell/README.md "Apple code
+        # signing & notarization - configure before a real macOS release"), so
+        # this is expected to block ALL releases - Windows too - until those
+        # six secrets are configured; it is medium-blocked, not broken.
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
