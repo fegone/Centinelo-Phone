@@ -938,14 +938,29 @@ jobs:
           if ($premiumDll) { Write-Error "Community edition build shipped centinelo_premium.dll - the resources filter leaked a premium artifact into a public-repo release"; exit 1 }
           Write-Host "OK: Community edition correctly ships no centinelo_premium.dll"
 
+      - name: Stage Windows release assets flat
+        # upload-artifact@v4 preserves the common-ancestor directory
+        # structure of the given paths. These three files come from
+        # bundle/nsis/ and bundle/msi/, so the artifact would ship them
+        # nested under nsis/ and msi/ - but publish-release expects a FLAT
+        # layout (dist/windows/*.exe etc.), exactly like the macOS job,
+        # whose assets all live in a single bundle dir and are therefore
+        # already flat. Copy them into one flat dir before uploading so the
+        # downloaded artifact is flat and publish-release's globs/finds match.
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/windows-assets
+          cp shell/src-tauri/target/release/bundle/nsis/*.exe     dist/windows-assets/
+          cp shell/src-tauri/target/release/bundle/nsis/*.exe.sig dist/windows-assets/
+          cp shell/src-tauri/target/release/bundle/msi/*.msi      dist/windows-assets/
+          find dist/windows-assets -type f
+
       - name: Upload Windows release assets
         uses: actions/upload-artifact@v4
         with:
           name: release-assets-windows
-          path: |
-            shell/src-tauri/target/release/bundle/nsis/*.exe
-            shell/src-tauri/target/release/bundle/nsis/*.exe.sig
-            shell/src-tauri/target/release/bundle/msi/*.msi
+          path: dist/windows-assets/*
           if-no-files-found: error
           # Same rationale as the macOS job's own retention-days above -
           # this is a handoff window to publish-release, not the artifacts'
