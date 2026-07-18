@@ -40,6 +40,13 @@ import {
   renderUpdaterAboutStatus,
 } from "./updater.js";
 import { computeBlfUiHidden, BLF_UI_TARGETS } from "./blf-ui.js";
+import {
+  armHandshake,
+  reduceRegHandshake,
+  shouldReleaseSaveButton,
+  shouldShowInterimConnecting,
+  reduceRegResult,
+} from "./reg-status.js";
 
 // `Channel` (updater download progress) and `Resource` both live on
 // window.__TAURI__.core alongside `invoke` - withGlobalTauri bundles the
@@ -72,6 +79,17 @@ const state = {
   consoleUnlocked: false,
   bridge: null, // BridgeSettingsView from the backend (click-to-call + deep links)
   regState: "unregistered", // unregistered|registering|registered|failed
+  regReason: null, // last SIP failure reason text (only meaningful when regState === "failed")
+  // Set by saveAccountSettings while awaiting the next terminal reg_state after a
+  // Save; cleared/resolved by handleSidecarEvent/renderSaveStatusForRegState.
+  // { generation, resolve, timer } | null. See reg-status.js's module
+  // header for what `generation` buys (and doesn't, today).
+  pendingRegResult: null,
+  // Per-Save generation counter: bumped each time saveAccountSettings arms a
+  // handshake (awaitRegResult). Also gates re-enabling #btn-save-settings
+  // (releaseSaveButton) so an older, preempted Save's terminal path can't
+  // re-enable a button a newer, still in-flight Save disabled.
+  regGeneration: 0,
   transport: null,
   sidecarStatus: { status: "idle" },
   call: null, // { direction, state, peer, callId, createdAt, establishedAt }
@@ -207,7 +225,9 @@ function renderRegPill() {
     state.regState === "registered"
       ? t("regPill.registeredTitle", { transport: transportText })
       : state.regState === "failed"
-        ? t("regPill.failedTitle")
+        ? state.regReason
+          ? t("regPill.failedReason", { reason: state.regReason })
+          : t("regPill.failedTitle")
         : t("regPill.notRegisteredTitle");
 }
 
@@ -844,6 +864,16 @@ function handleSidecarEvent(evt) {
     case "reg_state":
       state.regState = evt.state || "unregistered";
       state.transport = evt.transport || state.transport;
+      state.regReason = evt.reason || null;
+      // FIX B: while a Settings Save handshake is active, mirror the pill into
+      // #save-status LIVE on every reg_state. Never freeze on the first
+      // `failed`: the engine auto-retries registration after a failure (see
+      // regPill.failedReason's "...retrying automatically"), so a `failed` must
+      // show "retrying" and keep waiting — a later `registered` then flips
+      // #save-status green instead of contradicting a permanent red. Only
+      // `registered` is terminal (settles the handshake). Both the pill and
+      // #save-status read this same evt, so they can never disagree.
+      renderSaveStatusForRegState(evt.state, evt.reason);
       renderAll();
       break;
     case "call_state":
@@ -947,7 +977,13 @@ function applyLockUI() {
   } else {
     overlay.hidden = true;
   }
-  saveBtn.disabled = !state.adminUnlocked;
+  // A reg-status handshake in flight (saveAccountSettings disables the
+  // button for its duration - see releaseSaveButton) must win over the
+  // admin-lock gate here: applyLockUI also runs on re-opening Settings
+  // (openSettings) and on admin unlock, both reachable WHILE a Save from
+  // moments ago is still awaiting its terminal reg_state, and would
+  // otherwise stomp the disabled flag back to enabled out from under it.
+  saveBtn.disabled = !state.adminUnlocked || !!state.pendingRegResult;
 }
 
 // ---------------------------------------------------------------------------
@@ -1853,6 +1889,100 @@ function refreshAllUiText() {
   renderUpdaterUI();
 }
 
+/// How long saveAccountSettings waits for a terminal reg_state
+/// ("registered" / "failed") after a successful Save before giving up on the
+/// inline connect-status feedback. The engine re-registers on save, so a
+/// reg_state almost always follows; this just bounds the wait so the
+/// "Connecting…" message can never hang forever if one doesn't arrive.
+const REG_RESULT_TIMEOUT_MS = 10000;
+
+/// Resolves with the real registration outcome the next time
+/// handleSidecarEvent sees a terminal reg_state ({ state, reason }), or with
+/// { timedOut: true } after REG_RESULT_TIMEOUT_MS. state.pendingRegResult is
+/// the handshake: saveAccountSettings sets it, the reg_state handler clears +
+/// resolves it. If the user clicks Save again while one is already pending,
+/// the previous wait is settled (timedOut) first so its stale timer can't
+/// fire into the new wait.
+function awaitRegResult() {
+  // Each Save gets a fresh generation (see reg-status.js's module header
+  // for what this buys); the handshake records it so a timeout/reg_state
+  // evaluated against a stale handshake reduces to ignore-stale instead of
+  // resolving/repainting for the wrong Save.
+  state.regGeneration += 1;
+  const generation = state.regGeneration;
+  if (state.pendingRegResult) {
+    const stale = state.pendingRegResult;
+    state.pendingRegResult = null;
+    clearTimeout(stale.timer);
+    stale.resolve({ timedOut: true });
+  }
+  return new Promise((resolve) => {
+    const entry = { generation, resolve, timer: 0 };
+    entry.timer = setTimeout(() => {
+      const action = reduceRegHandshake(
+        state.pendingRegResult === entry ? armHandshake(generation) : null,
+        state.regGeneration,
+        { type: "timeout" },
+      );
+      if (action.type === "timeout") {
+        state.pendingRegResult = null;
+        resolve({ timedOut: true });
+      }
+    }, REG_RESULT_TIMEOUT_MS);
+    state.pendingRegResult = entry;
+  });
+}
+
+/// Live-update #save-status for a reg_state while a Settings Save handshake
+/// is active (FIX B). Keeps pill <-> save-status coherent: both read this
+/// same reg_state, so they can never disagree. `registered` settles the
+/// handshake (terminal success, painted green and any prior failed-retrying
+/// red cleared); `failed` paints "retrying" but does NOT settle - the engine
+/// auto-retries registration after a failure, so a later `registered` must be
+/// able to flip #save-status green rather than contradict a permanent red.
+/// No-op when no handshake is active (then the reg-pill alone is the live
+/// source of truth; #save-status is just stale "save" feedback).
+function renderSaveStatusForRegState(regState, reason) {
+  const pending = state.pendingRegResult;
+  const handshake = pending ? armHandshake(pending.generation) : null;
+  const action = reduceRegHandshake(handshake, state.regGeneration, {
+    type: "reg_state",
+    state: regState,
+    reason,
+  });
+  if (action.type === "ignore-stale") return;
+  const statusEl = $("save-status");
+  if (action.type === "show-connected") {
+    state.pendingRegResult = null;
+    clearTimeout(pending.timer);
+    statusEl.className = "status ok";
+    statusEl.textContent = t("regStatus.connected");
+    pending.resolve({ state: "registered" });
+  } else if (action.type === "show-failed-retrying") {
+    statusEl.className = "status err";
+    statusEl.textContent = t("regStatus.failedRetrying", {
+      reason: action.reason || t("regStatus.unknownReason"),
+    });
+  } else {
+    // keep-connecting: registering / unregistered / anything else non-terminal.
+    statusEl.className = "status";
+    statusEl.textContent = t("regStatus.connecting");
+  }
+}
+
+/// Re-enable the Save button, but only if THIS save is still the newest: a
+/// newer Save keeps it disabled, so an older Save's terminal path must not
+/// re-enable it out from under the in-flight newer handshake. In practice
+/// the button is disabled synchronously at Save start (see
+/// saveAccountSettings), so a newer Save can't start until this one ends —
+/// shouldReleaseSaveButton's generation check is the documented safety net
+/// for that invariant, same framing as reduceRegHandshake's.
+function releaseSaveButton(myGeneration) {
+  if (shouldReleaseSaveButton(state.regGeneration, myGeneration)) {
+    $("btn-save-settings").disabled = false;
+  }
+}
+
 /// Two independent backend calls make up one "Save": save_account_settings
 /// (+ set_core_binary_path + save_favorites, which all live or die
 /// together with it) always runs first and reconnects the engine on
@@ -1866,6 +1996,13 @@ function refreshAllUiText() {
 /// left showing pre-save values even though the account was, in fact,
 /// already saved and the engine already reconnected by that point).
 async function saveAccountSettings() {
+  // Disabled for the whole handshake below (re-enabled by every terminal
+  // path via releaseSaveButton): the only call site is this button's own
+  // click listener, so disabling it synchronously here, before any await,
+  // closes the double-click reentrancy window - two overlapping
+  // saveAccountSettings() runs would each fire their own backend save
+  // calls and race to clear/repopulate #in-secret in the finally block.
+  $("btn-save-settings").disabled = true;
   const statusEl = $("save-status");
   statusEl.className = "status";
   statusEl.textContent = t("settings.saving");
@@ -1873,6 +2010,19 @@ async function saveAccountSettings() {
   const ext = $("in-ext").value.trim();
   const secret = $("in-secret").value;
   const displayName = $("in-display-name").value.trim();
+
+  // FIX A (race: listener armed late): arm the registration-result handshake
+  // BEFORE the save invoke that restarts the sidecar. save_account_settings
+  // reconnects the engine on success, firing a fresh reg_state; if we armed
+  // pendingRegResult only AFTER that await returned, the reg_state could land
+  // in the gap and be lost, leaving #save-status stuck on "Connecting…"
+  // until REG_RESULT_TIMEOUT_MS. Arm first, await later.
+  const regPromise = awaitRegResult();
+  // Safe to read synchronously right here (no await has run yet since
+  // awaitRegResult bumped it): this Save's own generation, used to guard
+  // releaseSaveButton below against a stale re-enable if a newer Save
+  // somehow preempts this one before it reaches a terminal path.
+  const myGeneration = state.regGeneration;
 
   let accountSaved = false;
   let transcriptionError = null;
@@ -1933,9 +2083,18 @@ async function saveAccountSettings() {
     // save_favorites, in that order - nothing after this point ran,
     // including transcription. Nothing to refresh either (accountSaved
     // stays false), so this is the one path that skips the finally
-    // block's identity refresh below.
+    // block's identity refresh below. Also cancel the handshake armed
+    // above: no re-register follows a failed save, so settle regPromise
+    // (timedOut shape) and clear its timer rather than letting it dangle.
+    if (state.pendingRegResult) {
+      const pending = state.pendingRegResult;
+      state.pendingRegResult = null;
+      clearTimeout(pending.timer);
+      pending.resolve({ timedOut: true });
+    }
     statusEl.textContent = String(e);
     statusEl.className = "status err";
+    releaseSaveButton(myGeneration);
     return;
   } finally {
     // Runs whenever save_account_settings's own try block succeeded
@@ -1956,13 +2115,72 @@ async function saveAccountSettings() {
     }
   }
 
-  if (transcriptionError) {
+  // Reflect the REAL registration result inline (was a hardcoded optimistic
+  // "Saved — reconnecting…" that gave no signal about whether the SIP account
+  // actually registered). Save triggers an engine re-register, so a terminal
+  // reg_state ("registered"/"failed") follows shortly — awaitRegResult
+  // resolves on it via handleSidecarEvent, or times out after
+  // REG_RESULT_TIMEOUT_MS. Neutral while connecting; green on success; red +
+  // the real SIP reason (e.g. 401 Unauthorized / 408 Timeout) on failure.
+  //
+  // 2026-07-18 RELIABILITY regression fix: the "Connecting…" repaint below
+  // used to be unconditional. But a terminal reg_state can land DURING the
+  // invokes above (set_core_binary_path/save_favorites/save_transcription_
+  // settings/the finally block's get_account_settings - IPC round-trips
+  // that run concurrently with the engine's own SIP re-register), in which
+  // case renderSaveStatusForRegState already painted the real outcome live
+  // and resolved regPromise. Repainting "Connecting…" over that
+  // unconditionally froze #save-status on a stale message the instant the
+  // already-resolved regPromise resolved right after - the exact original
+  // "stuck Connecting" bug, reintroduced in this timing window.
+  // shouldShowInterimConnecting only allows the repaint while THIS save's
+  // own handshake is still genuinely pending; reduceRegResult below then
+  // always (re)asserts the true terminal text from `result` itself, so the
+  // final state is never left depending on "surely it was already painted".
+  if (
+    shouldShowInterimConnecting(
+      state.pendingRegResult ? state.pendingRegResult.generation : null,
+      myGeneration,
+    )
+  ) {
+    statusEl.className = "status";
+    statusEl.textContent = t("regStatus.connecting");
+  }
+  const result = await regPromise;
+  let regOk = false;
+  const finalAction = reduceRegResult(result);
+  if (finalAction.type === "show-connected") {
+    regOk = true;
+    // Explicit, not assumed: renderSaveStatusForRegState already painted
+    // this green live in the common case, but this line is what actually
+    // guarantees it - including the case the repaint above was skipped
+    // for (handshake settled during the intermediate invokes).
+    statusEl.className = "status ok";
+    statusEl.textContent = t("regStatus.connected");
+  } else {
+    // keep-last (timedOut): no terminal `registered` arrived within
+    // REG_RESULT_TIMEOUT_MS. Leave whatever #save-status last showed
+    // ("Connecting…" if no reg_state came, or the most recent "failed —
+    // retrying"). The live reg-pill keeps showing the true state, so we
+    // don't clobber #save-status with a message that could contradict the
+    // pill once the engine eventually registers.
+  }
+  // A transcription-only failure is secondary to the SIP outcome: surface it
+  // only when registration itself succeeded, so a real connect failure stays
+  // the headline when both go wrong (matches the two-nested-try split above).
+  if (transcriptionError && regOk) {
     statusEl.textContent = t("settings.savedAccountTranscriptionFailed", { reason: transcriptionError });
     statusEl.className = "status err";
-  } else {
-    statusEl.textContent = t("settings.savedReconnecting");
-    statusEl.className = "status ok";
   }
+  // Terminal: registered, failed-then-timed-out, or never-registered-timed-
+  // out all end the wait here (result is either {state:"registered"} or
+  // {timedOut:true} - both settle regPromise, see awaitRegResult/
+  // renderSaveStatusForRegState). A newer Save preempting this one instead
+  // (see awaitRegResult's own stale-cancel) also resolves regPromise with
+  // {timedOut:true} and reaches this same line - releaseSaveButton's
+  // generation guard is what keeps that case from re-enabling a button the
+  // newer Save has since disabled again.
+  releaseSaveButton(myGeneration);
 }
 
 // ---------------------------------------------------------------------------
