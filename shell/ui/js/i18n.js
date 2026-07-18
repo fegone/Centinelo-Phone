@@ -131,10 +131,37 @@ const ENTRIES = [
     "Não é possível alcançar seu sistema telefônico — tentando novamente de forma automática.",
     "No se puede contactar tu sistema telefónico — reintentando automáticamente.",
   ],
+  [
+    "regPill.failedReason",
+    "Registration failed: {reason} — retrying automatically.",
+    "Falha no registro: {reason} — tentando novamente de forma automática.",
+    "Error de registro: {reason} — reintentando automáticamente.",
+  ],
   ["regPill.notRegisteredTitle", "Not registered yet.", "Ainda não registrado.", "Aún no registrado."],
   ["regPill.connecting", "Connecting", "Conectando", "Conectando"],
   ["regPill.retrying", "Retrying", "Tentando novamente", "Reintentando"],
   ["regPill.offline", "Offline", "Offline", "Sin conexión"],
+  // -- save-status registration feedback (settings Save button) ---------
+  [
+    "regStatus.connecting",
+    "Connecting…",
+    "Conectando…",
+    "Conectando…",
+  ],
+  ["regStatus.connected", "Connected", "Conectado", "Conectado"],
+  [
+    "regStatus.failedReason",
+    "Couldn't connect: {reason}",
+    "Não foi possível conectar: {reason}",
+    "No se pudo conectar: {reason}",
+  ],
+  [
+    "regStatus.unknownReason",
+    "unknown error",
+    "erro desconhecido",
+    "error desconocido",
+  ],
+
 
   // -- titlebar dynamic state ------------------------------------------------
   ["titlebarState.notSetUp", "Not set up", "Não configurado", "Sin configurar"],
