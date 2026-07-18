@@ -245,6 +245,58 @@ pub fn save_favorites(
     Ok(settings.snapshot().favorites)
 }
 
+// ---- BLF master switch (P4, "BLF favorites admin toggle") ---------------
+//
+// A single admin-gated persisted bool (settings::BlfSettings) that turns BLF
+// (the free 4-favorite grid AND the premium receptionist console) fully off,
+// engine-level. `get_blf_enabled` is a free read (the UI needs the value to
+// decide whether to render the favorites grid / console at all, same unlocked-
+// read reasoning `get_theme`/`get_locale` already use); `set_blf_enabled` is
+// admin-gated like `save_favorites`. The subscribe-loop call-site gating that
+// actually enforces "no BLF at all" while off, plus the UI hide, are P5 - this
+// command only owns the persisted switch and the teardown half of a live
+// `true -> false` transition. See `settings::BlfSettings` and
+// `docs/SPEC-2026-07-17-blf-admin-toggle-design.md` §3/§4.
+
+/// Free-readable (no admin-lock) BLF master switch. Not sensitive on its own
+/// (a read-only boolean), and the frontend can't decide whether to even show
+/// the lock-protected toggle without first knowing the value - same shape as
+/// `get_theme`/`get_locale`. P5 reads this to gate the favorites grid +
+/// console UI.
+#[tauri::command(rename_all = "snake_case")]
+pub fn get_blf_enabled(settings: State<Arc<SettingsStore>>) -> bool {
+    settings.snapshot().blf.enabled
+}
+
+/// Admin-gated writer for the BLF master switch. On a `true -> false`
+/// transition it tears down every currently-tracked BLF subscription BEFORE
+/// persisting, so the frontend can never observe "the setting says off but
+/// live SUBSCRIBE (RFC 4235) traffic is still running" - SPEC §2's
+/// "gone, not hidden". The tracked-extensions source is `get_blf_states`'s
+/// keys (`sidecar.blf_states()`, the only already-exposed BLF-tracking
+/// surface); `SidecarHandle::blf_unsubscribe` is idempotent (see its doc), so
+/// an ext present in `blf_states` that isn't currently subscribed is a
+/// harmless no-op. Unsubscribe failures are warned-and-continued (best-effort
+/// teardown), then the value is persisted regardless so a half-flaky teardown
+/// never leaves the user stuck with BLF "on" after they asked for "off".
+#[tauri::command(rename_all = "snake_case")]
+pub fn set_blf_enabled(
+    settings: State<Arc<SettingsStore>>,
+    admin: State<AdminSession>,
+    sidecar: State<SidecarHandle>,
+    enabled: bool,
+) -> Result<(), String> {
+    require_unlocked(&admin)?;
+    if !enabled {
+        for ext in sidecar.blf_states().keys() {
+            if let Err(e) = sidecar.blf_unsubscribe(ext) {
+                log::warn!("set_blf_enabled: blf_unsubscribe({ext}) failed: {e}");
+            }
+        }
+    }
+    settings.update_blf_enabled(enabled).map_err(|e| e.to_string())
+}
+
 // ---- audio devices (real-audio-devices fix) --------------------------
 //
 // Free-tier readable (mic/speaker choice isn't sensitive the way the SIP
@@ -1396,5 +1448,75 @@ mod reveal_in_file_manager_tests {
     fn strip_windows_extended_prefix_leaves_a_plain_path_unchanged() {
         let p = strip_windows_extended_prefix(std::path::Path::new(r"C:\Users\front-desk\calls"));
         assert_eq!(p, std::path::PathBuf::from(r"C:\Users\front-desk\calls"));
+    }
+}
+
+#[cfg(test)]
+mod blf_enabled_command_tests {
+    use super::*;
+    use crate::settings::SettingsStore;
+    use std::path::PathBuf;
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("centinelo-blf-cmd-test.{name}.{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    // Note on test shape: `#[tauri::command]` fns take `State<T>`, which can't
+    // be constructed outside the Tauri runtime, so these tests exercise the
+    // exact code path the commands themselves run - `require_unlocked` (the
+    // first line of `set_blf_enabled`, identical to `save_favorites`) and
+    // `SettingsStore::update_blf_enabled` (its persistence step) - against a
+    // real `SettingsStore` + `AdminSession`. This mirrors how the rest of this
+    // file's command tests (e.g. `audio_settings_command_tests`) test the
+    // helpers a command calls rather than the State-wrapped command fn itself.
+
+    #[test]
+    fn set_blf_enabled_is_rejected_without_unlock() {
+        // P4 test #2: `set_blf_enabled` must be refused while locked, with the
+        // SAME error string shape `save_favorites`'s `require_unlocked` guard
+        // already produces (so the frontend's existing "settings locked"
+        // handling applies unchanged). `AdminSession` defaults to locked.
+        let admin = AdminSession::default();
+        assert!(!admin.is_unlocked());
+        let err = require_unlocked(&admin).unwrap_err();
+        assert_eq!(
+            err,
+            "Settings are locked. Unlock with the admin password first."
+        );
+    }
+
+    #[test]
+    fn set_blf_enabled_flips_and_persists_when_unlocked() {
+        // P4 test #3: while unlocked, flipping `true -> false` (then back to
+        // `true`) must move the persisted value and be observable via the same
+        // `snapshot().blf.enabled` read `get_blf_enabled` uses. Simulates the
+        // command body (require_unlocked -> update_blf_enabled) end-to-end
+        // against a real on-disk store. (The live unsubscribe teardown in the
+        // command needs a running sidecar, exercised by P5's integration tests
+        // - here we assert the persisted-switch half, which is this piece's
+        // scope.)
+        let dir = scratch_dir("flip");
+        let store = SettingsStore::load(&dir).unwrap();
+        let admin = AdminSession::default();
+        admin.set_unlocked(true);
+        require_unlocked(&admin).unwrap();
+        assert!(store.snapshot().blf.enabled);
+
+        store.update_blf_enabled(false).unwrap();
+        assert!(!store.snapshot().blf.enabled);
+
+        store.update_blf_enabled(true).unwrap();
+        assert!(store.snapshot().blf.enabled);
+
+        // A fresh reload sees the last-written value (true) - the flip hit
+        // disk, not just the in-memory copy.
+        let reloaded = SettingsStore::load(&dir).unwrap();
+        assert!(reloaded.snapshot().blf.enabled);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -529,6 +529,49 @@ impl Default for UpdaterSettings {
     }
 }
 
+// ---- BLF admin toggle (P4, "BLF favorites admin toggle" feature) ----------
+//
+// The single admin-gated switch that turns BLF (the free 4-favorite grid AND
+// the premium receptionist console) fully OFF, engine-level - see
+// `docs/SPEC-2026-07-17-blf-admin-toggle-design.md` §2 ("real engine-level
+// off, not a UI hide"). Default ON: BLF is a flagship differentiator and this
+// is opt-OUT, so a missing field on an older settings.json must resolve to
+// `true` (the `app_settings_without_blf_key_defaults_to_true` migration test
+// locks that in).
+//
+// Lives in its OWN struct (not folded into `AdminSettings`) to mirror the
+// shape of every other feature-area settings struct here
+// (`TranscriptionSettings`/`HidSettings`/`UpdaterSettings`/...): one struct
+// per concern, composed into `AppSettings`, while `AdminSettings` stays the
+// pure admin-auth-credential holder (`password_hash`) it already is. The
+// admin-lock is an enforcement point in the command
+// (`set_blf_enabled`'s `require_unlocked()`), not a structural property of
+// the persisted struct - same split `HidSettings` (admin-gated via
+// `save_audio_settings`/`update_hid`) already uses.
+//
+// The subscribe-loop gating that actually CONSUMES `enabled` (P5) reads it as
+// `settings.snapshot().blf.enabled`; this piece only adds the field plus the
+// `get_blf_enabled`/`set_blf_enabled` commands.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BlfSettings {
+    /// `false` = this install ships no BLF at all: the shell skips every
+    /// `blf_subscribe` call site (P5) and hides the favorites grid + premium
+    /// console entry point (P5 UI), and a `true -> false` transition (handled
+    /// in `commands::set_blf_enabled`) issues `blf_unsubscribe` for every
+    /// currently-tracked extension. `#[serde(default = "default_true")]` so a
+    /// pre-this-field settings.json loads as the shipped default (ON) - same
+    /// shape `HidSettings::auto_detect`/`UpdaterSettings::check_on_startup`
+    /// already use.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for BlfSettings {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AdminSettings {
     /// Argon2 PHC hash string, e.g. "$argon2id$v=19$...". `None` until the
@@ -612,6 +655,11 @@ pub struct AppSettings {
     pub updater: UpdaterSettings,
     #[serde(default)]
     pub license: LicenseSettings,
+    /// BLF master switch (P4) - see `BlfSettings`. Composed last so the
+    /// surrounding field list is untouched; `#[serde(default)]` makes the
+    /// field's on-disk absence resolve to `BlfSettings::default()` (ON).
+    #[serde(default)]
+    pub blf: BlfSettings,
 }
 
 fn default_favorites() -> Vec<FavoriteSlot> {
@@ -736,6 +784,17 @@ impl SettingsStore {
     pub fn update_favorites(&self, favorites: Vec<FavoriteSlot>) -> std::io::Result<()> {
         let mut guard = self.inner.lock_or_recover();
         guard.favorites = normalize_favorites(favorites);
+        self.persist(&guard)
+    }
+
+    /// Sets `blf.enabled` and persists - the write half of
+    /// `commands::set_blf_enabled` (P5 consumes the field at
+    /// `snapshot().blf.enabled`; the true->false unsubscribe round-trip lives
+    /// in the command, not here). Same mutate-then-persist shape as every
+    /// sibling `update_*` method (`update_favorites` just above, etc.).
+    pub fn update_blf_enabled(&self, enabled: bool) -> std::io::Result<()> {
+        let mut guard = self.inner.lock_or_recover();
+        guard.blf.enabled = enabled;
         self.persist(&guard)
     }
 
@@ -1320,5 +1379,85 @@ mod updater_settings_tests {
         let back: UpdaterSettings = serde_json::from_str(&json).unwrap();
         assert_eq!(updater, back);
         assert!(!back.check_on_startup);
+    }
+}
+
+#[cfg(test)]
+mod blf_settings_tests {
+    use super::*;
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("centinelo-blf-settings-test.{name}.{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn defaults_to_enabled() {
+        // Default ON - BLF is a flagship differentiator, opt-OUT not opt-in
+        // (SPEC §2 "Default ON"). P4 test #1 (struct/default level): both the
+        // struct default and AppSettings' composed default must read true.
+        assert!(BlfSettings::default().enabled);
+        assert!(AppSettings::default().blf.enabled);
+    }
+
+    #[test]
+    fn app_settings_without_blf_key_defaults_to_true() {
+        // P4 test #5 (migration): a pre-this-field settings.json (or a
+        // hand-edited one missing the key) must NOT fail to load, and the
+        // absent `blf` field must resolve to the shipped default (ON) - same
+        // #[serde(default)] discipline every other AppSettings field
+        // (transcription/hid/audio/updater above) already follows. "9999" is
+        // a never-real test extension (this is a public repo).
+        let json = r#"{"account":{"host":"pbx.example.test","ext":"9999","secret":"x"}}"#;
+        let app: AppSettings = serde_json::from_str(json).unwrap();
+        assert!(app.blf.enabled);
+    }
+
+    #[test]
+    fn explicit_false_round_trips_through_json() {
+        // Round-trips the struct by itself (P4 test #4, struct half) - an
+        // explicit `false` must survive a serialize/deserialize cycle, not
+        // silently snap back to the default `true`.
+        let blf = BlfSettings { enabled: false };
+        let json = serde_json::to_string(&blf).unwrap();
+        let back: BlfSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(blf, back);
+        assert!(!back.enabled);
+    }
+
+    #[test]
+    fn fresh_settings_store_starts_blf_enabled_true() {
+        // P4 test #1 (SettingsStore level): a fresh store with no persisted
+        // file must expose blf_enabled == true end-to-end (what
+        // `commands::get_blf_enabled` returns on a brand-new install).
+        let dir = scratch_dir("fresh");
+        let store = SettingsStore::load(&dir).unwrap();
+        assert!(store.snapshot().blf.enabled);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_blf_enabled_persists_and_survives_reload() {
+        // P4 test #4 (disk round-trip): write false through
+        // `update_blf_enabled`, then load a BRAND-NEW `SettingsStore` from the
+        // same dir - the value must have hit disk (not just the in-memory
+        // copy), matching how `update_favorites`/`update_theme` already
+        // behave. A reload that lost it would mean the command silently lied
+        // to the user about a disabled feature.
+        let dir = scratch_dir("roundtrip");
+        let store = SettingsStore::load(&dir).unwrap();
+        assert!(store.snapshot().blf.enabled);
+        store.update_blf_enabled(false).unwrap();
+        assert!(!store.snapshot().blf.enabled);
+
+        let reloaded = SettingsStore::load(&dir).unwrap();
+        assert!(
+            !reloaded.snapshot().blf.enabled,
+            "blf_enabled=false must survive a reload"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }

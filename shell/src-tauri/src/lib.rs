@@ -145,6 +145,8 @@ pub fn run() {
             commands::get_favorites,
             commands::save_favorites,
             commands::get_blf_states,
+            commands::get_blf_enabled,
+            commands::set_blf_enabled,
             commands::get_audio_settings,
             commands::save_audio_settings,
             commands::sidecar_list_devices,
