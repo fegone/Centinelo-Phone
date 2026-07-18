@@ -40,6 +40,7 @@ import {
   renderUpdaterAboutStatus,
 } from "./updater.js";
 import { computeBlfUiHidden, BLF_UI_TARGETS } from "./blf-ui.js";
+import { armHandshake, reduceRegHandshake, shouldReleaseSaveButton } from "./reg-status.js";
 
 // `Channel` (updater download progress) and `Resource` both live on
 // window.__TAURI__.core alongside `invoke` - withGlobalTauri bundles the
@@ -74,8 +75,15 @@ const state = {
   regState: "unregistered", // unregistered|registering|registered|failed
   regReason: null, // last SIP failure reason text (only meaningful when regState === "failed")
   // Set by saveAccountSettings while awaiting the next terminal reg_state after a
-  // Save; cleared/resolved by handleSidecarEvent. { resolve, timer } | null.
+  // Save; cleared/resolved by handleSidecarEvent/renderSaveStatusForRegState.
+  // { generation, resolve, timer } | null. See reg-status.js's module
+  // header for what `generation` buys (and doesn't, today).
   pendingRegResult: null,
+  // Per-Save generation counter: bumped each time saveAccountSettings arms a
+  // handshake (awaitRegResult). Also gates re-enabling #btn-save-settings
+  // (releaseSaveButton) so an older, preempted Save's terminal path can't
+  // re-enable a button a newer, still in-flight Save disabled.
+  regGeneration: 0,
   transport: null,
   sidecarStatus: { status: "idle" },
   call: null, // { direction, state, peer, callId, createdAt, establishedAt }
@@ -963,7 +971,13 @@ function applyLockUI() {
   } else {
     overlay.hidden = true;
   }
-  saveBtn.disabled = !state.adminUnlocked;
+  // A reg-status handshake in flight (saveAccountSettings disables the
+  // button for its duration - see releaseSaveButton) must win over the
+  // admin-lock gate here: applyLockUI also runs on re-opening Settings
+  // (openSettings) and on admin unlock, both reachable WHILE a Save from
+  // moments ago is still awaiting its terminal reg_state, and would
+  // otherwise stomp the disabled flag back to enabled out from under it.
+  saveBtn.disabled = !state.adminUnlocked || !!state.pendingRegResult;
 }
 
 // ---------------------------------------------------------------------------
@@ -1884,6 +1898,12 @@ const REG_RESULT_TIMEOUT_MS = 10000;
 /// the previous wait is settled (timedOut) first so its stale timer can't
 /// fire into the new wait.
 function awaitRegResult() {
+  // Each Save gets a fresh generation (see reg-status.js's module header
+  // for what this buys); the handshake records it so a timeout/reg_state
+  // evaluated against a stale handshake reduces to ignore-stale instead of
+  // resolving/repainting for the wrong Save.
+  state.regGeneration += 1;
+  const generation = state.regGeneration;
   if (state.pendingRegResult) {
     const stale = state.pendingRegResult;
     state.pendingRegResult = null;
@@ -1891,9 +1911,14 @@ function awaitRegResult() {
     stale.resolve({ timedOut: true });
   }
   return new Promise((resolve) => {
-    const entry = { resolve, timer: 0 };
+    const entry = { generation, resolve, timer: 0 };
     entry.timer = setTimeout(() => {
-      if (state.pendingRegResult === entry) {
+      const action = reduceRegHandshake(
+        state.pendingRegResult === entry ? armHandshake(generation) : null,
+        state.regGeneration,
+        { type: "timeout" },
+      );
+      if (action.type === "timeout") {
         state.pendingRegResult = null;
         resolve({ timedOut: true });
       }
@@ -1913,23 +1938,42 @@ function awaitRegResult() {
 /// source of truth; #save-status is just stale "save" feedback).
 function renderSaveStatusForRegState(regState, reason) {
   const pending = state.pendingRegResult;
-  if (!pending) return;
+  const handshake = pending ? armHandshake(pending.generation) : null;
+  const action = reduceRegHandshake(handshake, state.regGeneration, {
+    type: "reg_state",
+    state: regState,
+    reason,
+  });
+  if (action.type === "ignore-stale") return;
   const statusEl = $("save-status");
-  if (regState === "registered") {
+  if (action.type === "show-connected") {
     state.pendingRegResult = null;
     clearTimeout(pending.timer);
     statusEl.className = "status ok";
     statusEl.textContent = t("regStatus.connected");
     pending.resolve({ state: "registered" });
-  } else if (regState === "failed") {
+  } else if (action.type === "show-failed-retrying") {
     statusEl.className = "status err";
     statusEl.textContent = t("regStatus.failedRetrying", {
-      reason: reason || t("regStatus.unknownReason"),
+      reason: action.reason || t("regStatus.unknownReason"),
     });
   } else {
-    // registering / unregistered / anything else - still in flight.
+    // keep-connecting: registering / unregistered / anything else non-terminal.
     statusEl.className = "status";
     statusEl.textContent = t("regStatus.connecting");
+  }
+}
+
+/// Re-enable the Save button, but only if THIS save is still the newest: a
+/// newer Save keeps it disabled, so an older Save's terminal path must not
+/// re-enable it out from under the in-flight newer handshake. In practice
+/// the button is disabled synchronously at Save start (see
+/// saveAccountSettings), so a newer Save can't start until this one ends —
+/// shouldReleaseSaveButton's generation check is the documented safety net
+/// for that invariant, same framing as reduceRegHandshake's.
+function releaseSaveButton(myGeneration) {
+  if (shouldReleaseSaveButton(state.regGeneration, myGeneration)) {
+    $("btn-save-settings").disabled = false;
   }
 }
 
@@ -1946,6 +1990,13 @@ function renderSaveStatusForRegState(regState, reason) {
 /// left showing pre-save values even though the account was, in fact,
 /// already saved and the engine already reconnected by that point).
 async function saveAccountSettings() {
+  // Disabled for the whole handshake below (re-enabled by every terminal
+  // path via releaseSaveButton): the only call site is this button's own
+  // click listener, so disabling it synchronously here, before any await,
+  // closes the double-click reentrancy window - two overlapping
+  // saveAccountSettings() runs would each fire their own backend save
+  // calls and race to clear/repopulate #in-secret in the finally block.
+  $("btn-save-settings").disabled = true;
   const statusEl = $("save-status");
   statusEl.className = "status";
   statusEl.textContent = t("settings.saving");
@@ -1961,6 +2012,11 @@ async function saveAccountSettings() {
   // in the gap and be lost, leaving #save-status stuck on "Connecting…"
   // until REG_RESULT_TIMEOUT_MS. Arm first, await later.
   const regPromise = awaitRegResult();
+  // Safe to read synchronously right here (no await has run yet since
+  // awaitRegResult bumped it): this Save's own generation, used to guard
+  // releaseSaveButton below against a stale re-enable if a newer Save
+  // somehow preempts this one before it reaches a terminal path.
+  const myGeneration = state.regGeneration;
 
   let accountSaved = false;
   let transcriptionError = null;
@@ -2032,6 +2088,7 @@ async function saveAccountSettings() {
     }
     statusEl.textContent = String(e);
     statusEl.className = "status err";
+    releaseSaveButton(myGeneration);
     return;
   } finally {
     // Runs whenever save_account_settings's own try block succeeded
@@ -2082,6 +2139,15 @@ async function saveAccountSettings() {
     statusEl.textContent = t("settings.savedAccountTranscriptionFailed", { reason: transcriptionError });
     statusEl.className = "status err";
   }
+  // Terminal: registered, failed-then-timed-out, or never-registered-timed-
+  // out all end the wait here (result is either {state:"registered"} or
+  // {timedOut:true} - both settle regPromise, see awaitRegResult/
+  // renderSaveStatusForRegState). A newer Save preempting this one instead
+  // (see awaitRegResult's own stale-cancel) also resolves regPromise with
+  // {timedOut:true} and reaches this same line - releaseSaveButton's
+  // generation guard is what keeps that case from re-enabling a button the
+  // newer Save has since disabled again.
+  releaseSaveButton(myGeneration);
 }
 
 // ---------------------------------------------------------------------------
