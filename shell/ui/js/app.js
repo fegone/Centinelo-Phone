@@ -851,16 +851,15 @@ function handleSidecarEvent(evt) {
       state.regState = evt.state || "unregistered";
       state.transport = evt.transport || state.transport;
       state.regReason = evt.reason || null;
-      // If a Settings Save is awaiting the real registration outcome, settle it
-      // on a terminal state (registered/failed). "registering"/"unregistered"
-      // are in-flight, not a result, so we keep waiting (and let the timeout in
-      // awaitRegResult be the only other way out).
-      if (state.pendingRegResult && (evt.state === "registered" || evt.state === "failed")) {
-        const pending = state.pendingRegResult;
-        state.pendingRegResult = null;
-        clearTimeout(pending.timer);
-        pending.resolve({ state: evt.state, reason: evt.reason });
-      }
+      // FIX B: while a Settings Save handshake is active, mirror the pill into
+      // #save-status LIVE on every reg_state. Never freeze on the first
+      // `failed`: the engine auto-retries registration after a failure (see
+      // regPill.failedReason's "...retrying automatically"), so a `failed` must
+      // show "retrying" and keep waiting — a later `registered` then flips
+      // #save-status green instead of contradicting a permanent red. Only
+      // `registered` is terminal (settles the handshake). Both the pill and
+      // #save-status read this same evt, so they can never disagree.
+      renderSaveStatusForRegState(evt.state, evt.reason);
       renderAll();
       break;
     case "call_state":
@@ -1903,6 +1902,37 @@ function awaitRegResult() {
   });
 }
 
+/// Live-update #save-status for a reg_state while a Settings Save handshake
+/// is active (FIX B). Keeps pill <-> save-status coherent: both read this
+/// same reg_state, so they can never disagree. `registered` settles the
+/// handshake (terminal success, painted green and any prior failed-retrying
+/// red cleared); `failed` paints "retrying" but does NOT settle - the engine
+/// auto-retries registration after a failure, so a later `registered` must be
+/// able to flip #save-status green rather than contradict a permanent red.
+/// No-op when no handshake is active (then the reg-pill alone is the live
+/// source of truth; #save-status is just stale "save" feedback).
+function renderSaveStatusForRegState(regState, reason) {
+  const pending = state.pendingRegResult;
+  if (!pending) return;
+  const statusEl = $("save-status");
+  if (regState === "registered") {
+    state.pendingRegResult = null;
+    clearTimeout(pending.timer);
+    statusEl.className = "status ok";
+    statusEl.textContent = t("regStatus.connected");
+    pending.resolve({ state: "registered" });
+  } else if (regState === "failed") {
+    statusEl.className = "status err";
+    statusEl.textContent = t("regStatus.failedRetrying", {
+      reason: reason || t("regStatus.unknownReason"),
+    });
+  } else {
+    // registering / unregistered / anything else - still in flight.
+    statusEl.className = "status";
+    statusEl.textContent = t("regStatus.connecting");
+  }
+}
+
 /// Two independent backend calls make up one "Save": save_account_settings
 /// (+ set_core_binary_path + save_favorites, which all live or die
 /// together with it) always runs first and reconnects the engine on
@@ -2033,24 +2063,17 @@ async function saveAccountSettings() {
   statusEl.textContent = t("regStatus.connecting");
   const result = await regPromise;
   let regOk = false;
-  if (result.timedOut) {
-    // No terminal reg_state arrived — the engine is still working. Leave the
-    // neutral "Connecting…" (the live reg-pill keeps showing the true state)
-    // rather than hanging or falsely claiming success/failure.
-    statusEl.textContent = t("regStatus.connecting");
-  } else if (result.state === "registered") {
-    statusEl.textContent = t("regStatus.connected");
-    statusEl.className = "status ok";
+  if (result.state === "registered") {
     regOk = true;
-  } else if (result.state === "failed") {
-    statusEl.textContent = t("regStatus.failedReason", {
-      reason: result.reason || t("regStatus.unknownReason"),
-    });
-    statusEl.className = "status err";
-  } else {
-    // Defensive: the handler only resolves on terminal states, so this is
-    // unreachable today — keep "Connecting…" rather than guessing.
-    statusEl.textContent = t("regStatus.connecting");
+    // #save-status was already painted green LIVE by
+    // renderSaveStatusForRegState the instant `registered` arrived (FIX B);
+    // reaching here just means the handshake is settled — nothing to repaint.
+  } else if (result.timedOut) {
+    // No terminal `registered` arrived within REG_RESULT_TIMEOUT_MS. Leave
+    // whatever #save-status last showed ("Connecting…" if no reg_state came,
+    // or the most recent "failed — retrying"). The live reg-pill keeps
+    // showing the true state, so we don't clobber #save-status with a message
+    // that could contradict the pill once the engine eventually registers.
   }
   // A transcription-only failure is secondary to the SIP outcome: surface it
   // only when registration itself succeeded, so a real connect failure stays

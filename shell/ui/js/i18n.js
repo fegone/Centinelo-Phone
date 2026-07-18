@@ -155,13 +155,22 @@ const ENTRIES = [
     "Não foi possível conectar: {reason}",
     "No se pudo conectar: {reason}",
   ],
+  // Non-terminal: shown live while the engine retries registration after a
+  // failure (the first `failed` is NOT final — see save-status handling,
+  // app.js renderSaveStatusForRegState). Distinct from failedReason so the
+  // permanent "couldn't connect" wording isn't reused for a transient retry.
+  [
+    "regStatus.failedRetrying",
+    "Attempt failed: {reason} — retrying…",
+    "Tentativa falhou: {reason} — tentando novamente…",
+    "Intento falló: {reason} — reintentando…",
+  ],
   [
     "regStatus.unknownReason",
     "unknown error",
     "erro desconhecido",
-    "error desconocido",
+    "error desconhecido",
   ],
-
 
   // -- titlebar dynamic state ------------------------------------------------
   ["titlebarState.notSetUp", "Not set up", "Não configurado", "Sin configurar"],
