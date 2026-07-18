@@ -358,6 +358,85 @@ const ENTRIES = [
     "Tudo acima acontece nesta máquina. Áudio e transcrições são gravados apenas na pasta que você escolheu.",
     "Todo lo anterior ocurre en este equipo. El audio y las transcripciones se escriben solo en la carpeta que elegiste.",
   ],
+
+  // ---- remote STT (P6, SPEC-2026-07-17-remote-stt-design.md §7) --------
+  // Same settings-card language as the rest of Settings → Transcription
+  // above, kept as its own card + its own trust line (settings.
+  // remoteSttTrustLine) rather than folded into transcriptionTrustLine's
+  // blanket "nothing is sent anywhere" claim, which stops being true the
+  // moment stt_mode is switched to Remote - see index.html's
+  // #remote-stt-card comment for why this card sits AFTER
+  // #transcription-section's own privacy note instead of before it.
+  ["settings.sttModeLabel", "Speech-to-text engine", "Motor de transcrição", "Motor de transcripción"],
+  ["settings.sttModeLocal", "Local", "Local", "Local"],
+  ["settings.sttModeRemote", "Remote", "Remoto", "Remoto"],
+  [
+    "settings.sttModeHint",
+    "Local runs entirely on this computer, as above. Remote sends each call's audio to the server below to be transcribed there instead.",
+    "Local roda inteiramente neste computador, como acima. Remoto envia o áudio de cada chamada para o servidor abaixo, que faz a transcrição.",
+    "Local funciona por completo en este equipo, como arriba. Remoto envía el audio de cada llamada al servidor de abajo para que la transcriba.",
+  ],
+  [
+    "settings.remoteSttTrustLine",
+    "Call audio leaves this computer only while Remote is selected, and only to the server below.",
+    "O áudio das chamadas só sai deste computador enquanto Remoto estiver selecionado, e só para o servidor abaixo.",
+    "El audio de las llamadas solo sale de este equipo mientras Remoto está seleccionado, y solo hacia el servidor de abajo.",
+  ],
+  ["settings.remoteSttBackendLabel", "Remote backend", "Backend remoto", "Backend remoto"],
+  ["settings.remoteSttBackendCentinelo", "Centinelo", "Centinelo", "Centinelo"],
+  ["settings.remoteSttBackendOpenaiCompat", "OpenAI-compatible", "Compatível com OpenAI", "Compatible con OpenAI"],
+  ["settings.remoteSttUrlLabel", "Server URL", "URL do servidor", "URL del servidor"],
+  ["settings.remoteSttUrlPlaceholder", "https://", "https://", "https://"],
+  [
+    "settings.remoteSttUrlHint",
+    "https:// required, except http://127.0.0.1 or http://localhost for local testing.",
+    "https:// é obrigatório, exceto http://127.0.0.1 ou http://localhost para testes locais.",
+    "Se requiere https://, salvo http://127.0.0.1 o http://localhost para pruebas locales.",
+  ],
+  ["settings.remoteSttKeyLabel", "API key", "Chave de API", "Clave de API"],
+  [
+    "settings.remoteSttKeyHint",
+    "Optional. Stored on this computer, never shown here again — retype it before saving if you restart the app, or leaving this blank on Save clears it.",
+    "Opcional. Fica guardada neste computador e nunca é exibida aqui de novo — digite-a novamente antes de salvar se reiniciar o app, ou deixar em branco ao salvar a apaga.",
+    "Opcional. Se guarda en este equipo y nunca se vuelve a mostrar aquí — vuelve a escribirla antes de guardar si reinicias la app, o dejarla en blanco al guardar la borra.",
+  ],
+  ["settings.remoteSttModelLabel", "Model", "Modelo", "Modelo"],
+  ["settings.remoteSttModelPlaceholder", "whisper-large-v3", "whisper-large-v3", "whisper-large-v3"],
+  [
+    "settings.remoteSttModelHint",
+    "Only used by the OpenAI-compatible backend.",
+    "Usado apenas pelo backend compatível com OpenAI.",
+    "Solo se usa con el backend compatible con OpenAI.",
+  ],
+  ["settings.remoteSttTestConnection", "Test connection", "Testar conexão", "Probar conexión"],
+  ["settings.remoteSttTesting", "Testing…", "Testando…", "Probando…"],
+  ["settings.remoteSttProbe.ok", "Connection successful.", "Conexão bem-sucedida.", "Conexión exitosa."],
+  [
+    "settings.remoteSttProbe.bad_url",
+    "That doesn't look like a valid server URL.",
+    "Isso não parece uma URL de servidor válida.",
+    "Esa URL del servidor no es válida.",
+  ],
+  [
+    "settings.remoteSttProbe.http_error",
+    "The server answered but reported an error.",
+    "O servidor respondeu, mas com um erro.",
+    "El servidor respondió, pero con un error.",
+  ],
+  [
+    "settings.remoteSttProbe.auth_required",
+    "Reachable, but the API key was rejected.",
+    "Alcançável, mas a chave de API foi rejeitada.",
+    "Se pudo alcanzar, pero se rechazó la clave de API.",
+  ],
+  [
+    "settings.remoteSttProbe.network",
+    "Couldn't reach that server.",
+    "Não foi possível contatar esse servidor.",
+    "No se pudo contactar ese servidor.",
+  ],
+  ["settings.remoteSttProbe.locked", "Unlock Settings first.", "Desbloqueie Configurações primeiro.", "Desbloquea Configuración primero."],
+
   ["settings.advancedHeading", "Advanced", "Avançado", "Avanzado"],
   ["settings.corePathLabel", "Core engine path", "Caminho do motor principal", "Ruta del motor principal"],
   ["settings.corePathPlaceholder", "Auto-detected", "Detectado automaticamente", "Detectado automáticamente"],

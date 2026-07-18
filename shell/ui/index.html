@@ -446,6 +446,72 @@
           <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l7 3v5c0 4.5-3 8-7 10-4-2-7-5.5-7-10V6l7-3z"/><path d="M9 11.5l2.2 2.2 4.3-4.2"/></svg>
           <p data-i18n="settings.transcriptionPrivacyNote">Everything above happens on this machine. Audio and transcripts are written only to the folder you chose.</p>
         </div>
+
+        <!-- ================= remote STT (P6, SPEC-2026-07-17-remote-stt-design.md §7) =================
+             A third card in the same #transcription-section, deliberately placed AFTER
+             the privacy-note above rather than folded into the first card next to
+             #transcription-mode-choice: the privacy note's "nothing is sent anywhere"
+             claim is only true while stt_mode is Local (the default - settings.rs
+             TranscriptionSettings::default()), so this card carries its own trust
+             line (#settings.remoteSttTrustLine) instead of silently contradicting it.
+             No mockup exists for this (a brand-new P6 surface, same "no plate to
+             adapt" situation #remote-stt-test-status's sibling controls are in) -
+             built in the same .settings-card/.field/.themerow/.btnrow/.hint language
+             every other section on this screen already uses. #remote-stt-fields
+             (backend selector, URL/key/model, Test connection) is hidden entirely
+             while stt_mode is Local (task brief item 2 - "visible SOLO cuando modo =
+             Remoto"); #remote-stt-model-field inside it is further hidden unless the
+             backend is openai_compat (see transcription-settings.js's
+             computeRemoteSttUiVisibility - the centinelo backend has no per-request
+             model to pick). -->
+        <div class="settings-card" style="margin-top:10px" id="remote-stt-card">
+          <div class="field">
+            <label data-i18n="settings.sttModeLabel">Speech-to-text engine</label>
+            <div class="themerow" role="radiogroup" aria-label="Speech-to-text engine" id="stt-mode-row" data-i18n-aria-label="settings.sttModeLabel">
+              <button data-stt-mode-choice="local" class="on" data-i18n="settings.sttModeLocal">Local</button>
+              <button data-stt-mode-choice="remote" data-i18n="settings.sttModeRemote">Remote</button>
+            </div>
+            <span class="hint" data-i18n="settings.sttModeHint">Local runs entirely on this computer, as above. Remote sends each call's audio to the server below to be transcribed there instead.</span>
+          </div>
+
+          <div id="remote-stt-fields" hidden>
+            <div class="privacy-note">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l7 3v5c0 4.5-3 8-7 10-4-2-7-5.5-7-10V6l7-3z"/><path d="M9 11.5l2.2 2.2 4.3-4.2"/></svg>
+              <p data-i18n="settings.remoteSttTrustLine">Call audio leaves this computer only while Remote is selected, and only to the server below.</p>
+            </div>
+
+            <div class="field">
+              <label data-i18n="settings.remoteSttBackendLabel">Remote backend</label>
+              <div class="themerow" role="radiogroup" aria-label="Remote backend" id="remote-stt-backend-row" data-i18n-aria-label="settings.remoteSttBackendLabel">
+                <button data-remote-backend-choice="centinelo" class="on" data-i18n="settings.remoteSttBackendCentinelo">Centinelo</button>
+                <button data-remote-backend-choice="openai_compat" data-i18n="settings.remoteSttBackendOpenaiCompat">OpenAI-compatible</button>
+              </div>
+            </div>
+
+            <div class="field">
+              <label for="in-remote-stt-url" data-i18n="settings.remoteSttUrlLabel">Server URL</label>
+              <input id="in-remote-stt-url" type="text" placeholder="https://" autocomplete="off" style="font-family:var(--font-mono)" data-i18n-placeholder="settings.remoteSttUrlPlaceholder">
+              <span class="hint" data-i18n="settings.remoteSttUrlHint">https:// required, except http://127.0.0.1 or http://localhost for local testing.</span>
+            </div>
+
+            <div class="field">
+              <label for="in-remote-stt-key" data-i18n="settings.remoteSttKeyLabel">API key</label>
+              <input id="in-remote-stt-key" type="password" autocomplete="off" placeholder="">
+              <span class="hint" data-i18n="settings.remoteSttKeyHint">Optional. Stored on this computer, never shown here again — retype it before saving if you restart the app, or leaving this blank on Save clears it.</span>
+            </div>
+
+            <div class="field" id="remote-stt-model-field">
+              <label for="in-remote-stt-model" data-i18n="settings.remoteSttModelLabel">Model</label>
+              <input id="in-remote-stt-model" type="text" placeholder="whisper-large-v3" autocomplete="off" style="font-family:var(--font-mono)" data-i18n-placeholder="settings.remoteSttModelPlaceholder">
+              <span class="hint" data-i18n="settings.remoteSttModelHint">Only used by the OpenAI-compatible backend.</span>
+            </div>
+
+            <div class="btnrow">
+              <button class="ghost" id="btn-test-remote-stt" data-i18n="settings.remoteSttTestConnection">Test connection</button>
+              <span class="hint" id="remote-stt-test-status"></span>
+            </div>
+          </div>
+        </div>
       </div>
 
       <h2 data-i18n="settings.advancedHeading">Advanced</h2>
