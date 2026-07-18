@@ -707,17 +707,15 @@ fn blf_unsubscribe_raw(shared: &Shared, ext: &str) -> Result<(), String> {
     send_cmd_raw(shared, serde_json::json!({"cmd": "blf_unsubscribe", "ext": ext}))
 }
 
-/// Which already-sent `blf_subscribe` extensions a `true -> false` BLF master-
-/// switch transition (`commands::set_blf_enabled`) must tear down. Takes the
-/// **authoritative** source - `SidecarHandle::subscribed_exts`, populated the
-/// moment `blf_subscribe_raw` enqueues the command - deliberately NOT
-/// `blf_states` (a NOTIFY-derived cache that only gains an entry once the
-/// *first* `blf` event for that ext arrives). That distinction is the whole
-/// point: an ext subscribed-but-not-yet-NOTIFY'd sits in `subscribed_exts`
-/// but NOT in `blf_states`, so iterating the cache (the pre-fix behavior)
-/// would leak a live SIP `SUBSCRIBE` (RFC 4235) past an "engine-level off"
-/// transition, contradicting SPEC §2's "gone, not hidden". Returns a sorted
-/// vec so teardown is deterministic (and so the unit test can assert exactly).
+/// Sorts the authoritative BLF-subscribed-extension set into a `Vec` so a
+/// `true -> false` master-switch teardown (`commands::set_blf_enabled`) is
+/// deterministic (and so the unit test can assert exactly). This is a thin
+/// pure function - it does NOT decide *which* set to tear down; the caller
+/// (`commands::set_blf_enabled`) passes `SidecarHandle::subscribed_exts`
+/// precisely because that is the authoritative "live SUBSCRIBE on the wire"
+/// source, NOT the NOTIFY-derived `blf_states` cache. For the full rationale
+/// of why `subscribed_exts` is the authoritative source, see
+/// `SidecarHandle::subscribed_exts`.
 ///
 /// Pure (takes a `&HashSet`, no `&Shared`/I/O) so the teardown's *source
 /// choice* is unit-testable without a running sidecar - `SidecarHandle`
