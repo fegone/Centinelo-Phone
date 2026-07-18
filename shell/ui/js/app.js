@@ -1924,6 +1924,14 @@ async function saveAccountSettings() {
   const secret = $("in-secret").value;
   const displayName = $("in-display-name").value.trim();
 
+  // FIX A (race: listener armed late): arm the registration-result handshake
+  // BEFORE the save invoke that restarts the sidecar. save_account_settings
+  // reconnects the engine on success, firing a fresh reg_state; if we armed
+  // pendingRegResult only AFTER that await returned, the reg_state could land
+  // in the gap and be lost, leaving #save-status stuck on "Connecting…"
+  // until REG_RESULT_TIMEOUT_MS. Arm first, await later.
+  const regPromise = awaitRegResult();
+
   let accountSaved = false;
   let transcriptionError = null;
   try {
@@ -1983,7 +1991,15 @@ async function saveAccountSettings() {
     // save_favorites, in that order - nothing after this point ran,
     // including transcription. Nothing to refresh either (accountSaved
     // stays false), so this is the one path that skips the finally
-    // block's identity refresh below.
+    // block's identity refresh below. Also cancel the handshake armed
+    // above: no re-register follows a failed save, so settle regPromise
+    // (timedOut shape) and clear its timer rather than letting it dangle.
+    if (state.pendingRegResult) {
+      const pending = state.pendingRegResult;
+      state.pendingRegResult = null;
+      clearTimeout(pending.timer);
+      pending.resolve({ timedOut: true });
+    }
     statusEl.textContent = String(e);
     statusEl.className = "status err";
     return;
@@ -2015,7 +2031,7 @@ async function saveAccountSettings() {
   // the real SIP reason (e.g. 401 Unauthorized / 408 Timeout) on failure.
   statusEl.className = "status";
   statusEl.textContent = t("regStatus.connecting");
-  const result = await awaitRegResult();
+  const result = await regPromise;
   let regOk = false;
   if (result.timedOut) {
     // No terminal reg_state arrived — the engine is still working. Leave the
