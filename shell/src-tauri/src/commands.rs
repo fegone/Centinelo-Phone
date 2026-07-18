@@ -5,7 +5,7 @@ use crate::premium::{CapabilityStatusView, PremiumHandle, PremiumInfoView};
 use crate::sidecar::SidecarHandle;
 use crate::settings::{
     self, AccountSettings, AdminSession, CallDirection, FavoriteSlot, LocalePref, ModelTier,
-    RecentCall, SettingsStore, ThemePref, TranscriptionActivation, TranscriptionMode,
+    RecentCall, RemoteBackend, SettingsStore, SttMode, ThemePref, TranscriptionActivation, TranscriptionMode,
     TranscriptionSettings, TransportPriority,
 };
 use crate::transcription::{PendingRetryView, TranscriptionHandle};
@@ -243,6 +243,61 @@ pub fn save_favorites(
     settings.update_favorites(favorites).map_err(|e| e.to_string())?;
     sidecar.restart_now();
     Ok(settings.snapshot().favorites)
+}
+
+// ---- BLF master switch (P4, "BLF favorites admin toggle") ---------------
+//
+// A single admin-gated persisted bool (settings::BlfSettings) that turns BLF
+// (the free 4-favorite grid AND the premium receptionist console) fully off,
+// engine-level. `get_blf_enabled` is a free read (the UI needs the value to
+// decide whether to render the favorites grid / console at all, same unlocked-
+// read reasoning `get_theme`/`get_locale` already use); `set_blf_enabled` is
+// admin-gated like `save_favorites`. The subscribe-loop call-site gating that
+// actually enforces "no BLF at all" while off, plus the UI hide, are P5 - this
+// command only owns the persisted switch and the teardown half of a live
+// `true -> false` transition. See `settings::BlfSettings` and
+// `docs/SPEC-2026-07-17-blf-admin-toggle-design.md` §3/§4.
+
+/// Free-readable (no admin-lock) BLF master switch. Not sensitive on its own
+/// (a read-only boolean), and the frontend can't decide whether to even show
+/// the lock-protected toggle without first knowing the value - same shape as
+/// `get_theme`/`get_locale`. P5 reads this to gate the favorites grid +
+/// console UI.
+#[tauri::command(rename_all = "snake_case")]
+pub fn get_blf_enabled(settings: State<Arc<SettingsStore>>) -> bool {
+    settings.snapshot().blf.enabled
+}
+
+/// Admin-gated writer for the BLF master switch. On a `true -> false`
+/// transition it tears down every currently-tracked BLF subscription BEFORE
+/// persisting, so the frontend can never observe "the setting says off but
+/// live SUBSCRIBE (RFC 4235) traffic is still running" - SPEC §2's
+/// "gone, not hidden". The teardown iterates `SidecarHandle::subscribed_exts`
+/// - the authoritative source of "we already sent `blf_subscribe` for this
+/// ext" - deliberately NOT the NOTIFY-derived `blf_states` cache (see
+/// `SidecarHandle::subscribed_exts` for why this is the authoritative
+/// source). `SidecarHandle::blf_unsubscribe`
+/// is idempotent (see its doc), so an ext in `subscribed_exts` that has
+/// already been dropped by the engine is a harmless no-op. Unsubscribe
+/// failures are warned-and-continued (best-effort teardown), then the value
+/// is persisted regardless so a half-flaky teardown never leaves the user
+/// stuck with BLF "on" after they asked for "off".
+#[tauri::command(rename_all = "snake_case")]
+pub fn set_blf_enabled(
+    settings: State<Arc<SettingsStore>>,
+    admin: State<AdminSession>,
+    sidecar: State<SidecarHandle>,
+    enabled: bool,
+) -> Result<(), String> {
+    require_unlocked(&admin)?;
+    if !enabled {
+        for ext in crate::sidecar::blf_teardown_targets(&sidecar.subscribed_exts()) {
+            if let Err(e) = sidecar.blf_unsubscribe(&ext) {
+                log::warn!("set_blf_enabled: blf_unsubscribe({ext}) failed: {e}");
+            }
+        }
+    }
+    settings.update_blf_enabled(enabled).map_err(|e| e.to_string())
 }
 
 // ---- audio devices (real-audio-devices fix) --------------------------
@@ -992,6 +1047,13 @@ pub struct TranscriptionSettingsView {
     pub view_only: bool,
     pub model_tier: ModelTier,
     pub language: String,
+    pub stt_mode: SttMode,
+    pub remote_backend: RemoteBackend,
+    pub remote_url: String,
+    pub remote_model: String,
+    // NOTE: `remote_api_key` is intentionally NOT echoed back to the
+    // frontend here - it's a secret. The frontend's "is a key set?" affordance
+    // reads a separate boolean (see `get_transcription_settings` below).
 }
 
 impl From<TranscriptionSettings> for TranscriptionSettingsView {
@@ -1004,6 +1066,10 @@ impl From<TranscriptionSettings> for TranscriptionSettingsView {
             view_only: t.view_only,
             model_tier: t.model_tier,
             language: t.language,
+            stt_mode: t.stt_mode,
+            remote_backend: t.remote_backend,
+            remote_url: t.remote_url,
+            remote_model: t.remote_model,
         }
     }
 }
@@ -1032,6 +1098,11 @@ pub struct SaveTranscriptionInput {
     pub view_only: bool,
     pub model_tier: ModelTier,
     pub language: String,
+    pub stt_mode: SttMode,
+    pub remote_backend: RemoteBackend,
+    pub remote_url: String,
+    pub remote_api_key: String,
+    pub remote_model: String,
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -1052,6 +1123,25 @@ pub fn save_transcription_settings(
     if input.language.trim().is_empty() {
         return Err("Language is required (e.g. \"es\" or \"auto\").".to_string());
     }
+    // Remote URL is only required when the operator actually picked the remote
+    // path - empty is the default for both modes. But a non-empty value is
+    // validated through the shared url_policy rule BEFORE it's persisted, so
+    // this shell never stores (let alone calls) a plaintext-HTTP remote host.
+    let remote_url = input.remote_url.trim().to_string();
+    if !remote_url.is_empty() {
+        if let Err(e) = crate::url_policy::validate_https_or_localhost(&remote_url) {
+            return Err(format!("Remote STT URL is not valid: {e}"));
+        }
+    }
+    // `remote_api_key` is a secret that's never echoed back to the frontend
+    // (see `TranscriptionSettingsView`'s NOTE), so an untouched key field
+    // round-trips as empty on every unrelated Save (e.g. flipping
+    // `view_only`) - same shape the SIP account `secret` field already
+    // solves via `save_account_settings`'s "empty/omitted = keep the
+    // currently stored secret" contract. Without this, every Save that
+    // didn't explicitly re-type the key would silently wipe it.
+    let previous_remote_api_key = settings.snapshot().transcription.remote_api_key;
+    let remote_api_key = resolved_remote_api_key(&input.remote_api_key, &previous_remote_api_key);
     let updated = TranscriptionSettings {
         mode: input.mode,
         activation: input.activation,
@@ -1060,8 +1150,188 @@ pub fn save_transcription_settings(
         view_only: input.view_only,
         model_tier: input.model_tier,
         language: input.language.trim().to_string(),
+        stt_mode: input.stt_mode,
+        remote_backend: input.remote_backend,
+        remote_url,
+        remote_api_key,
+        remote_model: input.remote_model.trim().to_string(),
     };
     settings.update_transcription(updated).map_err(|e| e.to_string())
+}
+
+/// "Empty/omitted = keep the currently stored key unchanged" for
+/// `remote_api_key`, mirroring `save_account_settings`'s identical contract
+/// for the SIP `secret` field. Checked against the *trimmed* value (a
+/// key field left blank in the UI, or one that's all whitespace, means "I
+/// didn't type anything") but a genuinely new key is stored AS SENT, NOT
+/// trimmed - a key may legitimately start/end with meaningful characters
+/// and is opaque to us (same reasoning `transcription-settings.js`'s
+/// `buildSaveTranscriptionInput` already documents on the frontend side for
+/// why it doesn't trim this one field either).
+fn resolved_remote_api_key(new_key: &str, previous_key: &str) -> String {
+    if new_key.trim().is_empty() {
+        previous_key.to_string()
+    } else {
+        new_key.to_string()
+    }
+}
+
+#[cfg(test)]
+mod resolved_remote_api_key_tests {
+    use super::*;
+
+    #[test]
+    fn empty_input_keeps_the_previous_key() {
+        assert_eq!(resolved_remote_api_key("", "sk-old"), "sk-old");
+    }
+
+    #[test]
+    fn whitespace_only_input_keeps_the_previous_key() {
+        assert_eq!(resolved_remote_api_key("   ", "sk-old"), "sk-old");
+    }
+
+    #[test]
+    fn non_empty_input_replaces_the_previous_key() {
+        assert_eq!(resolved_remote_api_key("sk-new", "sk-old"), "sk-new");
+    }
+
+    #[test]
+    fn non_empty_input_is_stored_untrimmed() {
+        // A key may legitimately carry meaningful leading/trailing
+        // characters - unlike storage_dir/remote_url/remote_model, this
+        // field is opaque to us and must round-trip exactly as typed.
+        assert_eq!(resolved_remote_api_key("  sk-new  ", "sk-old"), "  sk-new  ");
+    }
+
+    #[test]
+    fn both_empty_yields_empty() {
+        assert_eq!(resolved_remote_api_key("", ""), "");
+    }
+
+    /// The exact acceptance scenario this fix closes, chained end-to-end
+    /// through two saves: save an api_key, then save again with the field
+    /// left blank (e.g. the operator only changed an unrelated setting like
+    /// `view_only`) - the key must still be there afterward, not wiped.
+    #[test]
+    fn save_then_save_with_blank_field_preserves_the_key() {
+        let stored_after_first_save = resolved_remote_api_key("sk-test", "");
+        assert_eq!(stored_after_first_save, "sk-test");
+
+        let stored_after_second_save = resolved_remote_api_key("", &stored_after_first_save);
+        assert_eq!(
+            stored_after_second_save, "sk-test",
+            "a Save with a blank api_key field must not wipe the previously stored key"
+        );
+    }
+}
+
+// ---- remote STT connection probe (P6) ----------------------------------
+//
+// "Probar conexión" button: a typed, no-audio GET that just checks the
+// remote backend is reachable and speaks the protocol the operator picked.
+// For `Centinelo` we hit `{url}/health` (the Centinelo STT service's own
+// readiness endpoint). For `OpenaiCompat` there is no guaranteed `/health`
+// contract, so we try `{url}/v1/models` best-effort - a 401/403 still means
+// "the endpoint is there, the key is wrong", not "can't reach it". The URL
+// is re-validated through url_policy (defense in depth - it was validated
+// on save, but the operator can change the field and click this button
+// before saving).
+
+#[derive(Serialize)]
+pub struct RemoteSttProbeResult {
+    pub ok: bool,
+    /// Short human message for the UI, locale-translated client-side from the
+    /// stable `code` below when it matters.
+    pub code: String,
+    pub detail: String,
+}
+
+#[derive(Deserialize)]
+pub struct TestRemoteSttInput {
+    pub remote_url: String,
+    pub remote_backend: RemoteBackend,
+    /// Optional key: included as a Bearer header so a protected endpoint's
+    /// probe isn't a false negative.
+    pub remote_api_key: Option<String>,
+}
+
+/// Core probe logic, free of Tauri `State` so it's unit-testable directly.
+/// The command below is a thin admin-gate wrapper around this.
+fn probe_remote_stt(
+    raw_url: &str,
+    backend: RemoteBackend,
+    api_key: Option<&str>,
+) -> RemoteSttProbeResult {
+    let base = match crate::url_policy::validate_https_or_localhost(raw_url.trim()) {
+        Ok(u) => u,
+        Err(e) => {
+            return RemoteSttProbeResult {
+                ok: false,
+                code: "bad_url".to_string(),
+                detail: e,
+            };
+        }
+    };
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(8))
+        .build();
+    let probe_path = match backend {
+        RemoteBackend::Centinelo => "/health",
+        RemoteBackend::OpenaiCompat => "/v1/models",
+    };
+    let mut req = agent.get(&format!("{base}{probe_path}"));
+    if let Some(key) = api_key {
+        let key = key.trim();
+        if !key.is_empty() {
+            req = req.set("Authorization", &format!("Bearer {key}"));
+        }
+    }
+    match req.call() {
+        Ok(_) => RemoteSttProbeResult {
+            ok: true,
+            code: "ok".to_string(),
+            detail: "Connection successful.".to_string(),
+        },
+        // ureq 2.x: a 4xx/5xx is `Error::Status`, everything else (DNS,
+        // connection refused, TLS, timeout) is `Error::Transport`.
+        Err(ureq::Error::Status(code, _)) => {
+            // 401/403 on the OpenAI-compat probe still means "the endpoint
+            // answered" - a partial success worth distinguishing from a hard
+            // network failure so the UI can hint at the key.
+            let reachable =
+                matches!(code, 401 | 403) && backend == RemoteBackend::OpenaiCompat;
+            RemoteSttProbeResult {
+                ok: reachable,
+                code: if reachable { "auth_required".to_string() } else { "http_error".to_string() },
+                detail: format!("HTTP {code}"),
+            }
+        }
+        Err(ureq::Error::Transport(e)) => RemoteSttProbeResult {
+            ok: false,
+            code: "network".to_string(),
+            detail: e.to_string(),
+        },
+    }
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn test_remote_stt_connection(
+    admin: State<AdminSession>,
+    input: TestRemoteSttInput,
+) -> RemoteSttProbeResult {
+    // Admin-gated like every other settings mutation/probe.
+    if !admin.is_unlocked() {
+        return RemoteSttProbeResult {
+            ok: false,
+            code: "locked".to_string(),
+            detail: "Unlock Settings first.".to_string(),
+        };
+    }
+    probe_remote_stt(
+        &input.remote_url,
+        input.remote_backend,
+        input.remote_api_key.as_deref(),
+    )
 }
 
 /// Manual per-call start (`transcription.activation == "manual"`) - the
@@ -1396,5 +1666,154 @@ mod reveal_in_file_manager_tests {
     fn strip_windows_extended_prefix_leaves_a_plain_path_unchanged() {
         let p = strip_windows_extended_prefix(std::path::Path::new(r"C:\Users\front-desk\calls"));
         assert_eq!(p, std::path::PathBuf::from(r"C:\Users\front-desk\calls"));
+    }
+}
+
+#[cfg(test)]
+mod blf_enabled_command_tests {
+    use super::*;
+    use crate::settings::SettingsStore;
+    use std::path::PathBuf;
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("centinelo-blf-cmd-test.{name}.{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    // Note on test shape: `#[tauri::command]` fns take `State<T>`, which can't
+    // be constructed outside the Tauri runtime, so these tests exercise the
+    // exact code path the commands themselves run - `require_unlocked` (the
+    // first line of `set_blf_enabled`, identical to `save_favorites`) and
+    // `SettingsStore::update_blf_enabled` (its persistence step) - against a
+    // real `SettingsStore` + `AdminSession`. This mirrors how the rest of this
+    // file's command tests (e.g. `audio_settings_command_tests`) test the
+    // helpers a command calls rather than the State-wrapped command fn itself.
+
+    #[test]
+    fn set_blf_enabled_is_rejected_without_unlock() {
+        // P4 test #2: `set_blf_enabled` must be refused while locked, with the
+        // SAME error string shape `save_favorites`'s `require_unlocked` guard
+        // already produces (so the frontend's existing "settings locked"
+        // handling applies unchanged). `AdminSession` defaults to locked.
+        let admin = AdminSession::default();
+        assert!(!admin.is_unlocked());
+        let err = require_unlocked(&admin).unwrap_err();
+        assert_eq!(
+            err,
+            "Settings are locked. Unlock with the admin password first."
+        );
+    }
+
+    #[test]
+    fn set_blf_enabled_flips_and_persists_when_unlocked() {
+        // P4 test #3: while unlocked, flipping `true -> false` (then back to
+        // `true`) must move the persisted value and be observable via the same
+        // `snapshot().blf.enabled` read `get_blf_enabled` uses. Simulates the
+        // command body (require_unlocked -> update_blf_enabled) end-to-end
+        // against a real on-disk store. (The live unsubscribe teardown in the
+        // command needs a running sidecar, exercised by P5's integration tests
+        // - here we assert the persisted-switch half, which is this piece's
+        // scope.)
+        let dir = scratch_dir("flip");
+        let store = SettingsStore::load(&dir).unwrap();
+        let admin = AdminSession::default();
+        admin.set_unlocked(true);
+        require_unlocked(&admin).unwrap();
+        assert!(store.snapshot().blf.enabled);
+
+        store.update_blf_enabled(false).unwrap();
+        assert!(!store.snapshot().blf.enabled);
+
+        store.update_blf_enabled(true).unwrap();
+        assert!(store.snapshot().blf.enabled);
+
+        // A fresh reload sees the last-written value (true) - the flip hit
+        // disk, not just the in-memory copy.
+        let reloaded = SettingsStore::load(&dir).unwrap();
+        assert!(reloaded.snapshot().blf.enabled);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod remote_stt_probe_tests {
+    use super::*;
+
+    /// Spawns a one-shot mock HTTP server that replies with the given status
+    /// code, returning its base URL (e.g. `http://127.0.0.1:<port>`). Same
+    /// `tiny_http` pattern activation.rs's own tests already use.
+    fn spawn_mock_server(status: u16, body: String) -> String {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr();
+        let handle = std::thread::spawn(move || {
+            // The probe is a single GET, so one request is enough.
+            if let Ok(request) = server.recv() {
+                let response = tiny_http::Response::from_string(body).with_status_code(status);
+                let _ = request.respond(response);
+            }
+        });
+        // Detach: the thread exits after the one request is served.
+        let _ = handle;
+        format!("http://{addr}")
+    }
+
+    #[test]
+    fn bad_url_rejected_before_any_network_call() {
+        let result = probe_remote_stt("not a url", RemoteBackend::Centinelo, None);
+        assert!(!result.ok);
+        assert_eq!(result.code, "bad_url");
+    }
+
+    #[test]
+    fn plain_http_remote_rejected() {
+        let result = probe_remote_stt("http://stt.example.test", RemoteBackend::Centinelo, None);
+        assert!(!result.ok);
+        assert_eq!(result.code, "bad_url");
+    }
+
+    #[test]
+    fn centinelo_health_200_is_ok() {
+        let url = spawn_mock_server(200, r#"{"status":"ok"}"#.to_string());
+        let result = probe_remote_stt(&url, RemoteBackend::Centinelo, None);
+        assert!(result.ok, "expected ok, got {:?} / {}", result.code, result.detail);
+        assert_eq!(result.code, "ok");
+    }
+
+    #[test]
+    fn centinelo_health_500_is_http_error() {
+        let url = spawn_mock_server(500, "internal".to_string());
+        let result = probe_remote_stt(&url, RemoteBackend::Centinelo, None);
+        assert!(!result.ok);
+        assert_eq!(result.code, "http_error");
+    }
+
+    #[test]
+    fn openai_compat_200_is_ok() {
+        let url = spawn_mock_server(200, r#"{"data":[]}"#.to_string());
+        let result = probe_remote_stt(&url, RemoteBackend::OpenaiCompat, None);
+        assert!(result.ok);
+        assert_eq!(result.code, "ok");
+    }
+
+    #[test]
+    fn openai_compat_401_is_reachable_but_auth_required() {
+        // A 401 means the endpoint answered - the key is wrong, not the URL.
+        // The UI can hint "check your API key" instead of "can't reach host".
+        let url = spawn_mock_server(401, r#"unauthorized"#.to_string());
+        let result = probe_remote_stt(&url, RemoteBackend::OpenaiCompat, None);
+        assert!(result.ok, "401 on openai_compat should be reachable");
+        assert_eq!(result.code, "auth_required");
+    }
+
+    #[test]
+    fn network_failure_is_network_code() {
+        // Port 1 on localhost is almost certainly closed -> connection refused.
+        let result = probe_remote_stt("http://127.0.0.1:1", RemoteBackend::Centinelo, None);
+        assert!(!result.ok);
+        assert_eq!(result.code, "network");
     }
 }

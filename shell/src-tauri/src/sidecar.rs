@@ -14,7 +14,7 @@
 //! delete-on-stop scratch `accounts` file - the same sanctioned exception
 //! `run-spike.sh` itself documents - never anywhere else.
 
-use crate::settings::{write_private_file, AccountSettings, AudioSettings, SettingsStore, TransportPriority};
+use crate::settings::{write_private_file, AccountSettings, AppSettings, AudioSettings, SettingsStore, TransportPriority};
 use crate::sync_ext::PoisonRecover;
 use crate::transcription::TranscriptionHandle;
 use serde::Serialize;
@@ -498,6 +498,25 @@ impl SidecarHandle {
         self.0.blf_states.lock_or_recover().clone()
     }
 
+    /// Snapshot of every extension this process has already sent
+    /// `blf_subscribe` for (see `Shared::subscribed_exts`). This is the
+    /// **authoritative** "is there a live SIP SUBSCRIBE for this ext on the
+    /// wire right now?" source, populated the moment `blf_subscribe_raw`
+    /// enqueues the command - as opposed to `blf_states`, a NOTIFY-derived
+    /// cache that only gains an entry once the *first* `blf` event for that
+    /// ext arrives. `set_blf_enabled`'s teardown iterates THIS set (not
+    /// `blf_states`) so an ext subscribed-but-not-yet-NOTIFY'd - e.g. BLF
+    /// toggled off in the window between "we sent blf_subscribe for X" and
+    /// "the first NOTIFY for X landed" - is still torn down, honoring SPEC
+    /// §2's "gone, not hidden" / engine-level-off guarantee. This accessor
+    /// itself can't be unit-tested directly (`SidecarHandle` needs a live
+    /// `AppHandle`, same wall every other accessor here hits) - see
+    /// `blf_teardown_targets_tests` for the divergent-source property this
+    /// exists to expose, tested at the pure-function seam instead.
+    pub fn subscribed_exts(&self) -> HashSet<String> {
+        self.0.subscribed_exts.lock_or_recover().clone()
+    }
+
     /// Last known status, for the frontend's initial paint (before its event
     /// listener would otherwise catch the next transition).
     pub fn status(&self) -> StatusPayload {
@@ -686,6 +705,103 @@ fn blf_unsubscribe_raw(shared: &Shared, ext: &str) -> Result<(), String> {
     }
     drop(subscribed);
     send_cmd_raw(shared, serde_json::json!({"cmd": "blf_unsubscribe", "ext": ext}))
+}
+
+/// Sorts the authoritative BLF-subscribed-extension set into a `Vec` so a
+/// `true -> false` master-switch teardown (`commands::set_blf_enabled`) is
+/// deterministic (and so the unit test can assert exactly). This is a thin
+/// pure function - it does NOT decide *which* set to tear down; the caller
+/// (`commands::set_blf_enabled`) passes `SidecarHandle::subscribed_exts`
+/// precisely because that is the authoritative "live SUBSCRIBE on the wire"
+/// source, NOT the NOTIFY-derived `blf_states` cache. For the full rationale
+/// of why `subscribed_exts` is the authoritative source, see
+/// `SidecarHandle::subscribed_exts`.
+///
+/// Pure (takes a `&HashSet`, no `&Shared`/I/O) so the teardown's *source
+/// choice* is unit-testable without a running sidecar - `SidecarHandle`
+/// itself can't be instantiated in a unit test because its `app: AppHandle`
+/// needs a live Tauri runtime (the same wall QA hit on a full
+/// `set_blf_enabled` integration test), matching this file's
+/// `favorites_to_auto_subscribe`/`audio_config_lines` extract-pure-rule-for-
+/// testing convention.
+pub(crate) fn blf_teardown_targets(subscribed: &HashSet<String>) -> Vec<String> {
+    let mut exts: Vec<String> = subscribed.iter().cloned().collect();
+    exts.sort();
+    exts
+}
+
+#[cfg(test)]
+mod blf_teardown_targets_tests {
+    use super::*;
+
+    /// The property this seam exists to expose: teardown must be driven by
+    /// `subscribed_exts` (every ext a `blf_subscribe` was sent for), NOT
+    /// `blf_states` (only exts a NOTIFY has already landed for). A "sent the
+    /// SUBSCRIBE, NOTIFY hasn't arrived yet" ext is the exact race
+    /// `set_blf_enabled`'s doc describes - it must show up here even though
+    /// it would be ABSENT from a `blf_states`-keyed set.
+    #[test]
+    fn includes_an_ext_with_no_notify_yet() {
+        let subscribed: HashSet<String> = ["501", "502"].iter().map(|s| s.to_string()).collect();
+        // Simulates blf_states having only seen a NOTIFY for 501 - 502 is
+        // "sent, not yet NOTIFY'd". The old (pre-fix) call site iterated
+        // blf_states.keys() and would have silently skipped 502, leaving its
+        // SIP SUBSCRIBE alive past the master switch going off.
+        let blf_states_would_have_seen: HashSet<String> = ["501"].iter().map(|s| s.to_string()).collect();
+        assert!(!blf_states_would_have_seen.contains("502"));
+
+        let targets = blf_teardown_targets(&subscribed);
+        assert!(targets.contains(&"502".to_string()), "must tear down a subscribed-but-not-yet-NOTIFY'd ext, got {targets:?}");
+    }
+
+    #[test]
+    fn empty_set_yields_empty_targets() {
+        assert!(blf_teardown_targets(&HashSet::new()).is_empty());
+    }
+
+    #[test]
+    fn result_is_sorted_and_deduped() {
+        let subscribed: HashSet<String> = ["503", "501", "502", "501"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(blf_teardown_targets(&subscribed), vec!["501", "502", "503"]);
+    }
+}
+
+/// Decides which configured-favorite extensions to (re-)subscribe to on a
+/// `reg_state:"registered"` transition. The **single enforcement point** for
+/// the BLF master switch (`settings::BlfSettings::enabled`, P4):
+///
+/// - `enabled == false` (admin opt-out) returns an empty list, so the
+///   registration handler below never calls `blf_subscribe_raw` for any
+///   favorite. Since `blf_subscribe_raw` is the only shell->core call that
+///   turns into a SIP `SUBSCRIBE` (RFC 4235) - and `core/modules/ctrl_json/
+///   ctrl_json.c`'s `blf_subscribe()` is `static`, reached exclusively via the
+///   `blf_subscribe` JSON command (verified P5: the baresip event handler
+///   emits `reg_state` on REGISTER_OK but never triggers BLF) - this means
+///   **zero BLF traffic, engine-level**, not just a UI hide.
+///
+/// - `enabled == true` (the shipped default) returns the non-empty, trimmed
+///   extensions exactly as the inline loop did before this gate, so today's
+///   behavior is unchanged.
+///
+/// Pure (takes a settings snapshot, no `&Shared`/I/O) so the gate can be
+/// unit-tested without a running sidecar, matching this file's
+/// `audio_config_lines`/`apply_call_state_transition` test convention.
+fn favorites_to_auto_subscribe(settings: &AppSettings) -> Vec<String> {
+    if !settings.blf.enabled {
+        return Vec::new();
+    }
+    settings
+        .favorites
+        .iter()
+        .filter_map(|fav| {
+            let ext = fav.ext.trim();
+            if ext.is_empty() {
+                None
+            } else {
+                Some(ext.to_string())
+            }
+        })
+        .collect()
 }
 
 /// Shared implementation of [`SidecarHandle::emit_notice`] - a free
@@ -1001,13 +1117,13 @@ fn spawn_stdout_reader(
                     // the same process, and safe to overlap with the
                     // premium console's own subscribe-on-mount for the
                     // same extensions.
-                    let favorites = shared.settings.snapshot().favorites;
-                    for fav in favorites {
-                        let ext = fav.ext.trim();
-                        if ext.is_empty() {
-                            continue; // unconfigured slot - nothing to watch
-                        }
-                        if let Err(e) = blf_subscribe_raw(&shared, ext) {
+                    // BLF master switch (settings::BlfSettings::enabled): when the
+                    // admin opt-out is set this yields nothing, so
+                    // blf_subscribe_raw is never called for any favorite ->
+                    // zero `blf_subscribe` JSON commands to the core -> zero
+                    // SIP SUBSCRIBE (RFC 4235). See favorites_to_auto_subscribe.
+                    for ext in favorites_to_auto_subscribe(&shared.settings.snapshot()) {
+                        if let Err(e) = blf_subscribe_raw(&shared, &ext) {
                             log::warn!("sidecar: blf_subscribe({ext}) failed: {e}");
                         }
                     }
@@ -1837,4 +1953,63 @@ pub fn default_core_binary_path() -> Option<PathBuf> {
         }
     }
     None
+}
+
+
+#[cfg(test)]
+mod blf_gating_tests {
+    use super::*;
+    use crate::settings::{BlfSettings, FavoriteSlot};
+
+    fn fav(ext: &str) -> FavoriteSlot {
+        FavoriteSlot { ext: ext.to_string(), label: format!("F-{ext}") }
+    }
+
+    fn settings(favorites: Vec<FavoriteSlot>, blf_enabled: bool) -> AppSettings {
+        AppSettings {
+            blf: BlfSettings { enabled: blf_enabled },
+            favorites,
+            ..AppSettings::default()
+        }
+    }
+
+    /// P5 floor test (1): with the BLF master switch OFF and N configured
+    /// favorites, a `reg_state:"registered"` transition resolves to ZERO
+    /// extensions to auto-subscribe. Since favorites_to_auto_subscribe is the
+    /// sole input to blf_subscribe_raw in the registration handler, an empty
+    /// result here == zero `blf_subscribe` JSON commands to the core == zero
+    /// SIP SUBSCRIBE on registration.
+    #[test]
+    fn blf_disabled_with_favorites_yields_zero_subscribes() {
+        let s = settings(vec![fav("501"), fav("502"), fav("503")], false);
+        let to_subscribe = favorites_to_auto_subscribe(&s);
+        assert!(
+            to_subscribe.is_empty(),
+            "blf.enabled=false must gate off every favorite (got {to_subscribe:?})"
+        );
+    }
+
+    /// P5 floor test (2): with the BLF master switch ON (the shipped default),
+    /// the configured non-empty extensions are returned exactly as today's
+    /// loop produced them - no behavior change.
+    #[test]
+    fn blf_enabled_subscribes_configured_favorites_unchanged() {
+        let s = settings(vec![fav("501"), fav("502"), fav("503")], true);
+        assert_eq!(favorites_to_auto_subscribe(&s), vec!["501", "502", "503"]);
+    }
+
+    /// Edge: an unconfigured slot (empty ext) is skipped even when BLF is on,
+    /// preserving the previous `if ext.is_empty() { continue; }` guard.
+    #[test]
+    fn blank_favorite_exts_are_skipped_even_when_enabled() {
+        let s = settings(vec![fav("501"), fav(""), fav("   "), fav("503")], true);
+        assert_eq!(favorites_to_auto_subscribe(&s), vec!["501", "503"]);
+    }
+
+    /// Edge: the default-shipped install (BLF ON, no favorites filled in)
+    /// produces nothing to subscribe - matching a fresh install today.
+    #[test]
+    fn default_on_with_empty_slots_subscribes_nothing() {
+        assert!(favorites_to_auto_subscribe(&AppSettings::default()).is_empty());
+    }
 }

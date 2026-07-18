@@ -14,6 +14,7 @@ mod sync_ext;
 mod tray;
 mod transcription;
 mod updater;
+mod url_policy;
 
 use premium::PremiumHandle;
 use settings::{AdminSession, SettingsStore};
@@ -145,6 +146,8 @@ pub fn run() {
             commands::get_favorites,
             commands::save_favorites,
             commands::get_blf_states,
+            commands::get_blf_enabled,
+            commands::set_blf_enabled,
             commands::get_audio_settings,
             commands::save_audio_settings,
             commands::sidecar_list_devices,
@@ -180,6 +183,7 @@ pub fn run() {
             commands::sidecar_blf_unsubscribe,
             commands::get_transcription_settings,
             commands::save_transcription_settings,
+            commands::test_remote_stt_connection,
             commands::transcription_manual_start,
             commands::transcription_manual_stop,
             commands::transcription_pending_retries,

@@ -17,6 +17,7 @@ import {
   isDownloadStalled,
   computeModelChipState,
   computeDownloadPct,
+  computeRemoteSttUiVisibility,
 } from "./transcription-settings.js";
 import {
   initialUpdaterState,
@@ -38,6 +39,7 @@ import {
   renderUpdateBanner,
   renderUpdaterAboutStatus,
 } from "./updater.js";
+import { computeBlfUiHidden, BLF_UI_TARGETS } from "./blf-ui.js";
 
 // `Channel` (updater download progress) and `Resource` both live on
 // window.__TAURI__.core alongside `invoke` - withGlobalTauri bundles the
@@ -58,6 +60,16 @@ const state = {
   account: null, // AccountSettingsView from the backend
   favorites: [],
   blf: {}, // ext (string) -> "idle"|"ringing"|"busy"|"offline", from sidecar "blf" events
+  // ---- BLF master switch (P5) ----------------------------------------
+  // blfEnabled mirrors settings.blf.enabled (read via get_blf_enabled in
+  // boot). false = the favorites grid + heading are hidden and the console
+  // entry is absent from view (see renderBlfUi). Defaults to true to keep
+  // the shipped cold-boot appearance until the value resolves.
+  blfEnabled: true,
+  // consoleUnlocked is set by applyPremiumUI (premium_capability_status for
+  // blf_console); renderBlfUi ANDs it with blfEnabled so BLF off hides the
+  // console regardless of its own license gate.
+  consoleUnlocked: false,
   bridge: null, // BridgeSettingsView from the backend (click-to-call + deep links)
   regState: "unregistered", // unregistered|registering|registered|failed
   transport: null,
@@ -958,6 +970,28 @@ let selectedTranscriptionLanguage = "auto";
 let transcriptionKeepAudio = false;
 let transcriptionViewOnly = false;
 
+// ---- remote STT (P6) ----------------------------------------------------
+// stt_mode/remote_backend mirror the settings.rs enums (SttMode/
+// RemoteBackend) by their serde snake_case values ("local"/"remote",
+// "centinelo"/"openai_compat"). #in-remote-stt-key is NEVER populated from
+// get_transcription_settings (TranscriptionSettingsView deliberately omits
+// remote_api_key - see commands.rs's own comment on that struct), and
+// save_transcription_settings has no "blank = keep unchanged" affordance
+// for it the way save_account_settings's `secret: Option<String>` does for
+// the SIP password (settings.rs update_transcription replaces the whole
+// TranscriptionSettings struct wholesale) - every Save resends whatever is
+// currently in that field, blank or not. cachedRemoteApiKey is this app's
+// own (never-persisted-as-such, JS-memory-only) mitigation: once a Save
+// this session actually wrote a non-empty key, that value re-populates the
+// field the next time Settings reopens in the SAME running app, so an
+// unrelated field edit (e.g. the storage folder) followed by Save doesn't
+// silently wipe a key the operator set five minutes ago. A fresh app
+// launch starts this at "" like every other secret field on this screen -
+// #settings.remoteSttKeyHint says so.
+let selectedSttMode = "local";
+let selectedRemoteBackend = "centinelo";
+let cachedRemoteApiKey = "";
+
 // tier -> {present, sizeBytes} | {error: true} | null (not yet fetched
 // this Settings session) for modelStatus - see transcription-settings.js's
 // computeModelChipState doc for what each shape means and why {error:
@@ -1017,6 +1051,37 @@ function setModelTierUI(tier) {
     row.classList.toggle("sel", sel);
     row.setAttribute("aria-checked", String(sel));
   });
+}
+
+// ---- remote STT (P6) ------------------------------------------------------
+
+function setSttModeUI(mode) {
+  selectedSttMode = mode;
+  document.querySelectorAll("#stt-mode-row button").forEach((b) => {
+    b.classList.toggle("on", b.dataset.sttModeChoice === mode);
+  });
+  applyRemoteSttVisibility();
+}
+
+function setRemoteBackendUI(backend) {
+  selectedRemoteBackend = backend;
+  document.querySelectorAll("#remote-stt-backend-row button").forEach((b) => {
+    b.classList.toggle("on", b.dataset.remoteBackendChoice === backend);
+  });
+  applyRemoteSttVisibility();
+}
+
+/// Applies computeRemoteSttUiVisibility's decision to the two DOM nodes it
+/// covers - see that function's own doc (transcription-settings.js) for why
+/// the model field has its own, narrower condition than the rest of the
+/// remote block.
+function applyRemoteSttVisibility() {
+  const { remoteFieldsHidden, modelFieldHidden } = computeRemoteSttUiVisibility({
+    sttMode: selectedSttMode,
+    remoteBackend: selectedRemoteBackend,
+  });
+  $("remote-stt-fields").hidden = remoteFieldsHidden;
+  $("remote-stt-model-field").hidden = modelFieldHidden;
 }
 
 /// Rebuilds the one `.mrstatus` chip for `tier` from computeModelChipState's
@@ -1571,6 +1636,26 @@ function activationErrorText(code) {
   return translated === key ? String(code) : translated;
 }
 
+/// Maps a `test_remote_stt_connection` result (commands.rs's
+/// RemoteSttProbeResult - {ok, code, detail}) to displayed copy. Same
+/// stable-code-to-translated-string shape as activationErrorText above, but
+/// this command never throws for a reachability failure - a bad URL, an
+/// unreachable host, or a rejected key are all normal `ok: false` RETURN
+/// values (see probe_remote_stt's own doc), not caught exceptions. `detail`
+/// is appended for "network"/"http_error" specifically because those two
+/// carry a real, varying diagnostic (a raw OS transport error, or the exact
+/// HTTP status) - "ok"/"locked"/"bad_url"/"auth_required" all come back
+/// with a fixed detail string that would just repeat the headline.
+function remoteSttProbeText(result) {
+  const key = `settings.remoteSttProbe.${result.code}`;
+  const translated = t(key);
+  const headline = translated === key ? String(result.detail || result.code) : translated;
+  if (translated !== key && (result.code === "network" || result.code === "http_error") && result.detail) {
+    return `${headline} (${result.detail})`;
+  }
+  return headline;
+}
+
 async function openSettings() {
   try {
     const [account, theme, corePath, adminStatus, favorites, bridge, license] = await Promise.all([
@@ -1648,6 +1733,15 @@ async function openTranscriptionSettingsSection() {
   setBoolRowUI("transcription-keep-audio-row", transcriptionKeepAudio);
   setBoolRowUI("transcription-view-only-row", transcriptionViewOnly);
   $("in-transcription-storage-dir").value = settings.storage_dir || "";
+  setSttModeUI(settings.stt_mode || "local");
+  setRemoteBackendUI(settings.remote_backend || "centinelo");
+  $("in-remote-stt-url").value = settings.remote_url || "";
+  $("in-remote-stt-model").value = settings.remote_model || "";
+  // Never from `settings` (get_transcription_settings doesn't carry the key
+  // at all) - only this session's own cache, see cachedRemoteApiKey's doc.
+  $("in-remote-stt-key").value = cachedRemoteApiKey;
+  $("remote-stt-test-status").textContent = "";
+  $("remote-stt-test-status").className = "hint";
   modelStatus.accurate = null;
   modelStatus.light = null;
   // RESILIENCE #3 belt-and-suspenders: the watchdog interval (see
@@ -1801,6 +1895,7 @@ async function saveAccountSettings() {
 
     if (!$("transcription-section").hidden) {
       try {
+        const remoteApiKeyValue = $("in-remote-stt-key").value;
         await invoke("save_transcription_settings", {
           input: buildSaveTranscriptionInput({
             mode: selectedTranscriptionMode,
@@ -1810,6 +1905,11 @@ async function saveAccountSettings() {
             viewOnly: transcriptionViewOnly,
             modelTier: selectedModelTier,
             language: selectedTranscriptionLanguage,
+            sttMode: selectedSttMode,
+            remoteBackend: selectedRemoteBackend,
+            remoteUrl: $("in-remote-stt-url").value,
+            remoteApiKey: remoteApiKeyValue,
+            remoteModel: $("in-remote-stt-model").value,
           }),
         });
         // mode/activation feed maybeAutoStartTranscript/renderManualTranscribeButton
@@ -1819,6 +1919,11 @@ async function saveAccountSettings() {
         state.transcription.mode = selectedTranscriptionMode;
         state.transcription.activation = selectedTranscriptionActivation;
         renderManualTranscribeButton();
+        // Only on a CONFIRMED write - see cachedRemoteApiKey's own doc for
+        // why this cache exists at all (save_transcription_settings has no
+        // "blank = keep unchanged" affordance for this one field, unlike
+        // the SIP secret).
+        cachedRemoteApiKey = remoteApiKeyValue;
       } catch (e) {
         transcriptionError = String(e);
       }
@@ -1966,6 +2071,41 @@ function wireStaticHandlers() {
     if (!row) return;
     e.preventDefault();
     setModelTierUI(row.dataset.modelTier);
+  });
+
+  // ---- remote STT (P6) - mode/backend selection deferred to "Save" like
+  // every other #transcription-section control above; "Test connection" is
+  // the one immediate action, same pattern as #btn-activate-license.
+  document.querySelectorAll("#stt-mode-row button").forEach((b) => {
+    b.addEventListener("click", () => setSttModeUI(b.dataset.sttModeChoice));
+  });
+  document.querySelectorAll("#remote-stt-backend-row button").forEach((b) => {
+    b.addEventListener("click", () => setRemoteBackendUI(b.dataset.remoteBackendChoice));
+  });
+  $("btn-test-remote-stt").addEventListener("click", async () => {
+    const statusEl = $("remote-stt-test-status");
+    const btn = $("btn-test-remote-stt");
+    const remoteUrl = $("in-remote-stt-url").value.trim();
+    const remoteApiKey = $("in-remote-stt-key").value;
+    btn.disabled = true;
+    statusEl.textContent = t("settings.remoteSttTesting");
+    statusEl.className = "hint";
+    try {
+      const result = await invoke("test_remote_stt_connection", {
+        input: {
+          remote_url: remoteUrl,
+          remote_backend: selectedRemoteBackend,
+          remote_api_key: remoteApiKey.length ? remoteApiKey : null,
+        },
+      });
+      statusEl.textContent = remoteSttProbeText(result);
+      statusEl.className = result.ok ? "hint ok" : "hint err";
+    } catch (e) {
+      statusEl.textContent = String(e);
+      statusEl.className = "hint err";
+    } finally {
+      btn.disabled = false;
+    }
   });
 
   document.querySelectorAll("#theme-row button").forEach((b) => {
@@ -2297,15 +2437,32 @@ async function attachTauriListeners() {
 // actual answer for a licensed capability, counts here); "not_licensed"/
 // "unavailable" (no dylib, tampered signature, FFI error) hide it -
 // mirrors tray.rs's own gating exactly, so both surfaces agree.
+/// Applies the BLF master switch to the DOM. Pure policy lives in
+/// computeBlfUiHidden (blf-ui.js): with blfEnabled === false the favorites grid
+/// + heading disappear and the console entry is absent from view, REGARDLESS of
+/// its own license gate. Called both from boot() (after get_blf_enabled) and
+/// applyPremiumUI() (when the console's own license gate resolves), so either
+/// signal re-evaluates both surfaces. id names come from BLF_UI_TARGETS so the
+/// contract is pinned in one testable place.
+function renderBlfUi() {
+  const hidden = computeBlfUiHidden({ blfEnabled: state.blfEnabled, consoleUnlocked: state.consoleUnlocked });
+  $(BLF_UI_TARGETS.favoritesHeading).hidden = hidden.favoritesHeading;
+  $(BLF_UI_TARGETS.favoritesGrid).hidden = hidden.favoritesGrid;
+  $(BLF_UI_TARGETS.console).hidden = hidden.console;
+}
+
 async function applyPremiumUI() {
   try {
     const status = await invoke("premium_capability_status", { capability: "blf_console" });
-    const unlocked = status === "available" || status === "not_implemented";
-    $("btn-console").hidden = !unlocked;
+    state.consoleUnlocked = status === "available" || status === "not_implemented";
   } catch (e) {
     console.error("premium_capability_status failed", e);
-    $("btn-console").hidden = true;
+    state.consoleUnlocked = false;
   }
+  // Re-applied through renderBlfUi so the console respects BOTH its license
+  // gate (state.consoleUnlocked) and the BLF master switch (state.blfEnabled):
+  // BLF off hides the console even when the license would clear it.
+  renderBlfUi();
 }
 
 async function boot() {
@@ -2329,17 +2486,23 @@ async function boot() {
   applyStaticI18n();
 
   try {
-    const [account, favorites, theme, sidecarStatus, blfStates] = await Promise.all([
+    const [account, favorites, theme, sidecarStatus, blfStates, blfEnabled] = await Promise.all([
       invoke("get_account_settings"),
       invoke("get_favorites"),
       invoke("get_theme"),
       invoke("sidecar_status"),
       invoke("get_blf_states"),
+      invoke("get_blf_enabled"),
     ]);
     state.account = account;
     state.favorites = favorites;
     state.sidecarStatus = sidecarStatus;
     state.blf = blfStates || {};
+    // P5 master switch: blfEnabled gates both the favorites grid/heading and the
+    // console entry (see renderBlfUi). Read here alongside the other boot reads
+    // so the gate applies on the first paint; applyPremiumUI re-applies it once
+    // the console's own license gate resolves further down boot().
+    state.blfEnabled = blfEnabled === true;
     applyTheme(theme || "auto");
   } catch (e) {
     console.error("boot load failed", e);
@@ -2362,6 +2525,10 @@ async function boot() {
   renderIdentity();
   renderDial();
   renderFavorites();
+  // Apply the BLF master switch to the DOM now that state.blfEnabled has been
+  // read; applyPremiumUI() below re-applies it once the console license gate
+  // resolves (both touch renderBlfUi, so order-independent).
+  renderBlfUi();
   renderAll();
   await loadRecents();
   await attachTauriListeners();

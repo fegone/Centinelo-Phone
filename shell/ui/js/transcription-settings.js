@@ -30,11 +30,33 @@ export function mapCliTierToSettingsTier(cliTier) {
 
 /// Builds the exact payload `save_transcription_settings` expects
 /// (`commands::SaveTranscriptionInput` - mode/activation/keep_audio/
-/// storage_dir/view_only/model_tier/language, snake_case) from this pane's
+/// storage_dir/view_only/model_tier/language/stt_mode/remote_backend/
+/// remote_url/remote_api_key/remote_model, snake_case) from this pane's
 /// own camelCase-ish local state. Pulled out of saveAccountSettings so the
 /// payload shape has a name and a test, instead of being an inline object
 /// literal only ever exercised by hand-clicking through the app.
-export function buildSaveTranscriptionInput({ mode, activation, keepAudio, storageDir, viewOnly, modelTier, language }) {
+///
+/// The five `remote*`/`sttMode` params default to the same values
+/// `TranscriptionSettings::default()` (settings.rs) ships (`local`/
+/// `centinelo`/empty strings) - every caller of this function passes them
+/// explicitly today (app.js's saveAccountSettings), but the defaults keep
+/// this function's own contract honest for a caller that doesn't (and let
+/// existing tests that predate P6 stay valid without every one of them
+/// naming fields it isn't testing).
+export function buildSaveTranscriptionInput({
+  mode,
+  activation,
+  keepAudio,
+  storageDir,
+  viewOnly,
+  modelTier,
+  language,
+  sttMode = "local",
+  remoteBackend = "centinelo",
+  remoteUrl = "",
+  remoteApiKey = "",
+  remoteModel = "",
+}) {
   return {
     mode,
     activation,
@@ -43,6 +65,32 @@ export function buildSaveTranscriptionInput({ mode, activation, keepAudio, stora
     view_only: !!viewOnly,
     model_tier: modelTier,
     language,
+    stt_mode: sttMode,
+    remote_backend: remoteBackend,
+    remote_url: (remoteUrl || "").trim(),
+    remote_api_key: remoteApiKey || "",
+    remote_model: (remoteModel || "").trim(),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// remote STT (P6) - field visibility
+//
+// The remote backend selector + URL/key/model fields + "Test connection"
+// button only make sense once `sttMode === "remote"` (task brief item 2:
+// "visible SOLO cuando modo = Remoto"); the model field on top of that only
+// applies to the `openai_compat` backend (`RemoteBackend::OpenaiCompat` is
+// the only one `probe_remote_stt`/`transcribe-engine` ever read it for - the
+// `centinelo` backend has no per-request model selection). Pure so app.js's
+// applier (toggling `hidden` on the two DOM nodes) has a tested decision to
+// call instead of inlining the `===` checks at every call site (mirrors
+// blf-ui.js's computeBlfUiHidden for the same reason).
+// ---------------------------------------------------------------------------
+export function computeRemoteSttUiVisibility({ sttMode, remoteBackend }) {
+  const remoteOn = sttMode === "remote";
+  return {
+    remoteFieldsHidden: !remoteOn,
+    modelFieldHidden: !(remoteOn && remoteBackend === "openai_compat"),
   };
 }
 

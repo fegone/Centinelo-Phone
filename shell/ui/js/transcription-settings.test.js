@@ -17,6 +17,7 @@ import {
   isDownloadStalled,
   computeDownloadPct,
   computeModelChipState,
+  computeRemoteSttUiVisibility,
 } from "./transcription-settings.js";
 
 // ---------------------------------------------------------------------
@@ -50,10 +51,11 @@ test("MODEL_CLI_TIER_TO_SETTINGS_TIER: exactly the two tiers this app ships, no 
 // (b) buildSaveTranscriptionInput - the exact payload
 // save_transcription_settings expects (commands::SaveTranscriptionInput:
 // mode, activation, keep_audio, storage_dir, view_only, model_tier,
-// language - all 7 fields, snake_case).
+// language, stt_mode, remote_backend, remote_url, remote_api_key,
+// remote_model - all 12 fields, snake_case; the last 5 are P6).
 // ---------------------------------------------------------------------
 
-test("buildSaveTranscriptionInput: maps all 7 fields to the backend's exact snake_case shape", () => {
+test("buildSaveTranscriptionInput: maps all 12 fields to the backend's exact snake_case shape", () => {
   const input = buildSaveTranscriptionInput({
     mode: "live",
     activation: "manual",
@@ -62,6 +64,11 @@ test("buildSaveTranscriptionInput: maps all 7 fields to the backend's exact snak
     viewOnly: false,
     modelTier: "light",
     language: "es",
+    sttMode: "remote",
+    remoteBackend: "openai_compat",
+    remoteUrl: "https://stt.example.test",
+    remoteApiKey: "sk-test",
+    remoteModel: "whisper-large-v3",
   });
   assert.deepEqual(input, {
     mode: "live",
@@ -71,7 +78,48 @@ test("buildSaveTranscriptionInput: maps all 7 fields to the backend's exact snak
     view_only: false,
     model_tier: "light",
     language: "es",
+    stt_mode: "remote",
+    remote_backend: "openai_compat",
+    remote_url: "https://stt.example.test",
+    remote_api_key: "sk-test",
+    remote_model: "whisper-large-v3",
   });
+});
+
+test("buildSaveTranscriptionInput: P6 fields default to local/centinelo/empty when the caller omits them (pre-P6 call shape)", () => {
+  const input = buildSaveTranscriptionInput({
+    mode: "off",
+    activation: "all_calls",
+    keepAudio: false,
+    storageDir: "",
+    viewOnly: false,
+    modelTier: "accurate",
+    language: "auto",
+  });
+  assert.equal(input.stt_mode, "local");
+  assert.equal(input.remote_backend, "centinelo");
+  assert.equal(input.remote_url, "");
+  assert.equal(input.remote_api_key, "");
+  assert.equal(input.remote_model, "");
+});
+
+test("buildSaveTranscriptionInput: trims remote_url/remote_model but NOT remote_api_key (a key may legitimately start/end with meaningful characters, and it's opaque to us)", () => {
+  const input = buildSaveTranscriptionInput({
+    mode: "off",
+    activation: "all_calls",
+    keepAudio: false,
+    storageDir: "",
+    viewOnly: false,
+    modelTier: "accurate",
+    language: "auto",
+    sttMode: "remote",
+    remoteUrl: "  https://stt.example.test  ",
+    remoteApiKey: "  sk-test  ",
+    remoteModel: "  whisper-large-v3  ",
+  });
+  assert.equal(input.remote_url, "https://stt.example.test");
+  assert.equal(input.remote_model, "whisper-large-v3");
+  assert.equal(input.remote_api_key, "  sk-test  ");
 });
 
 test("buildSaveTranscriptionInput: trims storage_dir the same way #in-core-path's own save trims its path", () => {
@@ -273,4 +321,29 @@ test("formatModelSize: non-numeric/NaN input is an empty string, not 'NaN MB' or
   assert.equal(formatModelSize(undefined), "");
   assert.equal(formatModelSize(NaN), "");
   assert.equal(formatModelSize("547"), "");
+});
+
+// ---------------------------------------------------------------------
+// computeRemoteSttUiVisibility (P6)
+// ---------------------------------------------------------------------
+
+test("computeRemoteSttUiVisibility: local mode hides the whole remote block regardless of backend", () => {
+  assert.deepEqual(computeRemoteSttUiVisibility({ sttMode: "local", remoteBackend: "openai_compat" }), {
+    remoteFieldsHidden: true,
+    modelFieldHidden: true,
+  });
+});
+
+test("computeRemoteSttUiVisibility: remote + centinelo shows the block but hides the model field (no per-request model for this backend)", () => {
+  assert.deepEqual(computeRemoteSttUiVisibility({ sttMode: "remote", remoteBackend: "centinelo" }), {
+    remoteFieldsHidden: false,
+    modelFieldHidden: true,
+  });
+});
+
+test("computeRemoteSttUiVisibility: remote + openai_compat shows both the block and the model field", () => {
+  assert.deepEqual(computeRemoteSttUiVisibility({ sttMode: "remote", remoteBackend: "openai_compat" }), {
+    remoteFieldsHidden: false,
+    modelFieldHidden: false,
+  });
 });

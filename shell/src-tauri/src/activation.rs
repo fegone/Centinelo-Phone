@@ -319,19 +319,12 @@ impl std::fmt::Display for ActivationError {
 /// leaves surrounding whitespace; trailing `/` is stripped too so
 /// `format!("{base}/activate")` never produces a double slash.
 pub fn validate_server_url(raw: &str) -> Result<String, ActivationError> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err(ActivationError::BadUrl("empty".to_string()));
-    }
-    let url = url::Url::parse(trimmed).map_err(|_| ActivationError::BadUrl("not a valid URL".to_string()))?;
-    let host_is_local = matches!(url.host_str(), Some("127.0.0.1") | Some("localhost"));
-    let scheme_ok = url.scheme() == "https" || (url.scheme() == "http" && host_is_local);
-    if !scheme_ok {
-        return Err(ActivationError::BadUrl(
-            "must be https://, or http://127.0.0.1 / http://localhost for local testing".to_string(),
-        ));
-    }
-    Ok(trimmed.trim_end_matches('/').to_string())
+    // The actual rule lives in [`crate::url_policy`] now (P6): it's shared with
+    // the remote-STT settings, so it has to return a plain `Result<String, String>`
+    // instead of this enum. We keep the typed `ActivationError` wrapper (and the
+    // stable `bad_url` code callers/tests depend on) by mapping through.
+    crate::url_policy::validate_https_or_localhost(raw)
+        .map_err(ActivationError::BadUrl)
 }
 
 // ---------------------------------------------------------------------
