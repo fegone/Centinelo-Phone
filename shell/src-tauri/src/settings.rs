@@ -366,6 +366,40 @@ pub enum ModelTier {
     Light,
 }
 
+// ---- remote STT (P6, "STT remoto" plan) -----------------------------------
+//
+// Extends TranscriptionSettings with the optional remote-speech-to-text
+// backend (Centinelo-hosted by default; an OpenAI-compatible HTTP endpoint
+// as the escape hatch). All remote fields default to EMPTY/off - this public
+// repo ships zero internal hostnames or API keys, the same convention the
+// license/provisioning endpoints already follow. The `remote_url` is
+// validated through `url_policy::validate_https_or_localhost` (the same
+// shared rule the activation server URL uses) at the command layer, never
+// persisted unvalidated.
+
+/// Local whisper.cpp (in-process) vs. a remote HTTP backend. Defaults to
+/// `Local` so a fresh install keeps the proven v1 behavior unless an admin
+/// explicitly opts into the remote path.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SttMode {
+    #[default]
+    Local,
+    Remote,
+}
+
+/// Which remote protocol to speak. `Centinelo` = the Centinelo-hosted
+/// `/health` + `/transcribe` service; `OpenaiCompat` = any OpenAI-compatible
+/// `/v1/audio/transcriptions` endpoint, reached best-effort (no `/health`
+/// contract assumed).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteBackend {
+    #[default]
+    Centinelo,
+    OpenaiCompat,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TranscriptionSettings {
     #[serde(default)]
@@ -392,6 +426,27 @@ pub struct TranscriptionSettings {
     pub model_tier: ModelTier,
     #[serde(default = "default_transcription_language")]
     pub language: String,
+    /// Local whisper.cpp vs. remote HTTP backend (P6). Defaults to `Local`.
+    #[serde(default)]
+    pub stt_mode: SttMode,
+    /// Which remote protocol `remote_url` speaks (P6). Defaults to
+    /// `Centinelo`.
+    #[serde(default)]
+    pub remote_backend: RemoteBackend,
+    /// Base URL of the remote STT service, e.g.
+    /// `https://stt.example.test`. Empty by default - validated through
+    /// `url_policy::validate_https_or_localhost` before it's ever persisted.
+    #[serde(default)]
+    pub remote_url: String,
+    /// Bearer/API key for the remote backend. Empty by default; stored the
+    /// same way the SIP `secret` is (plaintext in the 0600 settings file,
+    /// never logged).
+    #[serde(default)]
+    pub remote_api_key: String,
+    /// Model name passed to the remote backend (e.g. `centinelo-es`,
+    /// `whisper-large-v3`). Empty = the backend's own default.
+    #[serde(default)]
+    pub remote_model: String,
 }
 
 fn default_transcription_language() -> String {
@@ -408,6 +463,11 @@ impl Default for TranscriptionSettings {
             view_only: false,
             model_tier: ModelTier::default(),
             language: default_transcription_language(),
+            stt_mode: SttMode::default(),
+            remote_backend: RemoteBackend::default(),
+            remote_url: String::new(),
+            remote_api_key: String::new(),
+            remote_model: String::new(),
         }
     }
 }
@@ -1141,6 +1201,11 @@ mod transcription_settings_tests {
             view_only: true,
             model_tier: ModelTier::Light,
             language: "auto".to_string(),
+            stt_mode: SttMode::Remote,
+            remote_backend: RemoteBackend::OpenaiCompat,
+            remote_url: "https://stt.example.test".to_string(),
+            remote_api_key: "sk-test".to_string(),
+            remote_model: "whisper-large-v3".to_string(),
         };
         let json = serde_json::to_string(&t).unwrap();
         let back: TranscriptionSettings = serde_json::from_str(&json).unwrap();
@@ -1180,6 +1245,60 @@ mod transcription_settings_tests {
         assert_eq!(serde_json::to_string(&TranscriptionMode::Live).unwrap(), "\"live\"");
         assert_eq!(serde_json::to_string(&TranscriptionActivation::AllCalls).unwrap(), "\"all_calls\"");
         assert_eq!(serde_json::to_string(&ModelTier::Accurate).unwrap(), "\"accurate\"");
+    }
+
+    // ---- remote STT (P6) ------------------------------------------------
+
+    #[test]
+    fn remote_defaults_are_local_centinelo_and_empty() {
+        // No internal hostname/key ships in this public repo - same
+        // convention the license/provisioning endpoints already follow.
+        let t = TranscriptionSettings::default();
+        assert_eq!(t.stt_mode, SttMode::Local);
+        assert_eq!(t.remote_backend, RemoteBackend::Centinelo);
+        assert!(t.remote_url.is_empty());
+        assert!(t.remote_api_key.is_empty());
+        assert!(t.remote_model.is_empty());
+    }
+
+    #[test]
+    fn remote_settings_round_trip_through_json() {
+        let t = TranscriptionSettings {
+            mode: TranscriptionMode::Live,
+            activation: TranscriptionActivation::Manual,
+            keep_audio: false,
+            storage_dir: "/tmp/x".to_string(),
+            view_only: false,
+            model_tier: ModelTier::Accurate,
+            language: "es".to_string(),
+            stt_mode: SttMode::Remote,
+            remote_backend: RemoteBackend::Centinelo,
+            remote_url: "https://stt.example.test".to_string(),
+            remote_api_key: "key-123".to_string(),
+            remote_model: "centinelo-es".to_string(),
+        };
+        let json = serde_json::to_string(&t).unwrap();
+        let back: TranscriptionSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(t, back);
+    }
+
+    #[test]
+    fn older_settings_json_without_remote_keys_defaults_gracefully() {
+        // A pre-P6 settings.json has no stt_mode/remote_* fields - they must
+        // resolve to Local/Centinelo/empty, not fail to deserialize.
+        let json = r#"{"mode":"off","activation":"all_calls"}"#;
+        let t: TranscriptionSettings = serde_json::from_str(json).unwrap();
+        assert_eq!(t.stt_mode, SttMode::Local);
+        assert_eq!(t.remote_backend, RemoteBackend::Centinelo);
+        assert!(t.remote_url.is_empty());
+    }
+
+    #[test]
+    fn stt_mode_and_backend_serialize_as_lowercase_snake_case() {
+        assert_eq!(serde_json::to_string(&SttMode::Local).unwrap(), "\"local\"");
+        assert_eq!(serde_json::to_string(&SttMode::Remote).unwrap(), "\"remote\"");
+        assert_eq!(serde_json::to_string(&RemoteBackend::Centinelo).unwrap(), "\"centinelo\"");
+        assert_eq!(serde_json::to_string(&RemoteBackend::OpenaiCompat).unwrap(), "\"openai_compat\"");
     }
 }
 

@@ -5,7 +5,7 @@ use crate::premium::{CapabilityStatusView, PremiumHandle, PremiumInfoView};
 use crate::sidecar::SidecarHandle;
 use crate::settings::{
     self, AccountSettings, AdminSession, CallDirection, FavoriteSlot, LocalePref, ModelTier,
-    RecentCall, SettingsStore, ThemePref, TranscriptionActivation, TranscriptionMode,
+    RecentCall, RemoteBackend, SettingsStore, SttMode, ThemePref, TranscriptionActivation, TranscriptionMode,
     TranscriptionSettings, TransportPriority,
 };
 use crate::transcription::{PendingRetryView, TranscriptionHandle};
@@ -1044,6 +1044,13 @@ pub struct TranscriptionSettingsView {
     pub view_only: bool,
     pub model_tier: ModelTier,
     pub language: String,
+    pub stt_mode: SttMode,
+    pub remote_backend: RemoteBackend,
+    pub remote_url: String,
+    pub remote_model: String,
+    // NOTE: `remote_api_key` is intentionally NOT echoed back to the
+    // frontend here - it's a secret. The frontend's "is a key set?" affordance
+    // reads a separate boolean (see `get_transcription_settings` below).
 }
 
 impl From<TranscriptionSettings> for TranscriptionSettingsView {
@@ -1056,6 +1063,10 @@ impl From<TranscriptionSettings> for TranscriptionSettingsView {
             view_only: t.view_only,
             model_tier: t.model_tier,
             language: t.language,
+            stt_mode: t.stt_mode,
+            remote_backend: t.remote_backend,
+            remote_url: t.remote_url,
+            remote_model: t.remote_model,
         }
     }
 }
@@ -1084,6 +1095,11 @@ pub struct SaveTranscriptionInput {
     pub view_only: bool,
     pub model_tier: ModelTier,
     pub language: String,
+    pub stt_mode: SttMode,
+    pub remote_backend: RemoteBackend,
+    pub remote_url: String,
+    pub remote_api_key: String,
+    pub remote_model: String,
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -1104,6 +1120,16 @@ pub fn save_transcription_settings(
     if input.language.trim().is_empty() {
         return Err("Language is required (e.g. \"es\" or \"auto\").".to_string());
     }
+    // Remote URL is only required when the operator actually picked the remote
+    // path - empty is the default for both modes. But a non-empty value is
+    // validated through the shared url_policy rule BEFORE it's persisted, so
+    // this shell never stores (let alone calls) a plaintext-HTTP remote host.
+    let remote_url = input.remote_url.trim().to_string();
+    if !remote_url.is_empty() {
+        if let Err(e) = crate::url_policy::validate_https_or_localhost(&remote_url) {
+            return Err(format!("Remote STT URL is not valid: {e}"));
+        }
+    }
     let updated = TranscriptionSettings {
         mode: input.mode,
         activation: input.activation,
@@ -1112,8 +1138,122 @@ pub fn save_transcription_settings(
         view_only: input.view_only,
         model_tier: input.model_tier,
         language: input.language.trim().to_string(),
+        stt_mode: input.stt_mode,
+        remote_backend: input.remote_backend,
+        remote_url,
+        remote_api_key: input.remote_api_key.trim().to_string(),
+        remote_model: input.remote_model.trim().to_string(),
     };
     settings.update_transcription(updated).map_err(|e| e.to_string())
+}
+
+// ---- remote STT connection probe (P6) ----------------------------------
+//
+// "Probar conexión" button: a typed, no-audio GET that just checks the
+// remote backend is reachable and speaks the protocol the operator picked.
+// For `Centinelo` we hit `{url}/health` (the Centinelo STT service's own
+// readiness endpoint). For `OpenaiCompat` there is no guaranteed `/health`
+// contract, so we try `{url}/v1/models` best-effort - a 401/403 still means
+// "the endpoint is there, the key is wrong", not "can't reach it". The URL
+// is re-validated through url_policy (defense in depth - it was validated
+// on save, but the operator can change the field and click this button
+// before saving).
+
+#[derive(Serialize)]
+pub struct RemoteSttProbeResult {
+    pub ok: bool,
+    /// Short human message for the UI, locale-translated client-side from the
+    /// stable `code` below when it matters.
+    pub code: String,
+    pub detail: String,
+}
+
+#[derive(Deserialize)]
+pub struct TestRemoteSttInput {
+    pub remote_url: String,
+    pub remote_backend: RemoteBackend,
+    /// Optional key: included as a Bearer header so a protected endpoint's
+    /// probe isn't a false negative.
+    pub remote_api_key: Option<String>,
+}
+
+/// Core probe logic, free of Tauri `State` so it's unit-testable directly.
+/// The command below is a thin admin-gate wrapper around this.
+fn probe_remote_stt(
+    raw_url: &str,
+    backend: RemoteBackend,
+    api_key: Option<&str>,
+) -> RemoteSttProbeResult {
+    let base = match crate::url_policy::validate_https_or_localhost(raw_url.trim()) {
+        Ok(u) => u,
+        Err(e) => {
+            return RemoteSttProbeResult {
+                ok: false,
+                code: "bad_url".to_string(),
+                detail: e,
+            };
+        }
+    };
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(8))
+        .build();
+    let probe_path = match backend {
+        RemoteBackend::Centinelo => "/health",
+        RemoteBackend::OpenaiCompat => "/v1/models",
+    };
+    let mut req = agent.get(&format!("{base}{probe_path}"));
+    if let Some(key) = api_key {
+        let key = key.trim();
+        if !key.is_empty() {
+            req = req.set("Authorization", &format!("Bearer {key}"));
+        }
+    }
+    match req.call() {
+        Ok(_) => RemoteSttProbeResult {
+            ok: true,
+            code: "ok".to_string(),
+            detail: "Connection successful.".to_string(),
+        },
+        // ureq 2.x: a 4xx/5xx is `Error::Status`, everything else (DNS,
+        // connection refused, TLS, timeout) is `Error::Transport`.
+        Err(ureq::Error::Status(code, _)) => {
+            // 401/403 on the OpenAI-compat probe still means "the endpoint
+            // answered" - a partial success worth distinguishing from a hard
+            // network failure so the UI can hint at the key.
+            let reachable =
+                matches!(code, 401 | 403) && backend == RemoteBackend::OpenaiCompat;
+            RemoteSttProbeResult {
+                ok: reachable,
+                code: if reachable { "auth_required".to_string() } else { "http_error".to_string() },
+                detail: format!("HTTP {code}"),
+            }
+        }
+        Err(ureq::Error::Transport(e)) => RemoteSttProbeResult {
+            ok: false,
+            code: "network".to_string(),
+            detail: e.to_string(),
+        },
+    }
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn test_remote_stt_connection(
+    admin: State<AdminSession>,
+    input: TestRemoteSttInput,
+) -> RemoteSttProbeResult {
+    // Admin-gated like every other settings mutation/probe.
+    if !admin.is_unlocked() {
+        return RemoteSttProbeResult {
+            ok: false,
+            code: "locked".to_string(),
+            detail: "Unlock Settings first.".to_string(),
+        };
+    }
+    probe_remote_stt(
+        &input.remote_url,
+        input.remote_backend,
+        input.remote_api_key.as_deref(),
+    )
 }
 
 /// Manual per-call start (`transcription.activation == "manual"`) - the
@@ -1518,5 +1658,84 @@ mod blf_enabled_command_tests {
         assert!(reloaded.snapshot().blf.enabled);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod remote_stt_probe_tests {
+    use super::*;
+
+    /// Spawns a one-shot mock HTTP server that replies with the given status
+    /// code, returning its base URL (e.g. `http://127.0.0.1:<port>`). Same
+    /// `tiny_http` pattern activation.rs's own tests already use.
+    fn spawn_mock_server(status: u16, body: String) -> String {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr();
+        let handle = std::thread::spawn(move || {
+            // The probe is a single GET, so one request is enough.
+            if let Ok(request) = server.recv() {
+                let response = tiny_http::Response::from_string(body).with_status_code(status);
+                let _ = request.respond(response);
+            }
+        });
+        // Detach: the thread exits after the one request is served.
+        let _ = handle;
+        format!("http://{addr}")
+    }
+
+    #[test]
+    fn bad_url_rejected_before_any_network_call() {
+        let result = probe_remote_stt("not a url", RemoteBackend::Centinelo, None);
+        assert!(!result.ok);
+        assert_eq!(result.code, "bad_url");
+    }
+
+    #[test]
+    fn plain_http_remote_rejected() {
+        let result = probe_remote_stt("http://stt.example.test", RemoteBackend::Centinelo, None);
+        assert!(!result.ok);
+        assert_eq!(result.code, "bad_url");
+    }
+
+    #[test]
+    fn centinelo_health_200_is_ok() {
+        let url = spawn_mock_server(200, r#"{"status":"ok"}"#.to_string());
+        let result = probe_remote_stt(&url, RemoteBackend::Centinelo, None);
+        assert!(result.ok, "expected ok, got {:?} / {}", result.code, result.detail);
+        assert_eq!(result.code, "ok");
+    }
+
+    #[test]
+    fn centinelo_health_500_is_http_error() {
+        let url = spawn_mock_server(500, "internal".to_string());
+        let result = probe_remote_stt(&url, RemoteBackend::Centinelo, None);
+        assert!(!result.ok);
+        assert_eq!(result.code, "http_error");
+    }
+
+    #[test]
+    fn openai_compat_200_is_ok() {
+        let url = spawn_mock_server(200, r#"{"data":[]}"#.to_string());
+        let result = probe_remote_stt(&url, RemoteBackend::OpenaiCompat, None);
+        assert!(result.ok);
+        assert_eq!(result.code, "ok");
+    }
+
+    #[test]
+    fn openai_compat_401_is_reachable_but_auth_required() {
+        // A 401 means the endpoint answered - the key is wrong, not the URL.
+        // The UI can hint "check your API key" instead of "can't reach host".
+        let url = spawn_mock_server(401, r#"unauthorized"#.to_string());
+        let result = probe_remote_stt(&url, RemoteBackend::OpenaiCompat, None);
+        assert!(result.ok, "401 on openai_compat should be reachable");
+        assert_eq!(result.code, "auth_required");
+    }
+
+    #[test]
+    fn network_failure_is_network_code() {
+        // Port 1 on localhost is almost certainly closed -> connection refused.
+        let result = probe_remote_stt("http://127.0.0.1:1", RemoteBackend::Centinelo, None);
+        assert!(!result.ok);
+        assert_eq!(result.code, "network");
     }
 }

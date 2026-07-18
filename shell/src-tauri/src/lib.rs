@@ -183,6 +183,7 @@ pub fn run() {
             commands::sidecar_blf_unsubscribe,
             commands::get_transcription_settings,
             commands::save_transcription_settings,
+            commands::test_remote_stt_connection,
             commands::transcription_manual_start,
             commands::transcription_manual_stop,
             commands::transcription_pending_retries,
