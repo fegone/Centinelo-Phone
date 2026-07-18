@@ -191,24 +191,42 @@ jobs:
           fi
           echo "OK: both signing secrets are configured (values never printed)."
 
+  # -------------------------------------------------------------------
+  # macOS (aarch64): builds core/ exactly like core-build.yml's macOS job
+  # (same patches, same MODULES list, same OpenSSL discovery), then the
+  # Tauri shell with createUpdaterArtifacts, then stages the core engine
+  # binary into the built .app via package-official.sh (Community edition
+  # - no premium dylib/console assets, this is the public repo only) the
+  # same way F5's packaging pass already proved out. See the "Regenerate
+  # the updater artifact" step below for the one real wrinkle this adds
+  # on top of package-official.sh's existing, unmodified mac path.
+  # -------------------------------------------------------------------
+  build-macos:
+    name: macOS (aarch64)
+    needs: preflight
+    runs-on: macos-14
+    # core-build.yml's own macOS job (re + baresip + Tauri, same steps)
+    # typically finishes in 20-30min - 90 gives ~3x margin for a cold
+    # cache / noisy-neighbor runner without masking a genuinely hung build
+    # for an hour-plus.
+    timeout-minutes: 90
+    steps:
       - name: Guard - Apple notarization secrets must be configured
-        # Mirrors the signing-secrets guard above: never prints any secret's
-        # VALUE, only whether each is missing, by NAME. macOS code signing +
-        # notarization are a hard release gate (Gatekeeper refuses an
-        # unsigned/un-notarized .app/.dmg for anyone who downloads it), so a
-        # missing APPLE_* secret fails the whole run in seconds here - before
+        # Mirrors the signing-secrets guard in preflight: never prints any
+        # secret's VALUE, only whether each is missing, by NAME. macOS code
+        # signing + notarization are a hard release gate (Gatekeeper refuses
+        # an unsigned/un-notarized .app/.dmg for anyone who downloads it), so
+        # a missing APPLE_* secret fails THIS job in seconds here - before
         # the 20-30min macOS compile starts - instead of failing deep inside
-        # codesign/notarytool. NOTE this guard lives in `preflight`, and BOTH
-        # downstream jobs - build-macos AND build-windows - declare
-        # `needs: preflight`, so a missing APPLE_* secret blocks the ENTIRE
-        # pipeline (Windows included), not just the macOS release. That is
-        # intentional: without an Apple signature there is no macOS asset, and
-        # publish-release refuses to publish a release missing a platform, so
-        # a half-signed release never ships. Felix has not yet obtained an
-        # Apple Developer Program membership (see shell/README.md "Apple code
-        # signing & notarization - configure before a real macOS release"), so
-        # this is expected to block ALL releases - Windows too - until those
-        # six secrets are configured; it is medium-blocked, not broken.
+        # codesign/notarytool. This guard lives in `build-macos` (moved out of
+        # `preflight`) so it gates ONLY the macOS build, NOT the whole
+        # pipeline: Windows needs no Apple signing at all (it signs its
+        # updater with the same Ed25519 updater keypair the preflight guard
+        # already checks, nothing Apple), so a tester can produce a Windows
+        # installer with ONLY the updater keypair configured, before the
+        # Apple Developer Program cert is obtained. publish-release still
+        # refuses to publish a release that produced no platform assets, so a
+        # half-signed release never ships.
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -239,26 +257,6 @@ jobs:
           fi
           echo "OK: all Apple notarization secrets are configured (values never printed)."
 
-  # -------------------------------------------------------------------
-  # macOS (aarch64): builds core/ exactly like core-build.yml's macOS job
-  # (same patches, same MODULES list, same OpenSSL discovery), then the
-  # Tauri shell with createUpdaterArtifacts, then stages the core engine
-  # binary into the built .app via package-official.sh (Community edition
-  # - no premium dylib/console assets, this is the public repo only) the
-  # same way F5's packaging pass already proved out. See the "Regenerate
-  # the updater artifact" step below for the one real wrinkle this adds
-  # on top of package-official.sh's existing, unmodified mac path.
-  # -------------------------------------------------------------------
-  build-macos:
-    name: macOS (aarch64)
-    needs: preflight
-    runs-on: macos-14
-    # core-build.yml's own macOS job (re + baresip + Tauri, same steps)
-    # typically finishes in 20-30min - 90 gives ~3x margin for a cold
-    # cache / noisy-neighbor runner without masking a genuinely hung build
-    # for an hour-plus.
-    timeout-minutes: 90
-    steps:
       - uses: actions/checkout@v4
         with:
           ref: refs/tags/${{ needs.preflight.outputs.tag }}
@@ -1307,3 +1305,4 @@ jobs:
             echo
             echo "https://github.com/fegone/Centinelo-Phone/releases/tag/$TAG"
           } >> "$GITHUB_STEP_SUMMARY"
+
