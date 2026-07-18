@@ -6,7 +6,14 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { armHandshake, reduceRegHandshake, isTerminalRegAction, shouldReleaseSaveButton } from "./reg-status.js";
+import {
+  armHandshake,
+  reduceRegHandshake,
+  isTerminalRegAction,
+  shouldReleaseSaveButton,
+  shouldShowInterimConnecting,
+  reduceRegResult,
+} from "./reg-status.js";
 
 // ---------------------------------------------------------------------
 // armHandshake
@@ -139,4 +146,64 @@ test("shouldReleaseSaveButton: true when the finishing save is still the newest 
 
 test("shouldReleaseSaveButton: false when a newer save has since armed - an older save's terminal path must not re-enable the button out from under it", () => {
   assert.equal(shouldReleaseSaveButton(3, 2), false);
+});
+
+// ---------------------------------------------------------------------
+// shouldShowInterimConnecting / reduceRegResult (2026-07-18 RELIABILITY
+// regression fix: saveAccountSettings used to repaint #save-status to
+// "Connecting…" unconditionally right before awaiting the handshake's
+// result, even when a terminal reg_state had already landed - and already
+// resolved that same promise - during the save's own intermediate invokes.
+// That stomped an already-correct "Connected" back to "Connecting…", which
+// then never got corrected because the code assumed "already painted,
+// nothing to do here".
+// ---------------------------------------------------------------------
+
+test("shouldShowInterimConnecting: true while THIS save's own handshake is still genuinely pending", () => {
+  assert.equal(shouldShowInterimConnecting(1, 1), true);
+});
+
+test("shouldShowInterimConnecting: false once the handshake has already settled (pendingRegResult cleared)", () => {
+  assert.equal(shouldShowInterimConnecting(null, 1), false);
+});
+
+test("shouldShowInterimConnecting: false if a newer save has since armed its own handshake", () => {
+  assert.equal(shouldShowInterimConnecting(2, 1), false);
+});
+
+test("reduceRegResult: a registered result -> show-connected", () => {
+  assert.deepEqual(reduceRegResult({ state: "registered" }), { type: "show-connected" });
+});
+
+test("reduceRegResult: a timedOut result -> keep-last (don't touch whatever's already shown)", () => {
+  assert.deepEqual(reduceRegResult({ timedOut: true }), { type: "keep-last" });
+});
+
+test("regression: a terminal reg_state arriving BEFORE the final await ends in Connected, not a stale Connecting", () => {
+  // Simulates saveAccountSettings's own sequence for one Save (generation 1):
+  const myGeneration = 1;
+  const handshake = armHandshake(myGeneration);
+
+  // The terminal reg_state lands during the save's intermediate invokes,
+  // exactly like renderSaveStatusForRegState's real call: settles the
+  // handshake and (in app.js) paints #save-status green immediately.
+  const liveAction = reduceRegHandshake(handshake, myGeneration, { type: "reg_state", state: "registered" });
+  assert.deepEqual(liveAction, { type: "show-connected" });
+  assert.equal(isTerminalRegAction(liveAction), true);
+
+  // app.js clears state.pendingRegResult the instant that happens - by the
+  // time saveAccountSettings reaches its own interim-repaint check, there
+  // is no pending handshake left for this generation.
+  const pendingHandshakeGenerationAfterSettling = null;
+
+  // The fix: the interim "Connecting…" repaint must NOT run here.
+  assert.equal(shouldShowInterimConnecting(pendingHandshakeGenerationAfterSettling, myGeneration), false);
+
+  // awaitRegResult's promise already resolved with the real outcome the
+  // instant renderSaveStatusForRegState settled it above.
+  const result = { state: "registered" };
+  const finalAction = reduceRegResult(result);
+  assert.deepEqual(finalAction, { type: "show-connected" });
+  // i.e. #save-status ends on "Connected" - never overwritten to
+  // "Connecting…" in between and never left stuck there.
 });

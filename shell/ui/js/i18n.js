@@ -149,16 +149,9 @@ const ENTRIES = [
     "Conectando…",
   ],
   ["regStatus.connected", "Connected", "Conectado", "Conectado"],
-  [
-    "regStatus.failedReason",
-    "Couldn't connect: {reason}",
-    "Não foi possível conectar: {reason}",
-    "No se pudo conectar: {reason}",
-  ],
   // Non-terminal: shown live while the engine retries registration after a
   // failure (the first `failed` is NOT final — see save-status handling,
-  // app.js renderSaveStatusForRegState). Distinct from failedReason so the
-  // permanent "couldn't connect" wording isn't reused for a transient retry.
+  // app.js renderSaveStatusForRegState).
   [
     "regStatus.failedRetrying",
     "Attempt failed: {reason} — retrying…",

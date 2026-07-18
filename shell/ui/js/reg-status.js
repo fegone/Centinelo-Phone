@@ -88,3 +88,48 @@ export function isTerminalRegAction(action) {
 export function shouldReleaseSaveButton(currentGeneration, myGeneration) {
   return currentGeneration === myGeneration;
 }
+
+/// Guards saveAccountSettings's interim "Connecting…" repaint, which runs
+/// right before it awaits the handshake's result (after save_account_
+/// settings/set_core_binary_path/save_favorites/save_transcription_settings/
+/// the finally block's get_account_settings - several IPC round-trips that
+/// run concurrently with the engine's own SIP re-register).
+///
+/// 2026-07-18 RELIABILITY regression this exists to close: a terminal
+/// reg_state (registered, or failed-then-registered) can land DURING those
+/// intermediate invokes. When it does, renderSaveStatusForRegState already
+/// painted the real outcome live and resolved the handshake - repainting
+/// "Connecting…" over that unconditionally would freeze #save-status on a
+/// stale message the instant the already-resolved promise resolves right
+/// after (reduceRegResult below is what un-freezes it, but the interim
+/// repaint must not run in the first place or it visibly flashes/reverts).
+///
+/// @param pendingHandshakeGeneration - state.pendingRegResult?.generation,
+///   or null if no handshake is currently pending (already settled, or -
+///   structurally unreachable today since the Save button is disabled for
+///   the whole handshake, but checked the same way as reduceRegHandshake's
+///   own safety net - preempted by a newer Save).
+/// @param myGeneration - the generation THIS saveAccountSettings call armed.
+/// @returns true only if this save's own handshake is still genuinely
+///   awaiting its terminal event.
+export function shouldShowInterimConnecting(pendingHandshakeGeneration, myGeneration) {
+  return pendingHandshakeGeneration === myGeneration;
+}
+
+/// Reduces the awaited handshake result into the final #save-status action,
+/// independent of whatever renderSaveStatusForRegState already painted
+/// live - always correct even where shouldShowInterimConnecting's repaint
+/// was skipped (or, before this fix, would have stomped it).
+///
+/// @param result - awaitRegResult's resolution: { state: "registered" } or
+///   { timedOut: true }. ("failed" is never terminal - see
+///   reduceRegHandshake's show-failed-retrying doc - so it never reaches
+///   here as a result.)
+/// @returns { type: "show-connected" } (paint green/Connected) or
+///   { type: "keep-last" } (no terminal registered arrived in time - leave
+///   whatever #save-status last showed; the live reg-pill stays the true
+///   source of truth, see the timedOut handling this replaces).
+export function reduceRegResult(result) {
+  if (result && result.state === "registered") return { type: "show-connected" };
+  return { type: "keep-last" };
+}

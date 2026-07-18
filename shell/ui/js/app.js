@@ -40,7 +40,13 @@ import {
   renderUpdaterAboutStatus,
 } from "./updater.js";
 import { computeBlfUiHidden, BLF_UI_TARGETS } from "./blf-ui.js";
-import { armHandshake, reduceRegHandshake, shouldReleaseSaveButton } from "./reg-status.js";
+import {
+  armHandshake,
+  reduceRegHandshake,
+  shouldReleaseSaveButton,
+  shouldShowInterimConnecting,
+  reduceRegResult,
+} from "./reg-status.js";
 
 // `Channel` (updater download progress) and `Resource` both live on
 // window.__TAURI__.core alongside `invoke` - withGlobalTauri bundles the
@@ -2116,21 +2122,48 @@ async function saveAccountSettings() {
   // resolves on it via handleSidecarEvent, or times out after
   // REG_RESULT_TIMEOUT_MS. Neutral while connecting; green on success; red +
   // the real SIP reason (e.g. 401 Unauthorized / 408 Timeout) on failure.
-  statusEl.className = "status";
-  statusEl.textContent = t("regStatus.connecting");
+  //
+  // 2026-07-18 RELIABILITY regression fix: the "Connecting…" repaint below
+  // used to be unconditional. But a terminal reg_state can land DURING the
+  // invokes above (set_core_binary_path/save_favorites/save_transcription_
+  // settings/the finally block's get_account_settings - IPC round-trips
+  // that run concurrently with the engine's own SIP re-register), in which
+  // case renderSaveStatusForRegState already painted the real outcome live
+  // and resolved regPromise. Repainting "Connecting…" over that
+  // unconditionally froze #save-status on a stale message the instant the
+  // already-resolved regPromise resolved right after - the exact original
+  // "stuck Connecting" bug, reintroduced in this timing window.
+  // shouldShowInterimConnecting only allows the repaint while THIS save's
+  // own handshake is still genuinely pending; reduceRegResult below then
+  // always (re)asserts the true terminal text from `result` itself, so the
+  // final state is never left depending on "surely it was already painted".
+  if (
+    shouldShowInterimConnecting(
+      state.pendingRegResult ? state.pendingRegResult.generation : null,
+      myGeneration,
+    )
+  ) {
+    statusEl.className = "status";
+    statusEl.textContent = t("regStatus.connecting");
+  }
   const result = await regPromise;
   let regOk = false;
-  if (result.state === "registered") {
+  const finalAction = reduceRegResult(result);
+  if (finalAction.type === "show-connected") {
     regOk = true;
-    // #save-status was already painted green LIVE by
-    // renderSaveStatusForRegState the instant `registered` arrived (FIX B);
-    // reaching here just means the handshake is settled — nothing to repaint.
-  } else if (result.timedOut) {
-    // No terminal `registered` arrived within REG_RESULT_TIMEOUT_MS. Leave
-    // whatever #save-status last showed ("Connecting…" if no reg_state came,
-    // or the most recent "failed — retrying"). The live reg-pill keeps
-    // showing the true state, so we don't clobber #save-status with a message
-    // that could contradict the pill once the engine eventually registers.
+    // Explicit, not assumed: renderSaveStatusForRegState already painted
+    // this green live in the common case, but this line is what actually
+    // guarantees it - including the case the repaint above was skipped
+    // for (handshake settled during the intermediate invokes).
+    statusEl.className = "status ok";
+    statusEl.textContent = t("regStatus.connected");
+  } else {
+    // keep-last (timedOut): no terminal `registered` arrived within
+    // REG_RESULT_TIMEOUT_MS. Leave whatever #save-status last showed
+    // ("Connecting…" if no reg_state came, or the most recent "failed —
+    // retrying"). The live reg-pill keeps showing the true state, so we
+    // don't clobber #save-status with a message that could contradict the
+    // pill once the engine eventually registers.
   }
   // A transcription-only failure is secondary to the SIP outcome: surface it
   // only when registration itself succeeded, so a real connect failure stays
