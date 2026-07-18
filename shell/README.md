@@ -1030,15 +1030,24 @@ it: the default "downloaded from the internet" quarantine flag plus the
 hardened-runtime requirement make an unsigned build unlaunchable for end
 users. This is a hard gate in release-ci, not a nice-to-have.
 
-**This is `medium-blocked` right now:** Felix does not yet hold an Apple
-Developer Program membership, so the `APPLE_*` secrets are not configured.
-The `preflight` job has a dedicated guard (`Guard - Apple notarization
-secrets must be configured`) that fails the whole run in seconds — before
-any compile starts — listing exactly which of the six secrets are missing
-and pointing here, rather than failing 20 minutes into a build with a
-cryptic `codesign`/`notarytool` error. Once the secrets below are set, the
-guard passes and `build-macos` signs + notarizes automatically. No code
-change is needed at that point.
+**This is `medium-blocked` (macOS only) right now:** Felix does not yet
+hold an Apple Developer Program membership, so the `APPLE_*` secrets are
+not configured. `build-macos` has a dedicated guard (`Guard - Apple
+notarization secrets must be configured`) as its **first step** — before
+the `actions/checkout` and the 20–30 min compile — that fails the macOS
+job in seconds, listing exactly which of the six secrets are missing and
+pointing here, rather than failing deep inside a build with a cryptic
+`codesign`/`notarytool` error. **This guard gates only the macOS build,
+not the whole pipeline:** it lives in `build-macos` (moved out of
+`preflight`), so a missing Apple cert does NOT block the Windows
+installer. Windows needs no Apple signing at all — it signs its updater
+with the same Ed25519 updater keypair the `preflight` guard already
+checks — so a tester can produce a Windows installer with ONLY the
+updater keypair configured, before the Apple Developer Program cert
+exists. (`publish-release` only refuses a release that produced no
+platform assets at all, so a Windows-only release still ships.) Once the
+secrets below are set, the guard passes and `build-macos` signs +
+notarizes automatically. No code change is needed at that point.
 
 ### Getting the certificate and the six secrets
 
