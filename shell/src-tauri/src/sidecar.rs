@@ -170,6 +170,62 @@ fn apply_call_state_transition(
     }
 }
 
+/// Availability + auto-answer -> engine-facing decision. Mirrored exactly
+/// by `ui/js/call-availability.js`'s `computeCallHandling` (frontend
+/// rendering only reads this same rule, never re-derives it) - both sides'
+/// unit tests cover all 4 combinations and must agree. See
+/// `settings::AvailabilitySettings`'s doc for the persisted-field half of
+/// this and why `available` always wins over `auto_answer`.
+///
+/// Returns the exact `mode` value for `{"cmd":"set_answer_mode","mode":...}`
+/// (`core/PROTOCOL.md`).
+fn effective_answer_mode(available: bool, auto_answer: bool) -> &'static str {
+    if !available {
+        "manual"
+    } else if auto_answer {
+        "auto"
+    } else {
+        "manual"
+    }
+}
+
+/// Whether an incoming call (`call_state:"incoming"`) should be
+/// auto-rejected (immediate `hangup` -> 486 Busy Here -> PBX voicemail)
+/// instead of being allowed to ring. `auto_answer` plays no part here on
+/// purpose: while `available` is false nothing should ever reach ringing
+/// in the first place, auto-answer or not.
+fn should_auto_reject_incoming(available: bool) -> bool {
+    !available
+}
+
+#[cfg(test)]
+mod availability_tests {
+    use super::*;
+
+    #[test]
+    fn available_manual_is_the_shipped_default() {
+        assert_eq!(effective_answer_mode(true, false), "manual");
+        assert!(!should_auto_reject_incoming(true));
+    }
+
+    #[test]
+    fn available_with_auto_answer_on_yields_auto_mode() {
+        assert_eq!(effective_answer_mode(true, true), "auto");
+        assert!(!should_auto_reject_incoming(true));
+    }
+
+    #[test]
+    fn not_available_always_yields_manual_and_auto_reject_regardless_of_auto_answer() {
+        // The interaction the shell task brief calls out explicitly:
+        // availability wins over auto-answer, no race. auto_answer=false
+        // and auto_answer=true both land on the identical outcome while
+        // available=false.
+        assert_eq!(effective_answer_mode(false, false), "manual");
+        assert_eq!(effective_answer_mode(false, true), "manual");
+        assert!(should_auto_reject_incoming(false));
+    }
+}
+
 /// Picks the phase [`SidecarHandle::ping_state`] should report when more
 /// than one call_id is tracked at once: `InCall` wins over `Incoming`
 /// over `Calling`, so a genuine ongoing conversation (e.g. the original
