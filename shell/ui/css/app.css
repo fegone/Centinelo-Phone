@@ -58,6 +58,17 @@ html[data-os="mac"] .titlebar #btn-close { display: none; }
 .wbtn:hover { background: var(--bg-3); color: var(--text-1); }
 .wbtn.close:hover { background: var(--st-busy); color: #fff; }
 
+/* Availability indicator (shell task) - dot color is the ONLY thing this
+   toggles (same color-only-differentiation convention .pill.reg-* already
+   uses for its own status dot); the full state is always spelled out in
+   the title/aria-label text. --st-idle (jade) = available, --st-dnd
+   (acromático slate) = do not disturb. Never amber - amber is exclusively
+   ringing (Vigilia rule). */
+.avail-btn.available { color: var(--st-idle); }
+.avail-btn.dnd { color: var(--st-dnd); }
+.avail-btn:hover.available { background: color-mix(in srgb, var(--st-idle) 14%, transparent); }
+.avail-btn:hover.dnd { background: var(--bg-3); }
+
 /* == body / idle surface ================================================= */
 .body { flex: 1; display: flex; flex-direction: column; padding: 4px 12px 12px; min-height: 0; position: relative; }
 

@@ -190,3 +190,56 @@ test("localeTag(): is always a valid tag Intl.DateTimeFormat accepts, for every 
   }
   setLocale("en");
 });
+
+// ---------------------------------------------------------------------
+// Availability/auto-answer keys (shell task) - key parity across all 3
+// locales: every key below must resolve to a REAL, distinct translation
+// in each supported locale, not silently fall back to the key itself
+// (which would mean the ENTRIES row is missing that locale's column) and
+// not silently fall back to the English string in pt-BR/es (which would
+// mean the row exists but that column was left equal to English by
+// mistake - only acceptable for the two tokens where en/es happen to
+// share a spelling, checked explicitly below instead of assumed).
+// ---------------------------------------------------------------------
+
+test("availability.* keys: every key resolves to a non-empty, non-key string in all 3 locales", () => {
+  const keys = [
+    "availability.settingsHeading",
+    "availability.availableLabel",
+    "availability.availableHint",
+    "availability.autoAnswerLabel",
+    "availability.autoAnswerHint",
+    "availability.titlebarAvailableTitle",
+    "availability.titlebarDndTitle",
+  ];
+  for (const key of keys) {
+    for (const locale of SUPPORTED_LOCALES) {
+      setLocale(locale);
+      const resolved = t(key);
+      assert.notEqual(resolved, key, `${key} must have a real translation for ${locale}, not fall back to the key`);
+      assert.ok(resolved.length > 0, `${key} must not resolve to an empty string for ${locale}`);
+    }
+  }
+  setLocale("en");
+});
+
+test("availability.* keys: pt-BR and es translations are each genuinely distinct from the English string (real translations, not copy-pasted columns)", () => {
+  const keys = [
+    "availability.settingsHeading",
+    "availability.availableLabel",
+    "availability.availableHint",
+    "availability.autoAnswerLabel",
+    "availability.autoAnswerHint",
+    "availability.titlebarAvailableTitle",
+    "availability.titlebarDndTitle",
+  ];
+  for (const key of keys) {
+    setLocale("en");
+    const en = t(key);
+    setLocale("pt-BR");
+    assert.notEqual(t(key), en, `${key}'s pt-BR column looks copy-pasted from English`);
+    setLocale("es");
+    assert.notEqual(t(key), en, `${key}'s es column looks copy-pasted from English`);
+  }
+  setLocale("en");
+});

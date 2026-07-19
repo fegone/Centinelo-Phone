@@ -570,6 +570,86 @@ pub fn set_updater_check_on_startup(settings: State<Arc<SettingsStore>>, check_o
     settings.update_updater_check_on_startup(check_on_startup).map_err(|e| e.to_string())
 }
 
+// ---- availability / auto-answer (shell task) ------------------------------
+// Not admin-gated, same reasoning as get_theme/set_theme/get_updater_settings
+// above - "am I taking calls right now" is routine front-desk/agent use, not
+// an account/transport/advanced-path change (see settings.rs
+// AvailabilitySettings's own doc). Both setters call
+// `SidecarHandle::apply_answer_mode` AFTER persisting, so the frontend can
+// never observe "the setting says X but the engine is still running the
+// previous mode" - same "persist then reapply" shape `set_blf_enabled` uses
+// for its own teardown, just reapply-after instead of teardown-before since
+// there's no live subscription to race here.
+
+#[derive(Serialize)]
+pub struct AvailabilitySettingsView {
+    pub available: bool,
+    pub auto_answer: bool,
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn get_availability_settings(settings: State<Arc<SettingsStore>>) -> AvailabilitySettingsView {
+    let a = settings.snapshot().availability;
+    AvailabilitySettingsView { available: a.available, auto_answer: a.auto_answer }
+}
+
+/// `available=false` also plays no active role here beyond persisting +
+/// reapplying `set_answer_mode` - the actual "reject whatever's ringing
+/// right now" behavior is driven live off this same setting by
+/// `sidecar.rs`'s `call_state:"incoming"` handling (2a), not by this
+/// command reaching into `call_phases` to hang up an in-flight call. A
+/// call that's ALREADY ringing when this flips to unavailable keeps
+/// ringing normally - only calls that arrive AFTER the flip are rejected
+/// - same "don't yank the rug out from under an in-progress interaction"
+/// restraint `set_blf_enabled`'s teardown doesn't need to make (BLF has no
+/// analogous "already ringing" state to leave alone).
+///
+/// The `apply_answer_mode` reapply is best-effort (warned, not
+/// propagated as a command error): `send_cmd` fails whenever the sidecar
+/// isn't currently running (no account configured yet, mid-restart, ...),
+/// which must NOT stop the preference itself from persisting - the next
+/// "registered" transition (sidecar.rs) reapplies it anyway the moment
+/// the engine comes up, same reasoning `set_blf_enabled`'s own
+/// best-effort teardown loop documents for its unsubscribe calls.
+/// `app` (auto-injected by Tauri, not part of the frontend's `invoke`
+/// payload) is used to keep the tray menu's own "Available" checkmark AND
+/// the webview (titlebar dot, Settings pane bool rows) in sync via
+/// `tray::sync_availability_menu` - that function both re-checks the tray
+/// item and emits `availability-changed`, the single point every route
+/// funnels through so the frontend's own `invoke("set_available", ...)`
+/// caller (already updating its local `state.availability` optimistically)
+/// and this event-driven path can never leave the 3 surfaces disagreeing.
+#[tauri::command(rename_all = "snake_case")]
+pub fn set_available(
+    app: tauri::AppHandle,
+    settings: State<Arc<SettingsStore>>,
+    sidecar: State<SidecarHandle>,
+    available: bool,
+) -> Result<(), String> {
+    settings.update_available(available).map_err(|e| e.to_string())?;
+    if let Err(e) = sidecar.apply_answer_mode() {
+        log::warn!("set_available({available}): apply_answer_mode failed (will reapply on next registration): {e}");
+    }
+    crate::tray::sync_availability_menu(&app, available, settings.snapshot().availability.auto_answer);
+    Ok(())
+}
+
+/// See `set_available`'s doc for why `app` is here.
+#[tauri::command(rename_all = "snake_case")]
+pub fn set_auto_answer(
+    app: tauri::AppHandle,
+    settings: State<Arc<SettingsStore>>,
+    sidecar: State<SidecarHandle>,
+    auto_answer: bool,
+) -> Result<(), String> {
+    settings.update_auto_answer(auto_answer).map_err(|e| e.to_string())?;
+    if let Err(e) = sidecar.apply_answer_mode() {
+        log::warn!("set_auto_answer({auto_answer}): apply_answer_mode failed (will reapply on next registration): {e}");
+    }
+    crate::tray::sync_availability_menu(&app, settings.snapshot().availability.available, auto_answer);
+    Ok(())
+}
+
 // ---- admin lock ------------------------------------------------------
 
 #[derive(Serialize)]

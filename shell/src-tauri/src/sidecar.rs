@@ -170,6 +170,62 @@ fn apply_call_state_transition(
     }
 }
 
+/// Availability + auto-answer -> engine-facing decision. Mirrored exactly
+/// by `ui/js/call-availability.js`'s `computeCallHandling` (frontend
+/// rendering only reads this same rule, never re-derives it) - both sides'
+/// unit tests cover all 4 combinations and must agree. See
+/// `settings::AvailabilitySettings`'s doc for the persisted-field half of
+/// this and why `available` always wins over `auto_answer`.
+///
+/// Returns the exact `mode` value for `{"cmd":"set_answer_mode","mode":...}`
+/// (`core/PROTOCOL.md`).
+fn effective_answer_mode(available: bool, auto_answer: bool) -> &'static str {
+    if !available {
+        "manual"
+    } else if auto_answer {
+        "auto"
+    } else {
+        "manual"
+    }
+}
+
+/// Whether an incoming call (`call_state:"incoming"`) should be
+/// auto-rejected (immediate `hangup` -> 486 Busy Here -> PBX voicemail)
+/// instead of being allowed to ring. `auto_answer` plays no part here on
+/// purpose: while `available` is false nothing should ever reach ringing
+/// in the first place, auto-answer or not.
+fn should_auto_reject_incoming(available: bool) -> bool {
+    !available
+}
+
+#[cfg(test)]
+mod availability_tests {
+    use super::*;
+
+    #[test]
+    fn available_manual_is_the_shipped_default() {
+        assert_eq!(effective_answer_mode(true, false), "manual");
+        assert!(!should_auto_reject_incoming(true));
+    }
+
+    #[test]
+    fn available_with_auto_answer_on_yields_auto_mode() {
+        assert_eq!(effective_answer_mode(true, true), "auto");
+        assert!(!should_auto_reject_incoming(true));
+    }
+
+    #[test]
+    fn not_available_always_yields_manual_and_auto_reject_regardless_of_auto_answer() {
+        // The interaction the shell task brief calls out explicitly:
+        // availability wins over auto-answer, no race. auto_answer=false
+        // and auto_answer=true both land on the identical outcome while
+        // available=false.
+        assert_eq!(effective_answer_mode(false, false), "manual");
+        assert_eq!(effective_answer_mode(false, true), "manual");
+        assert!(should_auto_reject_incoming(false));
+    }
+}
+
 /// Picks the phase [`SidecarHandle::ping_state`] should report when more
 /// than one call_id is tracked at once: `InCall` wins over `Incoming`
 /// over `Calling`, so a genuine ongoing conversation (e.g. the original
@@ -674,6 +730,25 @@ impl SidecarHandle {
     pub fn blf_unsubscribe(&self, ext: &str) -> Result<(), String> {
         blf_unsubscribe_raw(&self.0, ext)
     }
+
+    /// Reapplies the engine's answer mode from the CURRENT
+    /// `settings.availability` snapshot (`effective_answer_mode`) - called
+    /// after every `set_available`/`set_auto_answer` command (commands.rs)
+    /// and on every "registered" transition (`spawn_stdout_reader`, same
+    /// spot the favorites auto-subscribe loop already re-runs on every
+    /// re-REGISTER, since a fresh engine process/session has no memory of
+    /// a previous session's `set_answer_mode`). Always reads a fresh
+    /// snapshot rather than taking `available`/`auto_answer` as
+    /// parameters - this is what makes the "availability always wins, no
+    /// race" guarantee hold even if two settings changes land back to
+    /// back: every call recomputes from both CURRENT fields together, so
+    /// there's no window where a stale `auto_answer` value could be
+    /// combined with a newer `available` value or vice versa.
+    pub fn apply_answer_mode(&self) -> Result<(), String> {
+        let availability = self.0.settings.snapshot().availability;
+        let mode = effective_answer_mode(availability.available, availability.auto_answer);
+        self.send_cmd(serde_json::json!({"cmd": "set_answer_mode", "mode": mode}))
+    }
 }
 
 /// Shared implementation of [`SidecarHandle::blf_subscribe`], also used
@@ -1127,6 +1202,22 @@ fn spawn_stdout_reader(
                             log::warn!("sidecar: blf_subscribe({ext}) failed: {e}");
                         }
                     }
+                    // Availability/auto-answer (shell task, 2b): a fresh
+                    // engine process has no memory of a previous session's
+                    // `set_answer_mode` (same reasoning as the favorites
+                    // auto-subscribe just above), so this must re-run on
+                    // every "registered" transition too, not just at first
+                    // boot - covers the sidecar restarting (new account
+                    // settings, wss->udp fallback, ...) while
+                    // available/auto_answer are already persisted from an
+                    // earlier session.
+                    let availability = shared.settings.snapshot().availability;
+                    let mode = effective_answer_mode(availability.available, availability.auto_answer);
+                    if let Err(e) =
+                        send_cmd_raw(&shared, serde_json::json!({"cmd": "set_answer_mode", "mode": mode}))
+                    {
+                        log::warn!("sidecar: set_answer_mode({mode}) failed: {e}");
+                    }
                 } else {
                     if state == "failed" || state == "unregistered" {
                         shared.registered.store(false, Ordering::SeqCst);
@@ -1157,8 +1248,35 @@ fn spawn_stdout_reader(
                 // still-established call's state.
                 let call_state = value.get("state").and_then(Value::as_str).unwrap_or("");
                 if let Some(call_id) = value.get("call_id").and_then(Value::as_str) {
-                    let mut phases = shared.call_phases.lock_or_recover();
-                    apply_call_state_transition(&mut phases, call_id, call_state);
+                    {
+                        let mut phases = shared.call_phases.lock_or_recover();
+                        apply_call_state_transition(&mut phases, call_id, call_state);
+                    }
+                    // Availability "do not disturb" auto-reject (shell task):
+                    // fires BEFORE the emit() below reaches the frontend at
+                    // all, on every single "incoming" - not just the first
+                    // of a session - since `available` can flip mid-session
+                    // and every subsequent incoming call must honor whatever
+                    // it's set to right now. should_auto_reject_incoming
+                    // ignores auto_answer entirely (see its own doc):
+                    // nothing should ever ring while unavailable, auto-
+                    // answer or not. Best-effort/logged, not fatal - a
+                    // failed hangup here just means this one call rings
+                    // through instead of the shell silently eating a real
+                    // incoming call with no signal anyone can act on.
+                    if call_state == "incoming"
+                        && should_auto_reject_incoming(shared.settings.snapshot().availability.available)
+                    {
+                        log::info!(
+                            "sidecar: available=false, auto-rejecting incoming call_id={call_id} (486 Busy Here -> voicemail)"
+                        );
+                        if let Err(e) = send_cmd_raw(
+                            &shared,
+                            serde_json::json!({"cmd": "hangup", "call_id": call_id}),
+                        ) {
+                            log::warn!("sidecar: auto-reject hangup({call_id}) failed: {e}");
+                        }
+                    }
                 } else {
                     // Silently dropping this would be R4 all over again via
                     // a different trigger: a tracked call_id's own

@@ -632,6 +632,54 @@ impl Default for BlfSettings {
     }
 }
 
+// ---- availability / auto-answer (shell task "disponibilidad + auto-
+// answer") ------------------------------------------------------------
+//
+// Two independent, NOT admin-gated preferences (same "operational, not
+// sensitive" bucket as `UpdaterSettings::check_on_startup` above - an
+// agent flipping "I'm away from my desk" or "answer for me" is routine
+// day-to-day use, not an account/transport/advanced-path change that
+// needs an admin's blessing). The actual engine-facing decision
+// (`set_answer_mode` "auto"/"manual", plus whether an incoming call gets
+// auto-hung-up instead of ringing at all) is a pure function of BOTH
+// fields together - see `sidecar::effective_answer_mode`/
+// `sidecar::should_auto_reject_incoming` (mirrored in
+// `ui/js/call-availability.js`'s `computeCallHandling` for the frontend's
+// own rendering) - deliberately not stored here, so there is exactly one
+// place that combines them and `available` can never be bypassed by a
+// stale `auto_answer` read.
+//
+// `available` defaults to `true` (a fresh install rings normally, same
+// "opt-out not opt-in" shape `BlfSettings::enabled` uses) and
+// `auto_answer` defaults to `false` (auto-answering every call is an
+// explicit opt-in, not a surprise a first-run user should hit) - hence
+// two different `#[serde(default...)]` strategies below, both needed for
+// a pre-this-field settings.json to migrate to the shipped defaults
+// rather than failing to load.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AvailabilitySettings {
+    /// `false` = "do not disturb": every incoming call is auto-rejected
+    /// (486 Busy Here via `hangup` before the frontend ever sees it ring -
+    /// see `sidecar.rs`'s `call_state:"incoming"` handling) and the PBX
+    /// routes it to voicemail. Always wins over `auto_answer` - see this
+    /// struct's own doc.
+    #[serde(default = "default_true")]
+    pub available: bool,
+    /// `true` = while `available`, the engine answers every incoming call
+    /// itself (`set_answer_mode` "auto") instead of waiting for a manual
+    /// `answer`. Ignored entirely while `available` is `false` (no calls
+    /// ever reach ringing in that state to auto-answer in the first
+    /// place).
+    #[serde(default)]
+    pub auto_answer: bool,
+}
+
+impl Default for AvailabilitySettings {
+    fn default() -> Self {
+        Self { available: true, auto_answer: false }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AdminSettings {
     /// Argon2 PHC hash string, e.g. "$argon2id$v=19$...". `None` until the
@@ -720,6 +768,12 @@ pub struct AppSettings {
     /// field's on-disk absence resolve to `BlfSettings::default()` (ON).
     #[serde(default)]
     pub blf: BlfSettings,
+    /// Availability + auto-answer - see `AvailabilitySettings`. Composed
+    /// last for the same "untouched surrounding list" reason as `blf`
+    /// above; `#[serde(default)]` resolves a pre-this-field settings.json
+    /// to `AvailabilitySettings::default()` (available, manual answer).
+    #[serde(default)]
+    pub availability: AvailabilitySettings,
 }
 
 fn default_favorites() -> Vec<FavoriteSlot> {
@@ -856,6 +910,49 @@ impl SettingsStore {
         let mut guard = self.inner.lock_or_recover();
         guard.blf.enabled = enabled;
         self.persist(&guard)
+    }
+
+    /// Sets `availability.available` and persists - the write half of
+    /// `commands::set_available`. The engine-facing follow-up (reapplying
+    /// the effective answer mode, auto-rejecting whatever's already
+    /// ringing) is the command's job, not this store's - same split
+    /// `update_blf_enabled` uses (this method only owns the persisted
+    /// value).
+    ///
+    /// Rolls back the in-memory value on a failed `persist()` (4R
+    /// RESILIENCE, 2026-07-18 re-review) - same `previous`-then-revert
+    /// shape `update_account` above already uses, needed here for the same
+    /// reason: `apply_answer_mode`/the `call_state:"incoming"` auto-reject
+    /// both read straight off `snapshot().availability` (sidecar.rs), so a
+    /// mutate-without-persist-guarantee would leave the ENGINE'S actual
+    /// behavior driven by a value that disk disagrees with (and that a
+    /// reload would silently discard) while the command layer reports
+    /// failure - a disk-full/permissions error would otherwise flip live
+    /// call-answering behavior with no durable record of it happening.
+    pub fn update_available(&self, available: bool) -> std::io::Result<()> {
+        let mut guard = self.inner.lock_or_recover();
+        let previous = guard.availability.available;
+        guard.availability.available = available;
+        if let Err(e) = self.persist(&guard) {
+            guard.availability.available = previous;
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Sets `availability.auto_answer` and persists - the write half of
+    /// `commands::set_auto_answer`. See `update_available`'s doc for why
+    /// the engine-facing reapply lives in the command instead, and for why
+    /// this also rolls back on a failed persist.
+    pub fn update_auto_answer(&self, auto_answer: bool) -> std::io::Result<()> {
+        let mut guard = self.inner.lock_or_recover();
+        let previous = guard.availability.auto_answer;
+        guard.availability.auto_answer = auto_answer;
+        if let Err(e) = self.persist(&guard) {
+            guard.availability.auto_answer = previous;
+            return Err(e);
+        }
+        Ok(())
     }
 
     pub fn update_bridge_auto_dial(&self, auto_dial: bool) -> std::io::Result<()> {
@@ -1577,6 +1674,168 @@ mod blf_settings_tests {
             !reloaded.snapshot().blf.enabled,
             "blf_enabled=false must survive a reload"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod availability_settings_tests {
+    use super::*;
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("centinelo-availability-settings-test.{name}.{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn defaults_are_available_and_manual() {
+        // available defaults ON (rings normally), auto_answer defaults OFF
+        // (opt-in) - see AvailabilitySettings's own doc for why these two
+        // fields use different #[serde(default...)] strategies.
+        let d = AvailabilitySettings::default();
+        assert!(d.available);
+        assert!(!d.auto_answer);
+        assert!(AppSettings::default().availability.available);
+        assert!(!AppSettings::default().availability.auto_answer);
+    }
+
+    #[test]
+    fn app_settings_without_availability_key_migrates_to_defaults() {
+        // A pre-this-field settings.json (or a hand-edited one missing the
+        // key) must NOT fail to load, and must resolve to the shipped
+        // defaults - same migration discipline every other AppSettings
+        // field follows. "9999" is a never-real test extension (public
+        // repo).
+        let json = r#"{"account":{"host":"pbx.example.test","ext":"9999","secret":"x"}}"#;
+        let app: AppSettings = serde_json::from_str(json).unwrap();
+        assert!(app.availability.available);
+        assert!(!app.availability.auto_answer);
+    }
+
+    #[test]
+    fn explicit_values_round_trip_through_json() {
+        let a = AvailabilitySettings { available: false, auto_answer: true };
+        let json = serde_json::to_string(&a).unwrap();
+        let back: AvailabilitySettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(a, back);
+        assert!(!back.available);
+        assert!(back.auto_answer);
+    }
+
+    #[test]
+    fn fresh_settings_store_starts_available_true_auto_answer_false() {
+        let dir = scratch_dir("fresh");
+        let store = SettingsStore::load(&dir).unwrap();
+        assert!(store.snapshot().availability.available);
+        assert!(!store.snapshot().availability.auto_answer);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_available_persists_and_survives_reload() {
+        let dir = scratch_dir("available-roundtrip");
+        let store = SettingsStore::load(&dir).unwrap();
+        store.update_available(false).unwrap();
+        assert!(!store.snapshot().availability.available);
+
+        let reloaded = SettingsStore::load(&dir).unwrap();
+        assert!(
+            !reloaded.snapshot().availability.available,
+            "available=false must survive a reload"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_auto_answer_persists_and_survives_reload() {
+        let dir = scratch_dir("auto-answer-roundtrip");
+        let store = SettingsStore::load(&dir).unwrap();
+        store.update_auto_answer(true).unwrap();
+        assert!(store.snapshot().availability.auto_answer);
+
+        let reloaded = SettingsStore::load(&dir).unwrap();
+        assert!(
+            reloaded.snapshot().availability.auto_answer,
+            "auto_answer=true must survive a reload"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_available_and_auto_answer_are_independent() {
+        // Flipping one field must not disturb the other - both live in the
+        // same struct but are set through separate commands (set_available/
+        // set_auto_answer), each touching only its own field.
+        let dir = scratch_dir("independent");
+        let store = SettingsStore::load(&dir).unwrap();
+        store.update_auto_answer(true).unwrap();
+        store.update_available(false).unwrap();
+        let snap = store.snapshot().availability;
+        assert!(!snap.available);
+        assert!(snap.auto_answer, "auto_answer must be untouched by update_available");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn update_available_rolls_back_in_memory_value_on_persist_failure() {
+        // 4R RESILIENCE (2026-07-18 re-review): same rollback guarantee
+        // `update_account` already has, and the same read-only-tmp-sibling
+        // technique `removes_the_orphaned_tmp_file_when_the_write_step_fails`
+        // (above, `persist_write_failure_tests`-adjacent) uses to force a
+        // deterministic write failure without needing an actually-full
+        // disk. sidecar.rs's apply_answer_mode/auto-reject both read
+        // straight off `snapshot().availability` - a mutate-without-
+        // rollback here would leave the ENGINE'S live behavior driven by a
+        // value disk (and a future reload) disagrees with, while this
+        // very call reports failure.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch_dir("available-rollback");
+        let store = SettingsStore::load(&dir).unwrap();
+        assert!(store.snapshot().availability.available, "starts available (default)");
+
+        let settings_path = dir.join("settings.json");
+        let tmp_path = tmp_sibling_path(&settings_path);
+        fs::write(&tmp_path, b"stale").unwrap();
+        fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o400)).unwrap();
+
+        let result = store.update_available(false);
+        assert!(result.is_err(), "persist must fail - the tmp sibling is read-only");
+        assert!(
+            store.snapshot().availability.available,
+            "in-memory available must roll back to true (the previous value) after a failed persist, not stay stuck on the failed write's false"
+        );
+
+        let _ = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn update_auto_answer_rolls_back_in_memory_value_on_persist_failure() {
+        // See update_available_rolls_back_in_memory_value_on_persist_failure
+        // just above for the full rationale - same technique, other field.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch_dir("auto-answer-rollback");
+        let store = SettingsStore::load(&dir).unwrap();
+        assert!(!store.snapshot().availability.auto_answer, "starts off (default)");
+
+        let settings_path = dir.join("settings.json");
+        let tmp_path = tmp_sibling_path(&settings_path);
+        fs::write(&tmp_path, b"stale").unwrap();
+        fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o400)).unwrap();
+
+        let result = store.update_auto_answer(true);
+        assert!(result.is_err(), "persist must fail - the tmp sibling is read-only");
+        assert!(
+            !store.snapshot().availability.auto_answer,
+            "in-memory auto_answer must roll back to false (the previous value) after a failed persist"
+        );
+
+        let _ = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600));
         let _ = fs::remove_dir_all(&dir);
     }
 }

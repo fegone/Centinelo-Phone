@@ -122,6 +122,15 @@ const state = {
   // split theme/locale already use).
   updater: initialUpdaterState(),
   updaterCheckOnStartup: true,
+  // ---- availability / auto-answer (shell task) ---------------------------
+  // Mirrors settings.availability - not part of a call_state machine, just
+  // the two persisted preferences (see settings.rs AvailabilitySettings and
+  // ui/js/call-availability.js's computeCallHandling for the decision they
+  // combine into, which Rust alone actually applies to the engine). Seeded
+  // optimistically to the shipped defaults so the titlebar button never
+  // flashes an unstyled state before boot()'s get_availability_settings
+  // resolves.
+  availability: { available: true, autoAnswer: false },
 };
 
 const $ = (id) => document.getElementById(id);
@@ -263,10 +272,40 @@ function renderTitlebarState() {
   }
 }
 
+/// Reflects state.availability.available onto the titlebar's #btn-availability
+/// dot + its title/aria-label (availability.titlebarAvailableTitle/
+/// titlebarDndTitle) and, if Settings is open, the Availability section's
+/// bool rows. auto_answer's OWN visible state lives only in the tray
+/// checkmark + the Settings bool row (setAvailabilityFieldsUI) - no
+/// titlebar affordance for it, per the shell task brief ("Titlebar/
+/// indicador: refleja el estado de disponibilidad", auto-answer isn't
+/// named there).
+function renderAvailabilityUI() {
+  const btn = $("btn-availability");
+  const available = state.availability.available;
+  btn.classList.toggle("available", available);
+  btn.classList.toggle("dnd", !available);
+  const label = t(available ? "availability.titlebarAvailableTitle" : "availability.titlebarDndTitle");
+  btn.title = label;
+  btn.setAttribute("aria-label", label);
+  setAvailabilityFieldsUI();
+}
+
+/// Settings pane's Availability bool rows - only touches the DOM if the
+/// rows exist (they're always in index.html, unlike the transcription
+/// section's conditional markup, so this is really just keeping the
+/// helper symmetric with the rest of this file's setBoolRowUI call sites).
+function setAvailabilityFieldsUI() {
+  if (!$("available-row")) return;
+  setBoolRowUI("available-row", state.availability.available);
+  setBoolRowUI("auto-answer-row", state.availability.autoAnswer);
+}
+
 function renderAll() {
   renderWatchlamp();
   renderRegPill();
   renderTitlebarState();
+  renderAvailabilityUI();
 }
 
 // ---------------------------------------------------------------------------
@@ -1694,7 +1733,7 @@ function remoteSttProbeText(result) {
 
 async function openSettings() {
   try {
-    const [account, theme, corePath, adminStatus, favorites, bridge, license] = await Promise.all([
+    const [account, theme, corePath, adminStatus, favorites, bridge, license, availability] = await Promise.all([
       invoke("get_account_settings"),
       invoke("get_theme"),
       invoke("get_core_binary_path"),
@@ -1702,11 +1741,21 @@ async function openSettings() {
       invoke("get_favorites"),
       invoke("get_bridge_settings"),
       invoke("get_license_settings"),
+      invoke("get_availability_settings"),
     ]);
     state.account = { ...state.account, ...account };
     state.adminConfigured = adminStatus.configured;
     state.adminUnlocked = adminStatus.unlocked;
     state.bridge = bridge;
+    // 4R RELIABILITY fix (2026-07-18): re-fetch rather than trust whatever
+    // state.availability already held - boot()'s own copy can be stale by
+    // the time Settings is opened (e.g. a tray toggle that landed before
+    // the availability-changed listener existed, or simply this window
+    // having been backgrounded through a change made from elsewhere before
+    // this fix's event wiring). Cheap (one extra command in the same
+    // Promise.all batch) and matches every other field in this list, which
+    // is already a fresh re-fetch on every open, not a state.* reuse.
+    state.availability = { available: !!availability.available, autoAnswer: !!availability.auto_answer };
 
     $("in-display-name").value = account.display_name || "";
     $("in-host").value = account.host || "";
@@ -1724,6 +1773,10 @@ async function openSettings() {
     renderLicenseFields(license);
     await openTranscriptionSettingsSection();
     setBoolRowUI("updater-check-on-startup-row", state.updaterCheckOnStartup);
+    // renderAvailabilityUI (not just setAvailabilityFieldsUI) so the
+    // titlebar dot is re-synced too, not only the Settings pane rows -
+    // belt-and-suspenders alongside the availability-changed listener.
+    renderAvailabilityUI();
     $("save-status").textContent = "";
     $("save-status").className = "status";
   } catch (e) {
@@ -2191,6 +2244,19 @@ function wireStaticHandlers() {
   $("btn-close").addEventListener("click", () => win.hide());
   $("btn-settings").addEventListener("click", openSettings);
   $("settings-back").addEventListener("click", closeSettings);
+  // Availability indicator doubles as a toggle (shell task) - same
+  // set_available command + optimistic-then-reconciled-by-render pattern
+  // the Settings pane's own available-row button uses below.
+  $("btn-availability").addEventListener("click", async () => {
+    const next = !state.availability.available;
+    try {
+      await invoke("set_available", { available: next });
+      state.availability.available = next;
+      renderAvailabilityUI();
+    } catch (e) {
+      showBanner(String(e), "err");
+    }
+  });
   $("btn-cancel-settings").addEventListener("click", closeSettings);
   $("btn-console").addEventListener("click", () => {
     invoke("open_console").catch((e) => showBanner(String(e), "err"));
@@ -2540,6 +2606,51 @@ function wireStaticHandlers() {
     });
   });
 
+  // ---- availability / auto-answer (shell task) ------------------------
+  // Immediate-save bool rows, same shape as updater-check-on-startup-row
+  // just below - not admin-gated (see index.html's own comment on this
+  // section). set_available/set_auto_answer also push the tray's own
+  // checkmarks back in sync (tray::sync_availability_menu) and reapply the
+  // effective answer mode - none of that needs anything further from here,
+  // this handler only owns the DOM + state.availability half.
+  //
+  // 4R RESILIENCE fix (2026-07-18): setBoolRowUI paints the CLICKED value
+  // optimistically before the invoke() even starts (so the row feels
+  // instant) - the catch used to only show an error banner, leaving the
+  // row painted on the failed value while state.availability (and the
+  // titlebar dot, and the engine itself) were all still on the OLD one.
+  // Reverting via renderAvailabilityUI()/setAvailabilityFieldsUI() on
+  // failure repaints every row from the last known-good state.availability
+  // (never touched on the failure path), so a rejected change snaps
+  // straight back instead of lying until the next unrelated repaint.
+  document.querySelectorAll("#available-row button").forEach((b) => {
+    b.addEventListener("click", async () => {
+      const value = b.dataset.boolChoice === "true";
+      setBoolRowUI("available-row", value);
+      try {
+        await invoke("set_available", { available: value });
+        state.availability.available = value;
+        renderAvailabilityUI();
+      } catch (e) {
+        showBanner(String(e), "err");
+        renderAvailabilityUI(); // revert available-row (and the titlebar dot) to the real, unchanged state.availability
+      }
+    });
+  });
+  document.querySelectorAll("#auto-answer-row button").forEach((b) => {
+    b.addEventListener("click", async () => {
+      const value = b.dataset.boolChoice === "true";
+      setBoolRowUI("auto-answer-row", value);
+      try {
+        await invoke("set_auto_answer", { auto_answer: value });
+        state.availability.autoAnswer = value;
+      } catch (e) {
+        showBanner(String(e), "err");
+        setAvailabilityFieldsUI(); // revert auto-answer-row to the real, unchanged state.availability
+      }
+    });
+  });
+
   // ---- auto-updater (roadmap debt fix) -------------------------------
   // Settings > About's "Check for updates" button + the check_on_startup
   // toggle (immediate-save, same shape as auto-dial-row/tel-handler-row
@@ -2647,6 +2758,24 @@ async function attachTauriListeners() {
     const message = e.payload && e.payload.message ? e.payload.message : String(e.payload);
     showBanner(t("provisioning.linkError", { message }), "err");
   });
+  // Availability/auto-answer (4R RELIABILITY fix, 2026-07-18): the tray
+  // menu's own "Available"/"Auto-answer" checkboxes change this preference
+  // WITHOUT going through invoke() at all (tray.rs's click handler calls
+  // settings::update_available/update_auto_answer directly) - before this
+  // listener existed, a tray-originated change never reached this window,
+  // so the titlebar dot and Settings pane bool rows kept showing the last
+  // value from boot/the last invoke() round-trip while the engine's real
+  // answer-mode/auto-reject behavior had already changed. tray.rs emits
+  // this from `sync_availability_menu`, the one point every route (tray
+  // clicks AND set_available/set_auto_answer) funnels through, so this
+  // single listener covers all of them - including a self-triggered one
+  // from this same window's own invoke() call, which is harmless
+  // (identical values, renderAvailabilityUI is idempotent).
+  await listen("availability-changed", (e) => {
+    const payload = e.payload || {};
+    state.availability = { available: !!payload.available, autoAnswer: !!payload.auto_answer };
+    renderAvailabilityUI();
+  });
 }
 
 // Premium receptionist console entry point - hidden unless the license
@@ -2704,13 +2833,14 @@ async function boot() {
   applyStaticI18n();
 
   try {
-    const [account, favorites, theme, sidecarStatus, blfStates, blfEnabled] = await Promise.all([
+    const [account, favorites, theme, sidecarStatus, blfStates, blfEnabled, availability] = await Promise.all([
       invoke("get_account_settings"),
       invoke("get_favorites"),
       invoke("get_theme"),
       invoke("sidecar_status"),
       invoke("get_blf_states"),
       invoke("get_blf_enabled"),
+      invoke("get_availability_settings"),
     ]);
     state.account = account;
     state.favorites = favorites;
@@ -2721,6 +2851,9 @@ async function boot() {
     // so the gate applies on the first paint; applyPremiumUI re-applies it once
     // the console's own license gate resolves further down boot().
     state.blfEnabled = blfEnabled === true;
+    if (availability) {
+      state.availability = { available: !!availability.available, autoAnswer: !!availability.auto_answer };
+    }
     applyTheme(theme || "auto");
   } catch (e) {
     console.error("boot load failed", e);
