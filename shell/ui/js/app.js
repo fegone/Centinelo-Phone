@@ -122,6 +122,15 @@ const state = {
   // split theme/locale already use).
   updater: initialUpdaterState(),
   updaterCheckOnStartup: true,
+  // ---- availability / auto-answer (shell task) ---------------------------
+  // Mirrors settings.availability - not part of a call_state machine, just
+  // the two persisted preferences (see settings.rs AvailabilitySettings and
+  // ui/js/call-availability.js's computeCallHandling for the decision they
+  // combine into, which Rust alone actually applies to the engine). Seeded
+  // optimistically to the shipped defaults so the titlebar button never
+  // flashes an unstyled state before boot()'s get_availability_settings
+  // resolves.
+  availability: { available: true, autoAnswer: false },
 };
 
 const $ = (id) => document.getElementById(id);
@@ -263,10 +272,40 @@ function renderTitlebarState() {
   }
 }
 
+/// Reflects state.availability.available onto the titlebar's #btn-availability
+/// dot + its title/aria-label (availability.titlebarAvailableTitle/
+/// titlebarDndTitle) and, if Settings is open, the Availability section's
+/// bool rows. auto_answer's OWN visible state lives only in the tray
+/// checkmark + the Settings bool row (setAvailabilityFieldsUI) - no
+/// titlebar affordance for it, per the shell task brief ("Titlebar/
+/// indicador: refleja el estado de disponibilidad", auto-answer isn't
+/// named there).
+function renderAvailabilityUI() {
+  const btn = $("btn-availability");
+  const available = state.availability.available;
+  btn.classList.toggle("available", available);
+  btn.classList.toggle("dnd", !available);
+  const label = t(available ? "availability.titlebarAvailableTitle" : "availability.titlebarDndTitle");
+  btn.title = label;
+  btn.setAttribute("aria-label", label);
+  setAvailabilityFieldsUI();
+}
+
+/// Settings pane's Availability bool rows - only touches the DOM if the
+/// rows exist (they're always in index.html, unlike the transcription
+/// section's conditional markup, so this is really just keeping the
+/// helper symmetric with the rest of this file's setBoolRowUI call sites).
+function setAvailabilityFieldsUI() {
+  if (!$("available-row")) return;
+  setBoolRowUI("available-row", state.availability.available);
+  setBoolRowUI("auto-answer-row", state.availability.autoAnswer);
+}
+
 function renderAll() {
   renderWatchlamp();
   renderRegPill();
   renderTitlebarState();
+  renderAvailabilityUI();
 }
 
 // ---------------------------------------------------------------------------
@@ -2191,6 +2230,19 @@ function wireStaticHandlers() {
   $("btn-close").addEventListener("click", () => win.hide());
   $("btn-settings").addEventListener("click", openSettings);
   $("settings-back").addEventListener("click", closeSettings);
+  // Availability indicator doubles as a toggle (shell task) - same
+  // set_available command + optimistic-then-reconciled-by-render pattern
+  // the Settings pane's own available-row button uses below.
+  $("btn-availability").addEventListener("click", async () => {
+    const next = !state.availability.available;
+    try {
+      await invoke("set_available", { available: next });
+      state.availability.available = next;
+      renderAvailabilityUI();
+    } catch (e) {
+      showBanner(String(e), "err");
+    }
+  });
   $("btn-cancel-settings").addEventListener("click", closeSettings);
   $("btn-console").addEventListener("click", () => {
     invoke("open_console").catch((e) => showBanner(String(e), "err"));
@@ -2704,13 +2756,14 @@ async function boot() {
   applyStaticI18n();
 
   try {
-    const [account, favorites, theme, sidecarStatus, blfStates, blfEnabled] = await Promise.all([
+    const [account, favorites, theme, sidecarStatus, blfStates, blfEnabled, availability] = await Promise.all([
       invoke("get_account_settings"),
       invoke("get_favorites"),
       invoke("get_theme"),
       invoke("sidecar_status"),
       invoke("get_blf_states"),
       invoke("get_blf_enabled"),
+      invoke("get_availability_settings"),
     ]);
     state.account = account;
     state.favorites = favorites;
@@ -2721,6 +2774,9 @@ async function boot() {
     // so the gate applies on the first paint; applyPremiumUI re-applies it once
     // the console's own license gate resolves further down boot().
     state.blfEnabled = blfEnabled === true;
+    if (availability) {
+      state.availability = { available: !!availability.available, autoAnswer: !!availability.auto_answer };
+    }
     applyTheme(theme || "auto");
   } catch (e) {
     console.error("boot load failed", e);

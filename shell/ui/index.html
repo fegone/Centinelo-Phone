@@ -23,6 +23,17 @@
     </div>
     <span class="state" id="titlebar-state" data-i18n="titlebarState.starting">Starting…</span>
     <div class="winbtns">
+      <!-- Availability indicator (shell task) - always present (unlike
+           btn-console/btn-transcript below, which are absent until their
+           own gate clears). Reflects state.availability.available via the
+           .available/.dnd classes (see app.js renderAvailabilityUI) using
+           the Vigilia --st-idle (jade, available)/--st-dnd (acromático, do
+           not disturb) tokens - never amber, amber is exclusively ringing.
+           Doubles as a toggle: clicking flips availability the same way
+           the tray menu's own "Available" checkbox does. -->
+      <button class="wbtn avail-btn" id="btn-availability" aria-label="Available" title="Available" data-i18n-aria-label="availability.titlebarAvailableTitle" data-i18n-title="availability.titlebarAvailableTitle">
+        <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true"><circle class="avail-dot" cx="5" cy="5" r="4.2" fill="currentColor"/></svg>
+      </button>
       <!-- Premium receptionist console - hidden until premium_capability_status
            says the license gate cleared (see ui/js/app.js boot(), console.rs
            is_unlocked). Absent by default, not merely disabled: matches the
