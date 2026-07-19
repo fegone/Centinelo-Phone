@@ -1369,6 +1369,57 @@ static void cmd_park(const struct cent_cmd *cmd)
 
 
 /*
+ * v1.5 "set_answer_mode" (see PROTOCOL.md "set_answer_mode"). Not
+ * call-scoped - no call_id - it flips a single per-account setting,
+ * so the shape is register()'s, not cmd_hold()'s: fetch the one UA this
+ * engine runs (primary_ua()), its account (ua_account(ua)), and drive
+ * baresip's own account-level answermode primitive.
+ *
+ * Why account_set_answermode() alone is enough (no extra global flag):
+ * baresip's modules/menu/menu.c reads account_answermode(acc) on every
+ * BEVENT_CALL_INCOMING and, when it is ANSWERMODE_AUTO, answers the call
+ * itself (menu_autoanwser_call() -> 200 OK). This engine loads the menu
+ * module - it owns the dial/answer/quit long-commands this very file
+ * dispatches through cmd_process_long(baresip_commands(), ...) - so that
+ * auto-answer path is live, and a runtime change here takes effect for
+ * the very next incoming INVITE. MANUAL (the system default, and what a
+ * fresh account starts at - ANSWERMODE_MANUAL == 0) leaves the menu
+ * path inert again, i.e. waits for the explicit "answer" command.
+ *
+ * Idempotent: account_set_answermode() just stores the value, so setting
+ * the same mode twice (or setting MANUAL on an already-MANUAL account)
+ * is a harmless no-op. The startup default is never changed here - only
+ * a command does. Success ack follows set_device()'s convention: no own
+ * event (there is no natural follow-up event), the optional request "id"
+ * correlation (emit_result, ok=true) acks it - see process_line().
+ */
+static void cmd_set_answer_mode(const struct cent_cmd *cmd)
+{
+	struct ua *ua = primary_ua();
+	struct account *acc;
+	enum answermode mode;
+	int err;
+
+	if (!ua) {
+		emit_error("set_answer_mode: no UA configured");
+		return;
+	}
+
+	acc = ua_account(ua);
+	if (!acc) {
+		emit_error("set_answer_mode: UA has no account");
+		return;
+	}
+
+	mode = cmd->answer_auto ? ANSWERMODE_AUTO : ANSWERMODE_MANUAL;
+
+	err = account_set_answermode(acc, mode);
+	if (err)
+		emit_errorf("set_answer_mode failed (%m)", err);
+}
+
+
+/*
  * v1.1 "set_device" (see PROTOCOL.md "devices"/"set_device"). Splits
  * cmd->device_name back into module/device the same way
  * devices_add_driver() built it (see that function's header comment) -
@@ -1698,6 +1749,10 @@ static void process_line(const char *line, size_t len)
 
 	case CENT_CMD_PARK:
 		cmd_park(&cmd);
+		break;
+
+	case CENT_CMD_SET_ANSWER_MODE:
+		cmd_set_answer_mode(&cmd);
 		break;
 
 	default:
