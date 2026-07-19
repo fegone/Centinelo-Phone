@@ -730,6 +730,25 @@ impl SidecarHandle {
     pub fn blf_unsubscribe(&self, ext: &str) -> Result<(), String> {
         blf_unsubscribe_raw(&self.0, ext)
     }
+
+    /// Reapplies the engine's answer mode from the CURRENT
+    /// `settings.availability` snapshot (`effective_answer_mode`) - called
+    /// after every `set_available`/`set_auto_answer` command (commands.rs)
+    /// and on every "registered" transition (`spawn_stdout_reader`, same
+    /// spot the favorites auto-subscribe loop already re-runs on every
+    /// re-REGISTER, since a fresh engine process/session has no memory of
+    /// a previous session's `set_answer_mode`). Always reads a fresh
+    /// snapshot rather than taking `available`/`auto_answer` as
+    /// parameters - this is what makes the "availability always wins, no
+    /// race" guarantee hold even if two settings changes land back to
+    /// back: every call recomputes from both CURRENT fields together, so
+    /// there's no window where a stale `auto_answer` value could be
+    /// combined with a newer `available` value or vice versa.
+    pub fn apply_answer_mode(&self) -> Result<(), String> {
+        let availability = self.0.settings.snapshot().availability;
+        let mode = effective_answer_mode(availability.available, availability.auto_answer);
+        self.send_cmd(serde_json::json!({"cmd": "set_answer_mode", "mode": mode}))
+    }
 }
 
 /// Shared implementation of [`SidecarHandle::blf_subscribe`], also used
@@ -1182,6 +1201,22 @@ fn spawn_stdout_reader(
                         if let Err(e) = blf_subscribe_raw(&shared, &ext) {
                             log::warn!("sidecar: blf_subscribe({ext}) failed: {e}");
                         }
+                    }
+                    // Availability/auto-answer (shell task, 2b): a fresh
+                    // engine process has no memory of a previous session's
+                    // `set_answer_mode` (same reasoning as the favorites
+                    // auto-subscribe just above), so this must re-run on
+                    // every "registered" transition too, not just at first
+                    // boot - covers the sidecar restarting (new account
+                    // settings, wss->udp fallback, ...) while
+                    // available/auto_answer are already persisted from an
+                    // earlier session.
+                    let availability = shared.settings.snapshot().availability;
+                    let mode = effective_answer_mode(availability.available, availability.auto_answer);
+                    if let Err(e) =
+                        send_cmd_raw(&shared, serde_json::json!({"cmd": "set_answer_mode", "mode": mode}))
+                    {
+                        log::warn!("sidecar: set_answer_mode({mode}) failed: {e}");
                     }
                 } else {
                     if state == "failed" || state == "unregistered" {
