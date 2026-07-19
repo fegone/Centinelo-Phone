@@ -116,7 +116,16 @@ fn toggle_available(app: &AppHandle) {
     if let Err(e) = app.state::<SidecarHandle>().apply_answer_mode() {
         log::warn!("tray: apply_answer_mode after toggling available failed: {e}");
     }
-    sync_availability_menu(app, new_available, current.auto_answer);
+    // Re-read auto_answer FRESH right before syncing (4R RESILIENCE,
+    // 2026-07-18 re-review) rather than reusing the `current` snapshot
+    // taken at the top of this function - another route (a Settings-pane
+    // set_auto_answer, say) could have changed it in the window between
+    // that read and this sync, and pushing the stale value here would
+    // momentarily show a wrong auto-answer checkmark/event even though
+    // `available` itself is correct. Same "read fresh right before
+    // syncing" discipline commands::set_available/set_auto_answer already
+    // follow for the field they didn't just set.
+    sync_availability_menu(app, new_available, settings.snapshot().availability.auto_answer);
 }
 
 /// Tray-menu-click counterpart to `commands::set_auto_answer` - see
@@ -132,7 +141,9 @@ fn toggle_auto_answer(app: &AppHandle) {
     if let Err(e) = app.state::<SidecarHandle>().apply_answer_mode() {
         log::warn!("tray: apply_answer_mode after toggling auto_answer failed: {e}");
     }
-    sync_availability_menu(app, current.available, new_auto_answer);
+    // Fresh re-read of `available` right before syncing - see
+    // toggle_available's own comment just above for why.
+    sync_availability_menu(app, settings.snapshot().availability.available, new_auto_answer);
 }
 
 pub fn setup(app: &App, premium: &PremiumHandle) -> tauri::Result<()> {
