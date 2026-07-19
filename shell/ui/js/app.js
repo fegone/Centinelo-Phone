@@ -2613,6 +2613,16 @@ function wireStaticHandlers() {
   // checkmarks back in sync (tray::sync_availability_menu) and reapply the
   // effective answer mode - none of that needs anything further from here,
   // this handler only owns the DOM + state.availability half.
+  //
+  // 4R RESILIENCE fix (2026-07-18): setBoolRowUI paints the CLICKED value
+  // optimistically before the invoke() even starts (so the row feels
+  // instant) - the catch used to only show an error banner, leaving the
+  // row painted on the failed value while state.availability (and the
+  // titlebar dot, and the engine itself) were all still on the OLD one.
+  // Reverting via renderAvailabilityUI()/setAvailabilityFieldsUI() on
+  // failure repaints every row from the last known-good state.availability
+  // (never touched on the failure path), so a rejected change snaps
+  // straight back instead of lying until the next unrelated repaint.
   document.querySelectorAll("#available-row button").forEach((b) => {
     b.addEventListener("click", async () => {
       const value = b.dataset.boolChoice === "true";
@@ -2623,6 +2633,7 @@ function wireStaticHandlers() {
         renderAvailabilityUI();
       } catch (e) {
         showBanner(String(e), "err");
+        renderAvailabilityUI(); // revert available-row (and the titlebar dot) to the real, unchanged state.availability
       }
     });
   });
@@ -2635,6 +2646,7 @@ function wireStaticHandlers() {
         state.availability.autoAnswer = value;
       } catch (e) {
         showBanner(String(e), "err");
+        setAvailabilityFieldsUI(); // revert auto-answer-row to the real, unchanged state.availability
       }
     });
   });
