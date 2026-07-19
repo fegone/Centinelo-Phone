@@ -296,6 +296,55 @@ static void test_cmd_park(void)
 }
 
 
+/*
+ * v1.5: "set_answer_mode" (see PROTOCOL.md "set_answer_mode") - not
+ * call-scoped (no call_id, unlike park/mute/etc above), required "mode"
+ * restricted to "auto"/"manual", same shape as set_device's "kind"
+ * validation (test_cmd_devices_and_set_device() above).
+ */
+static void test_cmd_set_answer_mode(void)
+{
+	struct cent_cmd cmd;
+	const char *err = NULL;
+
+	CHECK(CENT_CMD_SET_ANSWER_MODE ==
+	      decode("{\"cmd\":\"set_answer_mode\",\"mode\":\"auto\"}",
+		     &cmd, &err), "set_answer_mode auto: type");
+	CHECK(cmd.answer_auto, "set_answer_mode auto: answer_auto true");
+
+	CHECK(CENT_CMD_SET_ANSWER_MODE ==
+	      decode("{\"cmd\":\"set_answer_mode\",\"mode\":\"manual\"}",
+		     &cmd, &err), "set_answer_mode manual: type");
+	CHECK(!cmd.answer_auto, "set_answer_mode manual: answer_auto false");
+
+	/* case-insensitive mode value, matching set_device's 'kind' and
+	 * cmd's own case-insensitivity. */
+	CHECK(CENT_CMD_SET_ANSWER_MODE ==
+	      decode("{\"cmd\":\"set_answer_mode\",\"mode\":\"AUTO\"}",
+		     &cmd, &err), "set_answer_mode: mode is case-insensitive");
+	CHECK(cmd.answer_auto,
+	      "set_answer_mode: 'AUTO' still sets answer_auto true");
+
+	CHECK(CENT_CMD_NONE ==
+	      decode("{\"cmd\":\"set_answer_mode\"}", &cmd, &err),
+	      "set_answer_mode: missing mode -> CENT_CMD_NONE");
+	CHECK(err != NULL && strstr(err, "mode") != NULL,
+	      "set_answer_mode: missing mode -> errmsg mentions 'mode'");
+
+	CHECK(CENT_CMD_NONE ==
+	      decode("{\"cmd\":\"set_answer_mode\",\"mode\":\"sideways\"}",
+		     &cmd, &err),
+	      "set_answer_mode: invalid mode -> CENT_CMD_NONE");
+	CHECK(err != NULL && strstr(err, "mode") != NULL,
+	      "set_answer_mode: invalid mode -> errmsg mentions 'mode'");
+
+	/* no call_id decoded for this command at all - it's a per-account
+	 * setting, not call-scoped (see cmd.h's answer_auto comment). */
+	CHECK(!cmd.have_call_id,
+	      "set_answer_mode: never decodes call_id (not call-scoped)");
+}
+
+
 static void test_cmd_unknown_and_malformed(void)
 {
 	struct cent_cmd cmd;
@@ -1354,6 +1403,7 @@ int main(void)
 	test_cmd_call_id_optional();
 	test_cmd_answer_call_id();
 	test_cmd_park();
+	test_cmd_set_answer_mode();
 	test_cmd_dtmf();
 	test_cmd_mute();
 	test_cmd_transfer();

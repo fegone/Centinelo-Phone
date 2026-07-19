@@ -227,6 +227,22 @@ enum cent_cmd_type cent_cmd_decode(struct cent_cmd *out,
 		optional_call_id(od, out);
 		out->type = CENT_CMD_PARK;
 	}
+	else if (!str_casecmp(cmd, "set_answer_mode")) {
+		/* v1.5 - see PROTOCOL.md "set_answer_mode". Not call-scoped
+		 * (no call_id) - flips the one account's answermode. 'mode'
+		 * is required, same "reject anything but the two known
+		 * values" shape as set_device's 'kind' validation above. */
+		const char *mode = odict_string(od, "mode");
+
+		if (!mode || (str_casecmp(mode, "auto") &&
+			      str_casecmp(mode, "manual"))) {
+			*errmsg = "set_answer_mode: 'mode' must be \"auto\" or"
+				  " \"manual\"";
+			return CENT_CMD_NONE;
+		}
+		out->answer_auto = !str_casecmp(mode, "auto");
+		out->type = CENT_CMD_SET_ANSWER_MODE;
+	}
 	else {
 		out->type = CENT_CMD_UNKNOWN;
 	}

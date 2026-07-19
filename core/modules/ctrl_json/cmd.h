@@ -48,6 +48,7 @@ enum cent_cmd_type {
 	CENT_CMD_TAP_START,    /**< v1.2 - see PROTOCOL.md "tap_start" */
 	CENT_CMD_TAP_STOP,     /**< v1.2 - see PROTOCOL.md "tap_stop" */
 	CENT_CMD_PARK,         /**< v1.3 - see PROTOCOL.md "park" */
+	CENT_CMD_SET_ANSWER_MODE, /**< v1.5 - see PROTOCOL.md "set_answer_mode" */
 };
 
 enum {
@@ -105,6 +106,15 @@ struct cent_cmd {
 				     *   growing a second one - see
 				     *   PROTOCOL.md "park". */
 	bool mute_on;
+
+	bool answer_auto;   /**< set_answer_mode: true = "auto" (this
+			     *   account answers every incoming INVITE with 200
+			     *   OK, via baresip's per-account answermode), false
+			     *   = "manual" (the default - wait for the "answer"
+			     *   command). v1.5 - see PROTOCOL.md
+			     *   "set_answer_mode". Stored as a bool, not the
+			     *   baresip enum, to keep this header dependency-free;
+			     *   ctrl_json.c maps it to enum answermode. */
 
 	/** v1.1 request/response correlation (see PROTOCOL.md) - unlike
 	 * every other field above, valid regardless of .type: decoded
