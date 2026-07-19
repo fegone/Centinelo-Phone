@@ -222,6 +222,32 @@ const ENTRIES = [
     "Ya está definida — déjala en blanco para no cambiarla.",
   ],
   ["settings.secretNotSet", "Not set yet.", "Ainda não definida.", "Aún no definida."],
+
+  // -- availability / auto-answer (shell task) - NOT admin-gated, same
+  // free-tier settings.rs bucket as theme/locale/updater check_on_startup.
+  // Shared between the Settings pane bool rows and the titlebar indicator
+  // button's aria-label/title (see app.js renderAvailability). Ámbar is
+  // NEVER used here (Vigilia rule: amber is exclusively ringing) - the
+  // available state uses --st-idle (jade), do-not-disturb uses --st-dnd
+  // (acromático).
+  ["availability.settingsHeading", "Availability", "Disponibilidade", "Disponibilidad"],
+  ["availability.availableLabel", "Available", "Disponível", "Disponible"],
+  [
+    "availability.availableHint",
+    "While off, every incoming call goes straight to voicemail — nothing rings here.",
+    "Enquanto desativado, toda chamada recebida vai direto para o correio de voz — nada toca aqui.",
+    "Mientras esté desactivado, cada llamada entrante va directo al buzón de voz — aquí no suena nada.",
+  ],
+  ["availability.autoAnswerLabel", "Auto-answer", "Atendimento automático", "Contestar automático"],
+  [
+    "availability.autoAnswerHint",
+    "Answer every incoming call automatically while you're available. Has no effect while Do Not Disturb is on.",
+    "Atende automaticamente toda chamada recebida enquanto você estiver disponível. Não tem efeito com Não perturbe ativado.",
+    "Contesta automáticamente cada llamada entrante mientras estás disponible. No tiene efecto con No molestar activado.",
+  ],
+  ["availability.titlebarAvailableTitle", "Available — click for Do Not Disturb", "Disponível — clique para ativar Não perturbe", "Disponible — clic para activar No molestar"],
+  ["availability.titlebarDndTitle", "Do Not Disturb — click to become available", "Não perturbe — clique para ficar disponível", "No molestar — clic para estar disponible"],
+
   ["settings.favoritesHeading", "Favorites", "Favoritos", "Favoritos"],
   [
     "settings.favoritesHint",
