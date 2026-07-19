@@ -1763,6 +1763,7 @@ async function openSettings() {
     renderLicenseFields(license);
     await openTranscriptionSettingsSection();
     setBoolRowUI("updater-check-on-startup-row", state.updaterCheckOnStartup);
+    setAvailabilityFieldsUI();
     $("save-status").textContent = "";
     $("save-status").className = "status";
   } catch (e) {
@@ -2586,6 +2587,39 @@ function wireStaticHandlers() {
       try {
         await invoke("set_register_tel_handler", { enabled: value });
         if (state.bridge) state.bridge.register_tel_handler = value;
+      } catch (e) {
+        showBanner(String(e), "err");
+      }
+    });
+  });
+
+  // ---- availability / auto-answer (shell task) ------------------------
+  // Immediate-save bool rows, same shape as updater-check-on-startup-row
+  // just below - not admin-gated (see index.html's own comment on this
+  // section). set_available/set_auto_answer also push the tray's own
+  // checkmarks back in sync (tray::sync_availability_menu) and reapply the
+  // effective answer mode - none of that needs anything further from here,
+  // this handler only owns the DOM + state.availability half.
+  document.querySelectorAll("#available-row button").forEach((b) => {
+    b.addEventListener("click", async () => {
+      const value = b.dataset.boolChoice === "true";
+      setBoolRowUI("available-row", value);
+      try {
+        await invoke("set_available", { available: value });
+        state.availability.available = value;
+        renderAvailabilityUI();
+      } catch (e) {
+        showBanner(String(e), "err");
+      }
+    });
+  });
+  document.querySelectorAll("#auto-answer-row button").forEach((b) => {
+    b.addEventListener("click", async () => {
+      const value = b.dataset.boolChoice === "true";
+      setBoolRowUI("auto-answer-row", value);
+      try {
+        await invoke("set_auto_answer", { auto_answer: value });
+        state.availability.autoAnswer = value;
       } catch (e) {
         showBanner(String(e), "err");
       }

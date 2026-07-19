@@ -256,6 +256,32 @@
         </div>
       </div>
 
+      <!-- Availability / auto-answer (shell task) - NOT admin-gated at the
+           command level (settings.rs AvailabilitySettings's own doc), same
+           "visual lock only" bucket theme-row/locale-row above and
+           updater-check-on-startup-row below already document. Also
+           reachable from the titlebar's #btn-availability button and the
+           tray menu's own checkboxes - all three stay in sync (see app.js
+           renderAvailabilityUI / setAvailabilityFieldsUI and tray.rs
+           sync_availability_menu). -->
+      <h2 data-i18n="availability.settingsHeading">Availability</h2>
+      <div class="settings-card">
+        <div class="field">
+          <label data-i18n="availability.availableLabel">Available</label>
+          <div class="themerow" role="radiogroup" aria-label="Available" id="available-row" data-i18n-aria-label="availability.availableLabel">
+            <button data-bool-choice="false" data-i18n="settings.boolOff">Off</button><button data-bool-choice="true" class="on" data-i18n="settings.boolOn">On</button>
+          </div>
+          <p class="hint" style="margin:6px 0 0" data-i18n="availability.availableHint">While off, every incoming call goes straight to voicemail — nothing rings here.</p>
+        </div>
+        <div class="field" style="margin-top:10px">
+          <label data-i18n="availability.autoAnswerLabel">Auto-answer</label>
+          <div class="themerow" role="radiogroup" aria-label="Auto-answer" id="auto-answer-row" data-i18n-aria-label="availability.autoAnswerLabel">
+            <button data-bool-choice="false" class="on" data-i18n="settings.boolOff">Off</button><button data-bool-choice="true" data-i18n="settings.boolOn">On</button>
+          </div>
+          <p class="hint" style="margin:6px 0 0" data-i18n="availability.autoAnswerHint">Answer every incoming call automatically while you're available. Has no effect while Do Not Disturb is on.</p>
+        </div>
+      </div>
+
       <h2 data-i18n="settings.phoneSystem">Phone system</h2>
       <div class="settings-card">
         <div class="field">
