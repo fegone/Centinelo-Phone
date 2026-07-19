@@ -4,7 +4,7 @@
 
 use tauri::menu::{CheckMenuItem, IsMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{App, AppHandle, Manager, Wry};
+use tauri::{App, AppHandle, Emitter, Manager, Wry};
 
 use std::sync::Arc;
 
@@ -54,17 +54,37 @@ impl AvailabilityTrayHandles {
 }
 
 /// Best-effort push of the current availability/auto-answer values onto the
-/// tray's own checkmarks - a no-op if the tray hasn't been built yet (or at
-/// all, e.g. under `cfg(test)`/e2e harnesses that never call
-/// `tray::setup`), matching this file's existing "never fails app startup"
-/// tolerance for anything tray-related. Called from
-/// `commands::set_available`/`set_auto_answer` right after persisting, so a
-/// change made from the titlebar button or the Settings pane bool rows is
-/// reflected here too, not just a change made from the tray menu itself.
+/// tray's own checkmarks, AND onto the webview via an `availability-changed`
+/// event - the SINGLE common point every route that changes this preference
+/// funnels through (`commands::set_available`/`set_auto_answer` AND this
+/// file's own `toggle_available`/`toggle_auto_answer`), so all 3 surfaces
+/// (tray checkmarks, titlebar dot, Settings pane bool rows) can never
+/// disagree with each other for longer than one round-trip.
+///
+/// 4R RELIABILITY (2026-07-18 re-review): before this fix, a change made
+/// from the TRAY only updated the tray's own checkmarks - there was no
+/// `emit` reaching the webview at all, so app.js had nothing to `listen`
+/// for. The titlebar dot and Settings pane bool rows kept showing whatever
+/// `state.availability` happened to be from the last boot/command-invoke
+/// round-trip, silently diverging from the engine's real, already-changed
+/// behavior (e.g. tray -> Do Not Disturb really rejects calls with 486,
+/// while the titlebar dot kept showing "Available" until the next reload).
+/// app.js's `listen("availability-changed", ...)` (attachTauriListeners)
+/// is the other half of this fix.
+///
+/// A no-op tray sync if the tray hasn't been built yet (or at all, e.g.
+/// under `cfg(test)`/e2e harnesses that never call `tray::setup`),
+/// matching this file's existing "never fails app startup" tolerance for
+/// anything tray-related - the `emit` still fires regardless (harmless,
+/// swallowed by Tauri, if no window is listening yet).
 pub fn sync_availability_menu(app: &AppHandle, available: bool, auto_answer: bool) {
     if let Some(handles) = app.try_state::<AvailabilityTrayHandles>() {
         handles.sync(available, auto_answer);
     }
+    let _ = app.emit(
+        "availability-changed",
+        serde_json::json!({"available": available, "auto_answer": auto_answer}),
+    );
 }
 
 /// Also used by bridge.rs and deeplink.rs - any external dial trigger

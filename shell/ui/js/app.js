@@ -1733,7 +1733,7 @@ function remoteSttProbeText(result) {
 
 async function openSettings() {
   try {
-    const [account, theme, corePath, adminStatus, favorites, bridge, license] = await Promise.all([
+    const [account, theme, corePath, adminStatus, favorites, bridge, license, availability] = await Promise.all([
       invoke("get_account_settings"),
       invoke("get_theme"),
       invoke("get_core_binary_path"),
@@ -1741,11 +1741,21 @@ async function openSettings() {
       invoke("get_favorites"),
       invoke("get_bridge_settings"),
       invoke("get_license_settings"),
+      invoke("get_availability_settings"),
     ]);
     state.account = { ...state.account, ...account };
     state.adminConfigured = adminStatus.configured;
     state.adminUnlocked = adminStatus.unlocked;
     state.bridge = bridge;
+    // 4R RELIABILITY fix (2026-07-18): re-fetch rather than trust whatever
+    // state.availability already held - boot()'s own copy can be stale by
+    // the time Settings is opened (e.g. a tray toggle that landed before
+    // the availability-changed listener existed, or simply this window
+    // having been backgrounded through a change made from elsewhere before
+    // this fix's event wiring). Cheap (one extra command in the same
+    // Promise.all batch) and matches every other field in this list, which
+    // is already a fresh re-fetch on every open, not a state.* reuse.
+    state.availability = { available: !!availability.available, autoAnswer: !!availability.auto_answer };
 
     $("in-display-name").value = account.display_name || "";
     $("in-host").value = account.host || "";
@@ -1763,7 +1773,10 @@ async function openSettings() {
     renderLicenseFields(license);
     await openTranscriptionSettingsSection();
     setBoolRowUI("updater-check-on-startup-row", state.updaterCheckOnStartup);
-    setAvailabilityFieldsUI();
+    // renderAvailabilityUI (not just setAvailabilityFieldsUI) so the
+    // titlebar dot is re-synced too, not only the Settings pane rows -
+    // belt-and-suspenders alongside the availability-changed listener.
+    renderAvailabilityUI();
     $("save-status").textContent = "";
     $("save-status").className = "status";
   } catch (e) {
@@ -2732,6 +2745,24 @@ async function attachTauriListeners() {
   await listen("provisioning://error", (e) => {
     const message = e.payload && e.payload.message ? e.payload.message : String(e.payload);
     showBanner(t("provisioning.linkError", { message }), "err");
+  });
+  // Availability/auto-answer (4R RELIABILITY fix, 2026-07-18): the tray
+  // menu's own "Available"/"Auto-answer" checkboxes change this preference
+  // WITHOUT going through invoke() at all (tray.rs's click handler calls
+  // settings::update_available/update_auto_answer directly) - before this
+  // listener existed, a tray-originated change never reached this window,
+  // so the titlebar dot and Settings pane bool rows kept showing the last
+  // value from boot/the last invoke() round-trip while the engine's real
+  // answer-mode/auto-reject behavior had already changed. tray.rs emits
+  // this from `sync_availability_menu`, the one point every route (tray
+  // clicks AND set_available/set_auto_answer) funnels through, so this
+  // single listener covers all of them - including a self-triggered one
+  // from this same window's own invoke() call, which is harmless
+  // (identical values, renderAvailabilityUI is idempotent).
+  await listen("availability-changed", (e) => {
+    const payload = e.payload || {};
+    state.availability = { available: !!payload.available, autoAnswer: !!payload.auto_answer };
+    renderAvailabilityUI();
   });
 }
 

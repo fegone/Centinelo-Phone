@@ -612,10 +612,13 @@ pub fn get_availability_settings(settings: State<Arc<SettingsStore>>) -> Availab
 /// the engine comes up, same reasoning `set_blf_enabled`'s own
 /// best-effort teardown loop documents for its unsubscribe calls.
 /// `app` (auto-injected by Tauri, not part of the frontend's `invoke`
-/// payload) is only used to keep the tray menu's own "Available"
-/// checkmark in sync (`tray::sync_availability_menu`) - see that
-/// function's doc for why this must reach the tray from here too, not
-/// just from the tray's own click handler.
+/// payload) is used to keep the tray menu's own "Available" checkmark AND
+/// the webview (titlebar dot, Settings pane bool rows) in sync via
+/// `tray::sync_availability_menu` - that function both re-checks the tray
+/// item and emits `availability-changed`, the single point every route
+/// funnels through so the frontend's own `invoke("set_available", ...)`
+/// caller (already updating its local `state.availability` optimistically)
+/// and this event-driven path can never leave the 3 surfaces disagreeing.
 #[tauri::command(rename_all = "snake_case")]
 pub fn set_available(
     app: tauri::AppHandle,
