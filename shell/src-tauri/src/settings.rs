@@ -918,19 +918,41 @@ impl SettingsStore {
     /// ringing) is the command's job, not this store's - same split
     /// `update_blf_enabled` uses (this method only owns the persisted
     /// value).
+    ///
+    /// Rolls back the in-memory value on a failed `persist()` (4R
+    /// RESILIENCE, 2026-07-18 re-review) - same `previous`-then-revert
+    /// shape `update_account` above already uses, needed here for the same
+    /// reason: `apply_answer_mode`/the `call_state:"incoming"` auto-reject
+    /// both read straight off `snapshot().availability` (sidecar.rs), so a
+    /// mutate-without-persist-guarantee would leave the ENGINE'S actual
+    /// behavior driven by a value that disk disagrees with (and that a
+    /// reload would silently discard) while the command layer reports
+    /// failure - a disk-full/permissions error would otherwise flip live
+    /// call-answering behavior with no durable record of it happening.
     pub fn update_available(&self, available: bool) -> std::io::Result<()> {
         let mut guard = self.inner.lock_or_recover();
+        let previous = guard.availability.available;
         guard.availability.available = available;
-        self.persist(&guard)
+        if let Err(e) = self.persist(&guard) {
+            guard.availability.available = previous;
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// Sets `availability.auto_answer` and persists - the write half of
     /// `commands::set_auto_answer`. See `update_available`'s doc for why
-    /// the engine-facing reapply lives in the command instead.
+    /// the engine-facing reapply lives in the command instead, and for why
+    /// this also rolls back on a failed persist.
     pub fn update_auto_answer(&self, auto_answer: bool) -> std::io::Result<()> {
         let mut guard = self.inner.lock_or_recover();
+        let previous = guard.availability.auto_answer;
         guard.availability.auto_answer = auto_answer;
-        self.persist(&guard)
+        if let Err(e) = self.persist(&guard) {
+            guard.availability.auto_answer = previous;
+            return Err(e);
+        }
+        Ok(())
     }
 
     pub fn update_bridge_auto_dial(&self, auto_dial: bool) -> std::io::Result<()> {
@@ -1754,6 +1776,66 @@ mod availability_settings_tests {
         let snap = store.snapshot().availability;
         assert!(!snap.available);
         assert!(snap.auto_answer, "auto_answer must be untouched by update_available");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn update_available_rolls_back_in_memory_value_on_persist_failure() {
+        // 4R RESILIENCE (2026-07-18 re-review): same rollback guarantee
+        // `update_account` already has, and the same read-only-tmp-sibling
+        // technique `removes_the_orphaned_tmp_file_when_the_write_step_fails`
+        // (above, `persist_write_failure_tests`-adjacent) uses to force a
+        // deterministic write failure without needing an actually-full
+        // disk. sidecar.rs's apply_answer_mode/auto-reject both read
+        // straight off `snapshot().availability` - a mutate-without-
+        // rollback here would leave the ENGINE'S live behavior driven by a
+        // value disk (and a future reload) disagrees with, while this
+        // very call reports failure.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch_dir("available-rollback");
+        let store = SettingsStore::load(&dir).unwrap();
+        assert!(store.snapshot().availability.available, "starts available (default)");
+
+        let settings_path = dir.join("settings.json");
+        let tmp_path = tmp_sibling_path(&settings_path);
+        fs::write(&tmp_path, b"stale").unwrap();
+        fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o400)).unwrap();
+
+        let result = store.update_available(false);
+        assert!(result.is_err(), "persist must fail - the tmp sibling is read-only");
+        assert!(
+            store.snapshot().availability.available,
+            "in-memory available must roll back to true (the previous value) after a failed persist, not stay stuck on the failed write's false"
+        );
+
+        let _ = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn update_auto_answer_rolls_back_in_memory_value_on_persist_failure() {
+        // See update_available_rolls_back_in_memory_value_on_persist_failure
+        // just above for the full rationale - same technique, other field.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch_dir("auto-answer-rollback");
+        let store = SettingsStore::load(&dir).unwrap();
+        assert!(!store.snapshot().availability.auto_answer, "starts off (default)");
+
+        let settings_path = dir.join("settings.json");
+        let tmp_path = tmp_sibling_path(&settings_path);
+        fs::write(&tmp_path, b"stale").unwrap();
+        fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o400)).unwrap();
+
+        let result = store.update_auto_answer(true);
+        assert!(result.is_err(), "persist must fail - the tmp sibling is read-only");
+        assert!(
+            !store.snapshot().availability.auto_answer,
+            "in-memory auto_answer must roll back to false (the previous value) after a failed persist"
+        );
+
+        let _ = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600));
         let _ = fs::remove_dir_all(&dir);
     }
 }
