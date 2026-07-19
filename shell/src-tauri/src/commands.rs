@@ -611,8 +611,14 @@ pub fn get_availability_settings(settings: State<Arc<SettingsStore>>) -> Availab
 /// "registered" transition (sidecar.rs) reapplies it anyway the moment
 /// the engine comes up, same reasoning `set_blf_enabled`'s own
 /// best-effort teardown loop documents for its unsubscribe calls.
+/// `app` (auto-injected by Tauri, not part of the frontend's `invoke`
+/// payload) is only used to keep the tray menu's own "Available"
+/// checkmark in sync (`tray::sync_availability_menu`) - see that
+/// function's doc for why this must reach the tray from here too, not
+/// just from the tray's own click handler.
 #[tauri::command(rename_all = "snake_case")]
 pub fn set_available(
+    app: tauri::AppHandle,
     settings: State<Arc<SettingsStore>>,
     sidecar: State<SidecarHandle>,
     available: bool,
@@ -621,11 +627,14 @@ pub fn set_available(
     if let Err(e) = sidecar.apply_answer_mode() {
         log::warn!("set_available({available}): apply_answer_mode failed (will reapply on next registration): {e}");
     }
+    crate::tray::sync_availability_menu(&app, available, settings.snapshot().availability.auto_answer);
     Ok(())
 }
 
+/// See `set_available`'s doc for why `app` is here.
 #[tauri::command(rename_all = "snake_case")]
 pub fn set_auto_answer(
+    app: tauri::AppHandle,
     settings: State<Arc<SettingsStore>>,
     sidecar: State<SidecarHandle>,
     auto_answer: bool,
@@ -634,6 +643,7 @@ pub fn set_auto_answer(
     if let Err(e) = sidecar.apply_answer_mode() {
         log::warn!("set_auto_answer({auto_answer}): apply_answer_mode failed (will reapply on next registration): {e}");
     }
+    crate::tray::sync_availability_menu(&app, settings.snapshot().availability.available, auto_answer);
     Ok(())
 }
 
