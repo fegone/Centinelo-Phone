@@ -1213,8 +1213,35 @@ fn spawn_stdout_reader(
                 // still-established call's state.
                 let call_state = value.get("state").and_then(Value::as_str).unwrap_or("");
                 if let Some(call_id) = value.get("call_id").and_then(Value::as_str) {
-                    let mut phases = shared.call_phases.lock_or_recover();
-                    apply_call_state_transition(&mut phases, call_id, call_state);
+                    {
+                        let mut phases = shared.call_phases.lock_or_recover();
+                        apply_call_state_transition(&mut phases, call_id, call_state);
+                    }
+                    // Availability "do not disturb" auto-reject (shell task):
+                    // fires BEFORE the emit() below reaches the frontend at
+                    // all, on every single "incoming" - not just the first
+                    // of a session - since `available` can flip mid-session
+                    // and every subsequent incoming call must honor whatever
+                    // it's set to right now. should_auto_reject_incoming
+                    // ignores auto_answer entirely (see its own doc):
+                    // nothing should ever ring while unavailable, auto-
+                    // answer or not. Best-effort/logged, not fatal - a
+                    // failed hangup here just means this one call rings
+                    // through instead of the shell silently eating a real
+                    // incoming call with no signal anyone can act on.
+                    if call_state == "incoming"
+                        && should_auto_reject_incoming(shared.settings.snapshot().availability.available)
+                    {
+                        log::info!(
+                            "sidecar: available=false, auto-rejecting incoming call_id={call_id} (486 Busy Here -> voicemail)"
+                        );
+                        if let Err(e) = send_cmd_raw(
+                            &shared,
+                            serde_json::json!({"cmd": "hangup", "call_id": call_id}),
+                        ) {
+                            log::warn!("sidecar: auto-reject hangup({call_id}) failed: {e}");
+                        }
+                    }
                 } else {
                     // Silently dropping this would be R4 all over again via
                     // a different trigger: a tracked call_id's own
