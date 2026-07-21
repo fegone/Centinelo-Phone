@@ -894,6 +894,134 @@ transports' `sipsub_alloc()` paths directly) — not attempted this
 session, judged too deep/risky for a bounded patch without it (risk of
 regressing `blind_transfer`'s already-working wss path).
 
+## F7 set_answer_mode (v1.5)
+
+Methodology: same as F3-F6 — a small Python harness (not checked in,
+scratch tooling), NDJSON over two `run-spike.sh` child processes
+(dual-contact self-bridge, same trick as (b) `blind_transfer`), a
+`wait_for(predicate, timeout)` primitive, read-only PBX-side snapshots.
+No PBX configuration was changed. Test extension for this session is
+`1100` (secret rotated since the `1000`-era scenarios above — see
+workspace `CLAUDE.md`, ext number itself isn't sensitive, only the
+secret/host are), `max_contacts: 2`, confirmed via `pjsip show aor
+1100` before starting. Engine rebuilt fresh this session
+(`cmake --build core/deps/baresip/build`) from commit `1739441` ("feat
+(core): add set_answer_mode command for auto-answer (PROTOCOL v1.5)")
+before any of the runs below — the binary on disk from the prior
+session (2026-07-16) predated that commit, so a stale-binary false pass
+was ruled out by rebuilding first. Unit suite re-run as part of this
+same rebuild: `ctest --test-dir core/modules/ctrl_json/test/build`,
+ASan (`CENT_ASAN=ON`), **1/1 passed** (the single `ctrl_json_test`
+binary, 279 checks incl. `test_cmd_set_answer_mode()`), confirming the
+existing unit coverage still holds against this session's rebuild
+before adding real-PBX evidence on top.
+
+### (k) `set_answer_mode` input validation (local, no call)
+
+**PASS.** Single registered engine instance, no PBX call involved
+(pure decode/dispatch-path checks, `cmd.c`'s `cent_cmd_decode()`):
+
+| Input | Result |
+|---|---|
+| `{"cmd":"set_answer_mode","mode":"foo","id":"bad-foo"}` | `{"event":"error","message":"set_answer_mode: 'mode' must be \"auto\" or \"manual\""}` |
+| `{"cmd":"set_answer_mode","id":"bad-missing"}` (no `mode` key) | same `error` message |
+| `{"cmd":"set_answer_mode","mode":"","id":"bad-empty"}` | same `error` message |
+| `{"cmd":"set_answer_mode","mode":"AUTO","id":"ok-case"}` | `{"event":"result","id":"ok-case","ok":true}` — case-insensitivity confirmed |
+
+Process (`baresip` child) stayed alive and responsive after all three
+invalid inputs (confirmed by the fourth, valid command still getting a
+normal `result` back on the same connection, no restart) — no crash on
+bad input.
+
+### (l) idempotency
+
+**PASS.** Same instance, `{"cmd":"set_answer_mode","mode":"auto",...}`
+sent twice in a row: both got `{"event":"result","ok":true}` — second
+call a harmless no-op, no error, process alive after.
+
+### (m) `mode:"auto"` — real incoming INVITE, auto-answered with zero driver intervention
+
+**PASS — the actual gap this task existed to close.**
+
+Two engine instances, both registered as ext `1100` (dual-contact, same
+trick as scenario (b)): **B** gets `{"cmd":"set_answer_mode",
+"mode":"auto","id":"set-auto"}` → `result ok:true` *before* any call
+exists. **A** then dials `sip:1100@<pbx host>` (its own extension —
+rings the other contact, B, exactly like (b)). B receives `call_state`
+`incoming`. **The driver never sends B an `answer` command at all** —
+the harness only ever wrote `set_answer_mode` to B's stdin, nothing
+else. B's own `call_state` reached `established` on its own, sourced
+purely from `modules/menu/menu.c`'s `BEVENT_CALL_INCOMING` handler
+reading `account_answermode(acc) == ANSWERMODE_AUTO` (per
+`PROTOCOL.md`'s v1.5 "Changes from v1.4" description of the mechanism)
+— this is the one thing unit tests structurally cannot prove (they stop
+at "the command parses and calls `account_set_answermode()`"; they
+don't run a real `BEVENT_CALL_INCOMING` through `menu.c` against a real
+INVITE).
+
+PBX-side corroboration, ~20-24s after `established` (past the ICE
+settle window, finding #1 below), read-only `asterisk -rx`:
+
+```
+$ asterisk -rx "core show channels verbose"
+PJSIP/1100-0000027b   dialOne-with-exten   1100   2  Up  Dial  PJSIP/1100/sip:1100@<ip>  BridgeID 385700b1-...
+PJSIP/1100-0000027d   from-internal                1  Up  AppDial (Outgoing Line)         BridgeID 385700b1-...
+2 active channels, 1 active call
+
+$ asterisk -rx "pjsip show channelstats"      (t=20s)
+ 385700b1 1100-0000027b   00:00:20 ulaw   Receive Count=882  Lost=0 Pct=0   Transmit Count=0
+ 385700b1 1100-0000027d   00:00:20 ulaw   Receive Count=0    Lost=1 Pct=0   Transmit Count=0
+$ asterisk -rx "pjsip show channelstats"      (t=24s, +4s)
+ 385700b1 1100-0000027b   00:00:24 ulaw   Receive Count=1109 Lost=0 Pct=0   Transmit Count=0
+ 385700b1 1100-0000027d   00:00:24 ulaw   Receive Count=0    Lost=1 Pct=0   Transmit Count=0
+```
+
+`1100-0000027b` is the `Dial` leg toward B (the auto-answered party) —
+its **Receive count grew 882 → 1109 (+227 packets over 4s, ≈57 pps,**
+consistent with 20ms-ptime G.711 `ulaw` — the same codec/rate math
+scenario (a) uses), i.e. real RTP genuinely flowing from B into
+Asterisk, not just a SIP-level `established` self-report. Both channels
+share one `BridgeID` (`385700b1-...`) — a genuine 2-party bridge, same
+positive signal (b) used. After `hangup` from A: `core show channels` →
+**0 active channels** — clean teardown, no orphaned call/leg on the PBX.
+
+(`1100-0000027d`'s own counters stayed at 0 in this window — A's own
+leg's ICE/DTLS hadn't finished settling yet by t=24s, independent of
+B's leg, which is consistent with finding #1 below: each leg's ICE
+negotiation settles on its own clock, not synchronized. Doesn't weaken
+the B-leg evidence above, which is what this scenario needed to prove.)
+
+### (n) `mode:"manual"` (default) — contrast, does NOT self-answer
+
+**PASS.** Same dual-contact setup, B explicitly set to
+`{"mode":"manual"}` this time (`result ok:true`). A dials `sip:1100@
+<pbx host>` again. B gets `call_state` `incoming`. Driver then
+**waits 8s doing nothing** — no `established` arrived (timeout, as
+expected: zero events seen on B in that window). PBX-side snapshot
+during that window corroborates independently: `core show channels
+verbose` showed the call still `Ringing`/`Ring` (not `Up`), **no
+`BridgeID` assigned yet**, and `pjsip show channelstats` returned
+`not valid` for all three channels present — i.e. the PBX itself has
+no RTP-capable session for this call yet, consistent with "never
+answered" rather than merely "driver didn't check in time". Driver then
+sent an explicit `{"cmd":"answer","call_id":"...",...}` to B →
+`call_state` `established` fired immediately, confirming `manual` mode
+still answers correctly *when told to* (this isn't "auto-answer is
+broken", it's a genuine contrast: `auto` self-answers, `manual`
+doesn't, both by design). Hangup → PBX back to **0 active channels**.
+
+### Conclusion
+
+`set_answer_mode` is now real-PBX e2e-verified end to end: `auto`
+answers a genuine incoming `INVITE` with zero driver/UI intervention
+and produces real, growing RTP counters PBX-side on the answered leg;
+`manual` (the default) correctly does *not* self-answer under the same
+conditions, and still answers normally when explicitly told to; invalid
+`mode` values are rejected without crashing the engine; the command is
+idempotent. No bugs found in `set_answer_mode`/`menu.c`'s auto-answer
+path itself. See `PROTOCOL.md`'s v1.5 status paragraph for the updated
+one-line status.
+
 ## Summary of findings (for future F-phases)
 
 1. ICE needs real settle time here (~15-20s) before relying on live RTP
@@ -1016,3 +1144,19 @@ regressing `blind_transfer`'s already-working wss path).
     genuinely open interop question, not yet root-caused past this
     point — see `PROTOCOL.md` "Planned" `park` entry for the suggested
     next debugging step.
+15. **(F7)** A stale build binary is worth checking for explicitly
+    before trusting *any* e2e run, not just reasoning "the source has
+    the feature": this session's on-disk `core/deps/baresip/build`
+    predated the `set_answer_mode` commit by two days (`git log` on
+    `cmd.c`/`ctrl_json.c` vs. the binary's mtime caught it before
+    running anything). Rebuilt fine once noticed —
+    `cmd.c`/`ctrl_json.c` compile into `ctrl_json.so`, a
+    dynamically-loaded app module, so only that `.so` needed
+    relinking, not the main `baresip` binary itself. Against the stale
+    binary this specific command would have failed *loudly* (a plain
+    `{"event":"error","message":"unknown cmd 'set_answer_mode'"}`, not
+    a false `ok:true`) — but a loud, wrong-looking failure is still a
+    real time sink if it's mistaken for a genuine engine bug instead of
+    "forgot to rebuild"; always rebuild (or at minimum diff source
+    commit dates against build-artifact mtimes) before an e2e pass that
+    matters, don't assume a build dir from a prior session is current.

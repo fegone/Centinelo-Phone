@@ -137,15 +137,26 @@ for the full changelog and `core/E2E-F1.md` for anything added there:
   this session's time budget didn't extend to).
 
 **v1.5 status: one new command, `set_answer_mode` — unit-tested (`cmd.c`
-parsing, `test/test_main.c`, ASan-clean, see "Changes from v1.4" below),
-NOT YET e2e-verified against the real test PBX.** v1.5 is **fully
-backward compatible with v1.4**: every existing command/event is
-byte-for-byte unchanged; v1.5 only *adds* `set_answer_mode`. A real
-incoming-call auto-answer run against the test PBX (confirming the
-account actually answers the *next* INVITE with 200 OK, not merely that
-the command itself parses/dispatches without an `error`) is still
-outstanding — see "Changes from v1.4" for exactly what was and wasn't
-exercised this session.
+parsing, `test/test_main.c`, ASan-clean, see "Changes from v1.4" below)
+AND e2e-verified against the real test PBX (2026-07-21) — see
+`core/E2E-F1.md` "F7 set_answer_mode".** v1.5 is **fully backward
+compatible with v1.4**: every existing command/event is byte-for-byte
+unchanged; v1.5 only *adds* `set_answer_mode`. The real incoming-call
+auto-answer run against the test PBX (dual-contact self-bridge on ext
+1100, engine rebuilt fresh from the `set_answer_mode` commit first) is
+done: `mode:"auto"` answered a genuine incoming `INVITE` with **zero**
+driver-sent `answer` command, corroborated PBX-side by growing RTP
+receive counters (`pjsip show channelstats`) on the answered leg and a
+shared `BridgeID`; `mode:"manual"` (the default) correctly did **not**
+self-answer under the same conditions (PBX-side: still `Ringing`, no
+`BridgeID`, `channelstats` `not valid` — consistent with never
+answered) and still answered normally once told to via an explicit
+`answer` command; invalid `mode` values are rejected without crashing
+the engine; idempotent. No bugs found in `set_answer_mode`/`menu.c`'s
+auto-answer path. See "Changes from v1.4" below for the implementation
+detail and `core/E2E-F1.md` "F7" for the full run, PBX evidence, and
+findings (incl. a stale-build-binary gotcha this session caught before
+it could produce a false result).
 
 ## Framing
 
@@ -253,7 +264,7 @@ either, both, or neither.
 | `{"cmd":"tap_start","dir":"/abs/path","call_id":"..."}` | **New in v1.2.** Starts tapping the resolved call's audio to two new mono 16-bit PCM WAV files under `dir` (required — an absolute, already-existing, writable directory; this command doesn't create it): `<dir>/<call_id>-rx.wav` (the remote party — decoded incoming audio) and `<dir>/<call_id>-tx.wav` (the local party — outgoing audio before encode). `call_id` is optional like every other call-scoped command (falls back to "the current call" — see `resolve_call()`); resolving to no call is an `error`, same as `hold`/`mute`/etc, **not** an "arm for the next call" — a tap always targets a call that already exists at the moment this command runs (see `core/E2E-F1.md` "F4 audio tap" for why the e2e sequence dials first, then taps). Errors (all `error` events, none of them crash the engine or the call): no current/resolvable call, the call has no audio yet, `dir` is missing/empty, a tap is already running for this call (stop it first), or the output file(s) couldn't be opened (bad `dir`, not writable, ...). Both files exist on disk (0 bytes) as soon as this command succeeds; each one's real WAV header is committed on that direction's first actual audio frame, not synchronously with this command (see `core/modules/ctrl_json/wav_writer.h`) — typically sub-20ms later on an already-flowing call. Sample rate is whatever the negotiated codec's audio path actually runs at, taken from each direction's real first frame, never guessed — this build's actual account (`audio_codecs=pcmu,pcma`, see `run-spike.sh`) runs at 8000 Hz mono; see `core/E2E-F1.md` "F4 audio tap" for the real numbers. Output is always mono — a source frame with more than one channel is downmixed (integer average) first, though this build's actual codec set never produces one (G.711 decodes to mono) — see `audiotap.c` `write_frame()`. |
 | `{"cmd":"tap_stop","call_id":"..."}` | **New in v1.2.** Stops a running tap on the resolved call, finalizing both WAV headers (correct final `RIFF`/`data` chunk sizes — a tap is also auto-finalized on call teardown even without this command, see "Events" `tap_state` row). Errors if the resolved call doesn't exist, has no audio, or has no tap currently running. |
 | `{"cmd":"park","ext":"<pilot ext>","call_id":"..."}` | **New in v1.3.** Parks a call by blind-transferring it (REFER, the exact same `call_transfer()` mechanism `blind_transfer` already uses) to `ext` — the target parking lot's **pilot** extension. `ext` is **required**, not defaulted — a pilot extension is per-PBX configuration, not a protocol constant this engine should guess at (unlike `*43`/`*60` test codes, which `park` never used either). Same target-address shape as `blf_subscribe`'s own `ext` (`sip:<ext>@<same PBX host the account registered against>` — see `build_pbx_ext_uri()` in `ctrl_json.c`, shared by both). `call_id` is optional, same `resolve_call()` fallback convention as every other call-scoped command. **The confirmation event's `ext` is always the pilot extension targeted, never a specific auto-assigned parking slot** — see "Events" `park` row for why, and this file's own v1.3/v1.4 status paragraphs plus `core/E2E-F1.md` "F5" for this command's current real-PBX e2e status (**v1.4: works end-to-end over udp/tcp; over wss, the async failure now at least surfaces as an `error` event instead of vanishing silently — see v1.4 status paragraph**). |
-| `{"cmd":"set_answer_mode","mode":"auto"}` | **New in v1.5.** Sets the engine's one account (`ua_account(primary_ua())`) to auto-answer (`mode:"auto"`) or wait for an explicit `answer` command (`mode:"manual"`, the default a fresh account starts at). `mode` is **required**, case-insensitive, exactly `"auto"` or `"manual"` — anything else is an `error`. Not call-scoped (no `call_id` — this flips a per-account setting, not a per-call one). Maps directly to baresip's own `account_set_answermode()`; when `ANSWERMODE_AUTO`, the `menu` module (already loaded — see `core/BUILD.md` "Module selection") answers every subsequent incoming `INVITE` itself on `BEVENT_CALL_INCOMING`, so the effect is live starting with the very next incoming call, no restart/re-register needed. Idempotent (setting the same mode twice, or `manual` on an already-manual account, is a harmless no-op). No dedicated confirmation event — success is acked the same way `set_device` is: only via the optional request/response `id` correlation (`result`, `ok:true` — see "Events"), since there's no natural per-call follow-up event for an account-level setting. Unit-tested (`cmd.c`/`test/test_main.c`) — **not yet e2e-verified against the real test PBX**, see this file's own top-of-file v1.5 status paragraph. |
+| `{"cmd":"set_answer_mode","mode":"auto"}` | **New in v1.5.** Sets the engine's one account (`ua_account(primary_ua())`) to auto-answer (`mode:"auto"`) or wait for an explicit `answer` command (`mode:"manual"`, the default a fresh account starts at). `mode` is **required**, case-insensitive, exactly `"auto"` or `"manual"` — anything else is an `error`. Not call-scoped (no `call_id` — this flips a per-account setting, not a per-call one). Maps directly to baresip's own `account_set_answermode()`; when `ANSWERMODE_AUTO`, the `menu` module (already loaded — see `core/BUILD.md` "Module selection") answers every subsequent incoming `INVITE` itself on `BEVENT_CALL_INCOMING`, so the effect is live starting with the very next incoming call, no restart/re-register needed. Idempotent (setting the same mode twice, or `manual` on an already-manual account, is a harmless no-op). No dedicated confirmation event — success is acked the same way `set_device` is: only via the optional request/response `id` correlation (`result`, `ok:true` — see "Events"), since there's no natural per-call follow-up event for an account-level setting. Unit-tested (`cmd.c`/`test/test_main.c`) and **e2e-verified against the real test PBX** (2026-07-21) — see `core/E2E-F1.md` "F7 set_answer_mode" and this file's own top-of-file v1.5 status paragraph. |
 
 Unknown `cmd` values, a required field missing/wrong-typed (e.g. `dial`
 without `uri`, `mute` without a real boolean `on`, `set_device` with a
@@ -587,10 +598,12 @@ already relies on changed shape or behavior. One new command:
   `core/modules/ctrl_json/test/CMakeLists.txt`. Compiles clean (no new
   warnings) as part of a full `core/deps/baresip` engine build with the
   `ctrl_json` app module, this session, from a clean submodule checkout
-  (`core/BUILD.md` steps 2-4, patches 0001-0005 applied). **Not yet
-  e2e-verified against the real test PBX** — this session verified the
-  decode/dispatch/build path only, not a real incoming call actually
-  auto-answering; see this file's own top-of-file v1.5 status paragraph.
+  (`core/BUILD.md` steps 2-4, patches 0001-0005 applied). That original
+  session verified the decode/dispatch/build path only, not a real
+  incoming call actually auto-answering — **now e2e-verified against
+  the real test PBX (2026-07-21)**, see `core/E2E-F1.md` "F7
+  set_answer_mode" and this file's own top-of-file v1.5 status
+  paragraph.
 
 ## Planned (still not in v1.5)
 
