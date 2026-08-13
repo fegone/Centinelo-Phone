@@ -39,7 +39,47 @@ pub fn run() {
             tray::show_and_focus(app);
         }))
         .plugin(tauri_plugin_deep_link::init())
-        .plugin(tauri_plugin_log::Builder::default().build())
+        // HIPAA remote-install hardening (2026-08-13): `sidecar.rs`'s
+        // `log::info!("sidecar event: {value}")` (module `app_lib::sidecar`)
+        // deliberately logs every ctrl_json event verbatim - README.md's own
+        // "Architecture: shell <-> sidecar" section and E2E.md document this
+        // as the intentional e2e/dev evidence trail (`RUST_LOG=info` +
+        // terminal capture). Those events include `call_state`'s `peer`
+        // field - the caller's real SIP URI/phone number
+        // (`core/PROTOCOL.md` "Events") - and, if transcription is ever
+        // turned on, `transcription.rs`'s `log::debug!("transcribe[{call_id}]:
+        // {line}")` (module `app_lib::transcription`) relays the transcribe
+        // sidecar's raw stdout, including `segment` events carrying the
+        // actual transcribed speech text.
+        //
+        // `tauri_plugin_log::Builder::default()` (the previous code here)
+        // targets BOTH stdout AND `TargetKind::LogDir` - the OS-specific
+        // logs folder (`%LOCALAPPDATA%\...\logs` on Windows) - meaning a
+        // plain production install silently accumulates every caller's
+        // phone number (and, if transcription is on, their words) in a
+        // plaintext file on disk forever, independent of any Settings
+        // toggle. That's exactly the kind of "PHI in a path nobody looks
+        // at" this task's audit called out - worth closing regardless of
+        // whether this particular install ever turns transcription on,
+        // since it's a structural default, not a per-install choice.
+        //
+        // Fix: keep stdout logging exactly as documented (unfiltered - the
+        // e2e/dev capture workflow in E2E.md/README.md depends on it
+        // unchanged), but exclude these two call-content-bearing modules
+        // from the persistent `LogDir` file. Every other module (sidecar
+        // crash/restart diagnostics, updater, activation, HID, ...) still
+        // gets written there for real troubleshooting - only the two log
+        // sites that can carry a caller's identity or their words are
+        // scoped out of the durable, on-disk copy.
+        .plugin(
+            tauri_plugin_log::Builder::default()
+                .targets([
+                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stdout),
+                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::LogDir { file_name: None })
+                        .filter(|metadata| !is_call_content_log_target(metadata.target())),
+                ])
+                .build(),
+        )
         // Auto-updater (roadmap debt fix, see shell/README.md
         // "Auto-updater") - endpoint/pubkey come from tauri.conf.json's
         // own `plugins.updater` block, nothing to configure here.
@@ -218,4 +258,47 @@ pub fn run() {
                 }
             }
         });
+}
+
+/// `true` for the two Rust module paths that log a caller's phone number
+/// (`sidecar`'s `call_state`/`reg_state`/... event trace) or their
+/// transcribed words (`transcription`'s raw sidecar-stdout relay) - see
+/// this file's own log-plugin setup comment for why those two, and only
+/// those two, are kept out of the persistent `LogDir` file. `log::Metadata::target()`
+/// defaults to the logging module's own path (`app_lib::sidecar`,
+/// `app_lib::transcription` - confirmed against `shell/E2E.md`'s own
+/// captured `[app_lib::sidecar][INFO] ...` lines), so a prefix match is
+/// exact and stable regardless of which function inside either module
+/// logged.
+fn is_call_content_log_target(target: &str) -> bool {
+    const MODULES: [&str; 2] = ["app_lib::sidecar", "app_lib::transcription"];
+    MODULES.iter().any(|m| target == *m || target.starts_with(&format!("{m}::")))
+}
+
+#[cfg(test)]
+mod log_target_tests {
+    use super::*;
+
+    #[test]
+    fn sidecar_and_transcription_targets_are_excluded() {
+        assert!(is_call_content_log_target("app_lib::sidecar"));
+        assert!(is_call_content_log_target("app_lib::transcription"));
+    }
+
+    #[test]
+    fn unrelated_targets_are_kept() {
+        assert!(!is_call_content_log_target("app_lib::updater"));
+        assert!(!is_call_content_log_target("app_lib::activation"));
+        assert!(!is_call_content_log_target("app_lib::hid::device"));
+        assert!(!is_call_content_log_target("tauri"));
+    }
+
+    #[test]
+    fn a_target_that_merely_contains_the_word_is_not_a_false_positive() {
+        // Prefix match, not substring match - a hypothetical future module
+        // like `app_lib::sidecar_metrics` (unrelated to the call-content
+        // logging this exists to scope out) must not be swept in by
+        // accident just because it shares a prefix word.
+        assert!(!is_call_content_log_target("app_lib::sidecar_metrics"));
+    }
 }
