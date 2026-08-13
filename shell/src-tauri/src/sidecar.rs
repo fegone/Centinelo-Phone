@@ -23,6 +23,12 @@ use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+
+// Windows-only: hides the console window that would otherwise flash/be visible when a
+// GUI subsystem app (this shell) spawns a console-subsystem child. See the notes
+// where CREATE_NO_WINDOW is applied to the engine Command below.
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -1186,9 +1192,12 @@ fn force_kill(pid: u32) {
 }
 #[cfg(windows)]
 fn force_kill(pid: u32) {
-    let _ = Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/F"])
-        .status();
+    let mut cmd = Command::new("taskkill");
+    cmd.args(["/PID", &pid.to_string(), "/F"]);
+    // CREATE_NO_WINDOW: avoid a flashing console when force-killing the
+    // engine's PID. Same rationale as the engine spawn site below.
+    cmd.creation_flags(0x0800_0000);
+    let _ = cmd.status();
 }
 
 fn supervisor_loop(shared: Arc<Shared>) {
@@ -1254,6 +1263,18 @@ fn supervisor_loop(shared: Arc<Shared>) {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        // CREATE_NO_WINDOW (0x08000000): on Windows, launching a
+        // console-subsystem executable from this GUI app would otherwise pop a
+        // black console window next to the softphone. That window is not just
+        // cosmetic ugliness - it is *uncloseable by the user*: closing it kills
+        // the engine, the supervisor below detects the exit and respawns it, and
+        // a fresh console appears - so the user ends up fighting our own
+        // recovery loop. Hiding it via creation_flags does NOT touch the
+        // stdout/stderr pipes above, which the shell still reads the engine's
+        // control channel over; do not remove this thinking it only helps
+        // debugging. macOS path is a no-op (CommandExt doesn't exist there).
+        #[cfg(windows)]
+        cmd.creation_flags(0x0800_0000);
         if let Some(pin) = account.tls_pin_sha256.as_deref().filter(|p| !p.is_empty()) {
             cmd.env("CENT_TLS_PIN", pin);
         }

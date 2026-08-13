@@ -72,6 +72,12 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+
+// Windows-only: see the CREATE_NO_WINDOW notes on spawn_transcribe /
+// spawn_ensure_model below. Hides the console window when this GUI app spawns a
+// console-subsystem child (centinelo-transcribe), without affecting stdio pipes.
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -816,8 +822,8 @@ struct TranscribeArgs {
 }
 
 fn spawn_transcribe(args: &TranscribeArgs) -> std::io::Result<Child> {
-    Command::new(&args.bin)
-        .arg("run")
+    let mut cmd = Command::new(&args.bin);
+    cmd.arg("run")
         .arg("--rx")
         .arg(&args.rx)
         .arg("--tx")
@@ -834,8 +840,15 @@ fn spawn_transcribe(args: &TranscribeArgs) -> std::io::Result<Child> {
         .arg(&args.meta_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        .stderr(Stdio::piped());
+    // CREATE_NO_WINDOW (0x08000000): centinelo-transcribe is a
+    // console-subsystem binary; on Windows this GUI app would otherwise flash
+    // a console window each time transcription runs. Does not affect the
+    // stdout/stderr pipes above (control channel + transcript output). No-op
+    // on macOS where CommandExt doesn't exist.
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000);
+    cmd.spawn()
 }
 
 /// Writes this call's metadata to `<tap_dir>/meta.json` and returns its
@@ -1360,16 +1373,21 @@ fn parse_ensure_model_line(line: &str) -> Option<EnsureModelLine> {
 }
 
 fn spawn_ensure_model(bin: &Path, tier: ModelTier, models_dir: &Path) -> std::io::Result<Child> {
-    Command::new(bin)
-        .arg("ensure-model")
+    let mut cmd = Command::new(bin);
+    cmd.arg("ensure-model")
         .arg("--tier")
         .arg(tier_cli_name(tier))
         .arg("--models-dir")
         .arg(models_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        .stderr(Stdio::piped());
+    // CREATE_NO_WINDOW: same rationale as spawn_transcribe above - hide the
+    // console window when shelling out to centinelo-transcribe ensure-model
+    // on Windows. Stdout/stderr pipes (progress stream) are unaffected.
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000);
+    cmd.spawn()
 }
 
 /// Ensures `tier`'s model (+ its VAD companion) is present and
