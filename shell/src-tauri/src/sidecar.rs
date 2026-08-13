@@ -198,6 +198,55 @@ fn should_auto_reject_incoming(available: bool) -> bool {
     !available
 }
 
+/// Reapplies the operator's persisted codec preference (`codecs-shell`
+/// feature, `core/PROTOCOL.md` v1.6 `set_codecs`) on every
+/// `reg_state:registered` transition - same "a fresh engine process has no
+/// memory of a previous session's live command" reasoning the
+/// `set_answer_mode` reapply just above this call site already documents,
+/// and the same hook (registration, not spawn - regint=120's periodic
+/// re-REGISTER hits this too, harmlessly, since `set_codecs` is idempotent
+/// to resend).
+///
+/// **What "wins" at a cold start, and why** (task requirement: define this
+/// explicitly). `SpawnPlan::build`'s generated account config always writes
+/// a static `audio_codecs=pcmu,pcma;` line (see `write_config_file` below),
+/// deliberately UNCHANGED by this feature: still G.711-only, still bare
+/// (unsuffixed) names. That's safe for `pcmu`/`pcma` (both really are
+/// 8000/1, the bare-name default baresip's own `account_set_audio_codecs()`
+/// parser assumes), but core/PROTOCOL.md's `set_codecs` doc documents a
+/// real footgun for any codec that ISN'T 8000/1: a bare `"opus"` in that
+/// same static-config parser silently fails to match (opus is 48000/2),
+/// leaving the account's codec list empty, which baresip then treats as
+/// "unrestricted", i.e. exactly the opposite of what a caller who thought
+/// they'd restricted the account to G.711 actually asked for. Because of
+/// that, this shell must NEVER write a user's codec preference straight
+/// into the static config file if it can include a non-8000/1 codec like
+/// Opus; only `core/modules/ctrl_json/ctrl_json.c`'s `cmd_set_codecs()` is
+/// safe against this, since it always builds each entry as the real
+/// `"<name>/<srate>/<ch>"` from the live `struct aucodec` it resolved, never
+/// a bare name.
+///
+/// So: an operator who has never opened the codecs panel
+/// (`preferred_order` empty) gets exactly today's unchanged behavior - the
+/// static config's G.711-only baseline, nothing sent here. An operator who
+/// HAS set a preference (which may include Opus) gets it reapplied via this
+/// live, suffix-safe `set_codecs` command right after every registration -
+/// always before any call in the normal flow, so "takes effect starting
+/// the next call" (core/PROTOCOL.md) is, for all practical purposes,
+/// "immediately" for a freshly (re)started session. Best-effort/logged, not
+/// fatal, same as every other post-registration reapply in this block - a
+/// failure here just means the account falls back to the static baseline
+/// for this session, not a lost call.
+fn reapply_codec_preference(shared: &Shared) {
+    let preferred = shared.settings.snapshot().codecs.preferred_order;
+    if preferred.is_empty() {
+        return; // never customized - the static config's own baseline stands
+    }
+    if let Err(e) = send_cmd_raw(shared, serde_json::json!({"cmd": "set_codecs", "codecs": preferred})) {
+        log::warn!("sidecar: set_codecs(reapply) failed: {e}");
+    }
+}
+
 #[cfg(test)]
 mod availability_tests {
     use super::*;
@@ -1188,6 +1237,20 @@ fn spawn_stdout_reader(
                 if let Err(e) = send_cmd_raw(&shared, serde_json::json!({"cmd": "devices"})) {
                     log::warn!("sidecar: couldn't request the initial devices enumeration: {e}");
                 }
+                // Same idea, for codecs (codecs-shell feature): fires a
+                // `codecs` query on every spawn so a `codecs` event (with
+                // this build's real `available`/`active`) is already
+                // sitting in the frontend by the time an operator opens
+                // Settings, instead of only ever populating on an explicit
+                // `sidecar_list_codecs` from that screen. No server-side
+                // cache needed here (unlike `known_devices`) - nothing in
+                // this crate reads the *live* codec list, only the
+                // *persisted preference* (`reapply_codec_preference`,
+                // fired later on `reg_state:registered`) - this call
+                // exists purely so the frontend doesn't start blank.
+                if let Err(e) = send_cmd_raw(&shared, serde_json::json!({"cmd": "codecs"})) {
+                    log::warn!("sidecar: couldn't request the initial codecs enumeration: {e}");
+                }
             } else if event_name == "reg_state" {
                 let state = value.get("state").and_then(Value::as_str).unwrap_or("");
                 if state == "registered" {
@@ -1225,6 +1288,7 @@ fn spawn_stdout_reader(
                     {
                         log::warn!("sidecar: set_answer_mode({mode}) failed: {e}");
                     }
+                    reapply_codec_preference(&shared);
                 } else {
                     if state == "failed" || state == "unregistered" {
                         shared.registered.store(false, Ordering::SeqCst);

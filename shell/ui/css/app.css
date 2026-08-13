@@ -325,3 +325,84 @@ html[data-os="mac"] .settings-header { padding-left: 78px; }
 
 .sidecar-whisper { flex: none; display: flex; align-items: center; gap: 6px; padding: 6px 8px; margin: 0 2px 6px; font: 500 10px/1.4 var(--font-mono); color: var(--text-3); letter-spacing: .03em; }
 .sidecar-whisper .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--st-busy); flex: none; }
+
+/* == Settings → Audio & devices → Audio codecs (Plate 09) ==================
+   Ported from premium/design/mockups/settings-codecs.html (PR #6
+   design/settings-codecs) - class names/structure kept verbatim for
+   fidelity, values already this app's own Vigilia tokens (tokens.css),
+   never re-derived. See index.html's own comment on why this section's
+   markup sits BEFORE (outside) .settings-locked-region below. */
+
+/* Scopes #lock-overlay's position:absolute;inset:0 to exactly this
+   wrapper's box instead of the whole #settings-body - see index.html's
+   comment at this class's one usage for the full rationale. */
+.settings-locked-region { position: relative; }
+
+.sect h3 { margin: 0; font: 700 10px/1 var(--font-mono); letter-spacing: .16em; color: var(--text-3); text-transform: uppercase; }
+.sect .plate { white-space: nowrap; margin-left: auto; }
+
+.introp { margin: 0 0 10px; font: 400 12px/1.55 var(--font-ui); color: var(--text-2); }
+
+.notice { display: flex; gap: 10px; margin: 2px 0 10px; padding: 10px 14px; background: var(--bg-2); border: 1px solid var(--border-1); border-radius: var(--r-2); }
+.notice svg { flex: none; color: var(--text-3); margin-top: 1px; }
+.notice p { margin: 0; font: 400 11.5px/1.55 var(--font-ui); color: var(--text-2); }
+.notice p b { font-weight: 600; color: var(--text-1); }
+
+.codecs { background: var(--bg-1); border: 1px solid var(--border-1); border-radius: var(--r-2); box-shadow: var(--edge), var(--shadow-1); overflow: hidden; }
+.codec { display: flex; align-items: center; gap: 12px; padding: 10px 14px; border-bottom: 1px solid var(--border-1); transition: background var(--t-fast) var(--ease); }
+.codec:last-child { border-bottom: 0; }
+.codec.changed { background: var(--amber-soft); }
+.codec.changed .plate, .codec.changed .meter .lbl { color: var(--text-2); } /* AA on the tinted row */
+.grip { flex: none; color: var(--text-3); cursor: grab; opacity: .7; }
+.num { flex: none; width: 20px; height: 20px; display: grid; place-items: center; font: 600 10.5px/1 var(--font-mono); color: var(--text-2); background: var(--bg-2); border: 1px solid var(--border-2); border-radius: 5px; }
+.cx { flex: 1; min-width: 0; }
+.namerow { display: flex; align-items: center; gap: 7px; }
+.cx b { font: 600 13px/1.3 var(--font-ui); }
+.mchip { font: 700 8.5px/1 var(--font-mono); letter-spacing: .1em; color: var(--text-3); border: 1px solid var(--border-2); border-radius: 5px; padding: 3.5px 6px 3px; text-transform: uppercase; white-space: nowrap; }
+.cx span.desc { display: block; margin-top: 3px; font: 400 11px/1.5 var(--font-ui); color: var(--text-2); }
+.cx .plate { margin-top: 6px; display: block; }
+/* honest little meters — ink, never amber (Vigilia rule: amber marks
+   ringing/attention only, never a quality/data comparison) */
+.meters { flex: none; width: 168px; display: flex; flex-direction: column; gap: 6px; }
+.meter { display: flex; align-items: center; gap: 6px; }
+.meter .lbl { font: 600 8.5px/1 var(--font-mono); letter-spacing: .1em; color: var(--text-3); text-transform: uppercase; width: 46px; }
+.meter .bars { display: flex; gap: 2px; }
+.meter .bars i { width: 10px; height: 4px; border-radius: 2px; background: var(--border-2); }
+.meter .bars i.f { background: var(--text-2); }
+.meter .val { font: 600 8.5px/1 var(--font-mono); letter-spacing: .08em; color: var(--text-2); text-transform: uppercase; }
+.mv { flex: none; display: flex; flex-direction: column; gap: 2px; }
+.mv button { width: 24px; height: 17px; display: grid; place-items: center; border-radius: 5px; color: var(--text-3); }
+.mv button:hover { background: var(--bg-3); color: var(--text-1); }
+.mv button[disabled] { opacity: .3; cursor: default; }
+.mv button[disabled]:hover { background: none; color: var(--text-3); }
+button.sw { flex: none; display: grid; place-items: center; }
+.tgl { flex: none; width: 34px; height: 20px; border-radius: var(--r-pill); background: var(--bg-3); border: 1px solid var(--border-2); position: relative; transition: background var(--t-fast) var(--ease); }
+.tgl::after { content: ""; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%; background: var(--bg-1); box-shadow: var(--shadow-1); transition: transform var(--t-fast) var(--ease); }
+button.sw[aria-checked=true] .tgl { background: var(--amber-fill); border-color: var(--amber-fill); }
+button.sw[aria-checked=true] .tgl::after { transform: translateX(14px); background: #FFF; }
+
+.offhead { padding: 7px 14px 6px; font: 700 9px/1 var(--font-mono); letter-spacing: .14em; color: var(--text-3); text-transform: uppercase; background: var(--bg-2); border-top: 1px solid var(--border-1); border-bottom: 1px solid var(--border-1); }
+.codec.off .cx b { color: var(--text-2); }
+.codec.off .cx span.desc { color: var(--text-3); }
+.codec.off .meters { opacity: .55; }
+.codec.off .grip, .codec.off .num, .codec.off .mv { visibility: hidden; }
+
+/* guard — the last lamp can't be blown out */
+.guard { display: none; gap: 9px; align-items: flex-start; margin: 8px 2px 0; padding: 9px 12px; background: var(--bg-2); border: 1px solid var(--border-2); border-radius: var(--r-2); }
+.guard.show { display: flex; }
+.guard svg { flex: none; color: var(--text-2); margin-top: 1px; }
+.guard p { margin: 0; font: 500 11.5px/1.5 var(--font-ui); color: var(--text-1); }
+
+.footnote { margin: 10px 0 0; font: 400 11px/1.5 var(--font-ui); color: var(--text-3); }
+
+/* apply bar — sticky at the pane's foot, appears only when something changed */
+.applywrap { position: sticky; bottom: 0; margin-top: 10px; padding: 14px 0 4px; background: linear-gradient(to top, var(--bg-0) 78%, transparent); }
+.applybar { display: none; align-items: center; gap: 14px; padding: 12px 14px; background: var(--bg-1); border: 1px solid color-mix(in srgb, var(--amber-fill) 40%, var(--border-1)); border-radius: var(--r-2); box-shadow: var(--edge), var(--shadow-2); }
+.applybar.show { display: flex; animation: settleUp .3s var(--ease) both; }
+@keyframes settleUp { from { transform: translateY(6px); opacity: 0; } to { transform: none; opacity: 1; } }
+.applybar .ax { flex: 1; min-width: 0; }
+.applybar .ax b { display: block; font: 600 13px/1.3 var(--font-ui); }
+.applybar .ax span { display: block; margin-top: 2px; font: 400 11.5px/1.45 var(--font-ui); color: var(--text-2); }
+.applybar .mchip { align-self: center; }
+.quietbtn { font: 500 11.5px/1 var(--font-ui); color: var(--text-3); }
+.quietbtn:hover { color: var(--text-1); text-decoration: underline; text-underline-offset: 3px; }

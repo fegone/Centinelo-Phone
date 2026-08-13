@@ -43,6 +43,15 @@
 //! the normal sidecar-event log line, same as every other engine event -
 //! see `commands::sidecar_list_devices`'s doc for why this is
 //! fire-and-forget rather than something this step can return directly),
+//! `list_codecs` (codecs-shell feature - fires `core/PROTOCOL.md`'s
+//! `codecs` command; the resulting `event:"codecs"` line is captured the
+//! same way `list_devices`'s `event:"devices"` is - see
+//! `commands::sidecar_list_codecs`'s doc), `set_codecs:<name1,name2,...>`
+//! (NOT admin-gated, unlike `set_device` below - no `admin_set_password`
+//! needed first; persists the preference and best-effort applies it live
+//! via `set_codecs`, see `commands::save_codec_settings` -
+//! `<name1,name2,...>` is comma-split into the ordered `codecs` array
+//! verbatim, e.g. `set_codecs:opus,PCMU,PCMA`),
 //! `set_device:<input|output>:<name>` (admin-gated, needs
 //! `admin_set_password` first in the script - persists the device choice
 //! and best-effort applies it live via `set_device`, see
@@ -240,6 +249,23 @@ pub fn maybe_run_e2e_script(app: &AppHandle) {
                 match commands::sidecar_list_devices(sidecar) {
                     Ok(()) => log::info!("e2e: list_devices -> ok (watch for event:\"devices\" on sidecar-event)"),
                     Err(e) => log::error!("e2e: list_devices -> err: {e}"),
+                }
+            } else if step == "list_codecs" {
+                match commands::sidecar_list_codecs(sidecar) {
+                    Ok(()) => log::info!("e2e: list_codecs -> ok (watch for event:\"codecs\" on sidecar-event)"),
+                    Err(e) => log::error!("e2e: list_codecs -> err: {e}"),
+                }
+            } else if let Some(rest) = step.strip_prefix("set_codecs:") {
+                let settings: tauri::State<std::sync::Arc<crate::settings::SettingsStore>> = app.state();
+                // NOT admin-gated (codecs-shell feature - settings.rs
+                // CodecSettings's own doc) - no admin_set_password needed
+                // first, unlike set_device just below.
+                let input = commands::SaveCodecsInput {
+                    codecs: rest.split(',').map(str::to_string).collect(),
+                };
+                match commands::save_codec_settings(settings, sidecar, input) {
+                    Ok(()) => log::info!("e2e: set_codecs({rest}) -> ok"),
+                    Err(e) => log::error!("e2e: set_codecs({rest}) -> err: {e}"),
                 }
             } else if let Some(rest) = step.strip_prefix("set_device:") {
                 let settings: tauri::State<std::sync::Arc<crate::settings::SettingsStore>> = app.state();
