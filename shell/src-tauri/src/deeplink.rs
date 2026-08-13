@@ -127,15 +127,19 @@ fn handle_url(app: &AppHandle, settings: &Arc<SettingsStore>, url: &url::Url) {
         log::info!("deep-link: ignoring a tel: link - \"Answer tel: links\" is off in Settings");
         return;
     }
+    // Both log lines below are redacted (HIPAA remote-install hardening,
+    // 2026-08-13) - a raw `tel:`/`centinelo:` URL and its extracted dial
+    // target both carry a caller's phone number (PHI), and this handler
+    // runs in every release build (no `debug_assertions` gate), so both
+    // would otherwise land in the persistent on-disk log. See
+    // `bridge::redacted_log_number`'s doc for why fingerprinting instead of
+    // just dropping the module - "a malformed link arrived" and "the same
+    // number was retried" both stay diagnosable without the digits.
     let Some(number) = extract_dial_target(url) else {
-        log::warn!("deep-link: couldn't find a number to dial in {url}");
+        log::warn!("{}", no_dial_target_log_line(url));
         return;
     };
-    log::info!(
-        "deep-link: {scheme}: link for {number} (auto_dial={}) - {}",
-        snapshot.bridge.auto_dial,
-        if snapshot.bridge.auto_dial { "dialing immediately" } else { "asking for confirmation" }
-    );
+    log::info!("{}", dial_target_log_line(scheme, &number, snapshot.bridge.auto_dial));
     let _ = app.emit(
         crate::bridge::EVENT_CLICK_TO_CALL,
         serde_json::json!({
@@ -145,6 +149,28 @@ fn handle_url(app: &AppHandle, settings: &Arc<SettingsStore>, url: &url::Url) {
         }),
     );
     tray::show_and_focus(app);
+}
+
+/// The line logged when a `tel:`/`centinelo:` link's target extraction
+/// *fails* - HIPAA remote-install hardening (2026-08-13): the raw `url`
+/// itself carries the caller's phone number (`tel:3525550199`), so this
+/// must never interpolate `url` directly, only its scheme and length -
+/// see `handle_url`'s doc for the full "why redact instead of drop the
+/// module" reasoning. Pulled out as its own pure function so a test can
+/// assert the guarantee directly instead of just exercising the predicate.
+fn no_dial_target_log_line(url: &url::Url) -> String {
+    format!("deep-link: couldn't find a number to dial in a {} link ({} chars)", url.scheme(), url.as_str().len())
+}
+
+/// The line logged when a link's dial target *is* found - same redaction
+/// rule and reasoning as [`no_dial_target_log_line`], via
+/// `bridge::redacted_log_number`.
+fn dial_target_log_line(scheme: &str, number: &str, auto_dial: bool) -> String {
+    format!(
+        "deep-link: {scheme}: link for {} (auto_dial={auto_dial}) - {}",
+        crate::bridge::redacted_log_number(number),
+        if auto_dial { "dialing immediately" } else { "asking for confirmation" }
+    )
 }
 
 /// Mirrors v1's `extractDialTarget()` (src/main/main.js): for `tel:`, keep
@@ -234,5 +260,24 @@ mod tests {
     #[test]
     fn unrelated_scheme_ignored() {
         assert_eq!(extract_dial_target(&u("https://example.com/501")), None);
+    }
+
+    // HIPAA remote-install hardening (2026-08-13) - these pin the actual
+    // guarantee (no PHI in the constructed log line), matching bridge.rs's
+    // own tests for `redacted_log_number`.
+
+    #[test]
+    fn dial_target_log_line_never_contains_the_number() {
+        let line = dial_target_log_line("tel", "3525550199", false);
+        assert!(!line.contains("3525550199"), "log line leaked the raw number: {line}");
+        assert!(line.contains("tel:"));
+    }
+
+    #[test]
+    fn no_dial_target_log_line_never_contains_the_url() {
+        let url = u("tel:3525550199");
+        let line = no_dial_target_log_line(&url);
+        assert!(!line.contains("3525550199"), "log line leaked the raw url: {line}");
+        assert!(line.contains("tel"));
     }
 }

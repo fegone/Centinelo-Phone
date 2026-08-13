@@ -120,6 +120,38 @@ fn clean_number(raw: &str) -> String {
     raw.chars().filter(|c| c.is_ascii_digit() || matches!(c, '+' | '*' | '#')).collect()
 }
 
+/// Non-reversible fingerprint for a dialed number - HIPAA remote-install
+/// hardening (2026-08-13, RISK 4R finding on PR #20): a dialed number is a
+/// caller's phone number, PHI in the Neola Dental deployment this shell
+/// ships to, and must never reach the persistent on-disk log (see lib.rs's
+/// `is_call_content_log_target` doc). Unlike the sidecar/transcription
+/// module-wide exclusion, this call site's own log line is still genuinely
+/// useful for diagnosing the bridge/deep-link path itself (is a request
+/// even arriving? is the same number retried repeatedly? is a malformed
+/// link producing a 0-digit clean()?) on a remote Windows machine nobody is
+/// sitting in front of - so redact at the point of emission instead of
+/// dropping the whole module from the log file. `DefaultHasher` is *not*
+/// cryptographic and isn't meant to be here - the fix this closes is
+/// "plaintext PHI written to disk", not "information-theoretic secrecy";
+/// two log lines for the same number producing the same fingerprint is the
+/// whole point (it lets support see "this number again" without the digits
+/// ever touching disk).
+pub(crate) fn number_fingerprint(number: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    number.hash(&mut hasher);
+    format!("{:08x}", hasher.finish() as u32)
+}
+
+/// `"<N digits>#<fingerprint>"` - safe to write to the persistent log in
+/// place of a raw dialed number. `N` alone already answers most bridge/
+/// deep-link bug reports ("a 0-digit number means clean()/extraction found
+/// nothing"); the fingerprint answers "is this the same number as that
+/// other log line" without ever writing the number itself.
+pub(crate) fn redacted_log_number(number: &str) -> String {
+    format!("{} digits#{}", number.chars().count(), number_fingerprint(number))
+}
+
 fn handle_request(
     mut request: tiny_http::Request,
     app: &AppHandle,
@@ -181,8 +213,11 @@ fn handle_request(
                 return;
             }
             let auto_dial = settings.snapshot().bridge.auto_dial;
+            // Redacted - `clean` is the dialed number (PHI), see
+            // `redacted_log_number`'s doc.
             log::info!(
-                "click-to-call bridge: /dial request for {clean} (auto_dial={auto_dial}) - {}",
+                "click-to-call bridge: /dial request for {} (auto_dial={auto_dial}) - {}",
+                redacted_log_number(&clean),
                 if auto_dial { "dialing immediately" } else { "asking for confirmation" }
             );
             let _ = app.emit(
@@ -253,5 +288,44 @@ mod tests {
         let q = parse_query("number=%2A43&token=abc%20def");
         assert_eq!(q.get("number").map(String::as_str), Some("*43"));
         assert_eq!(q.get("token").map(String::as_str), Some("abc def"));
+    }
+
+    // HIPAA remote-install hardening (2026-08-13) - `redacted_log_number`
+    // is what stands between a caller's phone number and the persistent
+    // on-disk log for every /dial request. These pin the actual guarantee
+    // (RELIABILITY's fix-pass note: prove the behavior, not just the
+    // predicate) rather than just exercising the function.
+
+    #[test]
+    fn redacted_log_number_never_contains_the_digits() {
+        let number = "3525550199";
+        let redacted = redacted_log_number(number);
+        assert!(!redacted.contains(number), "redacted form leaked the raw number: {redacted}");
+        // ...nor any digit-substring long enough to be re-identifying on
+        // its own (a phone number's own area code, say).
+        for window in number.as_bytes().windows(4) {
+            let s = std::str::from_utf8(window).unwrap();
+            assert!(!redacted.contains(s), "redacted form leaked a 4-digit substring ({s}): {redacted}");
+        }
+    }
+
+    #[test]
+    fn redacted_log_number_reports_the_real_digit_count() {
+        assert!(redacted_log_number("3525550199").starts_with("10 digits#"));
+        assert!(redacted_log_number("*43").starts_with("3 digits#"));
+        assert!(redacted_log_number("").starts_with("0 digits#"));
+    }
+
+    #[test]
+    fn redacted_log_number_is_stable_for_the_same_number() {
+        // The whole point of fingerprinting instead of just dropping the
+        // line: support can see "this is the same number retrying" across
+        // two separate log lines without either one ever carrying PHI.
+        assert_eq!(redacted_log_number("3525550199"), redacted_log_number("3525550199"));
+    }
+
+    #[test]
+    fn redacted_log_number_differs_for_different_numbers() {
+        assert_ne!(redacted_log_number("3525550199"), redacted_log_number("3525550198"));
     }
 }
