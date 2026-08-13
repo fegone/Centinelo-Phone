@@ -3034,13 +3034,30 @@ async function boot() {
   // saved choice always wins. Applying [data-i18n*] markup here means the
   // very first real paint (post pre-JS-load flash of index.html's English
   // fallback text) is already in the right language.
+  //
+  // This is also the very first shell<->core-adjacent IPC round-trip of the
+  // whole session, so it doubles as an IPC health check: a broken transport
+  // (e.g. a Content-Security-Policy that blocks Tauri's connect-src, as
+  // shipped in 2.0.3 - a Windows-only bug invisible in macOS dev because the
+  // IPC scheme differs per platform) makes invoke() hang instead of
+  // rejecting, and the window silently paints but never responds to input.
+  // Race it against a timeout so that failure mode gets a banner instead of
+  // a mute app - see shell/README.md "IPC startup watchdog".
   try {
-    const localePref = await invoke("get_locale");
+    const localePref = await Promise.race([
+      invoke("get_locale"),
+      new Promise((_resolve, reject) => setTimeout(() => reject(new Error("ipc_timeout")), 4000)),
+    ]);
     state.localePref = localePref || "auto";
     setLocale(state.localePref);
   } catch (e) {
     console.error("get_locale failed", e);
     setLocale("auto");
+    if (e && e.message === "ipc_timeout") {
+      // Persistent (ttlMs 0): this is not a transient hiccup, it means every
+      // other button in the app is about to silently do nothing too.
+      showBanner(t("app.ipcUnreachable"), "err", 0);
+    }
   }
   applyStaticI18n();
 
