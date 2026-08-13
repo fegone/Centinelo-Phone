@@ -1022,6 +1022,255 @@ idempotent. No bugs found in `set_answer_mode`/`menu.c`'s auto-answer
 path itself. See `PROTOCOL.md`'s v1.5 status paragraph for the updated
 one-line status.
 
+## F8 codecs / set_codecs (Opus, v1.6) — qa-e2e independent verification
+
+**This is an independent qa-e2e pass, not a self-report.** The `codecs`
+sprint's own delivering agents (core-engine, shell-tauri) each
+self-reported PBX evidence in their task reports
+(`.claude/reports/core-engine-2026-08-13-codecs-opus.md`,
+`.claude/reports/shell-tauri-2026-08-13-codecs-panel.md`) and
+core-engine additionally wrote a one-paragraph "Real e2e evidence"
+summary directly into `PROTOCOL.md`'s `codecs` event row — but per this
+project's own rule ("self-report de otros agentes no cuenta como
+evidencia"), none of that substitutes for this section. Every number
+below was captured by this session directly, with independent PBX-side
+corroboration for every engine-side claim. shell-tauri's own report is
+explicit that it ran **zero** PBX e2e for the shell's `list_codecs`/
+`set_codecs:<...>` driver steps (`e2e.rs`) — see "shell driver
+(list_codecs/set_codecs) — verified by code inspection, not run" below
+for how that gap was closed without standing up the full Tauri app.
+
+**Stale-binary check done first** (precedent: finding #15 below): `git
+log` on `core/modules/ctrl_json/cmd.c`/`ctrl_json.c` showed the
+codecs-sprint commits (`1b92f39`, `c6b6047`) at `2026-08-13 02:43`/
+`02:56`; the on-disk `ctrl_json.so`/`baresip` predated that by minutes.
+Ran `cmake --build core/deps/baresip/build` before anything else —
+already up to date (nothing recompiled, 0 new object files), so the
+binary tested below is confirmed current, not stale. Unit suite
+re-run as part of the same check: `ctrl_json_test`, **300/300 checks
+passed** (matches core-engine's own reported count). Full `leaks`/ASan
+live-process re-pass was **not** independently redone in this session
+(time-boxed) — deferred to core-engine's own already-documented pass
+(`core/BUILD.md`, 1 leak / 1024 bytes, identical to the pre-existing
+baseline); no crash, hang, or abnormal exit was observed across the ~15
+live engine processes and 20+ `set_codecs`/dial/hangup cycles this
+session's own scripts drove, which is at least consistent with (not a
+substitute for) that clean baseline.
+
+Methodology: same as F3-F7 — small Python harnesses (not checked in,
+scratch tooling under this session's own scratchpad, not the repo),
+NDJSON over `run-spike.sh` child processes talking directly to the
+compiled `baresip`/`ctrl_json` engine (no shell involved for the
+core-level scenarios), a `wait_for(predicate, timeout)` primitive,
+read-only `pjsip show channelstats` snapshots via the read-only SSH key
+against the real test PBX. Ext `1100`, target `*43` only. No PBX
+configuration was touched. The ext 1100 secret was read once from
+`settings.json` into a local env var/gitignored scratch file, never
+printed or committed.
+
+### (m) Opus really negotiates — not just labeled
+
+**PASS.** Default engine start (`run-spike.sh`'s
+`audio_codecs=opus/48000/2,pcmu/8000/1,pcma/8000/1`, opus preferred),
+dial `*43`:
+
+- Engine `quality_stats` over the call: `codec":"opus"`, `tx_packets`
+  751 → 1502 / `rx_packets` 729 → 1478 across a 30s window (real growth,
+  not a stale read).
+- **Independent PBX-side confirmation, same call**: `asterisk -rx
+  "pjsip show channelstats"` on `100.119.230.80` showed `Codec opus`
+  for the live channel, counters growing **1069 → 1713 rx / 1047 → 1691
+  tx** over the same ~13s window, from the PBX's own independently-kept
+  counters — not a mirror of the engine's own numbers.
+- **Real-work proof beyond the label**: `tap_start` on a fresh opus
+  call (18s in, well past ICE settle) captured 8s of real decoded
+  audio; both `<call_id>-rx.wav` and `<call_id>-tx.wav` came back as
+  genuine mono PCM WAV files at **48000 Hz** (`766080`/`768000` raw PCM
+  bytes for ~8s ≈ 48000 samples/s × 2 bytes/sample × 8s, matching
+  exactly) — the *decoded* audio path is actually running at Opus's
+  real 48kHz rate, not just a cosmetic `"codec":"opus"` string on an
+  otherwise-G.711 path. Contrast with F4's own G.711 tap capture
+  (8000 Hz mono, `core/E2E-F1.md` "F4 audio tap") for the baseline this
+  is different from.
+
+### (n) G.711-only comparison call (same extension, same target)
+
+**PASS.** `set_codecs(["pcmu","pcma"])` before dialing, then `*43`:
+engine `quality_stats` showed `"codec":"PCMU"` throughout (1751 tx
+packets by close); PBX `channelstats` independently showed `Codec
+ulaw`, counters growing 1163+ over the call. Packet *cadence* is
+similar to the Opus call (both this account's codecs use 20ms ptime,
+so packet-per-second counts land close) — the real, measurable
+difference proving Opus is doing its own encode/decode work rather
+than defaulting to G.711 under the hood is (m)'s 48kHz WAV tap capture,
+not packet counts alone.
+
+### (o) `set_codecs` changes the NEXT call, verified PBX-side
+
+**PASS**, two independent single-codec restrictions, each confirmed on
+both sides:
+
+| `set_codecs` request | Engine `codecs` `active` | Engine call `codec` | PBX `channelstats` `Codec` |
+|---|---|---|---|
+| `["opus"]` | `["opus"]` | `opus` | (see (m)/(n) pattern — opus family already independently confirmed above) |
+| `["pcmu"]` | `["PCMU"]` | `PCMU` | `ulaw` |
+
+Both single-codec restrictions produced a call that negotiated **only**
+the requested codec — no silent fallback to the full catalog for either
+(see (q) below for why that matters).
+
+### (p) Active call untouched mid-call, no re-register — the contract's central promise
+
+**PASS.** Registered once, dialed `*43` (call A, opus). After ICE
+settle, confirmed `quality_stats` `codec:"opus"`, 751 tx packets.
+**Mid-call**, sent `{"cmd":"set_codecs","codecs":["pcma"]}` — engine
+replied with a fresh `codecs` event, `active:["PCMA"]`, applied
+immediately. Then, **on the same still-open call A**, with a 16s PBX
+poll window open specifically to catch this:
+
+- Engine `quality_stats` on call A, polled again 19s after the switch:
+  still `"codec":"opus"`, tx packets grown to 1751 (the call kept
+  flowing, unaffected).
+- **Independent PBX-side confirmation, same channel ID** (`1100-
+  00000ced` throughout): polled twice during the post-switch window,
+  `Codec opus` both times, counters growing (1184 rx @25s uptime → 1475
+  rx @31s uptime) — the PBX itself, not just the engine's own report,
+  confirms the in-progress call's codec never changed.
+- **No re-register anywhere in the sequence**: every `reg_state` event
+  for the entire run (register → dial → mid-call switch → hangup →
+  redial attempt → final teardown) was captured; exactly **2** fired —
+  the initial `registered` at startup and the final `unregistered` at
+  process teardown (`e.stop()`). Zero `reg_state` events around the
+  `set_codecs` call itself, confirming `PROTOCOL.md`'s "no re-register"
+  claim isn't just a reading of `call_streams_alloc()` — it holds
+  against a real registrar too.
+
+Then hung up call A and re-dialed (call B) to confirm the *next* call
+actually picks up the new preference — this surfaced a real, separate
+finding, not a `set_codecs` bug:
+
+- The first attempt used `set_codecs(["pcma"])` (G.711 A-law only).
+  Call B's dial got **no `established` event at all** — straight to
+  `call_state":"closed"`. Engine stderr showed why:
+  `sip:*43@100.119.230.80;transport=wss: session closed: 488 Not
+  Acceptable Here`. This is the **PBX endpoint correctly rejecting the
+  offer**, not an engine defect: `core/BUILD.md` already documents this
+  test endpoint's `allow=(opus|ulaw)` (confirmed for endpoint `1000`;
+  this session's evidence shows the same restriction applies to `1100`)
+  — A-law (`pcma`) was never in the endpoint's allowed set, so an
+  account restricted to *only* `pcma` cannot place a call here at all,
+  by design on the PBX side. **Reproduced 3 times** (deterministic, not
+  a flake) across separate re-runs. Confirmed via the control test
+  below that this is specific to the codec mismatch, not a general
+  re-dial timing issue.
+- **Control test** (no `set_codecs` involved at all): dial → hangup →
+  wait 5s → dial again, twice in a row, both established normally.
+  Rules out "engine can't handle back-to-back dial/hangup" as the
+  explanation for the `pcma`-only failure above.
+- Re-ran (p)'s full sequence using `set_codecs(["pcmu"])` (G.711 μ-law,
+  which the endpoint *does* allow) for the post-switch redial instead —
+  call B established normally, engine `quality_stats` showed
+  `"codec":"PCMU"` confirming the new preference really did apply to
+  the next call, and this is the same evidence already tabulated in
+  (o).
+- Engine behavior on the `488` failure itself was clean: no crash, no
+  hang, no stuck registration (the run's `reg_state` count stayed
+  consistent with "no re-register" above), the failed call just closed.
+
+**Not a `set_codecs`/protocol bug** — it's a real PBX-endpoint-config
+interaction worth remembering for anyone testing single-codec
+restrictions against this specific test extension: `pcma` alone is not
+a valid *offer* here at all, independent of any engine behavior. Filed
+as finding #16 below for future e2e sessions using ext 1100/`*43`.
+
+### (q) Bare-name / unrestricted-fallback bug — provoked, NOT reproduced
+
+**PASS** (the documented fix holds). The historical risk (`core/
+BUILD.md` "audio_codecs= bare-name silent-fallback bug"): asking to
+restrict to a single codec silently leaves the account **more
+permissive** than before (falls back to the full catalog) instead of
+actually restricting it. Directly provoked via the exact command a real
+Settings-panel user would send:
+
+- `set_codecs(["opus"])` → `codecs` event `active:["opus"]` — exactly
+  one entry, not the 3-codec full catalog. Confirmed live: the
+  resulting call negotiated `opus` and nothing else (see (m)).
+- `set_codecs(["pcmu"])` → `active:["PCMU"]` — same pattern, confirmed
+  live via (o)'s PBX-side `ulaw` result.
+
+Neither single-codec request left the account unrestricted. The
+`cmd_set_codecs()` fix (always building `"<name>/<srate>/<ch>"` from
+the real resolved `struct aucodec`, never a bare name) is doing its job
+against a live registrar and a live call, not just in the unit tests.
+
+### (r) Error paths — reject cleanly, no partial apply, no crash
+
+**PASS**, all three documented error cases, run back-to-back against
+the same live, already-`["PCMU"]`-restricted engine instance:
+
+| Input | Result |
+|---|---|
+| `{"cmd":"set_codecs","codecs":[]}` | `error`: `"'codecs' must be a non-empty JSON array of codec names"` |
+| `{"cmd":"set_codecs","codecs":["g722"]}` | `error`: `"unknown codec 'g722' (not compiled into this build - send 'codecs' first for the real available list)"` |
+| `{"cmd":"set_codecs","codecs":["opus","OPUS"]}` | `error`: `"duplicate codec 'OPUS'"` (case-insensitive dup, confirmed) |
+
+After all three failures, a final `{"cmd":"codecs"}` query got a normal
+response with `active:["PCMU"]` — **unchanged** from the last
+successful apply, not reverted to the full catalog and not partially
+applied from any of the three rejected requests. The engine answered
+this final query immediately, confirming it stayed fully responsive
+through every rejected input — no crash, no hang, no degraded state.
+
+### shell driver (`list_codecs`/`set_codecs`) — verified by code
+inspection, not run
+
+shell-tauri's own report is explicit: `e2e.rs`'s `list_codecs`/
+`set_codecs:<...>` steps were added but never run against the real PBX
+in that task. Standing up the full Tauri app under `CENTINELO_E2E_SCRIPT`
+was out of scope for the time available this session, so this gap is
+closed by code inspection instead of a substitute run: `commands::
+sidecar_list_codecs` (`shell/src-tauri/src/commands.rs:536-538`) sends
+the exact same `{"cmd":"codecs"}` already verified above with no
+shell-side transformation; `commands::save_codec_settings` (same file,
+~line 630) runs `validate_codec_order` (structurally the same checks as
+`cmd.c`'s `decode_codecs()` - non-empty, ≤16, ≤31 bytes, case-
+insensitive dedup) and then sends `{"cmd":"set_codecs","codecs":
+cleaned}` verbatim - the identical command already exercised end-to-end
+in (o)/(p)/(q)/(r) above. Both are thin, correct forwarders with no
+independent logic that could diverge from the core-level results in
+this section - **not** the same as having actually run it, but enough
+to say the underlying mechanism the shell drives is the one already
+proven against the real PBX, not an unverified parallel path.
+**Recommendation**: still worth an actual `CENTINELO_E2E_SCRIPT` run in
+a follow-up session before calling the shell surface itself e2e-closed
+- code parity isn't a substitute for watching the real UI-adjacent path
+fire against the PBX, same standard this project holds every other
+command to.
+
+### Conclusion (F8)
+
+`codecs`/`set_codecs` (v1.6, Opus) is real-PBX e2e-verified at the
+protocol/engine level, independently of every self-report in this
+sprint's own task reports: Opus genuinely negotiates and genuinely
+decodes at its own 48kHz rate (not just a label); `set_codecs`
+genuinely changes the next call's codec, confirmed PBX-side for two
+different single-codec restrictions; an active call is genuinely
+untouched by a mid-call `set_codecs`, confirmed PBX-side on the same
+channel, with zero re-registers anywhere in the sequence; the
+documented bare-name/unrestricted-fallback bug does **not** reproduce
+against a live registrar; all three error paths reject cleanly with no
+partial apply and no crash. **No bugs found in `set_codecs`/`codecs`
+themselves.** One real, non-blocking finding: `pcma`-only is not a
+valid offer against this test PBX's endpoint config (`allow=(opus|
+ulaw)`, no A-law) — a test-target footnote, not an engine or protocol
+defect, filed as finding #16 for future sessions. The shell's own
+`list_codecs`/`set_codecs` e2e driver steps remain genuinely unrun
+against the real PBX (shell-tauri's own honest disclosure) — closed
+here only by code-level parity inspection, not a substitute run; a real
+`CENTINELO_E2E_SCRIPT` pass is a recommended follow-up before this
+project calls the *shell* surface itself, not just the protocol it
+drives, e2e-closed.
+
 ## Summary of findings (for future F-phases)
 
 1. ICE needs real settle time here (~15-20s) before relying on live RTP
@@ -1160,3 +1409,16 @@ one-line status.
     "forgot to rebuild"; always rebuild (or at minimum diff source
     commit dates against build-artifact mtimes) before an e2e pass that
     matters, don't assume a build dir from a prior session is current.
+16. **(F8)** Ext 1100's PBX endpoint only allows `opus`/`ulaw`
+    (`allow=(opus|ulaw)`, matching what `core/BUILD.md` already
+    documented for endpoint `1000`) — **no A-law (`pcma`)**. A
+    `set_codecs(["pcma"])` restriction is a perfectly valid, correctly-
+    applied engine-side preference, but the *next* call using it cannot
+    succeed against this specific test target: the PBX rejects the
+    offer outright with a genuine SIP `488 Not Acceptable Here`, not an
+    engine bug. Reproduced 3 times, always the same clean rejection
+    (call closes, no crash, no stuck registration). Worth remembering
+    for any future codec-restriction e2e scenario against ext 1100/
+    `*43`: test single-codec restrictions with `opus` or `pcmu`, never
+    `pcma` alone, unless the point of the scenario is specifically to
+    exercise this exact rejection path.

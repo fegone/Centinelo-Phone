@@ -282,6 +282,55 @@
         </div>
       </div>
 
+      <!-- ================= Audio & devices → Audio codecs (Plate 09) =================
+           Adapted from premium/design/mockups/settings-codecs.html (creative-vigilia,
+           PR #6 design/settings-codecs) - see ui/js/codec-settings.js's header comment
+           for the full fidelity/behavior notes (no re-register, no in-call
+           interruption, last-active-codec guard, engine is the only source of
+           the codec list).
+
+           Deliberately sits BEFORE (outside) the <div class="settings-locked-region">
+           wrapper below, i.e. OUTSIDE #lock-overlay's covered area - unlike every
+           OTHER card in this screen. This is the one Settings section this task
+           requires be reachable with no admin unlock at all (approved decision,
+           see design/notes/settings-codecs.md "Dónde vive y para quién"): codecs
+           expose no patient data, only call-quality, and the real scenario is a
+           receptionist being talked through this over the phone by support with
+           no admin password in hand. `#lock-overlay` is `position:absolute;inset:0`
+           against the nearest `position:relative` ancestor (app.css `.settings-body`)
+           - moving it to be `.settings-locked-region`'s own last child (instead of
+           `#settings-body`'s) re-scopes its coverage to exactly "Phone system"
+           through "About" below, without touching applyLockUI()/the overlay's own
+           id/markup at all. General/Availability above happen to land outside that
+           wrapper too as a result - a deliberate, harmless side effect: both were
+           already documented as NOT admin-gated at the command level (their own
+           comments above), so this closes a pre-existing "visually gated but
+           backend-open" inconsistency instead of introducing a new one. -->
+      <div class="sect"><h3 data-i18n="settings.codecsHeading">Audio codecs</h3><span class="plate" id="codecs-count"></span></div>
+      <p class="introp" data-i18n="settings.codecsIntro">A codec is the format your voice travels in. On every call, Centinelo offers the enabled codecs in this order, and the call uses the first one your phone system also accepts.</p>
+      <div class="notice">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="8.2"/><path d="M12 7.5V12l3.2 1.9"/></svg>
+        <p data-i18n="settings.codecsNextCallNotice">Changes take effect on your next call. A call already in progress keeps the sound it started with.</p>
+      </div>
+      <div class="codecs" id="codecs-list" role="list" data-i18n-aria-label="settings.codecsListAria" aria-label="Audio codecs, in order of preference"></div>
+      <div class="guard" id="codecs-guard" role="status">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>
+        <p id="codecs-guard-msg" data-i18n="settings.codecsLastActiveGuard">At least one codec must stay on to make calls. Turn another one on before turning this one off.</p>
+      </div>
+      <p class="footnote" data-i18n="settings.codecsBuildNote">This list shows the codecs this Centinelo installation ships with. Another computer may show different options.</p>
+      <div class="applywrap">
+        <div class="applybar" id="codecs-applybar">
+          <div class="ax">
+            <b data-i18n="settings.codecsUnappliedTitle">Unapplied changes</b>
+            <span data-i18n="settings.codecsUnappliedHint">They'll take effect on your next call.</span>
+          </div>
+          <button type="button" class="quietbtn" id="codecs-discard" data-i18n="settings.codecsDiscard">Discard</button>
+          <button type="button" class="primary" id="codecs-apply" data-i18n="settings.codecsApply">Apply</button>
+        </div>
+      </div>
+      <span class="sr-only" aria-live="polite" id="codecs-live"></span>
+
+      <div class="settings-locked-region">
       <h2 data-i18n="settings.phoneSystem">Phone system</h2>
       <div class="settings-card">
         <div class="field">
@@ -659,6 +708,7 @@
           </div>
         </div>
       </div>
+      </div><!-- /.settings-locked-region -->
     </div>
 
     <div class="save-bar">

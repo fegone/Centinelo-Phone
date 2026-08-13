@@ -49,6 +49,8 @@ enum cent_cmd_type {
 	CENT_CMD_TAP_STOP,     /**< v1.2 - see PROTOCOL.md "tap_stop" */
 	CENT_CMD_PARK,         /**< v1.3 - see PROTOCOL.md "park" */
 	CENT_CMD_SET_ANSWER_MODE, /**< v1.5 - see PROTOCOL.md "set_answer_mode" */
+	CENT_CMD_CODECS,       /**< v1.6 - see PROTOCOL.md "codecs" */
+	CENT_CMD_SET_CODECS,   /**< v1.6 - see PROTOCOL.md "set_codecs" */
 };
 
 enum {
@@ -75,6 +77,23 @@ enum {
 				  *  (a directory path can legitimately be
 				  *  long; no protocol reason to cap it
 				  *  tighter). See PROTOCOL.md "tap_start". */
+
+	CENT_CODEC_NAME_SIZE = 32,  /**< set_codecs: one codec name, e.g.
+				      *  "opus"/"pcmu"/"pcma" - baresip's own
+				      *  aucodec names are short ASCII
+				      *  identifiers (see modules/g711/g711.c,
+				      *  modules/opus/opus.c); 32 is generous
+				      *  headroom, not a tight fit. */
+	CENT_MAX_CODECS = 16,       /**< set_codecs: matches baresip's own
+				      *  struct account::acv[16] cap (see
+				      *  core/deps/baresip/src/core.h) - the
+				      *  account-level codec-restriction list
+				      *  literally cannot hold more than this
+				      *  many entries, so this protocol layer
+				      *  rejects an oversized list up front
+				      *  with a clear error instead of letting
+				      *  account_set_audio_codecs() silently
+				      *  truncate it. */
 };
 
 /**
@@ -145,6 +164,19 @@ struct cent_cmd {
 				     *   call_id) - a missing/empty dir is a
 				     *   CENT_CMD_NONE decode error, same
 				     *   treatment as dial's "uri". */
+
+	/** set_codecs: ordered codec name list, decoded from the "codecs"
+	 * JSON array - see PROTOCOL.md "set_codecs". Everything this layer
+	 * can validate *without* a running engine (non-empty array, each
+	 * entry a non-empty string that fits CENT_CODEC_NAME_SIZE, no more
+	 * than CENT_MAX_CODECS entries, no case-insensitive duplicate) is
+	 * rejected here as a CENT_CMD_NONE decode error; whether each name
+	 * is actually a codec *this build* has compiled in is a separate,
+	 * impure check only ctrl_json.c's cmd_set_codecs() can make (it
+	 * needs baresip_aucodecl(), the live registered-codec list - see
+	 * that function's own comment). */
+	char codecs[CENT_MAX_CODECS][CENT_CODEC_NAME_SIZE];
+	size_t codecs_len;
 };
 
 /**

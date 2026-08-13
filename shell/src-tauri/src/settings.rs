@@ -735,6 +735,34 @@ pub struct LicenseSettings {
     pub activation_server_url: String,
 }
 
+// ---- audio codecs (codecs-shell feature, core/PROTOCOL.md v1.6) ---------
+//
+// NOT admin-gated (task brief, approved by Felix): unlike account/transport/
+// transcription, a codec preference exposes no patient data - the only risk
+// is call-quality, and the real-world case this exists for is a receptionist
+// being talked through it over the phone by support, without an admin
+// password in hand. See commands.rs's `save_codec_settings` for the command-
+// level (non-)gate and index.html's own comment on why this section sits
+// OUTSIDE `#lock-overlay`'s covered region, unlike every other Settings card.
+//
+// `preferred_order` is names only, in offer-priority order - exactly the
+// shape `core/PROTOCOL.md`'s `set_codecs` command's own `codecs` array
+// takes, and exactly what its `codecs` event's `active` field echoes back.
+// Structural validation (non-empty when non-default, no dup, ≤16, ≤31 bytes
+// each) lives in `commands::validate_codec_order`, mirrored from
+// `core/modules/ctrl_json/cmd.c`'s `decode_codecs()` - see that function's
+// doc for why both layers validate independently.
+//
+// **Empty = never customized** - the operator has never touched this panel,
+// so nothing here overrides the engine's own baseline. See sidecar.rs's
+// `reapply_codec_preference` for exactly how (and why only THAT baseline,
+// never a static config-file line) a non-empty preference gets applied.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CodecSettings {
+    #[serde(default)]
+    pub preferred_order: Vec<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AppSettings {
     #[serde(default)]
@@ -774,6 +802,12 @@ pub struct AppSettings {
     /// to `AvailabilitySettings::default()` (available, manual answer).
     #[serde(default)]
     pub availability: AvailabilitySettings,
+    /// Codec preference order - see `CodecSettings`. Composed last for the
+    /// same "untouched surrounding list" reason as `availability` above;
+    /// `#[serde(default)]` resolves a pre-this-field settings.json to
+    /// `CodecSettings::default()` (empty = never customized).
+    #[serde(default)]
+    pub codecs: CodecSettings,
 }
 
 fn default_favorites() -> Vec<FavoriteSlot> {
@@ -1002,6 +1036,28 @@ impl SettingsStore {
         let mut guard = self.inner.lock_or_recover();
         guard.license.activation_server_url = activation_server_url;
         self.persist(&guard)
+    }
+
+    /// Sets `codecs.preferred_order` and persists - the write half of
+    /// `commands::save_codec_settings` (already structurally validated by
+    /// that command's `validate_codec_order` before this is ever called).
+    /// Rolls back the in-memory value on a failed `persist()`, same shape
+    /// `update_available`/`update_auto_answer` use above and for the same
+    /// reason: `sidecar::reapply_codec_preference` reads straight off
+    /// `snapshot().codecs.preferred_order` on every `reg_state:registered`
+    /// transition, so a mutate-without-persist-guarantee would leave a
+    /// fresh engine process reapplying a preference disk disagrees with
+    /// (and a reload would silently discard) while the command reports
+    /// failure.
+    pub fn update_codecs(&self, preferred_order: Vec<String>) -> std::io::Result<()> {
+        let mut guard = self.inner.lock_or_recover();
+        let previous = guard.codecs.preferred_order.clone();
+        guard.codecs.preferred_order = preferred_order;
+        if let Err(e) = self.persist(&guard) {
+            guard.codecs.preferred_order = previous;
+            return Err(e);
+        }
+        Ok(())
     }
 
     pub fn set_admin_password_hash(&self, hash: String) -> std::io::Result<()> {
@@ -1833,6 +1889,107 @@ mod availability_settings_tests {
         assert!(
             !store.snapshot().availability.auto_answer,
             "in-memory auto_answer must roll back to false (the previous value) after a failed persist"
+        );
+
+        let _ = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600));
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod codec_settings_tests {
+    use super::*;
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("centinelo-codec-settings-test.{name}.{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn defaults_to_empty_never_customized() {
+        // Empty = "the operator never touched this panel" - see
+        // CodecSettings's own doc for why that's the signal
+        // sidecar::reapply_codec_preference uses to send nothing at all
+        // (leaving the engine's own baseline standing) rather than an
+        // explicit-but-empty set_codecs (which core/PROTOCOL.md's
+        // decode_codecs rejects outright anyway).
+        assert!(CodecSettings::default().preferred_order.is_empty());
+        assert!(AppSettings::default().codecs.preferred_order.is_empty());
+    }
+
+    #[test]
+    fn app_settings_without_codecs_key_migrates_to_empty_default() {
+        // A pre-this-field settings.json must not fail to load. "9999" is a
+        // never-real test extension (public repo).
+        let json = r#"{"account":{"host":"pbx.example.test","ext":"9999","secret":"x"}}"#;
+        let app: AppSettings = serde_json::from_str(json).unwrap();
+        assert!(app.codecs.preferred_order.is_empty());
+    }
+
+    #[test]
+    fn explicit_order_round_trips_through_json() {
+        let c = CodecSettings { preferred_order: vec!["opus".into(), "PCMU".into()] };
+        let json = serde_json::to_string(&c).unwrap();
+        let back: CodecSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(c, back);
+    }
+
+    #[test]
+    fn fresh_settings_store_starts_with_no_codec_preference() {
+        let dir = scratch_dir("fresh");
+        let store = SettingsStore::load(&dir).unwrap();
+        assert!(store.snapshot().codecs.preferred_order.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_codecs_persists_and_survives_reload() {
+        let dir = scratch_dir("roundtrip");
+        let store = SettingsStore::load(&dir).unwrap();
+        store.update_codecs(vec!["opus".into(), "PCMU".into(), "PCMA".into()]).unwrap();
+        assert_eq!(
+            store.snapshot().codecs.preferred_order,
+            vec!["opus".to_string(), "PCMU".to_string(), "PCMA".to_string()]
+        );
+
+        let reloaded = SettingsStore::load(&dir).unwrap();
+        assert_eq!(
+            reloaded.snapshot().codecs.preferred_order,
+            vec!["opus".to_string(), "PCMU".to_string(), "PCMA".to_string()],
+            "the codec preference must survive a reload"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn update_codecs_rolls_back_in_memory_value_on_persist_failure() {
+        // Same rollback guarantee update_available/update_auto_answer have -
+        // see update_available_rolls_back_in_memory_value_on_persist_failure
+        // (availability_settings_tests, above) for the full rationale.
+        // sidecar::reapply_codec_preference reads straight off
+        // snapshot().codecs.preferred_order on every registration, so a
+        // mutate-without-rollback here would leave a fresh engine process
+        // reapplying a preference disk disagrees with.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch_dir("rollback");
+        let store = SettingsStore::load(&dir).unwrap();
+        store.update_codecs(vec!["opus".into()]).unwrap();
+
+        let settings_path = dir.join("settings.json");
+        let tmp_path = tmp_sibling_path(&settings_path);
+        fs::write(&tmp_path, b"stale").unwrap();
+        fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o400)).unwrap();
+
+        let result = store.update_codecs(vec!["PCMU".into()]);
+        assert!(result.is_err(), "persist must fail - the tmp sibling is read-only");
+        assert_eq!(
+            store.snapshot().codecs.preferred_order,
+            vec!["opus".to_string()],
+            "in-memory preferred_order must roll back to the previous value after a failed persist"
         );
 
         let _ = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600));

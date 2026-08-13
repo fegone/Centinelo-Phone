@@ -198,6 +198,254 @@ fn should_auto_reject_incoming(available: bool) -> bool {
     !available
 }
 
+/// Reapplies the operator's persisted codec preference (`codecs-shell`
+/// feature, `core/PROTOCOL.md` v1.6 `set_codecs`) on every
+/// `reg_state:registered` transition - same "a fresh engine process has no
+/// memory of a previous session's live command" reasoning the
+/// `set_answer_mode` reapply just above this call site already documents,
+/// and the same hook (registration, not spawn - regint=120's periodic
+/// re-REGISTER hits this too, harmlessly, since `set_codecs` is idempotent
+/// to resend).
+///
+/// **What "wins" at a cold start, and why** (task requirement: define this
+/// explicitly). `SpawnPlan::build`'s generated account config always writes
+/// a static `audio_codecs=pcmu,pcma;` line (see `write_config_file` below),
+/// deliberately UNCHANGED by this feature: still G.711-only, still bare
+/// (unsuffixed) names. That's safe for `pcmu`/`pcma` (both really are
+/// 8000/1, the bare-name default baresip's own `account_set_audio_codecs()`
+/// parser assumes), but core/PROTOCOL.md's `set_codecs` doc documents a
+/// real footgun for any codec that ISN'T 8000/1: a bare `"opus"` in that
+/// same static-config parser silently fails to match (opus is 48000/2),
+/// leaving the account's codec list empty, which baresip then treats as
+/// "unrestricted", i.e. exactly the opposite of what a caller who thought
+/// they'd restricted the account to G.711 actually asked for. Because of
+/// that, this shell must NEVER write a user's codec preference straight
+/// into the static config file if it can include a non-8000/1 codec like
+/// Opus; only `core/modules/ctrl_json/ctrl_json.c`'s `cmd_set_codecs()` is
+/// safe against this, since it always builds each entry as the real
+/// `"<name>/<srate>/<ch>"` from the live `struct aucodec` it resolved, never
+/// a bare name.
+///
+/// So: an operator who has never opened the codecs panel
+/// (`preferred_order` empty) gets exactly today's unchanged behavior - the
+/// static config's G.711-only baseline, nothing sent here. An operator who
+/// HAS set a preference (which may include Opus) gets it reapplied via this
+/// live, suffix-safe `set_codecs` command right after every registration -
+/// always before any call in the normal flow, so "takes effect starting
+/// the next call" (core/PROTOCOL.md) is, for all practical purposes,
+/// "immediately" for a freshly (re)started session. Best-effort/logged, not
+/// fatal, same as every other post-registration reapply in this block - a
+/// failure here just means the account falls back to the static baseline
+/// for this session, not a lost call.
+///
+/// **The recurring-banner bug this closes** (codecs sprint follow-up, found
+/// during the Opus module-loading review): `set_codecs` is all-or-nothing
+/// (`core/PROTOCOL.md`) - if the persisted preference names even ONE codec
+/// this build doesn't actually have compiled in (the exact scenario this
+/// same review's `write_config_file` fix makes newly possible: a machine
+/// whose build predates Opus, or one where the Opus module failed to
+/// load), the engine rejects the whole command with a generic `error`
+/// event. That event rides the same broadcast stream every real engine
+/// event does, and `ui/js/app.js`'s `handleSidecarEvent` turns any
+/// `event:"error"` into a banner - with no correlation to `set_codecs`
+/// specifically, and no way to tell "actionable, one-time protocol error"
+/// apart from "this exact reapply is going to keep failing forever". Since
+/// this function reruns on *every* `reg_state:registered` - including
+/// `regint=120`'s periodic re-REGISTER - a stale preference that once
+/// worked meant an error banner every two minutes, indefinitely, with
+/// nothing the operator could do about it short of manually reopening the
+/// codecs panel and re-saving. Fixed at the root instead of papering over
+/// the symptom: `plan_codec_reapply` cross-checks the preference against
+/// `Shared::known_codecs` (this build's real, live catalog, refreshed by a
+/// `codecs` query on every spawn) BEFORE ever sending `set_codecs`, and
+/// auto-corrects the persisted preference by dropping whatever this build
+/// doesn't actually have - the same "cross-check against what the engine
+/// last reported, then persist the correction" shape `resolve_device`/
+/// `AudioSettings` already use for a stale device (2026-07-16 4R
+/// re-review). Once corrected, the persisted preference is valid again, so
+/// the very next `reg_state:registered` (including the 120s periodic one)
+/// has nothing left to correct: the notice (and the underlying engine
+/// `error`) each fire at most ONCE per actual staleness event, not once
+/// per re-register forever. `known_codecs == None` (this session's
+/// `codecs` query hasn't answered yet) fails OPEN - sends the persisted
+/// preference exactly as before this fix, since there's no data yet to
+/// filter it with - matching `resolve_device`'s own `known == None`
+/// convention; self-corrects the moment the cache populates.
+fn reapply_codec_preference(shared: &Shared) {
+    let preferred = shared.settings.snapshot().codecs.preferred_order;
+    let known = shared.known_codecs.lock_or_recover().clone();
+    let plan = plan_codec_reapply(&preferred, known.as_deref());
+
+    if let Some(corrected) = plan.to_persist {
+        if let Err(e) = shared.settings.update_codecs(corrected) {
+            log::warn!("sidecar: couldn't persist the auto-corrected codec preference: {e}");
+        }
+    }
+    if let Some(notice) = &plan.notice {
+        log::warn!("sidecar: {notice}");
+        emit_shell_notice(shared, notice);
+    }
+    if let Some(to_send) = plan.to_send {
+        if let Err(e) = send_cmd_raw(shared, serde_json::json!({"cmd": "set_codecs", "codecs": to_send})) {
+            log::warn!("sidecar: set_codecs(reapply) failed: {e}");
+        }
+    }
+}
+
+/// `reapply_codec_preference`'s decision, factored out as a pure function
+/// (like `audio_config_lines`/`resolve_device` above) so every branch is
+/// unit-testable without a live `Shared`/`AppHandle`.
+#[derive(Debug, PartialEq, Eq)]
+struct CodecReapplyPlan {
+    /// The (possibly corrected) list to send via `set_codecs` this cycle -
+    /// `None` means nothing to reapply (either the persisted preference
+    /// was empty to begin with, or filtering it against `known_codecs`
+    /// left nothing valid - the account's static G.711 baseline stands for
+    /// this session, same as "never customized").
+    to_send: Option<Vec<String>>,
+    /// The corrected preference to persist back to `settings.json`, if
+    /// filtering actually dropped something - `None` means the persisted
+    /// value is already fine as-is.
+    to_persist: Option<Vec<String>>,
+    /// A one-time, user-visible notice, if filtering dropped anything -
+    /// `None` means nothing to say. Once `to_persist` lands on disk, the
+    /// *next* call to this function reads the now-corrected preference
+    /// back from `settings.json`, which no longer drops anything - this is
+    /// what makes the notice (and the underlying engine `error` this whole
+    /// thing exists to avoid) fire once per staleness event, not once per
+    /// `reg_state:registered` forever.
+    notice: Option<String>,
+}
+
+fn plan_codec_reapply(preferred: &[String], known_codecs: Option<&[String]>) -> CodecReapplyPlan {
+    if preferred.is_empty() {
+        return CodecReapplyPlan { to_send: None, to_persist: None, notice: None };
+    }
+    let known = match known_codecs {
+        None => {
+            // No catalog yet this session - fail open exactly as before
+            // this fix (see this function's own doc / `resolve_device`'s
+            // `known == None` precedent).
+            return CodecReapplyPlan { to_send: Some(preferred.to_vec()), to_persist: None, notice: None };
+        }
+        Some(k) => k,
+    };
+    let (valid, dropped): (Vec<String>, Vec<String>) =
+        preferred.iter().cloned().partition(|name| known.iter().any(|k| k.eq_ignore_ascii_case(name)));
+    if dropped.is_empty() {
+        return CodecReapplyPlan { to_send: Some(preferred.to_vec()), to_persist: None, notice: None };
+    }
+    let notice = format!(
+        "your saved codec preference included {} - not supported by this build - removed from the preference{}",
+        dropped.join(", "),
+        if valid.is_empty() { "; using this build's default codec order instead" } else { "" }
+    );
+    CodecReapplyPlan {
+        to_send: if valid.is_empty() { None } else { Some(valid.clone()) },
+        to_persist: Some(valid),
+        notice: Some(notice),
+    }
+}
+
+#[cfg(test)]
+mod codec_reapply_tests {
+    use super::*;
+
+    fn v(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn never_customized_sends_and_persists_nothing() {
+        let plan = plan_codec_reapply(&[], Some(&v(&["opus", "PCMU", "PCMA"])));
+        assert_eq!(plan, CodecReapplyPlan { to_send: None, to_persist: None, notice: None });
+    }
+
+    #[test]
+    fn no_catalog_yet_fails_open_and_sends_the_persisted_preference_unchanged() {
+        let preferred = v(&["opus", "PCMU"]);
+        let plan = plan_codec_reapply(&preferred, None);
+        assert_eq!(plan.to_send, Some(preferred));
+        assert_eq!(plan.to_persist, None);
+        assert_eq!(plan.notice, None);
+    }
+
+    #[test]
+    fn fully_valid_preference_is_sent_unchanged_with_no_persist_and_no_notice() {
+        let preferred = v(&["opus", "PCMU", "PCMA"]);
+        let known = v(&["opus", "PCMU", "PCMA"]);
+        let plan = plan_codec_reapply(&preferred, Some(&known));
+        assert_eq!(plan.to_send, Some(preferred));
+        assert_eq!(plan.to_persist, None);
+        assert_eq!(plan.notice, None);
+    }
+
+    #[test]
+    fn case_insensitive_match_does_not_count_as_dropped() {
+        // Real e2e-confirmed casing (core/PROTOCOL.md v1.6 codecs event
+        // example): available lists "PCMU"/"PCMA"/"opus", but a persisted
+        // preference could plausibly have been saved with different
+        // casing - the engine's own aucodec lookup is case-insensitive, so
+        // this must not be treated as "unsupported".
+        let preferred = v(&["Opus", "pcmu", "pcma"]);
+        let known = v(&["opus", "PCMU", "PCMA"]);
+        let plan = plan_codec_reapply(&preferred, Some(&known));
+        assert_eq!(plan.to_send, Some(preferred));
+        assert_eq!(plan.to_persist, None);
+        assert_eq!(plan.notice, None);
+    }
+
+    /// The exact regression this whole thing exists to fix: a preference
+    /// with one unsupported codec (e.g. a build that just lost Opus) gets
+    /// that one entry dropped, the rest reapplied, and the correction
+    /// persisted - so this is a ONE-TIME event, not a recurring one.
+    #[test]
+    fn one_unsupported_codec_is_dropped_the_rest_reapplied_and_persisted() {
+        let preferred = v(&["opus", "PCMU", "PCMA"]);
+        let known = v(&["PCMU", "PCMA"]); // opus module missing this build
+        let plan = plan_codec_reapply(&preferred, Some(&known));
+        assert_eq!(plan.to_send, Some(v(&["PCMU", "PCMA"])));
+        assert_eq!(plan.to_persist, Some(v(&["PCMU", "PCMA"])));
+        let notice = plan.notice.expect("a dropped codec must produce a notice");
+        assert!(notice.contains("opus"));
+    }
+
+    /// If EVERY entry in the preference is unsupported, there's nothing
+    /// left worth sending via `set_codecs` (which rejects an empty array
+    /// outright per `core/PROTOCOL.md`) - persist the now-empty
+    /// preference (so the next reapply is the fast, no-op "never
+    /// customized" path) and let the account's static G.711 baseline
+    /// stand for this session, same as if the operator had never opened
+    /// the codecs panel.
+    #[test]
+    fn every_codec_unsupported_persists_empty_and_sends_nothing() {
+        let preferred = v(&["opus"]);
+        let known = v(&["PCMU", "PCMA"]);
+        let plan = plan_codec_reapply(&preferred, Some(&known));
+        assert_eq!(plan.to_send, None);
+        assert_eq!(plan.to_persist, Some(vec![]));
+        assert!(plan.notice.is_some());
+    }
+
+    /// Simulates the fix's own self-healing loop end to end: after the
+    /// first reapply persists the corrected (valid) preference, feeding
+    /// THAT preference back through the same known_codecs must produce no
+    /// further correction and no further notice - the property that turns
+    /// "every 2 minutes forever" into "once".
+    #[test]
+    fn reapplying_the_corrected_preference_is_a_stable_fixed_point() {
+        let preferred = v(&["opus", "PCMU", "PCMA"]);
+        let known = v(&["PCMU", "PCMA"]);
+        let first = plan_codec_reapply(&preferred, Some(&known));
+        let corrected = first.to_persist.expect("first pass must correct the preference");
+
+        let second = plan_codec_reapply(&corrected, Some(&known));
+        assert_eq!(second.to_persist, None, "a stable, already-corrected preference must not be re-persisted");
+        assert_eq!(second.notice, None, "a stable, already-corrected preference must not re-notice");
+        assert_eq!(second.to_send, Some(corrected));
+    }
+}
+
 #[cfg(test)]
 mod availability_tests {
     use super::*;
@@ -509,6 +757,24 @@ struct Shared {
     /// conservative "no data yet" default this file already uses for
     /// `blf_states` starting empty.
     known_devices: Mutex<Option<KnownDevices>>,
+    /// Cache of the most recent `codecs` event's own `available` names
+    /// (codecs sprint follow-up, same "cross-check a persisted preference
+    /// against reality before trusting it" shape as `known_devices` just
+    /// above) - `reapply_codec_preference` filters the persisted
+    /// `codecs.preferred_order` against this before ever sending
+    /// `set_codecs`, instead of firing it blind and letting the engine's
+    /// own all-or-nothing rejection (`core/PROTOCOL.md` v1.6's
+    /// `set_codecs` row) come back as a generic, unlogged-origin `error`
+    /// event on *every* `reg_state:registered` - including `regint=120`'s
+    /// periodic re-REGISTER, forever, for a preference that will never
+    /// stop being invalid once it's gone stale (e.g. a build that no
+    /// longer compiles in a codec the operator had picked). See
+    /// `plan_codec_reapply`'s doc for the actual decision logic this
+    /// enables. `None` until this session's first `codecs` event (a
+    /// `codecs` query already fires on every spawn, see the `"ready"`
+    /// handler below) - `plan_codec_reapply` fails open on `None`, same
+    /// convention as `resolve_device`'s `known == None` case.
+    known_codecs: Mutex<Option<Vec<String>>>,
 }
 
 #[derive(Clone)]
@@ -534,6 +800,7 @@ impl SidecarHandle {
             subscribed_exts: Mutex::new(HashSet::new()),
             transcription: Mutex::new(None),
             known_devices: Mutex::new(None),
+            known_codecs: Mutex::new(None),
         }))
     }
 
@@ -1188,6 +1455,20 @@ fn spawn_stdout_reader(
                 if let Err(e) = send_cmd_raw(&shared, serde_json::json!({"cmd": "devices"})) {
                     log::warn!("sidecar: couldn't request the initial devices enumeration: {e}");
                 }
+                // Same idea, for codecs (codecs-shell feature): fires a
+                // `codecs` query on every spawn so a `codecs` event (with
+                // this build's real `available`/`active`) is already
+                // sitting in the frontend by the time an operator opens
+                // Settings, instead of only ever populating on an explicit
+                // `sidecar_list_codecs` from that screen. No server-side
+                // cache needed here (unlike `known_devices`) - nothing in
+                // this crate reads the *live* codec list, only the
+                // *persisted preference* (`reapply_codec_preference`,
+                // fired later on `reg_state:registered`) - this call
+                // exists purely so the frontend doesn't start blank.
+                if let Err(e) = send_cmd_raw(&shared, serde_json::json!({"cmd": "codecs"})) {
+                    log::warn!("sidecar: couldn't request the initial codecs enumeration: {e}");
+                }
             } else if event_name == "reg_state" {
                 let state = value.get("state").and_then(Value::as_str).unwrap_or("");
                 if state == "registered" {
@@ -1225,6 +1506,7 @@ fn spawn_stdout_reader(
                     {
                         log::warn!("sidecar: set_answer_mode({mode}) failed: {e}");
                     }
+                    reapply_codec_preference(&shared);
                 } else {
                     if state == "failed" || state == "unregistered" {
                         shared.registered.store(false, Ordering::SeqCst);
@@ -1346,6 +1628,22 @@ fn spawn_stdout_reader(
                     input: extract_names(value.get("input")),
                     output: extract_names(value.get("output")),
                 });
+            } else if event_name == "codecs" {
+                // Cache this build's real codec catalog (codecs sprint
+                // follow-up, same shape as the `devices` cache just above)
+                // - `reapply_codec_preference` cross-checks the persisted
+                // preference against this before ever sending `set_codecs`
+                // again. `available` is `core/PROTOCOL.md`'s
+                // `[{"name":...,"srate":N,"ch":N},...]` shape - only the
+                // names matter here, same "extract just the identity
+                // field" pattern as `devices`' `extract_names` above.
+                if let Some(available) = value.get("available").and_then(Value::as_array) {
+                    let names: Vec<String> = available
+                        .iter()
+                        .filter_map(|c| c.get("name").and_then(Value::as_str).map(str::to_string))
+                        .collect();
+                    *shared.known_codecs.lock_or_recover() = Some(names);
+                }
             }
 
             let _ = shared.app.emit(EVENT_LINE, value);
@@ -1923,6 +2221,141 @@ mod audio_config_lines_tests {
         assert!(notice.contains("Old USB Speaker"), "unexpected notice: {notice}");
     }
 }
+/// Whether this platform's official baresip build links modules as real,
+/// separate per-module files at `module_path` (`opus.so`/`coreaudio.so`/
+/// ...) that a `Path::exists()` check can actually reason about, versus a
+/// STATIC build where every module - including the codec/driver ones - is
+/// compiled straight into the binary via baresip's own generated
+/// `src/static.c` exports table, with **zero** per-module files on disk,
+/// ever, by construction.
+///
+/// Only macOS's official build is dynamic; Windows's is STATIC
+/// (`core/BUILD.md` "Windows CI" points 2-4, confirmed independently by
+/// `scripts/package-official.sh`'s own packaging step: its `find
+/// $CORE_BUILD_DIR -name '*.dll' -o -name '*.so' ...` step "will
+/// legitimately find zero module files there - that is NOT a bug", and the
+/// script explicitly skips its own ctrl_json-file-shipped assertion on
+/// Windows for the same reason). This means an existence check gated only
+/// on "is there a real driver for this platform" (like the pre-existing A1
+/// check just below, `driver.module_file()`) is silently WRONG on Windows
+/// today: it reports `wasapi.so` - which genuinely is compiled in - as
+/// permanently missing, because no such file will ever exist at
+/// `module_path` on that platform. Filed as a related finding in this
+/// change's report rather than fixed here (out of the Opus codec module's
+/// own scope), but `opus_config_line` below deliberately does NOT repeat
+/// that mistake for the *codec* module it adds: it only runs its own
+/// `Path::exists()` check when `modules_are_dynamic_files()` is true, and
+/// unconditionally trusts the module is present otherwise - see that
+/// function's doc.
+fn modules_are_dynamic_files() -> bool {
+    cfg!(target_os = "macos")
+}
+
+/// The `module opus.so` config line to write (or `""` if this build/
+/// platform can't offer it) plus an optional degrade notice, mirroring the
+/// audio-driver A1 check's shape (`write_config_file` below) but for the
+/// Opus codec module added in the codecs sprint (`core/PROTOCOL.md` v1.6).
+///
+/// `dynamic` is `modules_are_dynamic_files()`, passed as a parameter
+/// (not read from `cfg!` internally) so every branch is unit-testable
+/// regardless of which platform this test suite happens to run on - same
+/// shape as `audio_config_lines` above.
+///
+/// Two real "Opus isn't actually available" cases this exists to catch,
+/// and one it deliberately does NOT try to catch:
+/// - **Dynamic build (mac) missing the module file** (an old local build
+///   from before `opus` was added to `-DMODULES=`, or a future build
+///   where `FindOPUS.cmake`/vcpkg genuinely failed) - `dynamic == true`
+///   and `opus.so` isn't at `module_path`: omit the `module` line
+///   entirely and degrade with a real notice, same shape as A1's
+///   audio-driver fallback. Confirmed this doesn't crash the engine even
+///   without this check (`write_config_file`'s own doc: baresip's
+///   `module_handler` in `module.c` discards a load failure with `(void)`
+///   and keeps running) - this check exists for a clear, immediate notice
+///   instead of a silent "codecs panel just never shows Opus" mystery.
+/// - **Static build (Windows) with no per-module file, ever** - `dynamic
+///   == false`: the module line is written unconditionally, trusting
+///   baresip's own static exports table (or, on a build that genuinely
+///   lacks Opus, the same graceful warn-and-continue discard as above) -
+///   see `modules_are_dynamic_files`'s doc for why an existence check here
+///   would be actively wrong, not just unnecessary.
+fn opus_config_line(dynamic: bool, module_path: &Path) -> (&'static str, Option<String>) {
+    if dynamic && !module_path.join("opus.so").exists() {
+        let notice = format!(
+            "the Opus codec module 'opus.so' was not found at {} - this core engine build doesn't include it. Calls will negotiate G.711 only until the build is fixed.",
+            module_path.display()
+        );
+        ("", Some(notice))
+    } else {
+        ("module\t\t\topus.so\n", None)
+    }
+}
+
+#[cfg(test)]
+mod opus_config_line_tests {
+    use super::*;
+
+    #[test]
+    fn dynamic_build_with_opus_present_includes_the_module_line() {
+        let dir = std::env::temp_dir().join(format!(
+            "centinelo-opus-cfg-test.present.{}.{}",
+            std::process::id(),
+            nanos_suffix()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("opus.so"), b"stub").unwrap();
+
+        let (line, notice) = opus_config_line(true, &dir);
+        assert_eq!(line, "module\t\t\topus.so\n");
+        assert_eq!(notice, None);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dynamic_build_missing_opus_omits_the_line_with_a_notice() {
+        let dir = std::env::temp_dir().join(format!(
+            "centinelo-opus-cfg-test.missing.{}.{}",
+            std::process::id(),
+            nanos_suffix()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Deliberately no opus.so written here.
+
+        let (line, notice) = opus_config_line(true, &dir);
+        assert_eq!(line, "");
+        assert!(notice.is_some(), "a missing module on a dynamic build must degrade with a real notice");
+        assert!(notice.unwrap().contains("opus.so"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The regression this function exists to prevent: a STATIC build
+    /// (Windows) never has a per-module file on disk, by construction -
+    /// gating on `Path::exists()` there would report a genuinely-compiled-
+    /// in Opus as permanently missing forever. `dynamic == false` must
+    /// include the module line unconditionally, even against an empty
+    /// directory with nothing in it at all - exactly what a real Windows
+    /// `module_path` looks like today (`scripts/package-official.sh`'s own
+    /// "module count is zero either way" comment).
+    #[test]
+    fn static_build_includes_the_line_unconditionally_even_with_no_file_on_disk() {
+        let dir = std::env::temp_dir().join(format!(
+            "centinelo-opus-cfg-test.static.{}.{}",
+            std::process::id(),
+            nanos_suffix()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Empty directory - no opus.so, no anything - matches a real
+        // Windows module_path exactly.
+
+        let (line, notice) = opus_config_line(false, &dir);
+        assert_eq!(line, "module\t\t\topus.so\n");
+        assert_eq!(notice, None);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
 
 /// Generates the scratch `config` baresip reads (mirrors `core/run-spike.sh`,
 /// see this file's module doc). Returns `Ok(Some(notice))` when the audio
@@ -2003,10 +2436,20 @@ fn write_config_file(
     let audio_player = &lines.player;
     let audio_alert = &lines.alert;
 
+    // Opus codec module (codecs sprint, core/PROTOCOL.md v1.6) - independent
+    // of the audio_source/audio_player synthetic-vs-real decision above,
+    // checked unconditionally (a synthetic-audio e2e run still wants a real
+    // `codecs` catalog to exercise the panel/protocol against). See
+    // `opus_config_line`'s doc for the dynamic-vs-static-build distinction
+    // this can't skip without breaking Windows.
+    let (opus_module_line, opus_notice) = opus_config_line(modules_are_dynamic_files(), module_path);
+    notice = merge_notice(notice, opus_notice);
+
     let contents = format!(
         "# Generated by Centinelo Phone shell - do not edit by hand, do not commit.\n\n\
 module_path\t\t{module_path_str}\n\n\
 module\t\t\tg711.so\n\
+{opus_module_line}\
 module\t\t\tauconv.so\n\
 module\t\t\tauresamp.so\n\
 {audio_module_lines}\
@@ -2023,6 +2466,107 @@ rtp_timeout\t\t0\n"
     );
     std::fs::write(scratch_dir.join("config"), contents).map_err(|e| e.to_string())?;
     Ok(notice)
+}
+
+#[cfg(test)]
+mod write_config_file_tests {
+    use super::*;
+
+    /// Two throwaway dirs per test - `scratch_dir` (where the generated
+    /// `config` file lands) and `module_path` (what `write_config_file`
+    /// checks `opus.so`/the audio driver's `.so` against) - same shape
+    /// `SpawnPlan::build` uses in production, just without a real core
+    /// binary next to `module_path`.
+    fn dirs(tag: &str) -> (PathBuf, PathBuf) {
+        let base = std::env::temp_dir().join(format!(
+            "centinelo-write-config-test.{tag}.{}.{}",
+            std::process::id(),
+            nanos_suffix()
+        ));
+        let scratch_dir = base.join("scratch");
+        let module_path = base.join("modules");
+        std::fs::create_dir_all(&scratch_dir).unwrap();
+        std::fs::create_dir_all(&module_path).unwrap();
+        (scratch_dir, module_path)
+    }
+
+    /// Also stubs this platform's real audio-driver module file (A1's own
+    /// pre-existing check, unrelated to this change) so a test asserting
+    /// "no notice at all" isn't tripped up by the *driver* being reported
+    /// missing - only used by tests that care about that.
+    fn stub_platform_driver(module_path: &Path) {
+        if let Some(driver) = platform_audio_driver() {
+            std::fs::write(module_path.join(driver.module_file()), b"stub").unwrap();
+        }
+    }
+
+    /// The actual bug this whole change fixes, guarded directly: whatever
+    /// `write_config_file` writes must list `opus.so` - the module the
+    /// codecs panel's entire feature depends on - not just the shell's own
+    /// UI-side plumbing for it. On this dev machine (macOS,
+    /// `modules_are_dynamic_files() == true`), that requires an
+    /// `opus.so` actually sitting at `module_path`, same as a real build.
+    #[test]
+    fn generated_config_lists_the_opus_module_when_present() {
+        let (scratch_dir, module_path) = dirs("opus-present");
+        std::fs::write(module_path.join("opus.so"), b"stub").unwrap();
+        stub_platform_driver(&module_path);
+
+        let notice = write_config_file(&scratch_dir, &module_path, "udp", &AudioSettings::default(), None).unwrap();
+
+        let contents = std::fs::read_to_string(scratch_dir.join("config")).unwrap();
+        assert!(contents.contains("module\t\t\topus.so\n"), "config must load the Opus codec module:\n{contents}");
+        assert_eq!(notice, None);
+
+        std::fs::remove_dir_all(module_path.parent().unwrap()).ok();
+    }
+
+    /// Load-order guard, straight from `core/BUILD.md` "account module must
+    /// load after codec/mnat/menc modules": `account.so` validates the
+    /// account's `audio_codecs=` restriction against whatever codecs are
+    /// *already* registered at the moment it parses - loading it before
+    /// `opus.so` would silently reduce the restriction check to G.711
+    /// only, and this is exactly the class of bug that manifests as "works
+    /// today, breaks the moment the account config *does* reference
+    /// Opus" - no coincidence: it's the account.so-load-order footgun
+    /// this repo has already documented once for the audio driver modules.
+    #[test]
+    fn opus_module_loads_before_account_module() {
+        let (scratch_dir, module_path) = dirs("opus-order");
+        std::fs::write(module_path.join("opus.so"), b"stub").unwrap();
+
+        write_config_file(&scratch_dir, &module_path, "udp", &AudioSettings::default(), None).unwrap();
+
+        let contents = std::fs::read_to_string(scratch_dir.join("config")).unwrap();
+        let opus_pos = contents.find("module\t\t\topus.so\n").expect("opus.so must be in the config");
+        let account_pos = contents.find("module\t\t\taccount.so\n").expect("account.so must be in the config");
+        assert!(opus_pos < account_pos, "opus.so must load before account.so:\n{contents}");
+
+        std::fs::remove_dir_all(module_path.parent().unwrap()).ok();
+    }
+
+    /// The other half of the bug this closes: a build/machine that
+    /// genuinely doesn't have `opus.so` (an old local build predating this
+    /// sprint, or a future one where vcpkg/Homebrew's opus install failed)
+    /// must not reference it in config at all - baresip's own
+    /// `module_handler` silently discards a load failure, so leaving the
+    /// line in would just mean Opus silently never shows up as
+    /// `available`, with nothing telling anyone why. On a dynamic build
+    /// (this dev machine) that must instead surface as a real notice.
+    #[test]
+    fn generated_config_omits_opus_and_notices_when_the_module_is_missing() {
+        let (scratch_dir, module_path) = dirs("opus-missing");
+        // Deliberately no opus.so written to module_path.
+
+        let notice = write_config_file(&scratch_dir, &module_path, "udp", &AudioSettings::default(), None).unwrap();
+
+        let contents = std::fs::read_to_string(scratch_dir.join("config")).unwrap();
+        assert!(!contents.contains("opus.so"), "a missing opus module must not be referenced in config:\n{contents}");
+        assert!(notice.is_some(), "a missing opus module on a dynamic build must produce a visible notice");
+        assert!(notice.unwrap().contains("opus.so"));
+
+        std::fs::remove_dir_all(module_path.parent().unwrap()).ok();
+    }
 }
 
 /// Joins two optional notices with `"; "` - small helper so
