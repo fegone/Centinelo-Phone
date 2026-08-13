@@ -237,12 +237,9 @@ merge:
 actual `centinelo-v*` tag (needs creating/moving a tag, outside this
 investigation's scope) — the anti-DLL MSI guard above is written and
 `actionlint`-clean but only executes against a real MSI the next time
-`build-windows` runs for a real release. See
-`.claude/reports/release-ci-2026-08-13-opus-windows-ci.md` (workspace,
-private) for the full writeup, including the `dumpbin`-unavailable
-non-fatal skip and the PR (`fegone/Centinelo-Phone#22`,
-`feature/codecs-windows-ci` → `feature/codecs-core`, **not yet merged —
-pending 4R**).
+`build-windows` runs for a real release.
+See the internal build notes for the full writeup, including the
+`dumpbin`-unavailable non-fatal skip.
 
 ## Codecs (G.722 — not in this build)
 
