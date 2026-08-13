@@ -194,6 +194,15 @@ jobs:
           "FAKE-FIXTURE-CENTINELO-LIBSSL-MARKER" | Out-File -Encoding ascii "fake-openssl-dlls\libssl-3-x64.dll"
           "FAKE-FIXTURE-CENTINELO-LIBCRYPTO-MARKER" | Out-File -Encoding ascii "fake-openssl-dlls\libcrypto-3-x64.dll"
 
+          # VCRUNTIME140_THREADS.dll fixture (codecs sprint follow-up,
+          # 2026-08-13) - same shape as the OpenSSL fixtures above, proving
+          # --vcredist-dll-dir's staging+packaging mechanism (not a real
+          # MSVC-toolset copy - release.yml's own "Locate
+          # VCRUNTIME140_THREADS.dll" step does that against the real
+          # runner toolset and is unaffected by this synthetic job).
+          New-Item -ItemType Directory -Force -Path "fake-vcredist-dlls" | Out-Null
+          "FAKE-FIXTURE-CENTINELO-VCRUNTIME-THREADS-MARKER" | Out-File -Encoding ascii "fake-vcredist-dlls\vcruntime140_threads.dll"
+
           $combo = "${{ matrix.combo }}"
           if ($combo -ne "community") {
             New-Item -ItemType Directory -Force -Path "fake-premium" | Out-Null
@@ -221,7 +230,7 @@ jobs:
           # produces the NSIS .exe + MSI .msi and the steps below still prove
           # bundle.resources really rode into both - that is what this job is
           # FOR, and it is unaffected by turning off updater artifacts.
-          ARGS=(--target windows --skip-core-build --no-updater-artifacts --openssl-dll-dir "$PWD/fake-openssl-dlls" --output-dir "dist/windows-${{ matrix.combo }}")
+          ARGS=(--target windows --skip-core-build --no-updater-artifacts --openssl-dll-dir "$PWD/fake-openssl-dlls" --vcredist-dll-dir "$PWD/fake-vcredist-dlls" --output-dir "dist/windows-${{ matrix.combo }}")
           if [[ "${{ matrix.combo }}" != "community" ]]; then
             ARGS+=(--premium-dylib "$PWD/fake-premium/centinelo_premium.dll" --premium-sig "$PWD/fake-premium/centinelo_premium.dll.sig")
           fi
@@ -284,6 +293,17 @@ jobs:
             exit 1
           }
           Write-Host "OK: baresip.exe + libssl-*.dll + libcrypto-*.dll all beside each other at $($baresipExe.DirectoryName)"
+
+          # VCRUNTIME140_THREADS.dll fixture check (codecs sprint
+          # follow-up, 2026-08-13) - same "required in EVERY combo, beside
+          # baresip.exe" shape as the OpenSSL DLLs above.
+          $vcruntimeThreads = Get-ChildItem -Recurse "$extractDir" -Filter "vcruntime140_threads.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $vcruntimeThreads) { Write-Error "no vcruntime140_threads.dll (fixture) found in extracted MSI - core.exe would fail to start on a clean machine with STATUS_DLL_NOT_FOUND"; exit 1 }
+          if ($baresipExe.DirectoryName -ne $vcruntimeThreads.DirectoryName) {
+            Write-Error "vcruntime140_threads.dll is NOT beside baresip.exe: baresip.exe in $($baresipExe.DirectoryName), vcruntime140_threads.dll in $($vcruntimeThreads.DirectoryName)"
+            exit 1
+          }
+          Write-Host "OK: vcruntime140_threads.dll (fixture) is beside baresip.exe at $($vcruntimeThreads.DirectoryName)"
 
           $exe = Get-ChildItem -Recurse "$extractDir" -Filter "centinelo-shell.exe" | Select-Object -First 1
           if (-not $exe) { Write-Error "centinelo-shell.exe not found in extracted MSI"; exit 1 }
