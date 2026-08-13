@@ -1150,18 +1150,71 @@ jobs:
           $baresipExe = Get-ChildItem -Recurse "$extractDir" -Filter "baresip.exe" | Select-Object -First 1
           if (-not $baresipExe) { Write-Error "baresip.exe not found in $extractDir - did the earlier extraction step run?"; exit 1 }
 
-          $dumpOutput = & $dumpbin.FullName /dependents $baresipExe.FullName
+          # Pin native argument passing so the space in paths like
+          # "...\PFiles\Centinelo Phone\core-engine\baresip.exe" (and the VS
+          # install path) is ALWAYS forwarded to dumpbin as a single, quoted
+          # argument regardless of $PSNativeCommandArgumentPassing default.
+          # The Windows runner's pwsh 7.3+ default ('Windows') already quotes
+          # correctly, but pinning 'Standard' makes it explicit and survives a
+          # future runner image downgrade. Pref var only exists on 7.3+.
+          if ($PSVersionTable.PSVersion -ge [version]'7.3') { $PSNativeCommandArgumentPassing = 'Standard' }
+
+          $exePath = $baresipExe.FullName
+          # Capture dumpbin stdout (to parse) and stderr (to diagnose)
+          # SEPARATELY, plus the exit code. A dumpbin that fails to actually
+          # read the binary (bad invocation, missing vcvars env, wrong arch,
+          # truncated extraction) writes a fatal error to stderr and an EMPTY
+          # stdout - which the old code silently turned into a misleading
+          # "no imports" message. Surfacing the real failure mode here is what
+          # lets us distinguish "I could not analyze this binary" from
+          # "this binary is missing DLLs" (see requirement #1).
+          $stderrFile = if ($env:RUNNER_TEMP) { Join-Path $env:RUNNER_TEMP ("dumpbin-stderr-" + [guid]::NewGuid().ToString('N') + '.log') } else { Join-Path $PWD 'dumpbin-stderr.log' }
+          $dumpOutput = & "$($dumpbin.FullName)" /dependents "$exePath" 2>"$stderrFile"
+          $dumpbinExit = $LASTEXITCODE
+          $dumpbinStderr = ''
+          if (Test-Path -LiteralPath $stderrFile) { $dumpbinStderr = (Get-Content -LiteralPath $stderrFile -Raw) }
+          Remove-Item -LiteralPath $stderrFile -ErrorAction SilentlyContinue
+
+          if ($dumpbinExit -ne 0) {
+            Write-Error "dumpbin /dependents FAILED (exit $dumpbinExit) and could not analyze baresip.exe at '$exePath'. This is an ANALYSIS failure (tool/environment problem - e.g. dumpbin invoked without the MSVC/vcvars environment, a path/invocation issue, or a corrupted extraction), NOT a missing-DLL finding. dumpbin stderr:`n$dumpbinStderr"
+            exit 1
+          }
+
+          # dumpbin /dependents prints:
+          #     Image has the following dependencies:
+          #                       <-- a BLANK line
+          #     KERNEL32.dll
+          #     ...
+          #     libssl-3-x64.dll
+          #
+          #   Summary
+          # The previous parser broke on the FIRST blank line (the one right
+          # after the header) and therefore parsed zero imports EVERY run -
+          # which fired the misleading 'output format may have changed'
+          # message and blocked centinelo-v2.0.4 (a false positive: the guard
+          # never got to run its real checks). Fix: terminate the import
+          # block ONLY on dumpbin's real section terminators (Summary /
+          # Section) or end-of-output, and SKIP blank lines instead of
+          # breaking on them. Accepting every non-blank line in the block
+          # (rather than only '*.dll') means an unexpected future import is
+          # never silently dropped - which is the whole point of this guard.
           $inBlock = $false
           $imports = @()
           foreach ($line in $dumpOutput) {
-            if ($line -match "has the following dependencies") { $inBlock = $true; continue }
-            if ($inBlock) {
-              $trimmed = $line.Trim()
-              if ($trimmed -eq "") { break }
-              $imports += $trimmed
-            }
+            if ($line -match 'has the following dependencies') { $inBlock = $true; continue }
+            if (-not $inBlock) { continue }
+            if ($line -match '^\s*Summary\b') { break }
+            if ($line -match '^\s*Section\b') { break }
+            $trimmed = $line.Trim()
+            if ($trimmed -eq '') { continue }
+            $imports += $trimmed
           }
-          if ($imports.Count -eq 0) { Write-Error "dumpbin /dependents produced no import list for $($baresipExe.FullName) - dumpbin output format may have changed"; exit 1 }
+
+          if ($imports.Count -eq 0) {
+            $stdoutJoined = $dumpOutput -join "`n"
+            Write-Error "dumpbin /dependents ran successfully (exit 0) but produced no recognizable import list for baresip.exe at '$exePath'. This is an ANALYSIS failure (dumpbin output format unrecognized), NOT a missing-DLL finding - the import-table guard did not get to run its checks. dumpbin stdout:`n$stdoutJoined"
+            exit 1
+          }
           Write-Host "== baresip.exe imports ($($imports.Count)) =="
           $imports | ForEach-Object { Write-Host "  $_" }
 
