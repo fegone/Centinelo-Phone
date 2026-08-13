@@ -9,10 +9,9 @@
 # for the full design this mirrors.
 #
 # Status: DRAFT / partially wired into CI. Exercised locally on macOS against
-# real core+shell builds and synthetic (non-secret) premium fixtures — see
-# .claude/reports/release-ci-2026-07-16-f5-prep.md (main report + 4R-fix
-# appendix) for the exact commands and what they produced, including a
-# dedicated symlink-fixture re-test (see "Known gaps" #1 below). Not yet run
+# real core+shell builds and synthetic (non-secret) premium fixtures,
+# including a dedicated symlink-fixture re-test (see "Known gaps" #1 below).
+# Not yet run
 # against a *real* signed premium dylib (that requires Felix's offline
 # signing key, which never touches this repo or CI) or a *real* Windows core
 # build via THIS script specifically — core-win (windows-media-modules,
@@ -973,9 +972,8 @@ fi
 #      NSIS/MSI installer — verified end-to-end with synthetic fixtures
 #      against resources placement + build succeeding across all three
 #      supported combinations (Community / Pro-without-console /
-#      Pro-with-console), see
-#      .claude/reports/release-ci-2026-07-16-windows-installer.md for the
-#      run URL. Still open: macOS DMG signing/notarization, and Windows OV
+#      Pro-with-console) via a real windows-latest CI run.
+#      Still open: macOS DMG signing/notarization, and Windows OV
 #      cert code-signing (`bundle.windows.certificateThumbprint` is
 #      deliberately unset) — both explicitly deferred until public launch
 #      per CLAUDE.md, SmartScreen/Gatekeeper will warn once for the beta.

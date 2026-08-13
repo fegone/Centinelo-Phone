@@ -778,6 +778,16 @@ jobs:
     # Windows job (same core/ build) already needs more headroom than its
     # macOS counterpart, and this job adds the Tauri/NSIS/MSI stage on top.
     timeout-minutes: 120
+    env:
+      # Opus (codecs sprint, v1.6) has no Chocolatey package (verified via
+      # `choco search opus` - see core/BUILD.md "Codecs (Opus)") and
+      # FindOPUS.cmake skips pkg-config entirely on WIN32, so vcpkg is the
+      # only real path to a Windows opus.h/opus.lib. Pinned to a specific
+      # vcpkg tag (not `master`) so a future upstream vcpkg change can't
+      # silently swap the opus version this release build links against
+      # without a deliberate bump here - reproducibility for a release
+      # pipeline, not just convenience.
+      VCPKG_REF: "2026.07.29"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -786,6 +796,53 @@ jobs:
 
       - name: Install OpenSSL (Chocolatey)
         run: choco install openssl -y --no-progress
+
+      - name: Cache vcpkg (opus)
+        # Caches the cloned+bootstrapped vcpkg tree AND its installed/
+        # output (opus.lib + opus.h) together, keyed on the pinned vcpkg
+        # tag + triplet + opus port version. A cache hit skips the clone/
+        # bootstrap/compile-from-source entirely - opus itself is small,
+        # but vcpkg's own bootstrap (fetching its bundled CMake/ninja) and
+        # git-cloning the ports registry is not, and paying that on every
+        # release run for a dependency that changes rarely would be pure
+        # waste. `opus-port-v1` is a manual cache-buster suffix: bump it
+        # if this job's opus triplet/build flags ever change without the
+        # VCPKG_REF pin also changing.
+        id: vcpkg-cache
+        uses: actions/cache@v4
+        with:
+          path: vcpkg
+          key: vcpkg-opus-x64-windows-static-md-${{ env.VCPKG_REF }}-opus-port-v1
+
+      - name: Bootstrap vcpkg + install opus (skipped on cache hit)
+        if: steps.vcpkg-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          git clone --depth 1 --branch $env:VCPKG_REF https://github.com/microsoft/vcpkg
+          .\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+          # x64-windows-static-md (a built-in vcpkg triplet, not a
+          # community one - confirmed present in the pinned vcpkg tag):
+          # STATIC opus.lib linked against the DYNAMIC (/MD) MSVC CRT,
+          # matching this job's existing Release/MSVC default CRT choice
+          # (no CMAKE_MSVC_RUNTIME_LIBRARY override anywhere in this
+          # workflow). Deliberately NOT the default x64-windows triplet,
+          # which builds a SHARED opus.dll: baresip.exe already needs the
+          # choco OpenSSL DLLs staged beside it (see "Verify installer +
+          # updater artifacts" step below), and every additional runtime
+          # DLL is one more way the installer can produce an .exe that
+          # launches fine on this runner and then fails to start on the
+          # end user's machine if packaging ever misses it. Static opus
+          # removes that failure mode entirely for this one codec: it
+          # rides inside baresip.exe with no DLL to stage or forget.
+          .\vcpkg\vcpkg.exe install opus:x64-windows-static-md
+
+      - name: Verify vcpkg opus install (fail fast, cache-hit or not)
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f vcpkg/installed/x64-windows-static-md/lib/opus.lib
+          test -f vcpkg/installed/x64-windows-static-md/include/opus/opus.h
+          echo "OK: opus.lib + opus.h present under vcpkg/installed/x64-windows-static-md"
 
       - name: Locate OpenSSL install dir (choco deploy path varies by pkg version)
         # Identical to core-build.yml's Windows job - see that file's own
@@ -864,7 +921,8 @@ jobs:
             -DRE_LIBRARY="$RE_INSTALL/lib/re-static.lib" \
             -DRE_INCLUDE_DIR="$(pwd -W)/core/deps/re/include" \
             -DOPENSSL_ROOT_DIR="$OPENSSL_ROOT_DIR" \
-            -DMODULES="account;g711;auconv;auresamp;ausine;aufile;ice;dtls_srtp;menu;wasapi" \
+            -DOPUS_HINTS="$(pwd -W)/vcpkg/installed/x64-windows-static-md" \
+            -DMODULES="account;g711;opus;auconv;auresamp;ausine;aufile;ice;dtls_srtp;menu;wasapi" \
             -DAPP_MODULES="ctrl_json" \
             -DAPP_MODULES_DIR="$(pwd -W)/core/modules" \
             2>&1 | tee baresip-configure.log
@@ -882,7 +940,7 @@ jobs:
             exit 1
           fi
           detected_tokens=";${detected_line#MODULES_DETECTED=};"
-          for mod in ausine aufile ice dtls_srtp wasapi; do
+          for mod in ausine aufile ice dtls_srtp wasapi opus; do
             case "$detected_tokens" in
               *";$mod;"*) ;;
               *)
@@ -891,7 +949,7 @@ jobs:
                 ;;
             esac
           done
-          echo "OK: re + baresip(+ctrl_json, +ausine, +aufile, +ice, +dtls_srtp, +wasapi) built on Windows"
+          echo "OK: re + baresip(+ctrl_json, +ausine, +aufile, +ice, +dtls_srtp, +wasapi, +opus) built on Windows"
 
       - uses: actions/setup-node@v4
         with:
@@ -968,6 +1026,17 @@ jobs:
           $premiumDll = Get-ChildItem -Recurse "$extractDir" -Filter "centinelo_premium.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
           if ($premiumDll) { Write-Error "Community edition build shipped centinelo_premium.dll - the resources filter leaked a premium artifact into a public-repo release"; exit 1 }
           Write-Host "OK: Community edition correctly ships no centinelo_premium.dll"
+
+          # Opus (codecs sprint, v1.6) is built via vcpkg's x64-windows-static-md
+          # triplet specifically so it links STATICALLY into baresip.exe - no
+          # opus.dll should exist anywhere. This is a regression guard: if a
+          # future edit ever swaps the triplet back to the default (dynamic)
+          # x64-windows, this catches the missing-DLL-on-the-end-user's-machine
+          # failure mode at CI time instead of after Felix's remote-work
+          # install this week.
+          $opusDll = Get-ChildItem -Recurse "$extractDir" -Filter "opus*.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($opusDll) { Write-Error "Found $($opusDll.Name) in the extracted MSI - opus should be statically linked (x64-windows-static-md), not shipped as a DLL"; exit 1 }
+          Write-Host "OK: opus is statically linked - no opus*.dll in the installer"
 
       - name: Stage Windows release assets flat
         # upload-artifact@v4 preserves the common-ancestor directory
