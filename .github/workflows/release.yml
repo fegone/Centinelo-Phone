@@ -38,6 +38,28 @@ name: release
 # prerelease release", not by tag name shape - see "Create GitHub
 # Release" below for why this workflow still passes `--latest` explicitly
 # rather than relying on that default.
+#
+# ---------------------------------------------------------------------
+# Prerelease default (2026-08-13, release-ci pass) - safe on BOTH trigger
+# paths, not just one
+# ---------------------------------------------------------------------
+# The two trigger types used to disagree on what "no explicit choice"
+# means: `workflow_dispatch`'s `prerelease` input defaulted to `false`
+# (so checking the box was required to stay in beta), while a plain
+# `centinelo-v*` tag push has no `inputs.prerelease` at all - the
+# "Publish the release" step's shell read that as an empty string, fell
+# into its `else` branch, and shipped `--latest`. Same version, same
+# code, different result depending on which button someone clicked - and
+# `--latest` is exactly the failure mode this repo cannot afford while
+# 2.0 has no Windows/Apple signing cert: it would silently displace
+# v1.0.0 as the repo's public "Latest" download for every anonymous
+# visitor, not just Edgar. Fixed by making BOTH paths default to
+# prerelease=true unless a human explicitly opts out: the
+# `workflow_dispatch` input's own default is now `true`, and the "Publish
+# the release" step below treats a tag push (no input to read at all) the
+# same way - `false` only reaches `--latest` when someone running
+# `workflow_dispatch` deliberately unchecks the box. Taking 2.0 out of
+# beta is still a one-input change, it's just opt-in instead of opt-out.
 on:
   push:
     tags:
@@ -60,10 +82,19 @@ on:
         required: true
         type: string
       prerelease:
-        description: 'Publish as a GitHub prerelease (not marked "Latest", won''t satisfy the update endpoint for the app''s own auto-updater).'
+        description: >-
+          Publish as a GitHub prerelease (not marked "Latest" - the
+          repo-wide "Latest" slot is shared with v1.0.0's Electron line
+          and, while 2.0 is beta, must never be silently taken over by a
+          v2.x build with no OS-level signing cert). Default is `true`
+          (safe): mark this run as prerelease UNLESS you explicitly
+          uncheck it. Pass `false` only as a deliberate "take 2.0 out of
+          beta" act - see the trigger-design comment at the top of this
+          file for why both trigger paths (this input AND a plain
+          `centinelo-v*` tag push) now default safe the same way.
         required: false
         type: boolean
-        default: false
+        default: true
 
 # Release builds are expensive (a full core + shell compile per platform)
 # and their output is a public artifact - a superseded run must never be
@@ -1264,13 +1295,28 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.preflight.outputs.tag }}
-          PRERELEASE: ${{ inputs.prerelease }}
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_PRERELEASE: ${{ inputs.prerelease }}
         run: |
           set -euo pipefail
-          FLAGS=(--draft=false)
-          if [[ "$PRERELEASE" == "true" ]]; then
-            FLAGS+=(--prerelease)
+          # Resolve the safe-by-default PRERELEASE decision described in
+          # this file's top-of-file "Prerelease default" comment: a tag
+          # push has no `inputs.prerelease` to read at all (DISPATCH_PRERELEASE
+          # is empty), so it's treated the same as an explicit `true` -
+          # `--latest` is reachable ONLY via workflow_dispatch with the
+          # box deliberately unchecked. This is done in bash, not a GHA
+          # `||` expression, on purpose: `inputs.prerelease == false || 'true'`
+          # would evaluate to 'true' too, because GHA's `||` treats a
+          # boolean `false` as falsy and falls through to the next
+          # operand - it cannot distinguish "explicitly false" from
+          # "absent" the way this decision needs to.
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            PRERELEASE="$DISPATCH_PRERELEASE"
           else
+            PRERELEASE="true"
+          fi
+          FLAGS=(--draft=false)
+          if [[ "$PRERELEASE" == "false" ]]; then
             # --latest: the app's own auto-updater endpoint is GitHub's
             # "latest release" alias - explicit here rather than relying
             # on gh's "automatic based on date and version" default,
@@ -1279,6 +1325,8 @@ jobs:
             # must not keep shadowing v2 releases as "Latest" just
             # because of tag/date ordering ambiguity.
             FLAGS+=(--latest)
+          else
+            FLAGS+=(--prerelease)
           fi
           # Retry with backoff (2026-07-17, 4R resilience fix) - see the
           # "Create the release as a DRAFT" step above for the full
@@ -1372,6 +1420,170 @@ jobs:
           }
           retry_gh gh release upload "$TAG" --repo fegone/Centinelo-Phone dist/latest.json
 
+      - name: Publish latest.json to the updater-manifest branch (beta update endpoint)
+        # tauri.conf.json's plugins.updater.endpoints now lists TWO
+        # endpoints: GitHub's `/releases/latest/download/` alias (first -
+        # already correct the day 2.0 leaves beta and starts publishing
+        # `--latest`, no config change needed that day) and this branch's
+        # raw.githubusercontent.com URL (second - the one that actually
+        # works TODAY, while every 2.0.x release is a prerelease and the
+        # first endpoint 404s, per .claude/reports/release-ci-2026-08-12-
+        # updater-endpoint-prerelease.md section 2/3). tauri-plugin-
+        # updater tries endpoints in array order and falls through to the
+        # next on ANY failure (updater.rs:412-518, verified in that same
+        # report) - so this second endpoint is a plain fallback, not a
+        # replacement, and needs no code change in the Rust shell.
+        #
+        # raw.githubusercontent.com serves a branch's file content
+        # directly - it has no concept of "release" at all, so prerelease/
+        # draft status is irrelevant to it (verified in the report above).
+        # The branch is public-repo content, on purpose scoped to ONLY
+        # this one file: no README, no other files, ever - it exists
+        # solely to be fetched by installed clients' auto-updaters, not to
+        # be a real branch of source history. Uses GITHUB_TOKEN (already
+        # `contents: write` for this job, see the job-level `permissions:`
+        # above) - no new secret.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          BRANCH="updater-manifest"
+          REMOTE="https://x-access-token:${GH_TOKEN}@github.com/fegone/Centinelo-Phone.git"
+          # GH_TOKEN is a GitHub Actions secret - the runner masks its
+          # literal value from all logs automatically (including inside
+          # this URL, on any error output), same as every other
+          # GH_TOKEN-bearing step in this job.
+          WORKDIR="$(mktemp -d)"
+
+          if git ls-remote --exit-code --heads "$REMOTE" "$BRANCH" >/dev/null 2>&1; then
+            echo "-- $BRANCH exists, cloning it"
+            git clone --quiet --depth 1 --branch "$BRANCH" "$REMOTE" "$WORKDIR"
+          else
+            echo "-- $BRANCH does not exist yet, creating it as an orphan branch (this file only, no history from main)"
+            git clone --quiet --depth 1 "$REMOTE" "$WORKDIR"
+            git -C "$WORKDIR" checkout --quiet --orphan "$BRANCH"
+            git -C "$WORKDIR" rm -rf --quiet . >/dev/null 2>&1 || true
+          fi
+
+          cp dist/latest.json "$WORKDIR/latest.json"
+          git -C "$WORKDIR" config user.name "centinelo-release-ci"
+          git -C "$WORKDIR" config user.email "release-ci@users.noreply.github.com"
+          git -C "$WORKDIR" add latest.json
+
+          if git -C "$WORKDIR" diff --cached --quiet; then
+            echo "OK: $BRANCH's latest.json already matches this release (no diff) - nothing to push"
+          else
+            git -C "$WORKDIR" commit --quiet -m "release: latest.json for $TAG (beta update endpoint, version $VERSION)"
+            push_with_retry() {
+              local attempt=1 max=3 delay=5
+              while true; do
+                if git -C "$WORKDIR" push --quiet origin "HEAD:$BRANCH"; then
+                  return 0
+                fi
+                if (( attempt >= max )); then
+                  echo "::error::push to $BRANCH failed after $max attempts" >&2
+                  return 1
+                fi
+                echo "-- push attempt $attempt/$max failed, fetching + rebasing onto origin/$BRANCH then retrying in ${delay}s..." >&2
+                git -C "$WORKDIR" fetch --quiet origin "$BRANCH"
+                git -C "$WORKDIR" rebase --quiet "origin/$BRANCH"
+                sleep "$delay"
+                delay=$(( delay * 3 ))
+                attempt=$(( attempt + 1 ))
+              done
+            }
+            push_with_retry
+            echo "OK: pushed latest.json ($VERSION) to $BRANCH -> https://raw.githubusercontent.com/fegone/Centinelo-Phone/$BRANCH/latest.json"
+          fi
+          rm -rf "$WORKDIR"
+
+      - name: Guard - verify a configured updater endpoint actually resolves this release
+        # This is the guard .claude/reports/release-ci-2026-08-12-updater-
+        # endpoint-prerelease.md section 5 flagged as missing: the guard
+        # above ("Verify latest.json download URLs resolve") only checks
+        # the download URLs INSIDE the manifest, never the endpoint a real
+        # installed client actually queries (tauri.conf.json's
+        # plugins.updater.endpoints) - that gap is exactly how v2.0.0 and
+        # v2.0.1 both shipped an auto-updater that could never find them.
+        # Reads the endpoints straight from tauri.conf.json with jq (never
+        # hardcoded here) so this guard tracks that file if it ever
+        # changes, substitutes the plugin's own template variables
+        # (updater.rs:413-440) defensively for any future endpoint that
+        # uses them (today's two endpoints are both static, no templates),
+        # and requires only that AT LEAST ONE configured endpoint serves
+        # this exact version - matching the plugin's real behavior
+        # (updater.rs:412-518: it tries each endpoint in order and stops
+        # at the first one that works, so a client only ever needs ONE to
+        # succeed). This also means the guard no longer needs the
+        # skip-during-prerelease escape hatch the report's section 5
+        # proposed: with the updater-manifest branch as a second endpoint,
+        # SOME endpoint should resolve on every release, prerelease or
+        # not - if none do, that is a real regression, not an expected
+        # prerelease side effect.
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          mapfile -t endpoints < <(jq -r '.plugins.updater.endpoints[]' shell/src-tauri/tauri.conf.json)
+          if [[ "${#endpoints[@]}" -eq 0 ]]; then
+            echo "::error::tauri.conf.json has no plugins.updater.endpoints configured - no installed client could ever check for updates." >&2
+            exit 1
+          fi
+
+          resolve_template() {
+            local url="$1"
+            url="${url//\{\{current_version\}\}/0.0.0}"
+            url="${url//\{\{target\}\}/darwin-aarch64}"
+            url="${url//\{\{arch\}\}/aarch64}"
+            url="${url//\{\{bundle_type\}\}/app}"
+            printf '%s' "$url"
+          }
+
+          any_ok=0
+          for raw_url in "${endpoints[@]}"; do
+            url="$(resolve_template "$raw_url")"
+            code="000"
+            body=""
+            max=5
+            delay=5
+            for (( attempt=1; attempt<=max; attempt++ )); do
+              # One request, not two: -w appends the http_code as its own
+              # trailing line after curl's normal stdout body, then the
+              # response is split back apart below - same idea as this
+              # job's "Verify latest.json download URLs resolve" step,
+              # adapted here because that step only needed the code, this
+              # one also needs the body to check `.version`.
+              raw="$(curl -sL --connect-timeout 5 --max-time 15 -w '\n%{http_code}' "$url" || printf '\n000')"
+              code="$(tail -n1 <<<"$raw")"
+              body="$(sed '$d' <<<"$raw")"
+              [[ "$code" == "200" ]] && break
+              if (( attempt < max )); then
+                echo "-- attempt $attempt/$max: $url -> HTTP $code, retrying in ${delay}s..." >&2
+                sleep "$delay"
+                delay=$(( delay * 2 ))
+              fi
+            done
+            if [[ "$code" != "200" ]]; then
+              echo "::warning::updater endpoint unreachable after $max attempts (HTTP $code): $raw_url (resolved: $url) - expected for the GitHub 'latest' alias while this release is a prerelease, see the trigger-design comment at the top of this file." >&2
+              continue
+            fi
+            seen_version="$(jq -r '.version // empty' <<<"$body" 2>/dev/null || true)"
+            if [[ "$seen_version" != "$VERSION" ]]; then
+              echo "::warning::updater endpoint $raw_url served a manifest with version '$seen_version' (expected '$VERSION') - a real installed client hitting THIS endpoint would not see this release." >&2
+              continue
+            fi
+            echo "OK: $raw_url resolves to version $VERSION"
+            any_ok=1
+          done
+
+          if [[ "$any_ok" -eq 0 ]]; then
+            echo "::error::NONE of tauri.conf.json's plugins.updater.endpoints resolve to the just-published version ($VERSION). An installed client's auto-updater would find no update at all for this release. This is the exact class of bug documented in .claude/reports/release-ci-2026-08-12-updater-endpoint-prerelease.md - if the GitHub 'latest' alias failed because this is a prerelease, the updater-manifest branch endpoint (pushed by the previous step) was expected to cover it; if that one failed too, the branch push above likely failed silently or the branch's content is stale - check that step's log." >&2
+            exit 1
+          fi
+          echo "OK: at least one configured updater endpoint resolves version $VERSION - an installed client's auto-updater would find this release."
+
       - name: Job summary
         env:
           TAG: ${{ needs.preflight.outputs.tag }}
@@ -1386,5 +1598,8 @@ jobs:
             echo "| Windows (windows-x86_64) | $([[ -d dist/windows ]] && echo yes || echo 'NO - build-windows did not succeed') |"
             echo
             echo "https://github.com/fegone/Centinelo-Phone/releases/tag/$TAG"
+            echo
+            echo "Beta update endpoint (auto-updater fallback while 2.0.x stays prerelease):"
+            echo "https://raw.githubusercontent.com/fegone/Centinelo-Phone/updater-manifest/latest.json"
           } >> "$GITHUB_STEP_SUMMARY"
 

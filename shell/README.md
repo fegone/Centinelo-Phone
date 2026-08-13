@@ -877,9 +877,28 @@ Everything below is what `ui/js/app.js`'s updater code and
 publish pipeline (a separate release-ci task) needs to produce exactly
 this, nothing here needs to change on the app side to match it.
 
-**Endpoint** (already set): `https://github.com/fegone/Centinelo-Phone/releases/latest/download/latest.json`
-— GitHub's "latest release" redirect, so this URL never changes across
-releases; only the release itself does.
+**Endpoints** (already set, two, tried in order — `tauri-plugin-updater`
+falls through to the next on ANY failure, `updater.rs:412-518`):
+
+1. `https://github.com/fegone/Centinelo-Phone/releases/latest/download/latest.json`
+   — GitHub's "latest release" redirect, so this URL never changes across
+   releases; only the release itself does. **GitHub excludes prereleases
+   from this alias, always, no exception** — while 2.0.x ships as a
+   prerelease (the default — see `release.yml`'s `prerelease` input and
+   its top-of-file "Prerelease default" comment), this endpoint 404s for
+   every installed client. That's expected, not a bug, until 2.0 leaves
+   beta and a release is explicitly published with `--latest`.
+2. `https://raw.githubusercontent.com/fegone/Centinelo-Phone/updater-manifest/latest.json`
+   — a plain branch file, not a GitHub Release at all, so prerelease/draft
+   status is irrelevant to it. `release.yml`'s "Publish latest.json to the
+   updater-manifest branch" step pushes the just-published release's
+   `latest.json` here on every release, so this is the endpoint that
+   actually works **today**, while 2.0.x stays prerelease. That branch
+   carries ONLY `latest.json`, on purpose — nothing internal, nothing
+   else, ever (this repo is public).
+
+Full investigation + rationale: `.claude/reports/release-ci-2026-08-12-
+updater-endpoint-prerelease.md` (private workspace, not in this repo).
 
 **`latest.json`** — uploaded as a release asset literally named
 `latest.json`, on every release:
