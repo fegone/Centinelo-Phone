@@ -7,6 +7,7 @@ mod deeplink;
 mod e2e;
 mod hid;
 mod premium;
+mod profile_cleanup;
 mod provisioning;
 mod settings;
 mod sidecar;
@@ -140,6 +141,34 @@ pub fn run() {
         .register_uri_scheme_protocol(console::ASSET_SCHEME, console::asset_protocol_handler)
         .setup(|app| {
             let app_data_dir = app.path().app_data_dir()?;
+
+            // Windows-only cleanup of a stale `%APPDATA%\.baresip\` profile
+            // left behind by a now-fixed engine bug that made the engine
+            // ignore the `-f <scratch_dir>` path this app passes it and
+            // fall back to baresip's own default profile location instead
+            // - which, during diagnosis, ended up with a real SIP
+            // `accounts` file (plaintext `auth_pass`) hand-copied into it.
+            // Runs on every startup, not just after an installer, because
+            // a machine that already hit the bug reaches this fix through
+            // the auto-updater, never the installer again. See
+            // profile_cleanup.rs's module doc for the full reasoning
+            // (what gets deleted, why the whole directory, why not
+            // unconditionally, and the safety line against ever touching
+            // `app_data_dir` itself). macOS never had this bug (baresip's
+            // Windows-only `fs_gethome()` fallback is what created the
+            // stale directory in the first place), so this is Windows-only
+            // by construction, not by omission.
+            #[cfg(target_os = "windows")]
+            {
+                match std::env::var("APPDATA") {
+                    Ok(appdata) => profile_cleanup::cleanup_stale_baresip_profile(
+                        std::path::Path::new(&appdata),
+                        &app_data_dir,
+                    ),
+                    Err(e) => log::warn!("stale-profile cleanup: APPDATA not set ({e}), skipping"),
+                }
+            }
+
             let settings = Arc::new(SettingsStore::load(&app_data_dir)?);
             app.manage(settings.clone());
             app.manage(AdminSession::default());
