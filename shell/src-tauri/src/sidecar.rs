@@ -2240,13 +2240,15 @@ mod audio_config_lines_tests {
 /// check just below, `driver.module_file()`) is silently WRONG on Windows
 /// today: it reports `wasapi.so` - which genuinely is compiled in - as
 /// permanently missing, because no such file will ever exist at
-/// `module_path` on that platform. Filed as a related finding in this
-/// change's report rather than fixed here (out of the Opus codec module's
-/// own scope), but `opus_config_line` below deliberately does NOT repeat
-/// that mistake for the *codec* module it adds: it only runs its own
-/// `Path::exists()` check when `modules_are_dynamic_files()` is true, and
-/// unconditionally trusts the module is present otherwise - see that
-/// function's doc.
+/// `module_path` on that platform. Was filed as a related finding rather
+/// than fixed at the time (out of the Opus codec module's own scope) -
+/// **fixed 2026-08-13**, see `audio_driver_module_missing`, which the A1
+/// check below now goes through instead of running `Path::exists()`
+/// directly. `opus_config_line` below never repeated that mistake for the
+/// *codec* module it adds: it only runs its own `Path::exists()` check when
+/// `modules_are_dynamic_files()` is true, and unconditionally trusts the
+/// module is present otherwise - see that function's doc; the fixed A1
+/// check now follows the exact same shape.
 fn modules_are_dynamic_files() -> bool {
     cfg!(target_os = "macos")
 }
@@ -2357,16 +2359,109 @@ mod opus_config_line_tests {
     }
 }
 
+/// Whether `write_config_file`'s A1 check should treat `driver_module_file`
+/// (e.g. `"wasapi.so"`) as missing and degrade to synthetic audio. Pure
+/// function (like `opus_config_line` just above, same shape) - `dynamic` is
+/// `modules_are_dynamic_files()`, passed as a parameter rather than read
+/// from `cfg!` internally, so every branch is unit-testable regardless of
+/// which platform this test suite happens to run on.
+///
+/// Fixed 2026-08-13: before this fix, `write_config_file` ran an
+/// unconditional `Path::exists()` check here on every platform. That's
+/// correct on a dynamic build (macOS) where `driver.module_file()` really
+/// is a `.so` file sitting beside the binary - but on a static build
+/// (Windows, per this repo's own CMake invocation, see
+/// `modules_are_dynamic_files`'s doc: `scripts/package-official.sh`'s
+/// `-DMODULES=` list produces no per-module output files at all, "module
+/// count is zero either way") no such file EVER exists, by construction,
+/// for ANY module - including `wasapi.so`, which genuinely is compiled in
+/// statically. The unconditional check reported the real driver as
+/// permanently missing on every single Windows install and silently
+/// degraded every call to the `ausine`/`aufile` tone generator instead -
+/// confirmed against a real packaged Windows build (2026-08-13): the
+/// generated `config` had `audio_source ausine,440` / `audio_player
+/// aufile,<scratch>/rx.wav`, no `wasapi.so` in the module list, exactly
+/// this bug, and it's the exact same "an existence check gated only on
+/// 'is there a real driver for this platform' ... is silently WRONG on
+/// Windows today" mistake this file's own `modules_are_dynamic_files` doc
+/// already called out as a known related gap. `opus_config_line` above
+/// never made this mistake for the *codec* module - this closes the same
+/// gap for the *audio driver* module.
+fn audio_driver_module_missing(dynamic: bool, driver_module_file: &str, module_path: &Path) -> bool {
+    dynamic && !module_path.join(driver_module_file).exists()
+}
+
+#[cfg(test)]
+mod audio_driver_module_missing_tests {
+    use super::*;
+
+    #[test]
+    fn dynamic_build_with_module_present_is_not_missing() {
+        let dir = std::env::temp_dir().join(format!(
+            "centinelo-audio-driver-test.present.{}.{}",
+            std::process::id(),
+            nanos_suffix()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("coreaudio.so"), b"stub").unwrap();
+
+        assert!(!audio_driver_module_missing(true, "coreaudio.so", &dir));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dynamic_build_missing_module_is_reported_missing() {
+        let dir = std::env::temp_dir().join(format!(
+            "centinelo-audio-driver-test.missing.{}.{}",
+            std::process::id(),
+            nanos_suffix()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Deliberately no coreaudio.so written here.
+
+        assert!(audio_driver_module_missing(true, "coreaudio.so", &dir));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The regression this function exists to prevent: a STATIC build
+    /// (Windows) never has a per-module file on disk, by construction -
+    /// gating on `Path::exists()` there would report a genuinely-compiled-in
+    /// `wasapi.so` as permanently missing forever, degrading every call to
+    /// the synthetic tone generator. `dynamic == false` must report "not
+    /// missing" unconditionally, even against an empty directory with
+    /// nothing in it at all - exactly what a real Windows `module_path`
+    /// looks like today (`scripts/package-official.sh`'s own "module count
+    /// is zero either way" comment).
+    #[test]
+    fn static_build_never_reports_missing_even_with_no_file_on_disk() {
+        let dir = std::env::temp_dir().join(format!(
+            "centinelo-audio-driver-test.static.{}.{}",
+            std::process::id(),
+            nanos_suffix()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Empty directory - no wasapi.so, no anything.
+
+        assert!(!audio_driver_module_missing(false, "wasapi.so", &dir));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
 /// Generates the scratch `config` baresip reads (mirrors `core/run-spike.sh`,
 /// see this file's module doc). Returns `Ok(Some(notice))` when the audio
 /// config actually written had to fall back away from what was asked for -
 /// `resolve_device`'s own sink-side validation rejection, OR (A1, 2026-07-16
 /// 4R review) the real driver's `.so` not actually being present in
-/// `module_path` for this build - `Ok(None)` when everything resolved
-/// exactly as configured, `Err` only for an actual I/O failure writing the
-/// file. The caller (`SpawnPlan::build` -> `supervisor_loop`) turns
-/// `Some(notice)` into a real, visible signal via `emit_shell_notice` once
-/// it has `shared`/`AppHandle` back in scope.
+/// `module_path` for this build on a dynamic build, see
+/// `audio_driver_module_missing`'s doc for why this is a no-op on a static
+/// one - `Ok(None)` when everything resolved exactly as configured, `Err`
+/// only for an actual I/O failure writing the file. The caller
+/// (`SpawnPlan::build` -> `supervisor_loop`) turns `Some(notice)` into a
+/// real, visible signal via `emit_shell_notice` once it has `shared`/
+/// `AppHandle` back in scope.
 ///
 /// `known` (2026-07-16 4R re-review, resilience) is `Shared::known_devices`'s
 /// cache, snapshotted by `SpawnPlan::build` before this call - see
@@ -2399,20 +2494,23 @@ fn write_config_file(
     let mut lines = audio_config_lines(audio, synthetic, driver, &scratch_str, known);
     notice = merge_notice(notice, lines.fallback_notice.take());
 
-    // A1 (2026-07-16 4R review): don't just ask baresip to load a module
-    // that isn't actually in this build - baresip's own `module_handler`
-    // (`module.c`) discards a load failure with `(void)`, so the engine
-    // would silently start with no real audio_source/audio_player at all,
-    // and the operator would just be mute/deaf with no error anywhere.
-    // Check the compiled module genuinely exists next to the binary
-    // BEFORE referencing it in config; degrade to the synthetic pair (same
-    // as "no driver known for this platform") if not, with a real notice
-    // instead of silence. Skipped when already synthetic - nothing to
-    // double-check in that branch.
+    // A1 (2026-07-16 4R review, fixed for Windows 2026-08-13): don't just
+    // ask baresip to load a module that isn't actually in this build -
+    // baresip's own `module_handler` (`module.c`) discards a load failure
+    // with `(void)`, so the engine would silently start with no real
+    // audio_source/audio_player at all, and the operator would just be
+    // mute/deaf with no error anywhere. Check the compiled module genuinely
+    // exists next to the binary BEFORE referencing it in config; degrade to
+    // the synthetic pair (same as "no driver known for this platform") if
+    // not, with a real notice instead of silence. Delegated to
+    // `audio_driver_module_missing` (pure, unit-tested regardless of the
+    // host platform) - see that function's doc for why the check is gated
+    // on `modules_are_dynamic_files()`, same pattern as `opus_config_line`
+    // below.
     if !synthetic {
         if let Some(driver) = driver {
             let module_file = driver.module_file();
-            if !module_path.join(module_file).exists() {
+            if audio_driver_module_missing(modules_are_dynamic_files(), module_file, module_path) {
                 notice = merge_notice(
                     notice,
                     Some(format!(
@@ -2582,10 +2680,23 @@ fn merge_notice(a: Option<String>, b: Option<String>) -> Option<String> {
 }
 
 /// Resolves the core binary: explicit setting override first, then
-/// `CENTINELO_CORE_BIN` env var, then a walk-up search from the current
-/// working directory and the running executable's directory for
-/// `core/deps/baresip/build/baresip` - matches this repo's dev layout
-/// (`shell/` next to `core/`) without hardcoding an absolute path.
+/// `CENTINELO_CORE_BIN` env var, then a packaged-install lookup, then a
+/// walk-up search from the current working directory and the running
+/// executable's directory for `core/deps/baresip/build/baresip` - matches
+/// this repo's dev layout (`shell/` next to `core/`) without hardcoding an
+/// absolute path.
+///
+/// A `None` result here (fed through the `Err` branch below) must never be
+/// silent: `supervisor_loop`'s `SpawnPlan::build` Err arm both logs it
+/// (`log::error!`, so it lands in the on-disk log even with the UI closed
+/// or nobody watching the window) and turns it into a `StatusPayload::Failed`
+/// event for the UI - see that call site. Measured on a real Windows
+/// install (2026-08-13): before this fix, a clean install + configured
+/// account gave total silence - the supervisor thread started (account
+/// `is_configured() == true`), found nothing to spawn, and neither the
+/// screen nor the log said why, because this function's candidate list
+/// only ever covered the dev tree layout, never the packaged one
+/// `scripts/package-official.sh` actually produces.
 pub fn resolve_core_binary(settings: &Arc<SettingsStore>) -> Result<PathBuf, String> {
     if let Some(p) = settings.snapshot().core_binary_path {
         let pb = PathBuf::from(&p);
@@ -2601,6 +2712,19 @@ pub fn resolve_core_binary(settings: &Arc<SettingsStore>) -> Result<PathBuf, Str
     Err("Core engine binary not found. Build core/ per core/BUILD.md, or set its path in Settings > Advanced.".to_string())
 }
 
+/// `<dir>/core-engine/<bin_name>` - the layout `scripts/package-official.sh`
+/// actually installs (see that script's `CORE_ENGINE_DIR="$ARTIFACT_DEST_DIR/
+/// core-engine"`, step 6): the core binary sits in a `core-engine/`
+/// subdirectory right beside the shell executable, not several levels up in
+/// a `core/deps/baresip/build/` dev tree. Confirmed against a real Windows
+/// install (2026-08-13): `C:\Users\<user>\AppData\Local\Centinelo Phone\
+/// core-engine\baresip.exe` exists on disk while the walk-up dev-tree search
+/// below finds nothing, because there is no `core/` tree at all in an
+/// installed app - only the packaged artifacts NSIS/the installer laid down.
+fn packaged_core_binary_path(exe_dir: &Path, bin_name: &str) -> PathBuf {
+    exe_dir.join("core-engine").join(bin_name)
+}
+
 pub fn default_core_binary_path() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("CENTINELO_CORE_BIN") {
         let pb = PathBuf::from(&p);
@@ -2609,6 +2733,20 @@ pub fn default_core_binary_path() -> Option<PathBuf> {
         }
     }
     let bin_name = if cfg!(windows) { "baresip.exe" } else { "baresip" };
+
+    // Packaged-install layout first (the common case for anyone who
+    // actually installed the app rather than running it from a dev
+    // checkout) - see `packaged_core_binary_path`'s doc.
+    if let Some(exe_dir) = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+    {
+        let candidate = packaged_core_binary_path(&exe_dir, bin_name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+
     let roots = [
         std::env::current_dir().ok(),
         std::env::current_exe()
@@ -2629,6 +2767,67 @@ pub fn default_core_binary_path() -> Option<PathBuf> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod default_core_binary_path_tests {
+    use super::*;
+
+    /// The regression this whole bug is about: a packaged install's
+    /// `core-engine/<bin>` layout (beside the shell executable, not several
+    /// levels up in a `core/deps/baresip/build/` dev tree) must resolve.
+    /// Exercises `packaged_core_binary_path` directly rather than
+    /// `default_core_binary_path` itself, since the latter hardcodes
+    /// `std::env::current_exe()` (this test binary's own path, not a
+    /// controllable fixture) - same reasoning `audio_config_lines_tests`
+    /// uses for testing the pure resolver instead of the impure caller.
+    #[test]
+    fn packaged_layout_candidate_is_dir_slash_core_engine_slash_binary() {
+        let exe_dir = Path::new("/opt/Centinelo Phone");
+        assert_eq!(
+            packaged_core_binary_path(exe_dir, "baresip.exe"),
+            PathBuf::from("/opt/Centinelo Phone/core-engine/baresip.exe")
+        );
+        assert_eq!(
+            packaged_core_binary_path(exe_dir, "baresip"),
+            PathBuf::from("/opt/Centinelo Phone/core-engine/baresip")
+        );
+    }
+
+    /// End-to-end through `default_core_binary_path` itself (not just the
+    /// pure helper above): stub a `core-engine/<current_test_binary_name>`
+    /// next to this test binary's own `current_exe()` and confirm it's
+    /// found and preferred - this is the actual code path a packaged
+    /// Windows install hits, not just the helper in isolation.
+    #[test]
+    fn default_core_binary_path_finds_packaged_layout_beside_current_exe() {
+        let exe = std::env::current_exe().expect("current_exe");
+        let exe_dir = exe.parent().expect("exe has a parent dir").to_path_buf();
+        let bin_name = if cfg!(windows) { "baresip.exe" } else { "baresip" };
+        let core_engine_dir = exe_dir.join("core-engine");
+        std::fs::create_dir_all(&core_engine_dir).unwrap();
+        let stub = core_engine_dir.join(bin_name);
+        std::fs::write(&stub, b"stub").unwrap();
+
+        // CENTINELO_CORE_BIN unset here would still pass since it's checked
+        // first and empty envs are `Err`, but be explicit this test isn't
+        // relying on that env var happening to be absent in this process.
+        let prior = std::env::var("CENTINELO_CORE_BIN").ok();
+        // SAFETY: test-only, single-threaded within this process's env
+        // mutation window; no other test in this suite reads/writes this
+        // var (grep-confirmed).
+        unsafe { std::env::remove_var("CENTINELO_CORE_BIN") };
+
+        let found = default_core_binary_path();
+
+        if let Some(p) = prior {
+            unsafe { std::env::set_var("CENTINELO_CORE_BIN", p) };
+        }
+        std::fs::remove_file(&stub).ok();
+        std::fs::remove_dir(&core_engine_dir).ok();
+
+        assert_eq!(found, Some(stub), "packaged core-engine/<bin> beside the running exe must resolve");
+    }
 }
 
 
