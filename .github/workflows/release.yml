@@ -961,9 +961,55 @@ jobs:
         shell: bash
         run: bash scripts/set-release-version.sh "${{ needs.preflight.outputs.version }}"
 
-      - name: Package official Windows installer (core + OpenSSL DLLs, Community edition)
+      - name: Locate VCRUNTIME140_THREADS.dll (MSVC runtime, app-local deploy)
+        # Closes the incident diagnosed 2026-08-13 on a remote clinic
+        # employee's Windows machine: baresip.exe (built with this same
+        # MSVC toolset) died with STATUS_DLL_NOT_FOUND (0xC0000135) before
+        # main() ever ran, because VCRUNTIME140_THREADS.DLL - split out of
+        # vcruntime140.dll starting with MSVC 14.40 / VS 2022 17.10 - is
+        # NOT one of the DLLs plain Windows ships in System32, and that
+        # machine had no VC++ Redistributable installed at all. See
+        # scripts/package-official.sh's "2c. Validate VC++ Redistributable
+        # DLL dir" comment for the full incident writeup and the licensing
+        # rationale for shipping it app-local instead of requiring the end
+        # user to install anything.
+        #
+        # windows-latest runners carry vswhere.exe at this fixed path (part
+        # of the Visual Studio Installer, present on every GitHub-hosted
+        # Windows image) - used here instead of hardcoding a VS version/
+        # edition/install path, all three of which are runner-image details
+        # that can change under us. The DLL itself is copied straight out
+        # of the SAME Visual Studio installation whose MSVC toolset just
+        # built baresip.exe above (not a separately-pinned download), so it
+        # can never drift from the compiler that produced the .exe it rides
+        # beside - a newer MSVC on a future runner image ships this file's
+        # newer version automatically, with no version to bump here.
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) {
+            Write-Error "vswhere.exe not found at $vswhere - cannot locate the installed Visual Studio to find the VC++ runtime redistributable on this runner"
+            exit 1
+          }
+          $installPath = & $vswhere -latest -products * -property installationPath
+          if (-not $installPath) {
+            Write-Error "vswhere.exe found no Visual Studio installation on this runner"
+            exit 1
+          }
+          Write-Host "Visual Studio installationPath: $installPath"
+          $dll = Get-ChildItem -Path $installPath -Recurse -Filter "vcruntime140_threads.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $dll) {
+            Write-Error "vcruntime140_threads.dll not found anywhere under $installPath - this runner's MSVC toolset predates VS 2022 17.10 / MSVC 14.40 and does not carry it. baresip.exe would fail to start on a clean end-user machine with STATUS_DLL_NOT_FOUND (0xC0000135) - see scripts/package-official.sh's '2c. Validate VC++ Redistributable DLL dir' comment for the incident this guards against. This must be fixed (e.g. update the runner image / MSVC toolset) before this job can produce a safe installer - refusing to silently ship a build missing this DLL."
+            exit 1
+          }
+          New-Item -ItemType Directory -Force -Path "vcredist-dlls" | Out-Null
+          Copy-Item $dll.FullName "vcredist-dlls\"
+          Write-Host "OK: found $($dll.FullName) -> staged to vcredist-dlls\"
+
+      - name: Package official Windows installer (core + OpenSSL + VC++ redist DLLs, Community edition)
         # package-official.sh's own Windows path does everything from here:
-        # stages the just-built baresip.exe + OpenSSL runtime DLLs into
+        # stages the just-built baresip.exe + OpenSSL runtime DLLs + the
+        # VCRUNTIME140_THREADS.DLL located above into
         # shell/dist-injected/core-engine/, generates a filtered
         # tauri.official.generated.json (no premium entries - Community
         # edition, same as the macOS job above), then runs
@@ -984,8 +1030,12 @@ jobs:
           # path so the bash script resolves the absolute dir. See windows-installer.yml
           # which already passes a Unix path ("$PWD/fake-openssl-dlls") to this script.
           OPENSSL_DLL_DIR="$(cygpath -u "$OPENSSL_ROOT_DIR")/bin"
+          # "vcredist-dlls" (created by the pwsh step above) is already a plain
+          # workspace-relative path, not a "C:\..." Windows path, so - unlike
+          # OPENSSL_DLL_DIR above - it needs no cygpath conversion here.
           bash scripts/package-official.sh --target windows --skip-core-build \
-            --openssl-dll-dir "$OPENSSL_DLL_DIR"
+            --openssl-dll-dir "$OPENSSL_DLL_DIR" \
+            --vcredist-dll-dir "$PWD/vcredist-dlls"
 
       - name: Verify installer + updater artifacts before upload
         shell: pwsh
@@ -1023,6 +1073,22 @@ jobs:
           }
           Write-Host "OK: baresip.exe + libssl-*.dll + libcrypto-*.dll all beside each other at $($baresipExe.DirectoryName)"
 
+          # VCRUNTIME140_THREADS.DLL (codecs sprint follow-up, 2026-08-13):
+          # regression guard for the incident this pass fixes - see
+          # scripts/package-official.sh's "2c. Validate VC++ Redistributable
+          # DLL dir" comment. baresip.exe is built with an MSVC toolset that
+          # requires this DLL and Windows itself does NOT ship it (unlike
+          # plain vcruntime140.dll) - without it beside baresip.exe, the
+          # process dies with STATUS_DLL_NOT_FOUND before main() ever runs,
+          # silently: no stdout, no stderr, no app log, no Event Log entry.
+          $vcruntimeThreads = Get-ChildItem -Recurse "$extractDir" -Filter "vcruntime140_threads.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $vcruntimeThreads) { Write-Error "no vcruntime140_threads.dll found in extracted MSI - core.exe would fail to start on a clean machine with STATUS_DLL_NOT_FOUND (0xC0000135), with NO stdout/stderr/log trace (this is the exact incident diagnosed 2026-08-13 on a remote clinic employee's machine)"; exit 1 }
+          if ($baresipExe.DirectoryName -ne $vcruntimeThreads.DirectoryName) {
+            Write-Error "vcruntime140_threads.dll is NOT beside baresip.exe: baresip.exe in $($baresipExe.DirectoryName), vcruntime140_threads.dll in $($vcruntimeThreads.DirectoryName)"
+            exit 1
+          }
+          Write-Host "OK: vcruntime140_threads.dll is beside baresip.exe at $($vcruntimeThreads.DirectoryName)"
+
           $premiumDll = Get-ChildItem -Recurse "$extractDir" -Filter "centinelo_premium.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
           if ($premiumDll) { Write-Error "Community edition build shipped centinelo_premium.dll - the resources filter leaked a premium artifact into a public-repo release"; exit 1 }
           Write-Host "OK: Community edition correctly ships no centinelo_premium.dll"
@@ -1037,6 +1103,98 @@ jobs:
           $opusDll = Get-ChildItem -Recurse "$extractDir" -Filter "opus*.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
           if ($opusDll) { Write-Error "Found $($opusDll.Name) in the extracted MSI - opus should be statically linked (x64-windows-static-md), not shipped as a DLL"; exit 1 }
           Write-Host "OK: opus is statically linked - no opus*.dll in the installer"
+
+      - name: Verify baresip.exe import-table dependencies are all satisfied
+        # Extra safety net beyond the specific libssl/libcrypto/
+        # vcruntime140_threads checks above: this parses the REAL PE import
+        # table of the packaged baresip.exe - not its strings, which
+        # false-positive on the ~70 statically-linked baresip/re modules
+        # and is exactly what let the VCRUNTIME140_THREADS.DLL gap through
+        # three earlier debugging sessions on the affected machine before
+        # someone inspected the import table directly - and asserts every
+        # imported DLL is either (a) shipped beside baresip.exe in this
+        # same installer, or (b) a DLL Windows itself guarantees on every
+        # supported release (the allowlist below, plus the api-ms-win-*/
+        # ext-ms-* apiset forwarders the OS loader resolves natively with
+        # no physical file needed). A future dependency this build doesn't
+        # yet know to ship - a new codec, a new baresip module - now turns
+        # into a red CI check here instead of a silent STATUS_DLL_NOT_FOUND
+        # on a clinic employee's machine with zero diagnostic trace.
+        #
+        # Uses dumpbin.exe from the SAME MSVC toolset that just built this
+        # binary (located via vswhere.exe, same approach as the
+        # VCRUNTIME140_THREADS.dll step above) rather than a hand-rolled PE
+        # parser - dumpbin /dependents is the tool Microsoft's own docs
+        # point to for this exact question ("Determine which DLLs to
+        # redistribute").
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) { Write-Error "vswhere.exe not found - cannot locate dumpbin.exe"; exit 1 }
+          $installPath = & $vswhere -latest -products * -property installationPath
+          $dumpbin = Get-ChildItem -Path "$installPath\VC\Tools\MSVC" -Recurse -Filter "dumpbin.exe" -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -like "*Hostx64\x64*" } | Select-Object -First 1
+          if (-not $dumpbin) { Write-Error "dumpbin.exe not found under $installPath\VC\Tools\MSVC (Hostx64\x64) - cannot verify baresip.exe's import table"; exit 1 }
+          Write-Host "Using dumpbin: $($dumpbin.FullName)"
+
+          # Same extracted-MSI directory the earlier "Verify installer +
+          # updater artifacts before upload" step in this job already
+          # populated via msiexec /a - steps in the same job share the
+          # filesystem (not shell variables), so this just re-resolves the
+          # same on-disk path rather than re-extracting.
+          $extractDir = "$PWD\msi-extracted"
+          $baresipExe = Get-ChildItem -Recurse "$extractDir" -Filter "baresip.exe" | Select-Object -First 1
+          if (-not $baresipExe) { Write-Error "baresip.exe not found in $extractDir - did the earlier extraction step run?"; exit 1 }
+
+          $dumpOutput = & $dumpbin.FullName /dependents $baresipExe.FullName
+          $inBlock = $false
+          $imports = @()
+          foreach ($line in $dumpOutput) {
+            if ($line -match "has the following dependencies") { $inBlock = $true; continue }
+            if ($inBlock) {
+              $trimmed = $line.Trim()
+              if ($trimmed -eq "") { break }
+              $imports += $trimmed
+            }
+          }
+          if ($imports.Count -eq 0) { Write-Error "dumpbin /dependents produced no import list for $($baresipExe.FullName) - dumpbin output format may have changed"; exit 1 }
+          Write-Host "== baresip.exe imports ($($imports.Count)) =="
+          $imports | ForEach-Object { Write-Host "  $_" }
+
+          # DLLs Windows itself guarantees present on every currently
+          # supported release (matches this codebase's own known-import
+          # list: qwave/IPHLPAPI/WSOCK32/WS2_32/ole32/KERNEL32/SHELL32 plus
+          # the other common Win32/CRT surface baresip+re+OpenSSL touch).
+          # VCRUNTIME140.DLL itself is in this list on purpose - unlike its
+          # "_threads" sibling, plain vcruntime140.dll DOES ship in
+          # System32 (confirmed in this incident's own diagnosis, see
+          # scripts/package-official.sh's "2c." comment) - only
+          # VCRUNTIME140_THREADS.DLL needed the app-local fix.
+          $systemDlls = @(
+            "kernel32.dll","user32.dll","advapi32.dll","ws2_32.dll","wsock32.dll",
+            "shell32.dll","ole32.dll","oleaut32.dll","iphlpapi.dll","qwave.dll",
+            "ntdll.dll","rpcrt4.dll","crypt32.dll","winmm.dll","gdi32.dll",
+            "msvcrt.dll","vcruntime140.dll","ucrtbase.dll","netapi32.dll",
+            "userenv.dll","setupapi.dll","wintrust.dll","imm32.dll","bcrypt.dll",
+            "secur32.dll","dbghelp.dll","version.dll","cfgmgr32.dll","psapi.dll"
+          )
+          $shippedDlls = Get-ChildItem -Recurse "$extractDir" -Filter "*.dll" | ForEach-Object { $_.Name.ToLowerInvariant() }
+          $shippedDlls += $baresipExe.Name.ToLowerInvariant()
+
+          $unsatisfied = @()
+          foreach ($imp in $imports) {
+            $impLower = $imp.ToLowerInvariant()
+            if ($impLower -match '^(api-ms-win-|ext-ms-)') { continue }
+            if ($systemDlls -contains $impLower) { continue }
+            if ($shippedDlls -contains $impLower) { continue }
+            $unsatisfied += $imp
+          }
+
+          if ($unsatisfied.Count -gt 0) {
+            Write-Error "baresip.exe imports DLL(s) that are neither shipped in this installer nor on the known-in-box-Windows allowlist: $($unsatisfied -join ', '). This is exactly the failure mode that caused the 2026-08-13 STATUS_DLL_NOT_FOUND incident (VCRUNTIME140_THREADS.DLL) - either ship the missing DLL(s) via package-official.sh, or add them to this step's `$systemDlls` allowlist ONLY if they are genuinely guaranteed present on every supported Windows release (verify before adding, don't assume)."
+            exit 1
+          }
+          Write-Host "OK: every baresip.exe import is either shipped in this installer or guaranteed present by Windows itself ($($imports.Count) imports checked)"
 
       - name: Stage Windows release assets flat
         # upload-artifact@v4 preserves the common-ancestor directory

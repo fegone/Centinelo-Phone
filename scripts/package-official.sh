@@ -82,6 +82,8 @@ PREMIUM_CONSOLE_ASSETS=""
 OUTPUT_DIR=""
 OPENSSL_DLL_DIR=""
 SKIP_OPENSSL_DLLS=0
+VCREDIST_DLL_DIR=""
+SKIP_VCREDIST_DLL=0
 NO_UPDATER_ARTIFACTS=0
 
 # Self-contained --help text (4R/READABILITY fix 2026-07-16: this used to be
@@ -180,6 +182,65 @@ Options:
                                    this for a build meant to run on a real
                                    machine. Mutually exclusive with
                                    --openssl-dll-dir.
+  --vcredist-dll-dir DIR          Windows only, effectively REQUIRED: directory
+                                   holding VCRUNTIME140_THREADS.DLL (the MSVC
+                                   14.40+/VS 2022 17.10+ "threads" runtime
+                                   split out from vcruntime140.dll). baresip.exe
+                                   is built with that toolset and will not even
+                                   reach main() without this DLL beside it on a
+                                   clean machine - the loader kills the process
+                                   with STATUS_DLL_NOT_FOUND (0xC0000135) before
+                                   any of our own code runs, so there is no
+                                   stdout/stderr/log/event-log trace at all (see
+                                   the incident this flag closes: a remote
+                                   clinic employee's install, diagnosed via PE
+                                   import-table inspection). Unlike
+                                   VCRUNTIME140.DLL itself (which Windows
+                                   ships in System32 on every supported
+                                   release), the "_threads" variant only
+                                   arrives via the VC++ Redistributable -
+                                   plain Windows does not carry it. Every
+                                   *.dll directly in this dir is copied flat
+                                   into core-engine/ beside baresip.exe (same
+                                   shape as --openssl-dll-dir), but the dir
+                                   MUST contain a file literally named
+                                   vcruntime140_threads.dll (case-insensitive)
+                                   - that is the one baresip.exe actually
+                                   needs. Microsoft's own docs explicitly
+                                   describe installing individual
+                                   Redistributable DLLs "in the application
+                                   local folder" as a supported option (see
+                                   "Install individual redistributable files",
+                                   https://learn.microsoft.com/cpp/windows/redistributing-visual-cpp-files)
+                                   - licensed via the Distributable Code /
+                                   REDIST list terms in the Visual Studio
+                                   license (visualstudio.microsoft.com/
+                                   license-terms), same terms any VC++ app
+                                   deployment relies on. Microsoft's only
+                                   caveat is servicing, not legality: an
+                                   app-local copy doesn't get Windows Update's
+                                   automatic security patching the way a
+                                   system-wide Redistributable install does.
+                                   This build sidesteps that: the DLL is
+                                   copied fresh from the SAME CI runner/MSVC
+                                   toolset that just compiled baresip.exe
+                                   (see release.yml's "Locate
+                                   VCRUNTIME140_THREADS.dll" step), every
+                                   release build - so the shipped DLL can
+                                   never independently drift from the
+                                   compiler that produced the .exe it rides
+                                   with, and a newer MSVC on a later CI run
+                                   ships this file's newer version
+                                   automatically.
+                                   Mutually exclusive with
+                                   --skip-vcredist-dll.
+  --skip-vcredist-dll             Explicit opt-out of the above, for local
+                                   iteration only (e.g. a dev machine that
+                                   already has the VC++ Redistributable
+                                   installed system-wide). CI must NOT pass
+                                   this for a build meant to run on a real
+                                   end-user machine. Mutually exclusive with
+                                   --vcredist-dll-dir.
   --no-updater-artifacts           CI-only: pass tauri.ci.conf.json
                                    (bundle.createUpdaterArtifacts=false) into the internal
                                    `tauri build`, so it skips producing the updater
@@ -239,6 +300,11 @@ while [[ $# -gt 0 ]]; do
             OPENSSL_DLL_DIR="$2"; shift 2 ;;
         --skip-openssl-dlls)
             SKIP_OPENSSL_DLLS=1; shift ;;
+        --vcredist-dll-dir)
+            [[ $# -ge 2 ]] || { echo "error: --vcredist-dll-dir requires a value" >&2; exit 1; }
+            VCREDIST_DLL_DIR="$2"; shift 2 ;;
+        --skip-vcredist-dll)
+            SKIP_VCREDIST_DLL=1; shift ;;
         --no-updater-artifacts)
             NO_UPDATER_ARTIFACTS=1; shift ;;
         -h|--help)
@@ -257,6 +323,10 @@ done
 # of surfacing it.
 if [[ -n "$OPENSSL_DLL_DIR" && "$SKIP_OPENSSL_DLLS" -eq 1 ]]; then
     echo "error: --openssl-dll-dir and --skip-openssl-dlls are contradictory (both given) - pick one: either point at a real OpenSSL DLL dir, or explicitly skip bundling them for local-only iteration" >&2
+    exit 1
+fi
+if [[ -n "$VCREDIST_DLL_DIR" && "$SKIP_VCREDIST_DLL" -eq 1 ]]; then
+    echo "error: --vcredist-dll-dir and --skip-vcredist-dll are contradictory (both given) - pick one: either point at a real VC++ redistributable DLL dir, or explicitly skip bundling it for local-only iteration" >&2
     exit 1
 fi
 
@@ -279,6 +349,7 @@ resolve_abs_path() {
 [[ -n "$PREMIUM_CONSOLE_ASSETS" ]] && PREMIUM_CONSOLE_ASSETS="$(resolve_abs_path "$PREMIUM_CONSOLE_ASSETS")"
 [[ -n "$OUTPUT_DIR" ]] && OUTPUT_DIR="$(resolve_abs_path "$OUTPUT_DIR")"
 [[ -n "$OPENSSL_DLL_DIR" ]] && OPENSSL_DLL_DIR="$(resolve_abs_path "$OPENSSL_DLL_DIR")"
+[[ -n "$VCREDIST_DLL_DIR" ]] && VCREDIST_DLL_DIR="$(resolve_abs_path "$VCREDIST_DLL_DIR")"
 
 # ---------------------------------------------------------------------------
 # 1. Resolve repo root + target platform
@@ -421,6 +492,65 @@ if [[ "$TARGET" == "windows" ]]; then
         echo "       (missing libssl/libcrypto DLLs at runtime). See core-build.yml's" >&2
         echo "       Windows job for how it locates OPENSSL_ROOT_DIR; pass" >&2
         echo "       \"\$OPENSSL_ROOT_DIR\\bin\"." >&2
+        exit 1
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# 2c. Validate VC++ Redistributable DLL dir (Windows runtime requirement)
+# ---------------------------------------------------------------------------
+# Incident (2026-08-13): a remote clinic employee's Windows install had
+# baresip.exe die with exit code -1073741515 (0xC0000135,
+# STATUS_DLL_NOT_FOUND) BEFORE main() ever ran - no stdout, no stderr, no
+# app log line, no Windows Event Log entry, because the process never got
+# far enough to produce any of those. PE import-table inspection (not the
+# binary's strings, which false-positive on ~70 statically-linked modules)
+# found the real dependency list, and VCRUNTIME140_THREADS.DLL was the one
+# missing from that machine. Confirmed experimentally: copying that single
+# DLL beside baresip.exe took the process from "dies instantly" to "17 TCP +
+# 9 UDP sockets listening". Unlike VCRUNTIME140.DLL (ships in Windows'
+# System32 on every supported release) and the api-ms-win-crt-* forwarders
+# (covered by ucrtbase.dll, also in-box), the "_threads" variant is NEW
+# (added with MSVC 14.40 / VS 2022 17.10) and only ever arrives via the VC++
+# Redistributable - a machine with no redistributable installed (the norm
+# for a non-developer's clinic workstation) simply does not have it, no
+# matter how current Windows itself is. This affects EVERY clean Windows
+# install of this app, not just that one machine.
+if [[ "$TARGET" == "windows" ]]; then
+    if [[ -n "$VCREDIST_DLL_DIR" ]]; then
+        [[ -d "$VCREDIST_DLL_DIR" ]] || { echo "error: --vcredist-dll-dir not a directory: $VCREDIST_DLL_DIR" >&2; exit 1; }
+        # `find -iname` here, NOT a nullglob/nocaseglob array test like the
+        # OpenSSL check above: this pattern is a plain literal filename with
+        # no wildcard characters, and bash's pathname expansion only kicks
+        # in for words that actually contain glob metacharacters - a
+        # metacharacter-free word is returned as-is unexpanded regardless of
+        # whether nullglob is set or the file exists, so an array-literal
+        # check here would ALWAYS report "found" even for a directory that
+        # doesn't have the file (caught locally: a directory containing only
+        # an unrelated wrong.dll still passed the array-based version of
+        # this check before this fix).
+        _vcredist_threads_check="$(find "$VCREDIST_DLL_DIR" -maxdepth 1 -iname 'vcruntime140_threads.dll' -print -quit)"
+        if [[ -z "$_vcredist_threads_check" ]]; then
+            echo "error: --vcredist-dll-dir has no vcruntime140_threads.dll file: $VCREDIST_DLL_DIR" >&2
+            echo "       (found: $(find "$VCREDIST_DLL_DIR" -maxdepth 1 -type f -printf '%f ' 2>/dev/null || ls "$VCREDIST_DLL_DIR" 2>/dev/null | tr '\n' ' '))" >&2
+            exit 1
+        fi
+    elif [[ "$SKIP_VCREDIST_DLL" -eq 1 ]]; then
+        echo "-- --skip-vcredist-dll given: packaging a Windows build WITHOUT"
+        echo "   VCRUNTIME140_THREADS.DLL. core.exe will fail to start with"
+        echo "   STATUS_DLL_NOT_FOUND (0xC0000135) on any machine that does not already"
+        echo "   have the matching VC++ Redistributable installed system-wide (dev"
+        echo "   machines only, usually). Do not ship this."
+        echo
+    else
+        echo "error: --target windows requires --vcredist-dll-dir (or the explicit" >&2
+        echo "       --skip-vcredist-dll opt-out for local-only iteration) - without it," >&2
+        echo "       the packaged core.exe cannot even reach main() on a clean end-user" >&2
+        echo "       machine (missing VCRUNTIME140_THREADS.DLL at load time, see this" >&2
+        echo "       block's comment for the incident this closes). On a CI runner, locate" >&2
+        echo "       it under the installed Visual Studio's VC\\Redist\\MSVC\\ tree (e.g." >&2
+        echo "       via vswhere.exe + a recursive search for the filename) and pass that" >&2
+        echo "       directory here." >&2
         exit 1
     fi
 fi
@@ -763,6 +893,39 @@ if [[ "$TARGET" == "windows" && -n "$OPENSSL_DLL_DIR" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# 6c. Copy VC++ Redistributable DLLs beside baresip.exe (Windows only)
+# ---------------------------------------------------------------------------
+# See "2c. Validate VC++ Redistributable DLL dir" above for why this is
+# required. Same flat-copy-into-CORE_ENGINE_DIR shape as 6b (Windows's
+# default DLL search order checks the launching executable's own directory
+# first), and the same tauri.official.conf.json
+# "../dist-injected/core-engine/*" glob already carries it into the
+# installer with no config change needed.
+if [[ "$TARGET" == "windows" && -n "$VCREDIST_DLL_DIR" ]]; then
+    cp "$VCREDIST_DLL_DIR"/*.dll "$CORE_ENGINE_DIR/"
+    echo "-- copied VC++ Redistributable DLLs -> $CORE_ENGINE_DIR:"
+    ls "$CORE_ENGINE_DIR"/*.dll
+fi
+
+# Post-copy verification, not just an optimistic exit 0: this is the exact
+# DLL whose ABSENCE killed a real deployment (see 2c's comment) - a
+# packaging run that claims success without it actually landing beside
+# baresip.exe must be a hard CI failure, not a silent repeat of that
+# incident on the next machine this installer reaches.
+if [[ "$TARGET" == "windows" && -n "$VCREDIST_DLL_DIR" ]]; then
+    # `find -iname`, not a nullglob array test - see 2c's comment for why a
+    # literal (no-wildcard) filename defeats nullglob and always reports
+    # "found" regardless of whether the file is actually there.
+    _vcredist_installed_check="$(find "$CORE_ENGINE_DIR" -maxdepth 1 -iname 'vcruntime140_threads.dll' -print -quit)"
+    [[ -n "$_vcredist_installed_check" ]] || {
+        echo "error: vcruntime140_threads.dll not found in $CORE_ENGINE_DIR after copy - the" >&2
+        echo "       packaged core.exe will fail to start with STATUS_DLL_NOT_FOUND on any" >&2
+        echo "       machine without the VC++ Redistributable already installed." >&2
+        exit 1
+    }
+fi
+
+# ---------------------------------------------------------------------------
 # 7. Copy premium dylib + .sig (Pro builds only)
 # ---------------------------------------------------------------------------
 # 4R/RESILIENCE fixes 2026-07-16, two issues in the previous version:
@@ -1078,4 +1241,32 @@ fi
 #      release-ci one): a tiny `--print-library-filename` mode on that
 #      crate (or a build script step) this script could shell out to
 #      instead of hardcoding the match.
+#   8. [Fixed 2026-08-13, release-ci pass] Same shape as gap #1's OpenSSL
+#      fix, for a second Windows-only runtime dependency:
+#      VCRUNTIME140_THREADS.DLL (MSVC 14.40+/VS 2022 17.10+ "threads"
+#      runtime) is required by default for --target windows via
+#      --vcredist-dll-dir DIR ("2c. Validate VC++ Redistributable DLL dir"
+#      / "6c. Copy VC++ Redistributable DLLs" above), with the same
+#      by-name (not "any *.dll") validation and a post-copy existence
+#      guard. This closes a real production incident (see 2c's comment):
+#      a remote clinic employee's baresip.exe died with
+#      STATUS_DLL_NOT_FOUND (0xC0000135) before main() ever ran - the
+#      loader kills the process before any of our own logging can fire,
+#      so there was no stdout/stderr/app-log/Event-Log trace at all.
+#      Confirmed by PE import-table inspection and an experimental fix on
+#      the affected machine. release.yml's Windows job locates the DLL on
+#      the runner via vswhere.exe + a recursive search under the
+#      installed Visual Studio's VC\Redist\MSVC\ tree (see that job's
+#      "Locate VCRUNTIME140_THREADS.dll" step) and passes it here; the
+#      MSI extraction check in that same job's "Verify installer +
+#      updater artifacts" step proves it rides beside baresip.exe in the
+#      real installer. windows-installer.yml's synthetic-fixture smoke
+#      test exercises the same staging+packaging mechanism with a fake
+#      DLL, same as it already did for OpenSSL. Per Microsoft's own
+#      guidance (https://learn.microsoft.com/cpp/windows/redistributing-visual-cpp-files),
+#      app-local (xcopy) deployment of VC++ runtime files, including this
+#      one, is an explicitly supported redistribution method - no
+#      separate installer/admin-rights requirement is introduced by this
+#      fix, consistent with this app's existing per-user, no-admin NSIS
+#      install.
 # ---------------------------------------------------------------------------
