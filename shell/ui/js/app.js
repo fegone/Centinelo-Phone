@@ -50,6 +50,12 @@ import {
   renderCodecsList,
 } from "./codec-settings.js";
 import {
+  buildDeviceOptions,
+  buildSaveDeviceInput,
+  renderDeviceOptionsHtml,
+  activeDeviceLabel,
+} from "./device-settings.js";
+import {
   armHandshake,
   reduceRegHandshake,
   shouldReleaseSaveButton,
@@ -153,6 +159,14 @@ const state = {
   // state (which rows get the "changed" tint - see renderCodecsList's own
   // doc), reset on every fresh `codecs` event and on Discard.
   codecs: { available: [], saved: { order: [], off: [] }, current: { order: [], off: [] }, touched: new Set() },
+  // Microphone & speaker (Plate 10) - repainted whole from the engine's own
+  // `devices` event (device-settings.js's own "fuente de verdad" doc); no
+  // saved/current split like codecs above, since there's no apply bar - see
+  // device-settings.js's header comment for why selecting IS applying.
+  devices: {
+    input: { options: [], activeId: "" },
+    output: { options: [], activeId: "" },
+  },
 };
 
 // Set right before save_codec_settings fires, cleared on the `codecs`
@@ -958,6 +972,9 @@ function handleSidecarEvent(evt) {
     case "codecs":
       handleCodecsEvent(evt);
       break;
+    case "devices":
+      handleDevicesEvent(evt);
+      break;
     case "error":
       // If a codecs Apply is currently in flight, this is (heuristically -
       // see codecsApplyPending's own doc) that save coming back rejected:
@@ -1227,6 +1244,142 @@ function wireCodecsHandlers() {
     } finally {
       applyBtn.disabled = false;
     }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// microphone & speaker (Plate 10 - Settings → Audio & devices → Microphone
+// & speaker)
+//
+// Same "outside applyLockUI/#lock-overlay, no admin lock" placement as the
+// codecs block just above - see index.html's own comment at .rows's markup,
+// and commands.rs save_audio_settings's doc, for the full reasoning. Unlike
+// codecs, there's no saved/current/dirty/apply-bar state here at all:
+// core/PROTOCOL.md's `set_device` hot-swaps a call already in progress AND
+// persists, in one shot, so selecting a row IS applying it (see
+// device-settings.js's header comment) - `selectDevice` below calls
+// `save_audio_settings` the moment an option is clicked/activated.
+// ---------------------------------------------------------------------------
+
+// Which custom listbox ("mic"/"spk") is currently open, or null - at most
+// one at a time (opening one closes the other, matching the mockup's own
+// `document.querySelectorAll('.pop.open')` behavior).
+let openDeviceSel = null;
+
+function handleDevicesEvent(evt) {
+  state.devices.input = buildDeviceOptions(Array.isArray(evt.input) ? evt.input : []);
+  state.devices.output = buildDeviceOptions(Array.isArray(evt.output) ? evt.output : []);
+  renderDevicesSection();
+}
+
+function renderDeviceSelect(prefix) {
+  const kind = prefix === "mic" ? "input" : "output";
+  const { options, activeId } = state.devices[kind];
+  $(`${prefix}-selname`).textContent = activeDeviceLabel(options, activeId);
+  $(`${prefix}-pop`).innerHTML = renderDeviceOptionsHtml(options, activeId);
+}
+
+function renderDevicesSection() {
+  renderDeviceSelect("mic");
+  renderDeviceSelect("spk");
+}
+
+function closeDeviceMenus() {
+  if (!openDeviceSel) return;
+  ["mic", "spk"].forEach((prefix) => {
+    $(`${prefix}-pop`).classList.remove("open");
+    $(`${prefix}-sel`).setAttribute("aria-expanded", "false");
+  });
+  openDeviceSel = null;
+}
+
+function openDeviceMenu(prefix) {
+  closeDeviceMenus();
+  $(`${prefix}-pop`).classList.add("open");
+  $(`${prefix}-sel`).setAttribute("aria-expanded", "true");
+  openDeviceSel = prefix;
+  const pop = $(`${prefix}-pop`);
+  const toFocus = pop.querySelector('.opt[aria-selected="true"]') || pop.querySelector(".opt");
+  toFocus?.focus();
+}
+
+/// Persists + best-effort live-applies one direction's device choice
+/// (`save_audio_settings`/`apply_live_device`, commands.rs), then ALWAYS
+/// re-queries `devices` afterward - success or failure - so the pane
+/// repaints from whatever the engine actually ends up running next
+/// (`handleDevicesEvent`), same "fuente de verdad, never an optimistic
+/// local mirror" rule codec-settings.js's own module doc documents for
+/// itself. `id === ""` is the System default row (device-settings.js
+/// `buildSaveDeviceInput`'s own doc).
+async function selectDevice(prefix, id) {
+  const kind = prefix === "mic" ? "input" : "output";
+  try {
+    await invoke("save_audio_settings", { input: buildSaveDeviceInput(kind, id) });
+    const { options } = state.devices[kind];
+    const name = activeDeviceLabel(options, id);
+    const inCall = !!(state.call && state.call.state === "established");
+    const key =
+      prefix === "mic"
+        ? inCall
+          ? "settings.micSwitchedInCallLive"
+          : "settings.micSwitchedLive"
+        : inCall
+          ? "settings.speakerSwitchedInCallLive"
+          : "settings.speakerSwitchedLive";
+    $("devices-live").textContent = t(key, { name });
+  } catch (e) {
+    showBanner(t("settings.devicesSaveFailed", { message: String(e) }), "err");
+  }
+  invoke("sidecar_list_devices").catch((e) => console.error("sidecar_list_devices (resync after select) failed", e));
+}
+
+function wireDeviceHandlers() {
+  ["mic", "spk"].forEach((prefix) => {
+    $(`${prefix}-sel`).addEventListener("click", () => {
+      if (openDeviceSel === prefix) {
+        closeDeviceMenus();
+        return;
+      }
+      openDeviceMenu(prefix);
+    });
+    $(`${prefix}-pop`).addEventListener("click", (e) => {
+      const opt = e.target.closest(".opt");
+      if (!opt) return;
+      closeDeviceMenus();
+      selectDevice(prefix, opt.dataset.deviceId);
+    });
+    // Minimal listbox keyboard pattern (roving focus, Escape to close) -
+    // design/notes/settings-devices.md's own autocritique flags the full
+    // pattern (type-ahead included) as shell follow-up work against this
+    // same ARIA markup; this covers the core case. Enter/Space need no
+    // handling here - each `.opt` is a real `<button>`, so the browser's own
+    // default activation already fires the `click` listener registered
+    // above; adding a manual `.click()` call here would fire it twice.
+    $(`${prefix}-pop`).addEventListener("keydown", (e) => {
+      const opts = [...$(`${prefix}-pop`).querySelectorAll(".opt")];
+      if (!opts.length) return;
+      const i = opts.indexOf(document.activeElement);
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        (opts[i + 1] || opts[0]).focus();
+      } else if (e.key === "ArrowUp") {
+        e.preventDefault();
+        (opts[i - 1] || opts[opts.length - 1]).focus();
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        closeDeviceMenus();
+        $(`${prefix}-sel`).focus();
+      }
+    });
+  });
+  document.addEventListener("click", (e) => {
+    if (!openDeviceSel) return;
+    const prefix = openDeviceSel;
+    if ($(`${prefix}-sel`).contains(e.target) || $(`${prefix}-pop`).contains(e.target)) return;
+    closeDeviceMenus();
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && openDeviceSel) closeDeviceMenus();
   });
 }
 
@@ -1990,11 +2143,14 @@ async function openSettings() {
   renderUpdaterUI();
   applyLockUI();
   renderCodecsSection(); // paints whatever the last `codecs` event carried (may be empty this early)
+  renderDevicesSection(); // same "paint whatever's cached, then re-query fresh" shape, for devices
   // Fire-and-forget re-query, same "always re-fetch fresh on open" pattern
   // the rest of this function follows for account/bridge/availability/... -
-  // the resulting `codecs` event (handleCodecsEvent) repaints the pane
-  // once it lands, same as every other sidecar-event-driven surface here.
+  // the resulting `codecs`/`devices` event (handleCodecsEvent/
+  // handleDevicesEvent) repaints each pane once it lands, same as every
+  // other sidecar-event-driven surface here.
   invoke("sidecar_list_codecs").catch((e) => console.error("sidecar_list_codecs failed", e));
+  invoke("sidecar_list_devices").catch((e) => console.error("sidecar_list_devices failed", e));
   $("screen-settings").hidden = false;
 }
 
@@ -3027,6 +3183,7 @@ async function boot() {
   document.documentElement.dataset.os = detectOS();
   wireStaticHandlers();
   wireCodecsHandlers();
+  wireDeviceHandlers();
 
   // Locale first, before any other render below reads t() - "auto" (the
   // default, matching an unconfigured settings.json) resolves against this

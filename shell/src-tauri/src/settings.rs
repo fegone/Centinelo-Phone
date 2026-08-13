@@ -535,10 +535,16 @@ impl Default for HidSettings {
 // fix. `None` on either field = that platform's driver at its own `default`
 // pseudo-device, which is what a fresh install gets with zero settings
 // changes - the whole point of this feature (a beta tester who never opens
-// Settings still hears/is heard). Admin-gated
-// (`commands::save_audio_settings`), same rationale as `HidSettings`: an
-// agent shouldn't be able to silently repoint the app at a different mic/
-// speaker than the one an admin verified.
+// Settings still hears/is heard). NOT admin-gated as of the
+// audio-device-picker feature (2026-08-13) - `commands::save_audio_settings`
+// used to `require_unlocked()` here, same rationale `HidSettings` still
+// documents for itself, but the approved Plate 10 design
+// (premium/design/notes/settings-devices.md "Dónde vive y para quién")
+// deliberately reverses that call for THIS struct's two fields specifically:
+// see `commands.rs`'s own section-header comment on `save_audio_settings`
+// for the full reasoning (remote receptionist, wrong headset, no admin
+// password in hand). `HidSettings` right above is unaffected by this and
+// stays admin-gated.
 //
 // A `CENTINELO_E2E_AUDIO=synthetic` env var overrides both fields at spawn
 // time regardless of what's persisted here - qa-e2e's driver depends on
