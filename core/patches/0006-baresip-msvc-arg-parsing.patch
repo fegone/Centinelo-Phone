@@ -1,0 +1,179 @@
+diff --git a/src/cent_getopt.h b/src/cent_getopt.h
+new file mode 100644
+index 0000000..0000000
+--- /dev/null
++++ b/src/cent_getopt.h
+@@ -0,0 +1,106 @@
++/**
++ * @file src/cent_getopt.h  Minimal getopt() stand-in for platforms
++ *                          without <getopt.h> (MSVC)
++ *
++ * Centinelo Phone v2 F1.2 patch (core/patches/) -- see the comment at
++ * this header's only #include site (src/main.c, "#ifndef HAVE_GETOPT")
++ * for why this exists.
++ *
++ * This implements the small subset of POSIX getopt() semantics
++ * src/main.c's own option loop needs:
++ *   - single-dash short options, declared in one optstring
++ *   - ':' right after a letter in optstring means "takes a value"
++ *   - a value may be glued to the flag ("-fpath") or be the next argv[]
++ *     ("-f path")
++ *   - flags with no value may be bundled ("-46")
++ *   - unknown option, or a value-taking option missing its value,
++ *     returns '?' and advances past it (never gets stuck, never aborts
++ *     the whole parse) -- this matches glibc/BSD getopt()'s own
++ *     behavior for the same cases, so callers (src/main.c's switch)
++ *     don't need to special-case this fallback
++ *   - "--" ends option parsing
++ *
++ * Not a general getopt() replacement (no GNU long-options, no optional
++ * "::" arguments, no reordering of non-option argv[] entries around
++ * options the way GNU getopt() does by default) -- deliberately scoped
++ * to exactly what src/main.c uses. `cent_optind` is not reset between
++ * calls to `cent_getopt()`-parsing a second, independent argv[] in the
++ * same process would need it reset to 1 first; src/main.c only ever
++ * parses argv[] once per process, so this header doesn't provide a
++ * reset entry point.
++ */
++
++#ifndef CENT_GETOPT_H
++#define CENT_GETOPT_H
++
++#include <string.h>
++
++static char *cent_optarg;
++static int cent_optind = 1;
++
++static int cent_getopt(int argc, char *const argv[], const char *optstring)
++{
++	static int subopt = 1; /* position within argv[cent_optind] */
++	char *arg;
++	char *p;
++	int c;
++
++	if (cent_optind >= argc)
++		return -1;
++
++	arg = argv[cent_optind];
++
++	if (arg[0] != '-' || arg[1] == '\0')
++		return -1;
++
++	if (arg[1] == '-' && arg[2] == '\0') {
++		/* "--" explicitly ends option parsing, POSIX-style */
++		++cent_optind;
++		return -1;
++	}
++
++	c = (unsigned char)arg[subopt];
++	p = strchr(optstring, c);
++
++	if (!p || c == ':') {
++		/* unknown option -- skip it and keep going, like getopt() */
++		++cent_optind;
++		subopt = 1;
++		return '?';
++	}
++
++	if (p[1] == ':') {
++		if (arg[subopt + 1] != '\0') {
++			/* "-fpath" (value glued to the flag) */
++			cent_optarg = &arg[subopt + 1];
++		}
++		else if (cent_optind + 1 < argc) {
++			/* "-f path" (value is the next argv[]) */
++			cent_optarg = argv[++cent_optind];
++		}
++		else {
++			/* missing required value */
++			cent_optarg = NULL;
++			++cent_optind;
++			subopt = 1;
++			return '?';
++		}
++		++cent_optind;
++		subopt = 1;
++	}
++	else {
++		cent_optarg = NULL;
++		if (arg[subopt + 1] != '\0') {
++			/* more bundled flags follow, e.g. "-46" */
++			++subopt;
++		}
++		else {
++			++cent_optind;
++			subopt = 1;
++		}
++	}
++
++	return c;
++}
++
++#endif /* CENT_GETOPT_H */
+diff --git a/src/main.c b/src/main.c
+index 624b3fd..cf5b088 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -55,7 +55,6 @@ static void tmr_quit_handler(void *arg)
+ }
+ 
+ 
+-#ifdef HAVE_GETOPT
+ static void usage(void)
+ {
+ 	(void)re_fprintf(stderr,
+@@ -79,6 +78,35 @@ static void usage(void)
+ 			 "\t-c               Disable colored log\n"
+ 			 );
+ }
++
++
++#ifndef HAVE_GETOPT
++/*
++ * Centinelo Phone v2 F1.2 patch (core/patches/): HAVE_GETOPT is false on
++ * every MSVC build (re/cmake/re-config.cmake's own
++ * check_include_file(getopt.h HAVE_GETOPT_H) fails - MSVC ships no
++ * <getopt.h>), which used to wrap the *entire* option-parsing loop below
++ * ("#ifdef HAVE_GETOPT ... #else (void)argc; (void)argv; #endif") out of
++ * the Windows build - every argv baresip.exe ever received on Windows,
++ * including this repo's own "-f <scratch_dir>" (the only flag
++ * shell/src-tauri/src/sidecar.rs passes - see its `cmd.arg("-f")` call
++ * site), was silently discarded: conf_path_set() never ran,
++ * conf_path_get() fell back to its compiled-in default
++ * (`%APPDATA%\.baresip` on Windows), and the engine loaded whatever
++ * config/accounts happened to already exist there instead of the
++ * scratch-dir config/accounts this repo's shell had just written -
++ * including, critically, that scratch config's own `ctrl_json` module
++ * line, so the shell<->core control channel documented in
++ * core/PROTOCOL.md never even started.
++ *
++ * cent_getopt.h is a minimal, dependency-free stand-in for the small
++ * subset of POSIX getopt() semantics main() below actually needs, kept
++ * in its own header (rather than inlined here) so it can be unit-tested
++ * on its own - see core/patches/test/test_cent_getopt.c.
++ */
++#include "cent_getopt.h"
++#define getopt(argc, argv, optstring) cent_getopt(argc, argv, optstring)
++#define optarg cent_optarg
+ #endif
+ 
+ 
+@@ -153,7 +181,6 @@ int main(int argc, char *argv[])
+ 
+ 	tmr_init(&tmr_quit);
+ 
+-#ifdef HAVE_GETOPT
+ 	for (;;) {
+ 		const int c = getopt(argc, argv, "46a:de:f:p:hu:n:vst:m:Tc");
+ 		if (0 > c)
+@@ -245,10 +272,6 @@ int main(int argc, char *argv[])
+ 			break;
+ 		}
+ 	}
+-#else
+-	(void)argc;
+-	(void)argv;
+-#endif
+ 
+ 	dbg_init(dbg_level, dbg_flags);
+ 	err = conf_configure();
