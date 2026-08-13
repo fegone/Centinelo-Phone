@@ -308,6 +308,7 @@ jobs:
         run: |
           git apply --directory=core/deps/baresip core/patches/0003-baresip-json-stdout-purity.patch
           git apply --directory=core/deps/baresip core/patches/0005-baresip-transfer-subscription-error-event.patch
+          git apply --directory=core/deps/baresip core/patches/0006-baresip-msvc-arg-parsing.patch
 
       - name: Verify every core/patches/*.patch is applied in this job
         # Same trip-wire as core-build.yml's own macOS job (see that
@@ -322,6 +323,7 @@ jobs:
             0003-baresip-json-stdout-purity.patch \
             0004-re-json-stdout-purity.patch \
             0005-baresip-transfer-subscription-error-event.patch \
+            0006-baresip-msvc-arg-parsing.patch \
             | sort)
           available=$(cd core/patches && ls -1 *.patch | sort)
           if [ "$applied" != "$available" ]; then
@@ -870,6 +872,7 @@ jobs:
         run: |
           git apply --directory=core/deps/baresip core/patches/0003-baresip-json-stdout-purity.patch
           git apply --directory=core/deps/baresip core/patches/0005-baresip-transfer-subscription-error-event.patch
+          git apply --directory=core/deps/baresip core/patches/0006-baresip-msvc-arg-parsing.patch
 
       - name: Verify every core/patches/*.patch is applied in this job
         shell: bash
@@ -881,6 +884,7 @@ jobs:
             0003-baresip-json-stdout-purity.patch \
             0004-re-json-stdout-purity.patch \
             0005-baresip-transfer-subscription-error-event.patch \
+            0006-baresip-msvc-arg-parsing.patch \
             | sort)
           available=$(cd core/patches && ls -1 *.patch | sort)
           if [ "$applied" != "$available" ]; then
