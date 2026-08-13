@@ -516,6 +516,182 @@ mod audio_settings_command_tests {
     }
 }
 
+// ---- audio codecs (codecs-shell feature, core/PROTOCOL.md v1.6) ----------
+//
+// NOT admin-gated (see settings.rs `CodecSettings`'s doc for the approved
+// rationale) - deliberately the one Settings command group in this file
+// with no `require_unlocked()` call anywhere below, and index.html places
+// its section OUTSIDE `#lock-overlay`'s covered region to match: the
+// backend gate and the visual gate agree, both open.
+
+/// Fires `core/PROTOCOL.md`'s `codecs` query - fire-and-forget, same shape
+/// as `sidecar_list_devices` just above: the actual
+/// `{"event":"codecs","available":[...],"active":[...]}` payload arrives
+/// on the normal `sidecar-event` stream (sidecar.rs `EVENT_LINE`), not as a
+/// return value here. The frontend paints its codec list from THAT event,
+/// never from a shell-side mirror (this workspace's "fuente de verdad"
+/// rule) - `get_codec_settings` below only ever returns the *persisted
+/// preference*, a different, narrower thing (see its own doc).
+#[tauri::command(rename_all = "snake_case")]
+pub fn sidecar_list_codecs(sidecar: State<SidecarHandle>) -> Result<(), String> {
+    sidecar.send_cmd(serde_json::json!({ "cmd": "codecs" }))
+}
+
+/// Returns the persisted codec preference (empty = never customized) - NOT
+/// the engine's live effective order, which the frontend gets from the
+/// `codecs` event `sidecar_list_codecs` triggers. This exists for the same
+/// reason `get_audio_settings` does alongside `sidecar_list_devices`: a
+/// settings screen that just opened has nothing to show until the first
+/// `codecs` event arrives, and this lets it show "you last set: opus,
+/// PCMU..." (or the empty/never-customized state) without waiting on the
+/// engine round-trip - still never a substitute for painting the actual
+/// on/off/order state, which always comes from the live event once it
+/// lands.
+#[tauri::command(rename_all = "snake_case")]
+pub fn get_codec_settings(settings: State<Arc<SettingsStore>>) -> Vec<String> {
+    settings.snapshot().codecs.preferred_order
+}
+
+#[derive(Deserialize)]
+pub struct SaveCodecsInput {
+    pub codecs: Vec<String>,
+}
+
+/// Structural validation mirrored from `core/modules/ctrl_json/cmd.c`'s
+/// `decode_codecs()` (core/PROTOCOL.md v1.6, `set_codecs`'s own doc) - non-
+/// empty, no more than 16 entries, each 1..=31 bytes, no case-insensitive
+/// duplicate. Deliberately duplicated here rather than skipped: catching a
+/// malformed list before it ever reaches the sidecar means a bug in the
+/// codecs-panel JS (or a future caller) fails fast with a clear message
+/// instead of round-tripping to the engine only to get the exact same
+/// rejection back (or, worse, silently doing nothing useful for an already-
+/// running session with the sidecar down). What this does NOT validate -
+/// deliberately left to the engine's own `aucodec_find()` check, since it
+/// needs a live `struct ua` this pure function doesn't have - is whether
+/// each name is actually a codec *this build* compiled in; an unknown name
+/// passes this function and fails at the sidecar as a normal `error` event,
+/// same as core/PROTOCOL.md documents.
+///
+/// Trims whitespace off each entry (defensive - the frontend never sends
+/// untrimmed names today, same "belt and suspenders" reasoning
+/// `merge_device_choice` uses for the device fields above).
+fn validate_codec_order(codecs: &[String]) -> Result<Vec<String>, String> {
+    if codecs.is_empty() {
+        return Err("At least one codec must stay on to make calls.".to_string());
+    }
+    if codecs.len() > 16 {
+        return Err("Too many codecs selected (16 max).".to_string());
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut cleaned = Vec::with_capacity(codecs.len());
+    for name in codecs {
+        let trimmed = name.trim();
+        if trimmed.is_empty() || trimmed.len() > 31 {
+            return Err(format!("Invalid codec name: {name:?}"));
+        }
+        if !seen.insert(trimmed.to_ascii_lowercase()) {
+            return Err(format!("Duplicate codec in the list: {trimmed}"));
+        }
+        cleaned.push(trimmed.to_string());
+    }
+    Ok(cleaned)
+}
+
+/// Persists the operator's codec preference and best-effort applies it live
+/// via `core/PROTOCOL.md`'s `set_codecs` - "persist first, best-effort
+/// live-apply second", same shape `save_audio_settings`/`apply_live_device`
+/// use above. No re-register, no in-call interruption: `set_codecs` takes
+/// effect starting the very next call (dial or incoming), and an
+/// already-established call keeps whatever it negotiated - see that
+/// command's own `core/PROTOCOL.md` doc for exactly why (`call_streams_alloc()`
+/// reads the account's codec list fresh only when a NEW `struct call` is
+/// allocated, nothing to do with SIP registration). There is deliberately
+/// no "apply is disabled during a call" or "changes take effect after you
+/// hang up" logic anywhere in this codebase - an earlier design draft
+/// assumed a re-register was needed and was wrong; see this workspace's
+/// `design/notes/settings-codecs.md`.
+///
+/// A live-apply failure (sidecar not running, or the engine rejects the
+/// list - e.g. a name this particular build never compiled in) is
+/// surfaced via `SidecarHandle::emit_notice`, same as
+/// `apply_live_device` - the save itself still succeeds (the preference is
+/// durably persisted and will apply starting the next successful spawn/
+/// registration either way), matching this function's own "persist first"
+/// framing. A synchronous send failure is reported this way because
+/// `send_cmd` has no correlation with the async `codecs`/`error` event
+/// that eventually answers it (core/PROTOCOL.md's `id`/`result`
+/// correlation isn't wired up in this app yet - same limitation
+/// `sidecar_list_devices`'s own doc notes); the frontend's own codecs
+/// panel additionally listens for a plain `error` event while a save is in
+/// flight and re-queries `codecs` to resync, so the UI never keeps
+/// claiming a preference is active that the engine actually rejected (see
+/// `ui/js/codec-settings.js`).
+#[tauri::command(rename_all = "snake_case")]
+pub fn save_codec_settings(
+    settings: State<Arc<SettingsStore>>,
+    sidecar: State<SidecarHandle>,
+    input: SaveCodecsInput,
+) -> Result<(), String> {
+    let cleaned = validate_codec_order(&input.codecs)?;
+    settings.update_codecs(cleaned.clone()).map_err(|e| e.to_string())?;
+    if let Err(e) = sidecar.send_cmd(serde_json::json!({"cmd": "set_codecs", "codecs": cleaned})) {
+        sidecar.emit_notice(&format!(
+            "couldn't apply the codec preference to the running engine ({e}) - it's saved and will apply the next time the engine starts"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod codec_settings_command_tests {
+    use super::*;
+
+    #[test]
+    fn empty_list_is_rejected() {
+        let err = validate_codec_order(&[]).unwrap_err();
+        assert!(err.contains("At least one"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn over_sixteen_entries_is_rejected() {
+        let codecs: Vec<String> = (0..17).map(|n| format!("c{n}")).collect();
+        let err = validate_codec_order(&codecs).unwrap_err();
+        assert!(err.contains("16"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn case_insensitive_duplicate_is_rejected() {
+        let err = validate_codec_order(&["opus".to_string(), "OPUS".to_string()]).unwrap_err();
+        assert!(err.contains("Duplicate"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn overlength_name_is_rejected() {
+        let name = "x".repeat(32);
+        let err = validate_codec_order(&[name]).unwrap_err();
+        assert!(err.contains("Invalid"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn empty_entry_is_rejected() {
+        let err = validate_codec_order(&["opus".to_string(), "  ".to_string()]).unwrap_err();
+        assert!(err.contains("Invalid"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn valid_list_is_trimmed_and_kept_in_order() {
+        let cleaned = validate_codec_order(&[" opus ".to_string(), "PCMU".to_string(), "PCMA".to_string()]).unwrap();
+        assert_eq!(cleaned, vec!["opus".to_string(), "PCMU".to_string(), "PCMA".to_string()]);
+    }
+
+    #[test]
+    fn thirty_one_byte_name_is_the_max_allowed() {
+        let name = "x".repeat(31);
+        let cleaned = validate_codec_order(std::slice::from_ref(&name)).unwrap();
+        assert_eq!(cleaned, vec![name]);
+    }
+}
+
 // ---- theme ------------------------------------------------------------
 
 #[tauri::command(rename_all = "snake_case")]

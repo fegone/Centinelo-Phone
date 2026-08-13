@@ -599,6 +599,115 @@ const ENTRIES = [
     "Cuenta guardada; transcripción NO guardada: {reason}",
   ],
 
+  // -- settings / audio & devices + codecs (Plate 09) --------------------
+  // Verbatim from premium/design/notes/settings-codecs.md's own "Strings
+  // para i18n.js" table (creative-vigilia, PR #6, design/settings-codecs)
+  // - not re-translated, the Portuguese was authored as a first-class
+  // language there, not filler. See ui/js/codec-settings.js for where each
+  // key is used.
+  ["settings.audioDevicesHeading", "Audio & devices", "Áudio e dispositivos", "Audio y dispositivos"],
+  [
+    "settings.audioDevicesSub",
+    "Your microphone, your speaker, and the format your voice travels in.",
+    "Seu microfone, seu alto-falante e o formato em que sua voz trafega.",
+    "Tu micrófono, tu altavoz y el formato en que viaja tu voz.",
+  ],
+  ["settings.microphoneLabel", "Microphone", "Microfone", "Micrófono"],
+  ["settings.speakerLabel", "Speaker", "Alto-falante", "Altavoz"],
+  ["settings.codecsHeading", "Audio codecs", "Codecs de áudio", "Códecs de audio"],
+  ["settings.codecsCount", "{n} on this computer", "{n} neste computador", "{n} en este equipo"],
+  [
+    "settings.codecsIntro",
+    "A codec is the format your voice travels in. On every call, Centinelo offers the enabled codecs in this order, and the call uses the first one your phone system also accepts.",
+    "Um codec é o formato em que a voz trafega. Em cada chamada, o Centinelo oferece os codecs ativados nesta ordem, e a chamada usa o primeiro que o seu sistema telefônico também aceita.",
+    "Un códec es el formato en que viaja la voz. En cada llamada, Centinelo ofrece los códecs activados en este orden, y la llamada usa el primero que tu sistema telefónico también acepte.",
+  ],
+  [
+    "settings.codecsNextCallNotice",
+    "Changes take effect on your next call. A call already in progress keeps the sound it started with.",
+    "As alterações passam a valer na sua próxima chamada. Uma chamada já em andamento mantém o som com que começou.",
+    "Los cambios toman efecto en tu próxima llamada. Una llamada ya en curso conserva el sonido con el que empezó.",
+  ],
+  ["settings.codecsListAria", "Audio codecs, in order of preference", "Codecs de áudio, em ordem de preferência", "Códecs de audio, en orden de preferencia"],
+  ["settings.codecRecommended", "Recommended", "Recomendado", "Recomendado"],
+  [
+    "settings.codecOpusDesc",
+    "Adapts to your connection: the best quality your internet allows at every moment, using the least data.",
+    "Adapta-se à sua conexão: a melhor qualidade que a internet permitir a cada momento, gastando menos dados.",
+    "Se adapta a tu conexión: la mejor calidad que el internet permita en cada momento, gastando menos datos.",
+  ],
+  ["settings.codecOpusWhisper", "OPUS · 48 KHZ · ADAPTIVE", "OPUS · 48 KHZ · ADAPTATIVO", "OPUS · 48 KHZ · ADAPTATIVO"],
+  [
+    "settings.codecPcmuDesc",
+    "The classic telephone sound. Understood by practically every system — the usual one in the Americas.",
+    "O som clássico do telefone. Entendido por praticamente qualquer sistema — o habitual nas Américas.",
+    "El sonido clásico del teléfono. Lo entiende prácticamente cualquier sistema — el habitual en América.",
+  ],
+  [
+    "settings.codecPcmaDesc",
+    "The same classic sound, in the variant common in Europe. Turn it on only if your phone system asks for it.",
+    "O mesmo som clássico, na variante habitual da Europa. Ative apenas se o seu sistema telefônico pedir.",
+    "El mismo sonido clásico, en la variante habitual de Europa. Actívalo solo si tu sistema telefónico lo pide.",
+  ],
+  ["settings.codecQualityLabel", "Quality", "Qualidade", "Calidad"],
+  ["settings.codecDataLabel", "Data", "Dados", "Datos"],
+  ["settings.codecQualityExcellent", "Excellent", "Excelente", "Excelente"],
+  ["settings.codecQualityStandard", "Standard", "Padrão", "Estándar"],
+  ["settings.codecDataLow", "Low", "Baixos", "Bajos"],
+  ["settings.codecDataMedium", "Medium", "Médios", "Medios"],
+  ["settings.codecsNotOffered", "Not offered", "Não oferecidos", "No se ofrecen"],
+  [
+    "settings.codecsLastActiveGuard",
+    "At least one codec must stay on to make calls. Turn another one on before turning this one off.",
+    "É preciso pelo menos um codec ativo para ligar. Ative outro antes de desativar este.",
+    "Se necesita al menos un códec activo para llamar. Activa otro antes de desactivar este.",
+  ],
+  [
+    "settings.codecsBuildNote",
+    "This list shows the codecs this Centinelo installation ships with. Another computer may show different options.",
+    "Esta lista mostra os codecs que esta instalação do Centinelo traz. Outro computador pode mostrar opções diferentes.",
+    "Esta lista muestra los códecs que trae esta instalación de Centinelo. Otra computadora puede mostrar opciones distintas.",
+  ],
+  ["settings.codecsUnappliedTitle", "Unapplied changes", "Alterações não aplicadas", "Cambios sin aplicar"],
+  [
+    "settings.codecsUnappliedHint",
+    "They'll take effect on your next call.",
+    "Elas passam a valer na sua próxima chamada.",
+    "Tomarán efecto en tu próxima llamada.",
+  ],
+  ["settings.codecsApply", "Apply", "Aplicar", "Aplicar"],
+  ["settings.codecsDiscard", "Discard", "Descartar", "Descartar"],
+  ["settings.codecsMoveUpAria", "Move {name} up", "Mover {name} para cima", "Subir {name}"],
+  ["settings.codecsMoveDownAria", "Move {name} down", "Mover {name} para baixo", "Bajar {name}"],
+  ["settings.codecsToggleOnAria", "Turn {name} on", "Ativar {name}", "Activar {name}"],
+  ["settings.codecsToggleOffAria", "Turn {name} off", "Desativar {name}", "Desactivar {name}"],
+  ["settings.codecsPositionAria", "Position {n}", "Posição {n}", "Posición {n}"],
+  ["settings.codecsMovedAnnounce", "{name} is now position {n}.", "{name} agora está na posição {n}.", "{name} ahora está en la posición {n}."],
+  ["settings.codecsDiscardedAnnounce", "Changes discarded.", "Alterações descartadas.", "Cambios descartados."],
+  [
+    "settings.codecsAppliedAnnounce",
+    "Changes applied — they take effect on your next call.",
+    "Alterações aplicadas — passam a valer na sua próxima chamada.",
+    "Cambios aplicados — toman efecto en tu próxima llamada.",
+  ],
+  // Not in the design table (shell-only, no mockup copy for these two
+  // states): a generic fallback for a codec name this shell has no canned
+  // description for (a future build's codec, e.g. G.722 - see
+  // ui/js/codec-settings.js's `describeCodec`) and the error banner shown
+  // when `set_codecs` comes back rejected.
+  [
+    "settings.codecUnknownDesc",
+    "This codec is available on this computer.",
+    "Este codec está disponível neste computador.",
+    "Este códec está disponible en este equipo.",
+  ],
+  [
+    "settings.codecsApplyFailed",
+    "Couldn't apply the codec change: {message}",
+    "Não foi possível aplicar a alteração de codec: {message}",
+    "No se pudo aplicar el cambio de códec: {message}",
+  ],
+
   // -- auto-updater (roadmap debt fix) -----------------------------------
   // Settings > About status line (renderUpdaterAboutStatus, app.js) and the
   // non-intrusive main-window banner (renderUpdateBanner, ui/js/updater.js)

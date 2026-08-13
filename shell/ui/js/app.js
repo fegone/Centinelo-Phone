@@ -41,6 +41,15 @@ import {
 } from "./updater.js";
 import { computeBlfUiHidden, BLF_UI_TARGETS } from "./blf-ui.js";
 import {
+  describeCodec,
+  buildCodecState,
+  isDirty as isCodecsDirty,
+  applyToggle as applyCodecToggle,
+  applyMove as applyCodecMove,
+  buildSaveCodecsInput,
+  renderCodecsList,
+} from "./codec-settings.js";
+import {
   armHandshake,
   reduceRegHandshake,
   shouldReleaseSaveButton,
@@ -131,7 +140,32 @@ const state = {
   // flashes an unstyled state before boot()'s get_availability_settings
   // resolves.
   availability: { available: true, autoAnswer: false },
+
+  // ---- audio codecs (Plate 09, Settings → Audio & devices) ------------
+  // `available`/`saved`/`current` all come from the engine's own
+  // core/PROTOCOL.md `codecs` event (handleCodecsEvent) - this app never
+  // paints a codec list it invented. `available` = the last event's
+  // `available` array verbatim ([{name,srate,ch}]); `saved` = the
+  // engine's last known effective order/off-split (codec-settings.js
+  // `buildCodecState`); `current` = this pane's own editable copy (what
+  // renderCodecsSection paints), diverges from `saved` only between a
+  // toggle/reorder and Apply/Discard. `touched` is session-only styling
+  // state (which rows get the "changed" tint - see renderCodecsList's own
+  // doc), reset on every fresh `codecs` event and on Discard.
+  codecs: { available: [], saved: { order: [], off: [] }, current: { order: [], off: [] }, touched: new Set() },
 };
+
+// Set right before save_codec_settings fires, cleared on the `codecs`
+// event that success produces (or, on failure, by the `error` event
+// handler itself) - see handleSidecarEvent's "error" case for why this
+// exists: core/PROTOCOL.md's plain `error` event carries no correlation
+// to which command triggered it (this app doesn't use v1.1's `id`/`result`
+// correlation), so this flag is the only way the codecs panel can tell
+// "an error just arrived, and it's plausibly about the change I just
+// asked for" from "some unrelated error". A short timeout clears it
+// defensively so an error days later can't still be misattributed.
+let codecsApplyPending = false;
+let codecsApplyPendingTimer = null;
 
 const $ = (id) => document.getElementById(id);
 
@@ -921,8 +955,21 @@ function handleSidecarEvent(evt) {
     case "blf":
       handleBlfEvent(evt);
       break;
+    case "codecs":
+      handleCodecsEvent(evt);
+      break;
     case "error":
-      showBanner(evt.message || t("sidecar.somethingWrong"), "err");
+      // If a codecs Apply is currently in flight, this is (heuristically -
+      // see codecsApplyPending's own doc) that save coming back rejected:
+      // hand it to the codecs panel instead of the generic banner, so the
+      // panel can show it in place and re-sync from the engine, rather
+      // than silently keeping the operator's rejected edit painted as if
+      // it had taken. Every other error keeps today's generic banner.
+      if (codecsApplyPending) {
+        handleCodecsApplyError(evt.message || t("sidecar.somethingWrong"));
+      } else {
+        showBanner(evt.message || t("sidecar.somethingWrong"), "err");
+      }
       break;
     default:
       break;
@@ -1023,6 +1070,164 @@ function applyLockUI() {
   // moments ago is still awaiting its terminal reg_state, and would
   // otherwise stomp the disabled flag back to enabled out from under it.
   saveBtn.disabled = !state.adminUnlocked || !!state.pendingRegResult;
+}
+
+// ---------------------------------------------------------------------------
+// audio codecs (Plate 09 - Settings → Audio & devices → Audio codecs)
+//
+// Deliberately NOT gated by applyLockUI/#lock-overlay - see index.html's
+// own comment at #codecs-list's markup for why (approved decision: no
+// patient data at risk, only call quality, and the real use case is a
+// receptionist walked through this by phone support with no admin
+// password). No re-register/in-call-interruption logic here or anywhere
+// in this codebase - core/PROTOCOL.md's `set_codecs` takes effect starting
+// the next call; an in-progress call is untouched either way.
+// ---------------------------------------------------------------------------
+
+let codecsGuardTimer = null;
+
+/// `core/PROTOCOL.md`'s `codecs` event (from the `codecs` query OR,
+/// automatically, right after a successful `set_codecs`) - the ONLY
+/// source of truth for the codec list/order (this workspace's "fuente de
+/// verdad" rule): never merged with, or overridden by, anything this pane
+/// itself was mid-edit on. A fresh event always wins - if the operator had
+/// unapplied local changes, this intentionally discards them in favor of
+/// the engine's real current state (same "the event, not a client mirror,
+/// is truth" reasoning `save_codec_settings`'s own doc gives for why
+/// `set_codecs` doesn't get its result merged onto `result` either).
+function handleCodecsEvent(evt) {
+  codecsApplyPending = false;
+  if (codecsApplyPendingTimer) {
+    clearTimeout(codecsApplyPendingTimer);
+    codecsApplyPendingTimer = null;
+  }
+  const available = Array.isArray(evt.available) ? evt.available : [];
+  const active = Array.isArray(evt.active) ? evt.active : [];
+  const built = buildCodecState(available, active);
+  state.codecs = {
+    available,
+    saved: built,
+    current: { order: [...built.order], off: [...built.off] },
+    touched: new Set(),
+  };
+  hideCodecsGuard();
+  renderCodecsSection();
+}
+
+/// The `error` event that arrived while `codecsApplyPending` was set (see
+/// that flag's own doc for the correlation caveat). Never leaves the pane
+/// claiming the rejected edit is active: shows the failure via the banner
+/// (same visible channel every other error uses) AND re-queries `codecs`
+/// so the next `codecs` event snaps the pane back to whatever the engine
+/// is actually running - "manejar el error con dignidad", not silently
+/// mislead about what's active.
+function handleCodecsApplyError(message) {
+  codecsApplyPending = false;
+  if (codecsApplyPendingTimer) {
+    clearTimeout(codecsApplyPendingTimer);
+    codecsApplyPendingTimer = null;
+  }
+  showBanner(t("settings.codecsApplyFailed", { message }), "err");
+  invoke("sidecar_list_codecs").catch((e) => console.error("sidecar_list_codecs (resync after error) failed", e));
+}
+
+function showCodecsGuard() {
+  const guard = $("codecs-guard");
+  if (!guard) return;
+  guard.classList.add("show");
+  $("codecs-live").textContent = $("codecs-guard-msg").textContent;
+  clearTimeout(codecsGuardTimer);
+  codecsGuardTimer = setTimeout(() => guard.classList.remove("show"), 5000);
+}
+
+function hideCodecsGuard() {
+  const guard = $("codecs-guard");
+  if (!guard) return;
+  clearTimeout(codecsGuardTimer);
+  guard.classList.remove("show");
+}
+
+/// Paints #codecs-count/#codecs-list/#codecs-applybar from state.codecs -
+/// the only place any of those three elements' content is set. Static
+/// copy around them (heading, intro, notice, guard message, footnote,
+/// apply-bar labels) is plain `data-i18n` markup, refreshed by the normal
+/// applyStaticI18n() pass on locale change - nothing here duplicates that.
+function renderCodecsSection() {
+  const { available, current, saved, touched } = state.codecs;
+  $("codecs-count").textContent = t("settings.codecsCount", { n: available.length });
+  $("codecs-list").innerHTML = renderCodecsList({ available, state: current, touched });
+  $("codecs-applybar").classList.toggle("show", isCodecsDirty(current, saved));
+}
+
+function wireCodecsHandlers() {
+  $("codecs-list").addEventListener("click", (e) => {
+    const row = e.target.closest(".codec");
+    if (!row) return;
+    const id = row.dataset.codecId;
+    const mv = e.target.closest("[data-mv]");
+    if (mv) {
+      if (mv.disabled) return;
+      const result = applyCodecMove(state.codecs.current, id, mv.dataset.mv);
+      if (!result) return;
+      state.codecs.current = result.state;
+      state.codecs.touched.add(result.touchedId);
+      const meta = state.codecs.available.find((c) => c.name === id);
+      const displayName = describeCodec(id, meta || {}).name;
+      $("codecs-live").textContent = t("settings.codecsMovedAnnounce", { name: displayName, n: result.newPosition });
+      renderCodecsSection();
+      return;
+    }
+    if (e.target.closest(".sw")) {
+      const result = applyCodecToggle(state.codecs.current, id);
+      if (result.guarded) {
+        showCodecsGuard();
+        return;
+      }
+      state.codecs.current = result.state;
+      state.codecs.touched.add(result.touchedId);
+      hideCodecsGuard();
+      renderCodecsSection();
+    }
+  });
+
+  $("codecs-discard").addEventListener("click", () => {
+    state.codecs.current = { order: [...state.codecs.saved.order], off: [...state.codecs.saved.off] };
+    state.codecs.touched.clear();
+    hideCodecsGuard();
+    $("codecs-live").textContent = t("settings.codecsDiscardedAnnounce");
+    renderCodecsSection();
+  });
+
+  $("codecs-apply").addEventListener("click", async () => {
+    const applyBtn = $("codecs-apply");
+    applyBtn.disabled = true;
+    codecsApplyPending = true;
+    clearTimeout(codecsApplyPendingTimer);
+    // Defensive-only clear (see codecsApplyPending's own doc) - the normal
+    // path clears it from the resulting `codecs`/`error` event, not this
+    // timer.
+    codecsApplyPendingTimer = setTimeout(() => {
+      codecsApplyPending = false;
+    }, 8000);
+    try {
+      await invoke("save_codec_settings", { input: buildSaveCodecsInput(state.codecs.current) });
+      // Success also arrives as a fresh `codecs` event (core/PROTOCOL.md:
+      // set_codecs emits one on success) - handleCodecsEvent repaints
+      // saved/current/touched from THAT, this call site doesn't optimistically
+      // assume anything applied.
+      $("codecs-live").textContent = t("settings.codecsAppliedAnnounce");
+    } catch (e) {
+      // A synchronous rejection here (validate_codec_order/persist failure,
+      // or the sidecar not running at all) - never even reached the engine,
+      // so there's no `codecs`/`error` event coming; show it directly
+      // instead of waiting on codecsApplyPending's heuristic.
+      codecsApplyPending = false;
+      clearTimeout(codecsApplyPendingTimer);
+      showBanner(t("settings.codecsApplyFailed", { message: String(e) }), "err");
+    } finally {
+      applyBtn.disabled = false;
+    }
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1784,6 +1989,12 @@ async function openSettings() {
   }
   renderUpdaterUI();
   applyLockUI();
+  renderCodecsSection(); // paints whatever the last `codecs` event carried (may be empty this early)
+  // Fire-and-forget re-query, same "always re-fetch fresh on open" pattern
+  // the rest of this function follows for account/bridge/availability/... -
+  // the resulting `codecs` event (handleCodecsEvent) repaints the pane
+  // once it lands, same as every other sidecar-event-driven surface here.
+  invoke("sidecar_list_codecs").catch((e) => console.error("sidecar_list_codecs failed", e));
   $("screen-settings").hidden = false;
 }
 
@@ -2815,6 +3026,7 @@ async function applyPremiumUI() {
 async function boot() {
   document.documentElement.dataset.os = detectOS();
   wireStaticHandlers();
+  wireCodecsHandlers();
 
   // Locale first, before any other render below reads t() - "auto" (the
   // default, matching an unconfigured settings.json) resolves against this
