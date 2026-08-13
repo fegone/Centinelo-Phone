@@ -10,7 +10,17 @@ name: _test-opus-windows (TEMPORARY - remove before merge)
 # the mechanism is confirmed - it is not part of the shipped pipeline.
 
 on:
-  workflow_dispatch: {}
+  # workflow_dispatch would be the cleaner trigger, but GitHub only lists a
+  # workflow_dispatch workflow as dispatchable via the API once its file
+  # exists on the repo's DEFAULT branch (confirmed here: dispatching this
+  # by ref from a feature branch 404'd - "workflow not found on the
+  # default branch" - even though the file is present and valid on THIS
+  # branch). A push trigger scoped to this exact branch sidesteps that:
+  # it fires on push regardless of default-branch status, no dispatch-API
+  # limitation involved.
+  push:
+    branches:
+      - feature/codecs-windows-ci
 
 permissions:
   contents: read
