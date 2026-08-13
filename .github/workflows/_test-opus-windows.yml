@@ -1,0 +1,155 @@
+name: _test-opus-windows (TEMPORARY - remove before merge)
+
+# TEMPORARY verification-only workflow. release.yml's own build-windows job
+# is tag-gated (needs an already-pushed `centinelo-v*` tag, see release.yml's
+# trigger comment) and this branch is explicitly forbidden from creating a
+# tag or publishing a release just to test a CI mechanism. This file mirrors
+# ONLY the new vcpkg+opus steps added to release.yml's build-windows job (not
+# the OpenSSL/Tauri/MSI packaging around them) against a real windows-latest
+# runner, on workflow_dispatch, with no tag required. Delete this file once
+# the mechanism is confirmed - it is not part of the shipped pipeline.
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  test-opus-windows:
+    name: Windows opus (vcpkg) - isolated verification
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      VCPKG_REF: "2026.07.29"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install OpenSSL (Chocolatey)
+        run: choco install openssl -y --no-progress
+
+      - name: Cache vcpkg (opus)
+        id: vcpkg-cache
+        uses: actions/cache@v4
+        with:
+          path: vcpkg
+          key: vcpkg-opus-x64-windows-static-md-${{ env.VCPKG_REF }}-opus-port-v1
+
+      - name: Bootstrap vcpkg + install opus (skipped on cache hit)
+        if: steps.vcpkg-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          git clone --depth 1 --branch $env:VCPKG_REF https://github.com/microsoft/vcpkg
+          .\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+          .\vcpkg\vcpkg.exe install opus:x64-windows-static-md
+
+      - name: Verify vcpkg opus install (fail fast, cache-hit or not)
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f vcpkg/installed/x64-windows-static-md/lib/opus.lib
+          test -f vcpkg/installed/x64-windows-static-md/include/opus/opus.h
+          echo "OK: opus.lib + opus.h present under vcpkg/installed/x64-windows-static-md"
+
+      - name: Locate OpenSSL install dir (choco deploy path varies by pkg version)
+        shell: pwsh
+        run: |
+          $candidates = @('C:\Program Files\OpenSSL', 'C:\Program Files\OpenSSL-Win64')
+          $root = $candidates | Where-Object { Test-Path "$_\include\openssl\ssl.h" } | Select-Object -First 1
+          if (-not $root) {
+            Write-Error "OpenSSL headers (include/openssl/ssl.h) not found under: $($candidates -join ', ')"
+            exit 1
+          }
+          "OPENSSL_ROOT_DIR=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "OPENSSL_ROOT_DIR=$root"
+
+      - name: Apply local re patches
+        shell: bash
+        run: |
+          git apply --directory=core/deps/re core/patches/0001-re-configurable-sip-ws-path.patch
+          git apply --directory=core/deps/re core/patches/0002-re-tls-fingerprint-pin.patch
+          git apply --directory=core/deps/re core/patches/0004-re-json-stdout-purity.patch
+
+      - name: Apply local baresip patches
+        shell: bash
+        run: |
+          git apply --directory=core/deps/baresip core/patches/0003-baresip-json-stdout-purity.patch
+          git apply --directory=core/deps/baresip core/patches/0005-baresip-transfer-subscription-error-event.patch
+
+      - name: Configure + build + install libre
+        shell: bash
+        run: |
+          set -o pipefail
+          RE_INSTALL="$(pwd -W)/re-install-prefix"
+          cmake -S core/deps/re -B core/deps/re/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$RE_INSTALL" \
+            -DLIBRE_BUILD_SHARED=OFF \
+            -DLIBRE_BUILD_STATIC=ON \
+            -DOPENSSL_ROOT_DIR="$OPENSSL_ROOT_DIR" \
+            2>&1 | tee re-configure.log
+          cmake --build core/deps/re/build --config Release 2>&1 | tee -a re-configure.log
+          cmake --install core/deps/re/build --config Release 2>&1 | tee -a re-configure.log
+
+      - name: Configure + build baresip + ctrl_json (with opus)
+        shell: bash
+        run: |
+          set -o pipefail
+          RE_INSTALL="$(pwd -W)/re-install-prefix"
+          cmake -S core/deps/baresip -B core/deps/baresip/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DRE_LIBRARY="$RE_INSTALL/lib/re-static.lib" \
+            -DRE_INCLUDE_DIR="$(pwd -W)/core/deps/re/include" \
+            -DOPENSSL_ROOT_DIR="$OPENSSL_ROOT_DIR" \
+            -DOPUS_HINTS="$(pwd -W)/vcpkg/installed/x64-windows-static-md" \
+            -DMODULES="account;g711;opus;auconv;auresamp;ausine;aufile;ice;dtls_srtp;menu;wasapi" \
+            -DAPP_MODULES="ctrl_json" \
+            -DAPP_MODULES_DIR="$(pwd -W)/core/modules" \
+            2>&1 | tee baresip-configure.log
+          cmake --build core/deps/baresip/build --config Release 2>&1 | tee -a baresip-configure.log
+
+      - name: Sanity - baresip + ctrl_json built (incl. opus)
+        shell: bash
+        run: |
+          RE_INSTALL="$(pwd -W)/re-install-prefix"
+          test -x core/deps/baresip/build/Release/baresip.exe
+          test -f "$RE_INSTALL/lib/re-static.lib"
+          detected_line="$(grep '^MODULES_DETECTED=' baresip-configure.log || true)"
+          if [ -z "$detected_line" ]; then
+            echo "error: MODULES_DETECTED line not found in baresip-configure.log" >&2
+            exit 1
+          fi
+          detected_tokens=";${detected_line#MODULES_DETECTED=};"
+          for mod in ausine aufile ice dtls_srtp wasapi opus; do
+            case "$detected_tokens" in
+              *";$mod;"*) ;;
+              *)
+                echo "error: module '$mod' missing from MODULES_DETECTED" >&2
+                exit 1
+                ;;
+            esac
+          done
+          echo "OK: re + baresip(+ctrl_json, +ausine, +aufile, +ice, +dtls_srtp, +wasapi, +opus) built on Windows"
+
+      - name: Search built binary for no dynamic opus DLL dependency
+        shell: pwsh
+        run: |
+          # dumpbin ships with the VS Build Tools already on windows-latest.
+          # Confirms opus really linked statically (no OPUS*.dll import) -
+          # belt-and-suspenders on top of the x64-windows-static-md triplet
+          # choice itself.
+          $dumpbin = Get-ChildItem "C:\Program Files (x86)\Microsoft Visual Studio" -Recurse -Filter "dumpbin.exe" -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match "Hostx64\\x64" } | Select-Object -First 1
+          if ($dumpbin) {
+            & $dumpbin.FullName /dependents core/deps/baresip/build/Release/baresip.exe | Select-String -Pattern "opus" -SimpleMatch
+            if ($LASTEXITCODE -eq 0) {
+              Write-Host "dumpbin found an opus*.dll dependency - opus did NOT link statically as intended"
+              # Select-String exits 0 only if it found a match, so getting
+              # here means the grep succeeded (bad). Fail loudly.
+              exit 1
+            }
+            Write-Host "OK: no opus*.dll in baresip.exe's import table (dumpbin /dependents)"
+          } else {
+            Write-Host "dumpbin.exe not found on this runner image - skipping the DLL-dependency check (non-fatal, the x64-windows-static-md triplet + earlier module-load proof already cover this)"
+          }
