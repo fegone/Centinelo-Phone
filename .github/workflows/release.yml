@@ -1426,23 +1426,51 @@ jobs:
         # already correct the day 2.0 leaves beta and starts publishing
         # `--latest`, no config change needed that day) and this branch's
         # raw.githubusercontent.com URL (second - the one that actually
-        # works TODAY, while every 2.0.x release is a prerelease and the
-        # first endpoint 404s, per .claude/reports/release-ci-2026-08-12-
-        # updater-endpoint-prerelease.md section 2/3). tauri-plugin-
+        # works TODAY, while every 2.0.x release is a prerelease). GitHub
+        # excludes prereleases from the `/latest/` alias unconditionally,
+        # so that first endpoint 404s for every installed client until
+        # 2.0 leaves beta - see shell/README.md's "Contract for
+        # release-ci" for the full endpoint rationale. tauri-plugin-
         # updater tries endpoints in array order and falls through to the
-        # next on ANY failure (updater.rs:412-518, verified in that same
-        # report) - so this second endpoint is a plain fallback, not a
-        # replacement, and needs no code change in the Rust shell.
+        # next on ANY failure (updater.rs:412-518) - so this second
+        # endpoint is a plain fallback, not a replacement, and needs no
+        # code change in the Rust shell.
         #
         # raw.githubusercontent.com serves a branch's file content
         # directly - it has no concept of "release" at all, so prerelease/
-        # draft status is irrelevant to it (verified in the report above).
-        # The branch is public-repo content, on purpose scoped to ONLY
+        # draft status is irrelevant to it. The branch is public-repo
+        # content, on purpose scoped to ONLY
         # this one file: no README, no other files, ever - it exists
         # solely to be fetched by installed clients' auto-updaters, not to
         # be a real branch of source history. Uses GITHUB_TOKEN (already
         # `contents: write` for this job, see the job-level `permissions:`
         # above) - no new secret.
+        #
+        # Concurrency note (2026-08-13, RELIABILITY/RESILIENCE 4R pass):
+        # this job's own `concurrency:` group is keyed by TAG (release
+        # identity), so two DIFFERENT releases (e.g. 2.0.2 and 2.0.3) can
+        # legitimately run this job at the same time - nothing serializes
+        # writes to this branch across tags. Two deliberately partial
+        # mitigations, not a fully atomic branch write (a dedicated
+        # serialized job / branch-level lock was judged out of scope for
+        # this pass):
+        #   1. Refuse to regress: before overwriting, this step compares
+        #      the version already on the branch (if any) against this
+        #      run's VERSION with `sort -V` - if the branch already
+        #      serves something newer, this run lost the race and skips
+        #      its own write (a warning, not an error: the newer
+        #      release's content is correct, no client sees anything
+        #      broken).
+        #   2. A genuine same-instant race on this branch's FIRST-EVER
+        #      write (both runs see "branch does not exist" and both try
+        #      to create it as an orphan) was a one-time bootstrap window
+        #      - it no longer applies once the branch exists (this pass
+        #      already created it, manually, to verify the mechanism
+        #      end-to-end). If a comparable race ever recurs (e.g. the
+        #      branch gets deleted and two releases race to recreate it),
+        #      `push_with_retry`'s rebase-conflict handling below turns
+        #      it into a clear, actionable failure instead of dying
+        #      opaquely under `set -e`.
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.preflight.outputs.tag }}
@@ -1457,6 +1485,16 @@ jobs:
           # GH_TOKEN-bearing step in this job.
           WORKDIR="$(mktemp -d)"
 
+          # Printed verbatim in every failure message below: the release
+          # itself is ALREADY published by the time this step can fail
+          # (it runs after "Publish the release"), and re-running this
+          # workflow for the same tag does NOT retry just this step - the
+          # "Clean up a leftover DRAFT" step at the top of this job
+          # refuses to touch an already-published release and fails
+          # first. So a human has to do exactly what this step does, by
+          # hand, against the real published release's own latest.json.
+          recovery_hint="git clone https://github.com/fegone/Centinelo-Phone.git /tmp/updater-manifest-fix && cd /tmp/updater-manifest-fix && git checkout $BRANCH && curl -sL https://github.com/fegone/Centinelo-Phone/releases/download/$TAG/latest.json -o latest.json && git commit -am 'release: latest.json for $TAG (manual recovery)' && git push origin HEAD:$BRANCH"
+
           if git ls-remote --exit-code --heads "$REMOTE" "$BRANCH" >/dev/null 2>&1; then
             echo "-- $BRANCH exists, cloning it"
             git clone --quiet --depth 1 --branch "$BRANCH" "$REMOTE" "$WORKDIR"
@@ -1467,6 +1505,19 @@ jobs:
             git -C "$WORKDIR" rm -rf --quiet . >/dev/null 2>&1 || true
           fi
 
+          # Refuse-to-regress check (mitigation 1 above) - BEFORE
+          # overwriting the clone's own copy with this run's dist/latest.json.
+          EXISTING_VERSION="$(jq -r '.version // empty' "$WORKDIR/latest.json" 2>/dev/null || true)"
+          if [[ -n "$EXISTING_VERSION" && "$EXISTING_VERSION" != "$VERSION" ]]; then
+            NEWER="$(printf '%s\n%s\n' "$EXISTING_VERSION" "$VERSION" | sort -V | tail -n1)"
+            if [[ "$NEWER" == "$EXISTING_VERSION" ]]; then
+              echo "::warning::$BRANCH already serves version $EXISTING_VERSION, newer than this run's $VERSION ($TAG) - another release most likely published concurrently and got there first. Leaving $BRANCH untouched rather than regressing it; the guard step right after this one will not treat this endpoint as proof for THIS release." >&2
+              echo "BRANCH_PUSH_OK=0" >> "$GITHUB_ENV"
+              rm -rf "$WORKDIR"
+              exit 0
+            fi
+          fi
+
           cp dist/latest.json "$WORKDIR/latest.json"
           git -C "$WORKDIR" config user.name "centinelo-release-ci"
           git -C "$WORKDIR" config user.email "release-ci@users.noreply.github.com"
@@ -1474,6 +1525,7 @@ jobs:
 
           if git -C "$WORKDIR" diff --cached --quiet; then
             echo "OK: $BRANCH's latest.json already matches this release (no diff) - nothing to push"
+            echo "BRANCH_PUSH_OK=1" >> "$GITHUB_ENV"
           else
             git -C "$WORKDIR" commit --quiet -m "release: latest.json for $TAG (beta update endpoint, version $VERSION)"
             push_with_retry() {
@@ -1483,12 +1535,19 @@ jobs:
                   return 0
                 fi
                 if (( attempt >= max )); then
-                  echo "::error::push to $BRANCH failed after $max attempts" >&2
+                  echo "::error::push to $BRANCH failed after $max attempts. $TAG is ALREADY published - installed clients relying on this endpoint (endpoint 1, GitHub's /latest/ alias, 404s by design during prerelease) will silently see NO update at all, not an error, until this is fixed by hand. Manual recovery: $recovery_hint" >&2
                   return 1
                 fi
                 echo "-- push attempt $attempt/$max failed, fetching + rebasing onto origin/$BRANCH then retrying in ${delay}s..." >&2
-                git -C "$WORKDIR" fetch --quiet origin "$BRANCH"
-                git -C "$WORKDIR" rebase --quiet "origin/$BRANCH"
+                if ! git -C "$WORKDIR" fetch --quiet origin "$BRANCH"; then
+                  echo "::error::git fetch of $BRANCH failed while retrying the push (network issue, not a conflict). $TAG is ALREADY published. Manual recovery: $recovery_hint" >&2
+                  return 1
+                fi
+                if ! git -C "$WORKDIR" rebase --quiet "origin/$BRANCH"; then
+                  git -C "$WORKDIR" rebase --abort >/dev/null 2>&1 || true
+                  echo "::error::git rebase onto origin/$BRANCH failed (a real content conflict - most likely two releases writing $BRANCH around the same time, or a recreated-branch race). Aborted the rebase rather than leaving the worktree half-rebased; NOT retrying automatically since a conflict needs a human to pick the right latest.json. $TAG is ALREADY published. Manual recovery: $recovery_hint" >&2
+                  return 1
+                fi
                 sleep "$delay"
                 delay=$(( delay * 3 ))
                 attempt=$(( attempt + 1 ))
@@ -1496,12 +1555,12 @@ jobs:
             }
             push_with_retry
             echo "OK: pushed latest.json ($VERSION) to $BRANCH -> https://raw.githubusercontent.com/fegone/Centinelo-Phone/$BRANCH/latest.json"
+            echo "BRANCH_PUSH_OK=1" >> "$GITHUB_ENV"
           fi
           rm -rf "$WORKDIR"
 
       - name: Guard - verify a configured updater endpoint actually resolves this release
-        # This is the guard .claude/reports/release-ci-2026-08-12-updater-
-        # endpoint-prerelease.md section 5 flagged as missing: the guard
+        # This is the guard that was missing before this pass: the guard
         # above ("Verify latest.json download URLs resolve") only checks
         # the download URLs INSIDE the manifest, never the endpoint a real
         # installed client actually queries (tauri.conf.json's
@@ -1516,16 +1575,46 @@ jobs:
         # this exact version - matching the plugin's real behavior
         # (updater.rs:412-518: it tries each endpoint in order and stops
         # at the first one that works, so a client only ever needs ONE to
-        # succeed). This also means the guard no longer needs the
-        # skip-during-prerelease escape hatch the report's section 5
-        # proposed: with the updater-manifest branch as a second endpoint,
-        # SOME endpoint should resolve on every release, prerelease or
-        # not - if none do, that is a real regression, not an expected
-        # prerelease side effect.
+        # succeed). This also means the guard does not need a
+        # skip-during-prerelease escape hatch: with the updater-manifest
+        # branch as a second endpoint, SOME endpoint should resolve on
+        # every release, prerelease or not - if none do, that is a real
+        # regression, not an expected prerelease side effect.
+        #
+        # updater-manifest branch endpoint gets DIFFERENT treatment
+        # (2026-08-13, RELIABILITY 4R pass): it fronts
+        # raw.githubusercontent.com, served through Fastly with a cache
+        # TTL measured in MINUTES, not seconds. The 5-attempt/~90s retry
+        # budget below (copied from the neighboring "Verify latest.json
+        # download URLs resolve" step) was sized for GitHub Release
+        # assets, which propagate in seconds - too short for this
+        # endpoint, and demonstrated for real the day before this pass:
+        # a fixed asset was correct at origin (confirmed via the API) but
+        # the CDN edge kept serving the stale copy for a while after.
+        # Waiting out an undocumented, variable CDN TTL on every single
+        # release (blocking the whole pipeline, with the release ALREADY
+        # published) is a worse trade than trusting a cheaper, stronger
+        # signal that already exists: the previous step's own git push
+        # succeeding IS proof this endpoint's content is correct at
+        # origin - raw.githubusercontent.com always converges to a
+        # branch's real HEAD once its edge cache expires, there is no
+        # permanent divergence to catch here. So when the previous step
+        # confirms that (`BRANCH_PUSH_OK=1`), this endpoint is trusted
+        # outright and gets one best-effort probe purely for visibility,
+        # never a blocking retry loop. Deliberately NOT using a
+        # cache-busting query string to force a fresh origin fetch: that
+        # would tell us what Fastly's ORIGIN has, not what a real
+        # installed client (which never sends a cache-buster) actually
+        # sees right now - reporting the honest, possibly-stale edge
+        # state is more useful here than an artificially "fixed" check.
         env:
           VERSION: ${{ needs.preflight.outputs.version }}
+          BRANCH_PUSH_OK: ${{ env.BRANCH_PUSH_OK }}
         run: |
           set -euo pipefail
+          BRANCH="updater-manifest"
+          BRANCH_URL="https://raw.githubusercontent.com/fegone/Centinelo-Phone/$BRANCH/latest.json"
+
           mapfile -t endpoints < <(jq -r '.plugins.updater.endpoints[]' shell/src-tauri/tauri.conf.json)
           if [[ "${#endpoints[@]}" -eq 0 ]]; then
             echo "::error::tauri.conf.json has no plugins.updater.endpoints configured - no installed client could ever check for updates." >&2
@@ -1544,6 +1633,23 @@ jobs:
           any_ok=0
           for raw_url in "${endpoints[@]}"; do
             url="$(resolve_template "$raw_url")"
+
+            if [[ "$url" == "$BRANCH_URL" && "${BRANCH_PUSH_OK:-0}" == "1" ]]; then
+              # Trusted via the previous step's own git-push confirmation
+              # (see this step's header comment) - probe once, informationally.
+              raw="$(curl -sL --connect-timeout 5 --max-time 15 -w '\n%{http_code}' "$url" || printf '\n000')"
+              code="$(tail -n1 <<<"$raw")"
+              body="$(sed '$d' <<<"$raw")"
+              seen_version="$(jq -r '.version // empty' <<<"$body" 2>/dev/null || true)"
+              if [[ "$code" == "200" && "$seen_version" == "$VERSION" ]]; then
+                echo "OK: $raw_url already serves version $VERSION (edge cache is warm)"
+              else
+                echo "-- $raw_url not yet reflecting version $VERSION at the edge (HTTP $code, version '${seen_version:-<none>}') - expected, Fastly's cache TTL is minutes; the previous step's successful push already confirmed this content is correct at origin, so this is informational only, not a failure."
+              fi
+              any_ok=1
+              continue
+            fi
+
             code="000"
             body=""
             max=5
@@ -1579,10 +1685,10 @@ jobs:
           done
 
           if [[ "$any_ok" -eq 0 ]]; then
-            echo "::error::NONE of tauri.conf.json's plugins.updater.endpoints resolve to the just-published version ($VERSION). An installed client's auto-updater would find no update at all for this release. This is the exact class of bug documented in .claude/reports/release-ci-2026-08-12-updater-endpoint-prerelease.md - if the GitHub 'latest' alias failed because this is a prerelease, the updater-manifest branch endpoint (pushed by the previous step) was expected to cover it; if that one failed too, the branch push above likely failed silently or the branch's content is stale - check that step's log." >&2
+            echo "::error::NONE of tauri.conf.json's plugins.updater.endpoints resolve to the just-published version ($VERSION), and the updater-manifest branch push did not confirm this version either (BRANCH_PUSH_OK=${BRANCH_PUSH_OK:-0} - see the previous step's log; 0 there most often means another release published concurrently and got there first, see that step's regression-guard warning). An installed client's auto-updater would find no update at all for this release." >&2
             exit 1
           fi
-          echo "OK: at least one configured updater endpoint resolves version $VERSION - an installed client's auto-updater would find this release."
+          echo "OK: at least one configured updater endpoint resolves version $VERSION (or is confirmed correct at origin) - an installed client's auto-updater would find this release."
 
       - name: Job summary
         env:
