@@ -63,6 +63,81 @@ static void optional_id(const struct odict *od, struct cent_cmd *out)
 }
 
 
+/* set_codecs' "codecs" field - a required, ordered JSON array of
+ * non-empty codec-name strings. Pure, structural validation only (see
+ * cmd.h's own comment on cent_cmd::codecs for what's deliberately left
+ * for ctrl_json.c instead): non-empty array, every entry a real JSON
+ * string that fits CENT_CODEC_NAME_SIZE, no more entries than
+ * CENT_MAX_CODECS (baresip's own struct account::acv[] cap), and no
+ * case-insensitive duplicate (a list with the same codec twice has no
+ * sane "effective order" - reject rather than silently keep-first/
+ * keep-last). Returns false (and sets *errmsg) on any violation. */
+static bool decode_codecs(const struct odict *od, struct cent_cmd *out,
+			   const char **errmsg)
+{
+	struct odict *arr = odict_get_array(od, "codecs");
+	struct le *le;
+	static char msg[160];
+
+	if (!arr || list_isempty(&arr->lst)) {
+		*errmsg = "set_codecs: 'codecs' must be a non-empty JSON"
+			  " array of codec names";
+		return false;
+	}
+
+	for (le = list_head(&arr->lst); le; le = le->next) {
+		const struct odict_entry *e = le->data;
+		const char *name;
+		size_t i;
+
+		if (odict_entry_type(e) != ODICT_STRING) {
+			*errmsg = "set_codecs: 'codecs' entries must all be"
+				  " strings";
+			return false;
+		}
+
+		name = odict_entry_str(e);
+		if (!name || !name[0]) {
+			*errmsg = "set_codecs: 'codecs' entries must not be"
+				  " empty";
+			return false;
+		}
+
+		if (str_len(name) >= CENT_CODEC_NAME_SIZE) {
+			(void)re_snprintf(msg, sizeof(msg),
+					   "set_codecs: codec name '%s' too"
+					   " long", name);
+			*errmsg = msg;
+			return false;
+		}
+
+		if (out->codecs_len >= CENT_MAX_CODECS) {
+			(void)re_snprintf(msg, sizeof(msg),
+					   "set_codecs: too many codecs"
+					   " (max %d)", CENT_MAX_CODECS);
+			*errmsg = msg;
+			return false;
+		}
+
+		for (i = 0; i < out->codecs_len; i++) {
+			if (!str_casecmp(out->codecs[i], name)) {
+				(void)re_snprintf(msg, sizeof(msg),
+						   "set_codecs: duplicate"
+						   " codec '%s'", name);
+				*errmsg = msg;
+				return false;
+			}
+		}
+
+		str_ncpy(out->codecs[out->codecs_len], name,
+			 sizeof(out->codecs[out->codecs_len]));
+		out->codecs_len++;
+	}
+
+	return true;
+}
+
+
 enum cent_cmd_type cent_cmd_decode(struct cent_cmd *out,
 				    const struct odict *od,
 				    const char **errmsg)
@@ -242,6 +317,19 @@ enum cent_cmd_type cent_cmd_decode(struct cent_cmd *out,
 		}
 		out->answer_auto = !str_casecmp(mode, "auto");
 		out->type = CENT_CMD_SET_ANSWER_MODE;
+	}
+	else if (!str_casecmp(cmd, "codecs")) {
+		/* v1.6 - see PROTOCOL.md "codecs". No payload, query-only,
+		 * same shape as "devices" above. */
+		out->type = CENT_CMD_CODECS;
+	}
+	else if (!str_casecmp(cmd, "set_codecs")) {
+		/* v1.6 - see PROTOCOL.md "set_codecs". Not call-scoped (no
+		 * call_id) - see decode_codecs()'s own comment for exactly
+		 * what's validated here vs. left for ctrl_json.c. */
+		if (!decode_codecs(od, out, errmsg))
+			return CENT_CMD_NONE;
+		out->type = CENT_CMD_SET_CODECS;
 	}
 	else {
 		out->type = CENT_CMD_UNKNOWN;
