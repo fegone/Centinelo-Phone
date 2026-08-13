@@ -196,12 +196,26 @@ the same admin-lock rule *except* for one carve-out:
   model. A stricter policy (full RFC1918/ULA block, or an installer-domain
   allowlist) is a product decision, not a purely technical one - flagged
   for Mario/Felix if the threat model should be tightened further.
-- **A TLS pin doesn't survive a host change** (2026-07-16 4R re-review,
-  M2): `commands::resolved_tls_pin` clears `tls_pin_sha256` whenever a
-  manual Settings save changes the host - a pin is a fingerprint of ONE
-  host's certificate, and silently carrying PBX A's pin over to PBX B
-  would fail that connection for a reason invisible in this UI (no field
-  here shows/clears the pin directly).
+- **Changing the host from Settings silently drops the TLS pin**
+  (2026-07-16 4R re-review, M2): `commands::resolved_tls_pin` clears
+  `tls_pin_sha256` whenever a manual Settings save changes `host` - a pin
+  is a fingerprint of ONE host's certificate, and carrying PBX A's pin
+  over to PBX B is simply wrong. The reason it's cleared rather than
+  carried is that there's no UI field that shows/clears the pin, so a
+  stale mismatch would surface only as a cryptic connect failure with no
+  way to diagnose it from this UI. The consequence is sharper than the
+  design note alone suggests: the engine starts with
+  `sip_verify_server no` (`sidecar.rs`'s `write_config_file`), i.e. it
+  does NOT validate the certificate chain at all, so against a PBX with a
+  private CA the pin is the *only* server verification in effect. Losing
+  it doesn't leave the connection "less secure"; it leaves it with
+  **zero** server verification, and registration carries on normally with
+  no warning of any kind. There's no way to set the pin back by hand
+  either - `tls_pin_sha256` has no manual-entry field in the UI, it can
+  only enter through provisioning (see the config table above), so once
+  cleared the only way to restore it is to re-apply a full provisioning
+  link. **Operational rule that follows: change the host by
+  re-provisioning, never by editing `host` by hand in Settings.**
 - **No file-path fields** in the config at all - see "Not supported yet".
 - The secret is validated, applied to `settings.json` (mode 600, written
   atomically via write-to-temp-then-rename - 2026-07-16 4R re-review, R2,
