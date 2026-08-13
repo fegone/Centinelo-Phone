@@ -373,6 +373,71 @@ changed real architecture, not just polish:
   via `frontendDist`, so anything under it ships in the release
   regardless of whether `index.html` links to it.
 
+## Content-Security-Policy and the IPC startup watchdog (2026-08-13 hotfix)
+
+`app.security.csp` in `tauri.conf.json` is a real allowlist, not boilerplate —
+Windows clinics run this app, so it stays `default-src 'self'` with the
+narrowest possible additions, never `*` or `'unsafe-eval'`:
+
+```json
+"csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost"
+```
+
+- `connect-src 'self' ipc: http://ipc.localhost` — **the 2.0.3 production
+  bug this section documents.** Tauri v2's own IPC transport is a `fetch()`
+  call, and that call is itself subject to CSP `connect-src` like any other
+  network request. On macOS/Linux the request goes out over the custom
+  `ipc:` scheme; on Windows it's `http://ipc.localhost` (neither counts as
+  `'self'`, which is only the frontend's own origin). Without an explicit
+  `connect-src`, the directive falls back to `default-src 'self'` and the
+  browser silently blocks the very first `invoke()` call of the session.
+  This is why it was invisible in macOS dev the whole time this shell has
+  existed — dev mode's IPC path differs enough that it never tripped the
+  same block — and only showed up once a real user ran a real Windows
+  install (CDP-captured console: `Log.entryAdded source: security` CSP
+  violation on `http://ipc.localhost/get_locale`, followed by Tauri's own
+  `"IPC custom protocol failed... postMessage interface instead"` fallback
+  warning). The result wasn't a crash: the static HTML/CSS painted fine,
+  every subsequent `invoke()` from any button silently failed too, and the
+  window looked alive while being completely unresponsive.
+  No other directive needed loosening for this fix — the frontend has no
+  remote fonts, images, or `fetch()`/`XMLHttpRequest`/`WebSocket` calls of
+  its own (`img-src`/`style-src` already covered everything it does use);
+  the "Remote STT URL" and "Activation server URL" settings fields are
+  free-text values handed to Rust commands via `invoke`, which make their
+  own HTTP calls from the Rust side — CSP doesn't apply there, so no
+  `connect-src` widening for arbitrary user-entered hosts was needed or
+  added.
+- **IPC startup watchdog** (`app.js` `boot()`, first block): `get_locale` is
+  the very first `invoke()` of the session, so it doubles as an IPC health
+  check. It's raced against a 4s timeout; on timeout, a persistent (`ttlMs
+  0`) error banner (`t("app.ipcUnreachable")`, `i18n.js`) tells the operator
+  to restart/reinstall instead of leaving a mute window with no signal
+  anything is wrong. A benign `get_locale` rejection (IPC itself working,
+  command failing for some other reason) does NOT show the banner — only an
+  actual timeout does, since that's the signature of the transport itself
+  being broken. This doesn't make every future `invoke()` call in the app
+  timeout-guarded (that's a much bigger change, out of scope for this
+  hotfix) — it only guarantees the single most common failure mode (broken
+  IPC from the first millisecond) is never silent again.
+
+### What to check on a real Windows box to confirm this landed
+
+1. Open the WebView's devtools console (or attach via CDP as the original
+   report did) and reload. **Before the fix**: a `Log.entryAdded` `source:
+   security` `level: error` CSP violation naming `connect-src`/
+   `http://ipc.localhost`, followed by the `"IPC custom protocol failed"`
+   warning. **After the fix**: neither line should appear.
+2. With no console attached at all: dial pad input, the Settings gear, and
+   the window's own custom minimize/close buttons should all respond
+   immediately on open — before the fix none of them did anything.
+3. To specifically exercise the watchdog banner (does not require breaking
+   anything else): temporarily revert just the `connect-src` addition,
+   rebuild, launch, and confirm the red "Could not reach the app's
+   backend..." banner appears within ~4s and does not auto-dismiss. This is
+   the regression test for "IPC breaks again in the future and nobody
+   notices."
+
 ## Design fidelity notes
 
 `ui/css/tokens.css` is `TOKENS.md` section 9 copied verbatim (no
