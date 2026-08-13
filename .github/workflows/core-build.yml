@@ -41,7 +41,15 @@ jobs:
           submodules: recursive
 
       - name: Install toolchain
-        run: brew install cmake openssl
+        # opus (added v1.6, codecs sprint): the real Opus codec library
+        # baresip's own opus module links against - see core/BUILD.md
+        # "Codecs (Opus)" for the full story, including why the Windows
+        # job (below) does NOT get the equivalent change in this same
+        # commit - Windows has no brew-equivalent "just works" path and
+        # needs a vcpkg bootstrap this session couldn't verify without a
+        # Windows runner; that part is release-ci's own follow-up, see
+        # BUILD.md for exactly what it needs to add.
+        run: brew install cmake openssl opus
 
       - name: Apply local re patches
         run: |
@@ -102,7 +110,7 @@ jobs:
           cmake -S core/deps/baresip -B core/deps/baresip/build \
             -DCMAKE_BUILD_TYPE=Release \
             -DOPENSSL_ROOT_DIR="$(brew --prefix openssl)" \
-            -DMODULES="account;g711;auconv;auresamp;ausine;aufile;ice;dtls_srtp;menu;coreaudio" \
+            -DMODULES="account;g711;opus;auconv;auresamp;ausine;aufile;ice;dtls_srtp;menu;coreaudio" \
             -DAPP_MODULES="ctrl_json" \
             -DAPP_MODULES_DIR="${{ github.workspace }}/core/modules" \
             2>&1 | tee baresip-configure.log
@@ -113,6 +121,7 @@ jobs:
           test -x core/deps/baresip/build/baresip
           test -e core/deps/baresip/build/ctrl_json.so
           test -e core/deps/baresip/build/coreaudio.so
+          test -e core/deps/baresip/build/opus.so
           # `baresip -h` deliberately exits non-zero (254 - -h's own
           # usage() path, unrelated to any change in this repo, verified
           # pre-existing: the very first CI run for this workflow, before
@@ -143,7 +152,7 @@ jobs:
             exit 1
           fi
           detected_tokens=";${detected_line#MODULES_DETECTED=};"
-          for mod in ausine aufile ice dtls_srtp coreaudio; do
+          for mod in ausine aufile ice dtls_srtp coreaudio opus; do
             case "$detected_tokens" in
               *";$mod;"*) ;;
               *)
@@ -152,7 +161,7 @@ jobs:
                 ;;
             esac
           done
-          echo "OK: re + baresip(+ctrl_json, +ausine, +aufile, +ice, +dtls_srtp, +coreaudio) built on macOS"
+          echo "OK: re + baresip(+ctrl_json, +ausine, +aufile, +ice, +dtls_srtp, +coreaudio, +opus) built on macOS"
 
       - name: Configure + build + run ctrl_json unit tests (ASan)
         # Standalone project (core/modules/ctrl_json/test/), not part of
@@ -284,6 +293,16 @@ jobs:
         # see core/BUILD.md "Windows CI" > "Windows media modules" for the
         # full rationale (why the previous, smaller list was a real
         # functional gap, not just a smaller compile).
+        #
+        # TODO (release-ci, codecs sprint 2026-08-13): `opus` is NOT yet
+        # in this list - the macOS job's own MODULES gained it this same
+        # sprint (real local build verified), but doing the same here
+        # needs a vcpkg bootstrap/cache step this session couldn't verify
+        # without a Windows runner. See core/BUILD.md "Codecs (Opus)" for
+        # the exact commands/flags this job needs (vcpkg install +
+        # -DOPUS_HINTS=... + add opus to MODULES + add opus to this job's
+        # own MODULES_DETECTED assertion below) - written up precisely so
+        # this is a drop-in addition, not a re-investigation.
         shell: bash
         run: |
           set -o pipefail

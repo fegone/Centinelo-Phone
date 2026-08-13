@@ -345,6 +345,116 @@ static void test_cmd_set_answer_mode(void)
 }
 
 
+/*
+ * v1.6: "codecs" (no fields, query-only, same shape as "devices") and
+ * "set_codecs" (see PROTOCOL.md "codecs"/"set_codecs"). Not call-scoped
+ * (no call_id), same convention as set_answer_mode above. cmd.c's job
+ * here is purely structural: non-empty array, string entries, length,
+ * CENT_MAX_CODECS cap, no case-insensitive duplicate - whether a name is
+ * actually a codec *this build* compiled in is a separate, impure check
+ * ctrl_json.c's cmd_set_codecs() makes (see decode_codecs()'s own
+ * comment in cmd.c) and is out of reach of this standalone binary, same
+ * split as set_device's module/device name (test_cmd_devices_and_
+ * set_device() above).
+ */
+static void test_cmd_codecs_and_set_codecs(void)
+{
+	struct cent_cmd cmd;
+	const char *err = NULL;
+	char big[512];
+	size_t i;
+
+	CHECK(CENT_CMD_CODECS == decode("{\"cmd\":\"codecs\"}", &cmd, &err),
+	      "codecs: type");
+
+	CHECK(CENT_CMD_SET_CODECS ==
+	      decode("{\"cmd\":\"set_codecs\",\"codecs\":[\"opus\",\"pcmu\","
+		     "\"pcma\"]}", &cmd, &err),
+	      "set_codecs: type");
+	CHECK(cmd.codecs_len == 3, "set_codecs: codecs_len == 3");
+	CHECK_STREQ(cmd.codecs[0], "opus", "set_codecs: codecs[0] == opus"
+		    " (order preserved)");
+	CHECK_STREQ(cmd.codecs[1], "pcmu", "set_codecs: codecs[1] == pcmu");
+	CHECK_STREQ(cmd.codecs[2], "pcma", "set_codecs: codecs[2] == pcma");
+	CHECK(!cmd.have_call_id,
+	      "set_codecs: never decodes call_id (not call-scoped)");
+
+	/* single-entry list is valid - "only opus" is a real, useful
+	 * request, not an edge case to special-case away. */
+	CHECK(CENT_CMD_SET_CODECS ==
+	      decode("{\"cmd\":\"set_codecs\",\"codecs\":[\"opus\"]}",
+		     &cmd, &err), "set_codecs: single-entry list: type");
+	CHECK(cmd.codecs_len == 1,
+	      "set_codecs: single-entry list: codecs_len == 1");
+
+	/* missing 'codecs' field entirely -> same "empty" treatment as an
+	 * explicit empty array below. */
+	CHECK(CENT_CMD_NONE ==
+	      decode("{\"cmd\":\"set_codecs\"}", &cmd, &err),
+	      "set_codecs: missing 'codecs' -> CENT_CMD_NONE");
+	CHECK(err != NULL && strstr(err, "codecs") != NULL,
+	      "set_codecs: missing 'codecs' -> errmsg mentions 'codecs'");
+
+	CHECK(CENT_CMD_NONE ==
+	      decode("{\"cmd\":\"set_codecs\",\"codecs\":[]}", &cmd, &err),
+	      "set_codecs: empty array -> CENT_CMD_NONE");
+	CHECK(err != NULL && strstr(err, "codecs") != NULL,
+	      "set_codecs: empty array -> errmsg mentions 'codecs'");
+
+	CHECK(CENT_CMD_NONE ==
+	      decode("{\"cmd\":\"set_codecs\",\"codecs\":[\"opus\",\"\"]}",
+		     &cmd, &err),
+	      "set_codecs: empty-string entry -> CENT_CMD_NONE");
+
+	CHECK(CENT_CMD_NONE ==
+	      decode("{\"cmd\":\"set_codecs\",\"codecs\":[\"opus\",7]}",
+		     &cmd, &err),
+	      "set_codecs: non-string entry -> CENT_CMD_NONE");
+
+	/* case-insensitive duplicate rejected outright - no sane "effective
+	 * order" for the same codec twice. */
+	CHECK(CENT_CMD_NONE ==
+	      decode("{\"cmd\":\"set_codecs\",\"codecs\":[\"opus\",\"OPUS\"]}",
+		     &cmd, &err),
+	      "set_codecs: case-insensitive duplicate -> CENT_CMD_NONE");
+	CHECK(err != NULL && strstr(err, "duplicate") != NULL,
+	      "set_codecs: duplicate -> errmsg mentions 'duplicate'");
+
+	/* CENT_MAX_CODECS (16) is the hard cap - matches baresip's own
+	 * struct account::acv[16] (see cmd.h). One more than that is
+	 * rejected, not silently truncated. */
+	str_ncpy(big, "{\"cmd\":\"set_codecs\",\"codecs\":[", sizeof(big));
+	for (i = 0; i < CENT_MAX_CODECS + 1; i++) {
+		char entry[24];
+
+		(void)re_snprintf(entry, sizeof(entry), "%s\"c%zu\"",
+				   i > 0 ? "," : "", i);
+		(void)strncat(big, entry, sizeof(big) - strlen(big) - 1);
+	}
+	(void)strncat(big, "]}", sizeof(big) - strlen(big) - 1);
+
+	CHECK(CENT_CMD_NONE == decode(big, &cmd, &err),
+	      "set_codecs: CENT_MAX_CODECS+1 entries -> CENT_CMD_NONE (not"
+	      " silently truncated)");
+	CHECK(err != NULL && strstr(err, "many") != NULL,
+	      "set_codecs: too many -> errmsg mentions the cap");
+
+	/* a codec name that fits CENT_CODEC_NAME_SIZE (32) exactly still
+	 * decodes; one byte over is rejected - boundary check, not just
+	 * "some long string fails". */
+	CHECK(CENT_CMD_SET_CODECS ==
+	      decode("{\"cmd\":\"set_codecs\",\"codecs\":"
+		     "[\"01234567890123456789012345678\"]}", &cmd, &err),
+	      "set_codecs: 31-char name (fits CENT_CODEC_NAME_SIZE-1): type");
+
+	CHECK(CENT_CMD_NONE ==
+	      decode("{\"cmd\":\"set_codecs\",\"codecs\":"
+		     "[\"012345678901234567890123456789012\"]}", &cmd, &err),
+	      "set_codecs: 35-char name (over CENT_CODEC_NAME_SIZE) ->"
+	      " CENT_CMD_NONE");
+}
+
+
 static void test_cmd_unknown_and_malformed(void)
 {
 	struct cent_cmd cmd;
@@ -1411,6 +1521,7 @@ int main(void)
 	test_cmd_unknown_and_malformed();
 	test_cmd_id_correlation();
 	test_cmd_devices_and_set_device();
+	test_cmd_codecs_and_set_codecs();
 	test_cmd_tap();
 
 	test_pathsafe_component();

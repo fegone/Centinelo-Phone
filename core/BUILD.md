@@ -8,8 +8,12 @@ Homebrew OpenSSL 3.6.3. The same sources are also built (best-effort, see
 ## 1. Toolchain
 
 ```bash
-brew install cmake openssl
+brew install cmake openssl opus
 ```
+
+(`opus` added v1.6, codecs sprint — the Opus audio codec's real
+encode/decode library, needed by baresip's `opus` module — see "Codecs
+(Opus)" below.)
 
 `re`/`baresip` themselves are **not** installed via brew — only build
 tooling is. The engine builds from the pinned git submodules in
@@ -76,7 +80,7 @@ cmake --build core/deps/re/build -j"$(sysctl -n hw.ncpu 2>/dev/null || nproc)"
 # 4b. baresip - minimal, explicit module set (see "Module selection")
 cmake -S core/deps/baresip -B core/deps/baresip/build \
   -DCMAKE_BUILD_TYPE=Release \
-  -DMODULES="account;g711;auconv;auresamp;ausine;aufile;ice;dtls_srtp;menu;coreaudio" \
+  -DMODULES="account;g711;opus;auconv;auresamp;ausine;aufile;ice;dtls_srtp;menu;coreaudio" \
   -DAPP_MODULES="ctrl_json" \
   -DAPP_MODULES_DIR="$PWD/core/modules"
 cmake --build core/deps/baresip/build -j"$(sysctl -n hw.ncpu 2>/dev/null || nproc)"
@@ -126,7 +130,8 @@ instead of relying on that default-everything list:
 
 | Module | Why |
 |---|---|
-| `g711` | codec — matches the test endpoint's `allow=(opus\|ulaw)` (`asterisk -rx "pjsip show endpoint 1000"`), zero external deps |
+| `g711` | codec — matches the test endpoint's `allow=(opus\|ulaw)` (`asterisk -rx "pjsip show endpoint 1000"`), zero external deps, always-available universal fallback |
+| `opus` | codec (**added v1.6, codecs sprint**) — the other half of the test endpoint's `allow=(opus\|ulaw)`, wideband/better-quality, preferred over G.711 when both ends support it. Needs the real Opus library (`brew install opus` on mac; see "Codecs (Opus)" below for the full story, including Windows and the G.722 codec this build deliberately does *not* include) |
 | `auconv`, `auresamp` | audio format/rate glue baresip's own default config always loads |
 | `ausine` | sine-wave audio **source** (`ausrc`) — no microphone / OS audio-permission needed, ideal for a headless/CI spike |
 | `aufile` | writes received audio to a `.wav` as audio **player** (`auplay`) — no speaker needed |
@@ -138,17 +143,212 @@ instead of relying on that default-everything list:
 
 Explicitly *not* loaded: `stdio` (its keyboard/tty UI would fight
 `ctrl_json` for stdin) and anything with an external media/GUI dependency
-(`opus`, `gst`, `sdl`, `portaudio`, ...) — none of it is needed for this
-spike, and leaving it out keeps the build free of brew/system
-audio-library dependencies, which matters for Windows CI parity.
-`coreaudio` **is** now loaded on macOS (added 2026-07-16, matching the
-Windows job's `wasapi`) — see "macOS media modules" below for why.
+this repo has no real use for (`gst`, `sdl`, `portaudio`, ...) — none of
+it is needed for this spike, and leaving it out keeps the build free of
+brew/system audio-library dependencies that don't earn their keep, which
+matters for Windows CI parity. `coreaudio` **is** now loaded on macOS
+(added 2026-07-16, matching the Windows job's `wasapi`) — see "macOS
+media modules" below for why. `opus` **is** now loaded too (added
+2026-08-13, codecs sprint) — unlike `coreaudio`/`wasapi` (platform audio
+*backends*), `opus` is a codec, i.e. what actually gets negotiated over
+the wire; see "Codecs (Opus)" below for the full build-side story,
+including why `g722` (baresip's other codec beyond G.711/Opus) is
+deliberately *not* in this list.
+
+## Codecs (Opus)
+
+Added v1.6 (codecs sprint, 2026-08-13) alongside the new `codecs`/
+`set_codecs` protocol commands (see `PROTOCOL.md`) — this section is the
+build-config half of that story.
+
+**mac: works out of the box, real build confirmed.** `brew install opus`
+(see "Toolchain" above) puts `opus.h`/`libopus.dylib` where baresip's own
+`cmake/FindOPUS.cmake` finds them — on this machine (Apple Silicon,
+Homebrew at `/opt/homebrew`) configure logged `Found OPUS:
+/opt/homebrew/lib/libopus.dylib` and the module compiled to
+`opus.so`/linked cleanly on the very first try, no extra CMake flags
+needed. `FindOPUS.cmake` tries `pkg-config` first on non-Windows
+(`pkg_search_module(OPUS opus)`) and falls back to a plain
+`find_path`/`find_library` otherwise — this run's `pkg-config` wasn't
+even present (`Could NOT find PkgConfig`) and it still resolved via the
+fallback path, since CMake's own `find_library`/`find_path` already walk
+Homebrew's prefix on this platform. Confirmed `MODULES_DETECTED` (see
+"Confirmed green run" below for the mechanism) includes `opus` in a full
+local build; `ctrl_json` compiles clean against it with no new warnings.
+
+**Windows: no confirmed path yet — needs vcpkg, and needs release-ci to
+actually run it on a Windows runner.** `FindOPUS.cmake` skips
+`pkg-config` entirely on `WIN32` and only looks at `OPUS_HINTS`/`OPUS_
+INCLUDE_DIRS`/`OPUS_LIBRARY_DIRS` plus a couple of Unix-only fallback
+paths that don't exist on Windows — so, unlike mac, there is no
+"already works" default here; something has to hand it real `opus.h`/
+`opus.lib`. No Chocolatey `opus` package was found during this
+investigation (`choco search opus` — the existing Windows job's own
+OpenSSL install already goes through Chocolatey, see "What's actually
+different on Windows" below, so that was the first thing checked); the
+real path is **vcpkg**:
+
+```bash
+# One-time bootstrap (a runner-persistent step, see caching note below)
+git clone https://github.com/microsoft/vcpkg
+./vcpkg/bootstrap-vcpkg.bat        # (or .sh on a non-Windows shell, N/A here)
+./vcpkg/vcpkg.exe install opus:x64-windows
+
+# Then, at baresip's own configure step, point FindOPUS.cmake straight
+# at what vcpkg installed - no full vcpkg-toolchain integration needed
+# (this build already resolves RE_LIBRARY/RE_INCLUDE_DIR/OPENSSL_ROOT_DIR
+# by hand for other reasons - see "What's actually different on
+# Windows" below - so a second, small explicit hint fits the existing
+# pattern rather than introducing a second, competing dependency-
+# resolution mechanism, i.e. CMAKE_TOOLCHAIN_FILE, that could shift how
+# every *other* find_package() in this configure step resolves too):
+cmake -S core/deps/baresip -B core/deps/baresip/build \
+  ... (existing flags unchanged) ...
+  -DOPUS_HINTS="$(pwd -W)/vcpkg/installed/x64-windows" \
+  -DMODULES="account;g711;opus;auconv;auresamp;ausine;aufile;ice;dtls_srtp;menu;wasapi"
+```
+
+This is **written up, not applied to `.github/workflows/core-build.yml`**
+by this version — the Windows job's `MODULES`/sanity-check lines are
+release-ci's own territory (see that workflow file's Windows job), and
+getting a vcpkg bootstrap + its own caching right on a fresh
+`windows-latest` runner (a real, runner-specific concern — vcpkg's own
+`git clone` + first `vcpkg install` is slow enough on a cold runner that
+it needs `actions/cache` keyed on the vcpkg commit + triplet, or every
+CI run pays that cost again) is genuinely outside what this session
+could verify without a Windows runner to iterate against, unlike the mac
+half above, which was verified with a real local build. **What release-ci
+needs to do**, concretely: add the bootstrap+install block above (as a
+cacheable step) to the Windows job, add `-DOPUS_HINTS=...` to that job's
+existing baresip configure step, add `opus` to `-DMODULES=`, and add
+`opus` to the job's own `MODULES_DETECTED` assertion loop (the same
+mechanism that already catches `ausine`/`aufile`/`ice`/`dtls_srtp`/
+`wasapi` silently dropping out — see "What's actually different on
+Windows" > point 4 below) so a future silent Windows-side opus drop
+fails CI loudly instead of shipping a build that's missing it. The macOS
+job's own `MODULES`/sanity-check *was* updated by this version (see
+".github/workflows/core-build.yml" — verified against a real local
+build first, same toolchain the file's own header cites) — only the
+Windows half is left for release-ci, per this task's own scope split.
+
+## Codecs (G.722 — not in this build)
+
+**Scope decision (approved by Felix, this session): G.722 is out of
+this build, on every platform, and not planned for the near term.**
+Investigated alongside Opus because it's baresip's other bundled audio
+codec module beyond G.711, but its dependency story is genuinely
+different, not just "another `find_package()`":
+
+- baresip's `modules/g722/` is **not standalone** — its own
+  `CMakeLists.txt` `find_package(SPANDSP)` and gates on `libspandsp`
+  (a full G.7xx-family DSP codec library), which neither vcpkg nor
+  Chocolatey packages today (checked while investigating this). Homebrew
+  *does* have it, but pulling it in on mac drags in `libtiff` and
+  `jpeg-turbo` as transitive dependencies of a *fax/image* library
+  (`spandsp`'s own T.30/T.4 fax support, entirely unrelated to this
+  softphone's actual use of it as a codec) — a real, disproportionate
+  dependency footprint for one audio codec this deployment doesn't
+  currently need.
+- **Why it doesn't matter for this deployment**: Opus already covers
+  what G.722 would add (wideband/better-than-G.711 audio) and does it
+  better (Opus is the modern, actively-developed codec; G.722 is an
+  older ITU standard largely superseded by it in practice). G.722 would
+  only earn its dependency cost if this deployment needed to interop
+  with an endpoint that speaks *G.722 and nothing wideband-capable
+  besides it* — no such endpoint exists in this repo's actual test PBX
+  or deployment today.
+- **Two real, documented paths if a future deployment ever does need
+  it** (left here so a future session doesn't have to re-derive this
+  investigation from scratch):
+  1. **Vendor a dependency-free G.722 codec implementation directly into
+     this repo**, the same way `core/modules/ctrl_json/wav_writer.c`
+     already hand-rolls a minimal WAV writer instead of linking
+     `libsndfile` (see `PROTOCOL.md` "Changes from v1.1" for that
+     precedent's own reasoning) — G.722 is a comparatively simple,
+     well-specified ADPCM-family codec (unlike Opus, which nobody
+     reasonably reimplements from scratch); a small, self-contained
+     encoder/decoder sized similarly to `wav_writer.c` is a realistic,
+     bounded scope, avoiding `libspandsp` (and its fax-library baggage)
+     entirely. This is the path most consistent with this repo's own
+     established precedent for "small, specific piece of a large library
+     needed, avoid the large library."
+  2. **`libspandsp` via a vcpkg overlay port (Windows) + a from-source
+     build (mac)** — vcpkg supports community/custom "overlay ports" for
+     libraries it doesn't package upstream; someone would need to write
+     one for `spandsp` (or find/vendor an existing third-party overlay
+     port — none confirmed to exist during this investigation, not
+     exhaustively searched) targeting just the codec functions this
+     engine needs, and, symmetrically, build `spandsp` from source on
+     mac rather than pulling brew's tiff/jpeg-turbo-laden package. More
+     work than path 1, and still carries the disproportionate-dependency
+     concern that path 1 avoids by construction.
+- **Protocol-side consequence** (see `PROTOCOL.md` "Events" `codecs`
+  row): since `codecs`' `available` array is walked live from
+  `baresip_aucodecl()` rather than hardcoded, a build without G.722
+  simply never lists it — no protocol change is needed to "hide" it, and
+  the day either path above lands, `available` starts listing it
+  automatically with zero protocol-layer work.
 
 ## Findings
 
 These were all discovered by actually running the spike end-to-end
 against the target PBX (FreePBX 17 / Asterisk 22 at `<pbx host>`),
 not from reading docs — each one blocked a real run until fixed.
+
+### `audio_codecs=` bare-name silent-fallback bug (found 2026-08-13, codecs sprint)
+
+`core/deps/baresip/src/account.c`'s `audio_codecs_decode()` (the parser
+behind both a static accounts-file `audio_codecs=` line **and** the
+runtime `account_set_audio_codecs()` API — same function, same bug
+surface either way) defaults a **bare** codec name (no explicit
+`"name/srate/ch"` suffix) to `srate=8000, ch=1` before resolving it via
+`aucodec_find(aucodecl, name, srate, ch)` — which rejects on *any*
+srate/ch mismatch (`core/deps/baresip/src/aucodec.c`: `if (srate &&
+srate != ac->srate) continue;`, same guard for `ch`). Opus registers at
+`srate=48000, ch=2` (`core/deps/baresip/modules/opus/opus.c`), not
+`8000/1` — so a bare `"opus"` in an `audio_codecs=` string **silently
+fails to resolve** (a `warning()` log line, not an error return) and
+never enters the account's codec list at all.
+
+That alone would just mean "the restriction doesn't include opus" — but
+`account_aucodecl()` (`src/account.c`) makes it worse: `return (acc &&
+!list_isempty(&acc->aucodecl)) ? &acc->aucodecl : baresip_aucodecl();` —
+if the account's own codec list ends up **empty** (which it does if
+*every* entry in a bare-name string fails to resolve, or if the string
+was e.g. `"opus"` alone), the account falls back to the **entire**
+compiled-in codec catalog, unrestricted. So a config/command asking to
+restrict a call to Opus-only could silently produce the *opposite* — an
+unrestricted account — with no error surfaced anywhere in this path.
+Confirmed by reading `account.c` end to end during this session, not
+assumed.
+
+**Fix, both places this can happen:**
+- `run-spike.sh`'s generated `audio_codecs=` line now spells out
+  `opus/48000/2,pcmu/8000/1,pcma/8000/1` — explicit `srate`/`ch` on
+  every entry (not just Opus) for consistency and self-documentation,
+  even though `pcmu`/`pcma`'s own `8000/1` registration happens to match
+  the parser's bare-name default already.
+- The new `set_codecs` protocol command (`core/modules/ctrl_json/
+  ctrl_json.c` `cmd_set_codecs()`) never hands a bare name to
+  `account_set_audio_codecs()` either — every component is built as
+  `"<name>/<srate>/<ch>"` from the real, already-resolved `struct
+  aucodec` (via `aucodec_find(baresip_aucodecl(), name, 0, 0)` — wildcard
+  srate/ch, 0 never mismatches per that same guard above), and the
+  applied result is re-verified (`list_count(account_aucodecl(acc))`
+  against the requested count) before reporting success. See
+  `PROTOCOL.md`'s `set_codecs` row and "Changes from v1.5" for the full
+  protocol-facing writeup of this same finding.
+
+**Real e2e evidence this fix works** (2026-08-13, real test PBX, ext
+1100 dual-contact, `*43` echo): `codecs` query returned `active:["opus",
+"PCMU","PCMA"]` (the full 3-entry list, Opus included and first —
+confirming the bare-name failure does *not* reproduce with the explicit
+suffix) and a real call negotiated Opus, confirmed both by this engine's
+own `quality_stats` (`"codec":"opus"`, packet counts growing across two
+samples 15s apart) and, independently, the PBX's own `pjsip show
+channelstats` (`Codec` column `opus`, its own separately-counted,
+growing packet counts). See `PROTOCOL.md`'s own v1.6 status paragraph
+for the full numbers.
 
 ### `webrtc=yes` forces DTLS-SRTP + ICE, independent of SIP transport
 

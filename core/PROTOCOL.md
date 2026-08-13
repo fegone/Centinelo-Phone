@@ -1,4 +1,4 @@
-# core/ — ctrl_json wire protocol (v1.5)
+# core/ — ctrl_json wire protocol (v1.6)
 
 `ctrl_json` (`core/modules/ctrl_json/`) is a baresip "application" module
 that turns the running engine into a sidecar controllable over stdio:
@@ -158,6 +158,44 @@ detail and `core/E2E-F1.md` "F7" for the full run, PBX evidence, and
 findings (incl. a stale-build-binary gotcha this session caught before
 it could produce a false result).
 
+**v1.6 status: two new commands, `codecs` (query) and `set_codecs`
+(apply) — unit-tested (`cmd.c` parsing, `test/test_main.c`, 300/300
+checks, ASan-clean) AND e2e-verified against the real test PBX
+(2026-08-13, dual-contact ext 1100, `*43` echo).** v1.6 is **fully
+backward compatible with v1.5**: every existing command/event is
+byte-for-byte unchanged; v1.6 only *adds* `codecs`, `set_codecs`, and
+the `codecs` event. This version also adds a second audio codec
+(Opus) to the engine build — see `core/BUILD.md` "Codecs (Opus)" for
+the full build-side story, and "Changes from v1.5" below for the
+protocol-side implementation detail. Real e2e run: engine built fresh
+from this version's commit, registered as ext 1100 (dual-contact
+self-bridge, same trick prior versions used), `codecs` query returned
+`available:[{"name":"PCMU",...},{"name":"PCMA",...},{"name":"opus",
+"srate":48000,"ch":2}]` (this build's real, live-registered codec list
+— not hardcoded) and `active:["opus","PCMU","PCMA"]` (the account's
+configured preference order, opus first); dialing `*43` (echo) then
+negotiated **opus** — confirmed two independent ways, not just this
+engine's own self-report: this engine's own `quality_stats` reported
+`"codec":"opus"` with `tx_packets`/`rx_packets` growing between two
+samples 15s apart (754→1754 tx, 729→1728 rx, i.e. real RTP flow, not a
+stale reading), **and**, separately, the PBX's own accounting
+(`asterisk -rx "pjsip show channelstats"`, read-only) showed the same
+channel's `Codec` column as `opus` with its own independently-counted,
+growing packet counts (50→585 receive, 26→561 transmit over ~11s) —
+the PBX has no way to know what this engine's own event claims, so
+this is real cross-checked evidence, not a single self-reported number.
+`set_codecs` was also exercised through every documented error path
+(empty list, unknown codec name, case-insensitive duplicate) 8 times
+in one process lifetime with a `leaks` pass after — 1 leak, 1024 bytes,
+identical to this repo's pre-existing documented baseline (see
+`core/BUILD.md` "Memory safety") — i.e. **zero leaks attributable to
+this version's new code**, and none of the three error paths crashed
+the engine or disrupted the live call. See `core/BUILD.md` "Codecs
+(Opus)" for the build-side writeup (including the real, load-bearing
+bug this version found and fixed in how a codec name gets handed to
+baresip's own `account_set_audio_codecs()`) and "Changes from v1.5"
+below for the full protocol changelog.
+
 ## Framing
 
 One JSON object per line (`\n`-terminated; a trailing `\r` is tolerated).
@@ -265,6 +303,8 @@ either, both, or neither.
 | `{"cmd":"tap_stop","call_id":"..."}` | **New in v1.2.** Stops a running tap on the resolved call, finalizing both WAV headers (correct final `RIFF`/`data` chunk sizes — a tap is also auto-finalized on call teardown even without this command, see "Events" `tap_state` row). Errors if the resolved call doesn't exist, has no audio, or has no tap currently running. |
 | `{"cmd":"park","ext":"<pilot ext>","call_id":"..."}` | **New in v1.3.** Parks a call by blind-transferring it (REFER, the exact same `call_transfer()` mechanism `blind_transfer` already uses) to `ext` — the target parking lot's **pilot** extension. `ext` is **required**, not defaulted — a pilot extension is per-PBX configuration, not a protocol constant this engine should guess at (unlike `*43`/`*60` test codes, which `park` never used either). Same target-address shape as `blf_subscribe`'s own `ext` (`sip:<ext>@<same PBX host the account registered against>` — see `build_pbx_ext_uri()` in `ctrl_json.c`, shared by both). `call_id` is optional, same `resolve_call()` fallback convention as every other call-scoped command. **The confirmation event's `ext` is always the pilot extension targeted, never a specific auto-assigned parking slot** — see "Events" `park` row for why, and this file's own v1.3/v1.4 status paragraphs plus `core/E2E-F1.md` "F5" for this command's current real-PBX e2e status (**v1.4: works end-to-end over udp/tcp; over wss, the async failure now at least surfaces as an `error` event instead of vanishing silently — see v1.4 status paragraph**). |
 | `{"cmd":"set_answer_mode","mode":"auto"}` | **New in v1.5.** Sets the engine's one account (`ua_account(primary_ua())`) to auto-answer (`mode:"auto"`) or wait for an explicit `answer` command (`mode:"manual"`, the default a fresh account starts at). `mode` is **required**, case-insensitive, exactly `"auto"` or `"manual"` — anything else is an `error`. Not call-scoped (no `call_id` — this flips a per-account setting, not a per-call one). Maps directly to baresip's own `account_set_answermode()`; when `ANSWERMODE_AUTO`, the `menu` module (already loaded — see `core/BUILD.md` "Module selection") answers every subsequent incoming `INVITE` itself on `BEVENT_CALL_INCOMING`, so the effect is live starting with the very next incoming call, no restart/re-register needed. Idempotent (setting the same mode twice, or `manual` on an already-manual account, is a harmless no-op). No dedicated confirmation event — success is acked the same way `set_device` is: only via the optional request/response `id` correlation (`result`, `ok:true` — see "Events"), since there's no natural per-call follow-up event for an account-level setting. Unit-tested (`cmd.c`/`test/test_main.c`) and **e2e-verified against the real test PBX** (2026-07-21) — see `core/E2E-F1.md` "F7 set_answer_mode" and this file's own top-of-file v1.5 status paragraph. |
+| `{"cmd":"codecs"}` | **New in v1.6.** Query-only, no fields — same shape as `devices`. Emits a `codecs` event (see "Events") enumerating every audio codec **this build actually has compiled in** (never a hardcoded list — see that event's own row for exactly where it's sourced from) plus the account's current effective codec-preference order. Use this before `set_codecs` to know what names are real for *this* build (a mac build without the eventual G.722 addition, say, simply won't list it — see `core/BUILD.md` "Codecs (G.722 — not in this build)"). |
+| `{"cmd":"set_codecs","codecs":["opus","pcmu","pcma"]}` | **New in v1.6.** Sets the engine's one account's audio-codec preference list, **in the given order** (first = most preferred in the SDP offer this account's *next* call sends — see below for exactly what "next" means). `codecs` is **required**: a JSON array of codec-name strings, non-empty, no more than 16 entries (matches baresip's own internal `struct account::acv[16]` cap — see `core/deps/baresip/src/core.h` — this protocol layer rejects an oversized list outright rather than letting it silently truncate), each entry non-empty and ≤31 bytes, and **no case-insensitive duplicate** (there's no sane "effective order" for the same codec twice — rejected outright, not silently deduped). All of that is validated structurally with no engine needed (`core/modules/ctrl_json/cmd.c`'s `decode_codecs()`) — an empty array, a non-string entry, an over-length name, too many entries, or a duplicate all produce an `error` and change nothing. A **separate, engine-side check** (needs a live `struct ua`/`baresip_aucodecl()`, so it can't happen in the pure decode layer above) then verifies every name is actually a codec *this build* compiled in — an unknown name (e.g. `"g722"` on a build that doesn't have it — see `core/BUILD.md`) is also an `error`, and, same as every structural failure above, **nothing is applied**: this command is all-or-nothing, never a partial apply of the names that did resolve. On success, applies immediately via baresip's own `account_set_audio_codecs()` and emits a fresh `codecs` event (see "Events") with the new effective list, re-read from the engine — never an echo of the request (see this workspace's "fuente de verdad" rule: the shell must not keep its own mirror of the effective order, it re-reads this event). <br><br>**What "next call" means, and why no re-register is needed** — read `core/deps/baresip/src/call.c`'s `call_streams_alloc()` before trusting this paragraph, not just this file: it reads `account_aucodecl(call->acc)` **fresh, at the moment a new `struct call` is allocated** (both an outgoing `dial` and an incoming `INVITE` go through this same path) and hands that list straight into `audio_alloc()`. This has **nothing to do with SIP registration** — a REGISTER carries no SDP/codec information in this engine's flow at all — so `set_codecs` takes effect for the very next call (dial or incoming) **immediately, with no re-register**, exactly like `set_answer_mode`'s "live starting with the very next incoming call" already established for a different per-account setting. An **already-established call is completely unaffected**: its `struct audio` was allocated against whatever codec list was in effect at that moment, and this command never forces a re-INVITE/renegotiation on it — baresip has no "swap the negotiated codec mid-call" primitive to hot-swap into even if this command wanted to (contrast `set_device`, which *does* have a live hot-swap half via `audio_set_source()`/`audio_set_player()` — those operate on the audio *source/player*, not the negotiated codec itself, a genuinely different mechanism). This is the least-surprising behavior available given what baresip's architecture actually supports: a client that wants to change a call already in progress has no engine-level lever for that today (out of scope for this version — would need this engine to originate a mid-call re-INVITE with new SDP, a real, separate feature). <br><br>**A real, load-bearing upstream footgun this command's implementation had to route around, not just document** — see `core/BUILD.md` "Codecs (Opus)" for the full writeup: baresip's own `account_set_audio_codecs()` re-parses its string argument through the same parser a static `audio_codecs=` accounts-file line uses, which defaults a **bare** codec name (no explicit `/srate/ch`) to `8000/1` before matching it against the real registered codec — silently failing (a log line, not an error) for Opus, which registers at `48000/2`. A fully-failed-to-match string leaves the account's codec list empty, and baresip's own `account_aucodecl()` then falls back to the *entire* compiled-in codec catalog the moment that list is empty — i.e. a caller that thought it just restricted the account to Opus-only would silently get an **unrestricted** account instead, with no error anywhere. `cmd_set_codecs()` (`core/modules/ctrl_json/ctrl_json.c`) never hands a bare name to `account_set_audio_codecs()` — every component is built as `"<name>/<srate>/<ch>"` using the real values from the exact `struct aucodec` this command already resolved via `aucodec_find()`, for every codec, not a one-off Opus special case — and, belt-and-suspenders, re-reads `account_aucodecl(acc)`'s count after applying and treats a mismatch as this function's own internal bug (never reported as success) rather than trusting the call succeeded. |
 
 Unknown `cmd` values, a required field missing/wrong-typed (e.g. `dial`
 without `uri`, `mute` without a real boolean `on`, `set_device` with a
@@ -295,7 +335,8 @@ exactly what `ok:true`/`ok:false` do and don't promise about a command's
 | `{"event":"blf","ext":"...","state":"idle\|ringing\|busy\|held\|dnd\|offline"}` | New in v1, from `blf_subscribe`. `idle`: no active dialog for that extension (either no `<dialog>` element in the NOTIFY body, *or* one present with `<state>terminated</state>` — both occur in practice, see `core/E2E-F1.md` for the real captured body, which uses the second shape). `ringing`: `<state>` is `early`/`proceeding`/`trying`. `busy`: `<state>confirmed</state>`, no hold signal (see `held` below). `held` (**new in v1.3, "presence_override"**): `<state>confirmed</state>` *and* the dialog's NOTIFY body also carries the RFC 4235/RFC 3840 standard hold indication (a `<target>` `+sip.rendering` param, `pvalue="no"`) — see `core/modules/ctrl_json/dialog_info.h`'s own header comment on `CENT_BLF_HELD` for the full parsing rule. **Real-PBX finding**: this engine's test PBX (FreePBX 17.0.30 / Asterisk 22.8.2, chan_pjsip) does **not** actually emit this signal for a locally-held call — confirmed via a real NOTIFY captured mid-hold (3 separate NOTIFYs across the hold window, `version=` incrementing each time, all byte-identical to the plain `busy` shape) — so a held call on *this* PBX currently still reports `busy`, not `held`; the parser rule itself is implemented correctly to the RFC-documented shape and unit tested against synthetic RFC-compliant fixtures, and will report `held` the moment a NOTIFY body actually carries the param (a different/future PBX config, or a different vendor). See `core/E2E-F1.md` "F5 presence_override" for the full real-capture evidence. `dnd` (**new in v1.3, "presence_override", best-effort**): a non-standard `<dnd>true</dnd>` element or `dnd=` attribute anywhere in the NOTIFY body — see `dialog_info.h`'s `CENT_BLF_DND` comment. **Not verified against a real Asterisk capture** — standard Asterisk chan_pjsip `Event: dialog` hints have no dedicated element for "this extension is in DND" (dialog-info is a *dialog* package; DND is a device-config state, not a dialog — an idle-but-DND'd extension has zero active dialogs either way, indistinguishable from plain idle at this layer without something extra in the XML, which this repo has not observed Asterisk actually send). `offline`: the subscription itself failed/was rejected/expired before a NOTIFY could be parsed, *or* a `<dialog>` element was present with no parseable `<state>` — the "can't currently tell" bucket. Parsing is pure, tiny, and unit-tested against both synthetic bodies and real captures (idle *and*, new in v1.3, the mid-hold "still busy" real capture) — see `core/modules/ctrl_json/dialog_info.c` and `test/test_main.c`. |
 | `{"event":"attended_transfer_started","source_call_id":"...","target_call_id":"..."}` | New in v1, from `attended_transfer`, right after the consultation call's dial succeeds. Lets a consumer correlate exactly which two `call_id`s a pending `complete_transfer`/`abort_transfer` will act on — there's no other way to learn `target_call_id` (it's a brand new call, not something the caller supplied). |
 | `{"event":"devices","input":[{"name":"...","active":true\|false},...],"output":[...]}` | **New in v1.1**, from `devices`. `name` is a `"<module>[,<device>]"` composite (matching baresip's own `audio_source`/`audio_player` config-file syntax) — pass it straight back as `set_device`'s own `"name"` field to select that device. This spike's actual module set (`ausine` input / `aufile` output only, see `core/BUILD.md` "Module selection" — no `coreaudio`/`alsa`/`wasapi`/...) has no real per-device enumeration, so today each of `input`/`output` always has exactly one entry — the driver module itself standing in for "the device" — rather than a genuinely empty or fake-populated list; a future real device-backend module plugs in with no protocol change (see `ctrl_json.c` `devices_add_driver()`'s own comment for exactly how the fallback works). |
-| `{"event":"result","id":"...","ok":true\|false,"error":"...?", ...}` | **New in v1.1**, from any command that carried an `id` (see "Commands") — a direct, correlated acknowledgment of that *specific* command's own synchronous dispatch. `ok:true` means the command was accepted and dispatched without a synchronous validation/API failure — it is **not** a promise about anything asynchronous: e.g. a `blind_transfer` that gets `result ok:true` can still fail far-end minutes later, surfaced the same way it always was, as a `BEVENT_CALL_TRANSFER_FAILED`-sourced `error` event — watch the normal `call_state`/`reg_state`/`stats`/`blf`/... events for that, same as always; `result` only ever reports the exact same synchronous success/failure an `id`-less send of the same command would have shown via a normal event (an `error` event on failure, nothing extra on success) — `id` doesn't change *what* happens, only whether you get a correlated acknowledgment of it. `error` is present (and identical to the text a plain `error` event would carry) only when `ok:false`. `quality_stats` and `devices` additionally merge their own "command-specific fields" (the same fields their own `stats`/`devices` event would carry) directly onto a successful `result`, so a correlated caller doesn't need to also match up a second event by hand just to read the data it asked for — every other command's `result` is just `{"event":"result","id":"...","ok":true}` on success. `tap_start`/`tap_stop` are **not** in the merge list (like `hold`/`mute`/`blind_transfer`/...) — they're action commands, not query commands; their real data travels on the dedicated `tap_state` event below, the same way `hold`'s travels on `call_state`. |
+| `{"event":"codecs","available":[{"name":"...","srate":N,"ch":N},...],"active":["...","...",...]}` | **New in v1.6**, from `codecs` (a query) and, additionally, automatically after a successful `set_codecs` (see that command's own row — the shell must not maintain its own mirror of the effective order, it re-reads this event instead; this workspace's own "fuente de verdad" rule). `available` is **this build's real, live-registered codec catalog** — walked fresh from baresip's own `baresip_aucodecl()` every time, one entry per compiled-in `struct aucodec`, `name`/`srate`/`ch` all taken from the real struct — **never a hardcoded list**: a build that doesn't compile a codec in (e.g. G.722 on any build today — see `core/BUILD.md` "Codecs (G.722 — not in this build)") simply won't list it, so a UI painting its picker from this array can never offer a codec that would then fail at `set_codecs` time. `active` is the account's own *effective*, ordered codec-preference list — names only, in offer-priority order — sourced from baresip's own `account_aucodecl()`, which already implements the right fallback on its own: the account's explicit `set_codecs`-applied list if one was ever set, otherwise (a freshly started engine, or one that only ever used the static `audio_codecs=` accounts-file line — see `run-spike.sh`) the same `available` catalog verbatim, so `active` is never an empty/useless array. Real e2e evidence (2026-08-13, real test PBX): `available` correctly listed `PCMU`/`PCMA`/`opus` (this build's actual `-DMODULES=` set — see `core/BUILD.md` "Module selection"), `active` correctly reflected `run-spike.sh`'s configured `opus,pcmu,pcma` preference order, and a subsequent real call negotiated `opus` — the first entry in `active` — confirming the ordering is genuinely the SDP offer priority, not cosmetic. |
+| `{"event":"result","id":"...","ok":true\|false,"error":"...?", ...}` | **New in v1.1**, from any command that carried an `id` (see "Commands") — a direct, correlated acknowledgment of that *specific* command's own synchronous dispatch. `ok:true` means the command was accepted and dispatched without a synchronous validation/API failure — it is **not** a promise about anything asynchronous: e.g. a `blind_transfer` that gets `result ok:true` can still fail far-end minutes later, surfaced the same way it always was, as a `BEVENT_CALL_TRANSFER_FAILED`-sourced `error` event — watch the normal `call_state`/`reg_state`/`stats`/`blf`/... events for that, same as always; `result` only ever reports the exact same synchronous success/failure an `id`-less send of the same command would have shown via a normal event (an `error` event on failure, nothing extra on success) — `id` doesn't change *what* happens, only whether you get a correlated acknowledgment of it. `error` is present (and identical to the text a plain `error` event would carry) only when `ok:false`. `quality_stats`, `devices`, and (**new in v1.6**) `codecs` additionally merge their own "command-specific fields" (the same fields their own `stats`/`devices`/`codecs` event would carry) directly onto a successful `result`, so a correlated caller doesn't need to also match up a second event by hand just to read the data it asked for — every other command's `result` is just `{"event":"result","id":"...","ok":true}` on success. `set_codecs` (a mutating command, unlike the `codecs` query it shares an event shape with) is deliberately **not** in that merge list — same reasoning as `tap_start`/`tap_stop`/`hold`/`mute`/...: its real data travels on the dedicated `codecs` event it emits on success, the same way `hold`'s travels on `call_state`. `tap_start`/`tap_stop` are **not** in the merge list either (like `hold`/`mute`/`blind_transfer`/...) — they're action commands, not query commands; their real data travels on the dedicated `tap_state` event below, the same way `hold`'s travels on `call_state`. |
 | `{"event":"tap_state","call_id":"...","state":"started"\|"stopped","rx_path":"...","tx_path":"...", ...}` | **New in v1.2**, from `tap_start` (`state:"started"`) and from `tap_stop` **or** call teardown (`state:"stopped"` either way — see `audiotap.h` `audiotap_call_closed()`: a tap that outlives its own `tap_stop`, e.g. the peer hangs up first, is auto-finalized so a WAV file is never left open/corrupt). `call_id` is always the resolved call's real id, regardless of whether the triggering command supplied one — same convention as `call_state`. `rx_path`/`tx_path` are present on both states (the same two paths `tap_start` chose, echoed back on `stopped` too so a consumer doesn't have to have kept them from the `started` event). `"stopped"` additionally carries `rx_bytes`/`tx_bytes` (PCM data bytes written, WAV header excluded) and `rx_duration_ms`/`tx_duration_ms` (derived from bytes/sample-rate/sample-size, integer math) — `"started"` never carries these fields at all (nothing's been written yet, not even a zero) — see `core/E2E-F1.md` "F4 audio tap" for real captured numbers. **Security note (v1.3):** `rx_path`/`tx_path`'s filename component is derived from `call_id`, which — for an *incoming* call — is the far end's own SIP `Call-ID` header, not an engine-generated value; see "Changes from v1.2" below and `core/modules/ctrl_json/pathsafe.h` for why that value is sanitized before ever reaching a filesystem path, and confirm any future code that interpolates a call_id into a path does the same. |
 | `{"event":"park","call_id":"...","ext":"..."}` | **New in v1.3**, from `park`, right after the REFER dispatches successfully (synchronous acceptance only — same "not a promise about the async outcome" caveat as `blind_transfer`'s own `call_state`/`error` story, see that command's row and `cmd_park()`'s own comment in `ctrl_json.c`). `call_id` is the resolved call's real id (same convention as `call_state`/`tap_state`). `ext` is always the **pilot** extension the park request targeted (echoed back from the command), **never** a specific auto-assigned parking-lot slot number — genuinely not observable over plain SIP signaling this engine's call leg is party to (confirmed by reading how Asterisk's REFER handling and `Park()` interact here, not guessed — see `core/E2E-F1.md` "F5 park"); a future consumer that needs the *actual* assigned slot would need an AMI/ARI integration, out of scope for this SIP-only engine. See this file's own top-of-file v1.3/v1.4 status paragraphs for `park`'s current real-PBX e2e status — **v1.4**: confirmed landing in the lot end-to-end over udp/tcp (real SIP trace: REFER on the wire, `202 Accepted`, final NOTIFY sipfrag `SIP/2.0 200 OK`); over wss specifically, the REFER-progress-subscription issue remains (see "Planned"), but the failure now surfaces via a normal `error` event (`BEVENT_CALL_TRANSFER_FAILED`, `core/patches/0005-*`) instead of silently vanishing. |
 
@@ -605,8 +646,77 @@ already relies on changed shape or behavior. One new command:
   set_answer_mode" and this file's own top-of-file v1.5 status
   paragraph.
 
-## Planned (still not in v1.5)
+## Changes from v1.5
 
+v1.6 is additive and fully backward compatible — nothing a v1.5 consumer
+already relies on changed shape or behavior. Everything below is new —
+see this file's own top-of-file v1.6 status paragraph for the real-PBX
+e2e verification (Opus negotiated, cross-checked engine-side and
+PBX-side) and `core/BUILD.md` "Codecs (Opus)" for the build-side half of
+this same story (module wiring, mac vs. Windows, and the G.722 scope
+decision):
+
+- **`codecs`/`set_codecs`** (see "Commands"/"Events") — query this
+  build's real compiled-in codec catalog and set the account's
+  codec-preference order. Mirrors `devices`/`set_device`'s existing
+  shape closely on purpose (query command → its own event, mutating
+  command → the same event re-emitted with the fresh state) rather than
+  inventing a new pattern.
+- **The engine now compiles a second audio codec, Opus**, alongside the
+  pre-existing G.711 (`pcmu`/`pcma`) — `-DMODULES=...;opus;...` (see
+  `core/BUILD.md` "Module selection"/"Codecs (Opus)"). `run-spike.sh`'s
+  generated account now offers `opus/48000/2,pcmu/8000/1,pcma/8000/1`
+  (Opus preferred, G.711 the universal fallback) instead of the old
+  G.711-only `pcmu,pcma` — a real, user-visible behavior change for
+  anyone dialing through this script unmodified, not just an additive
+  protocol change, called out here for that reason.
+- **A real upstream footgun found and closed, not just documented**:
+  baresip's `account_set_audio_codecs()` defaults a bare codec name (no
+  explicit `/srate/ch`) to `8000/1`, which silently fails to match Opus
+  (registered at `48000/2`) and, worse, leaves the account *entirely
+  unrestricted* the moment the resulting codec list ends up empty — see
+  `set_codecs`'s own "Commands" row above for the full mechanism and
+  `core/BUILD.md` "Codecs (Opus)" for the build-config half of the same
+  finding (why `run-spike.sh`'s static `audio_codecs=` line also needed
+  the explicit-suffix fix, not just the new `set_codecs` command).
+  `cmd_set_codecs()` (`core/modules/ctrl_json/ctrl_json.c`) always
+  builds explicit `"name/srate/ch"` components from the real resolved
+  `struct aucodec`, for every codec, and defensively re-verifies the
+  applied count afterward rather than trusting success.
+- **`cmd.h`/`cmd.c` gain the protocol's first JSON-array-typed command
+  field** (`set_codecs`'s `codecs`) — decoded via `re`'s
+  `odict_get_array()`/`odict_entry_type()`/`odict_entry_str()` walking
+  the array odict's own `.lst` (see `decode_codecs()` in `cmd.c`), the
+  same underlying JSON-array representation `fill_devices_fields()`
+  already *produces* on the output side, now consumed on the input
+  side for the first time. Validated structurally (non-empty, string
+  entries, length, `CENT_MAX_CODECS` cap matching baresip's own
+  `struct account::acv[16]`, no case-insensitive duplicate) with no
+  engine needed — 300/300 `ctrl_json_test` checks pass under ASan,
+  including this version's new coverage.
+
+## Planned (still not in v1.6)
+
+- **G.722 is not in this build, on any platform, and not planned for
+  the near term** — see `core/BUILD.md` "Codecs (G.722 — not in this
+  build)" for the full scope decision and the two real, documented
+  paths to close this gap if a future deployment ever needs it (a
+  vendored dependency-free G.722 decoder/encoder, following this
+  repo's own `wav_writer.c` precedent of hand-rolling rather than
+  pulling a heavy external library; or `libspandsp` via a vcpkg
+  overlay/from-source build on Windows plus the equivalent on mac).
+  Opus already covers what G.722 would add (wideband audio) and does
+  it better — G.722 only matters for interop with an endpoint that
+  speaks *only* G.722, which does not exist in this repo's actual test
+  deployment today.
+- A future protocol version's `set_codecs` could grow an optional
+  `call_id` the same way `set_device` might (see that command's own
+  "Planned" note) if a real per-call (not just per-account) codec
+  override is ever needed — not asked for by this version's task, and
+  baresip has no live mid-call codec-swap primitive to hook it into
+  even if the protocol grew the field (see `set_codecs`'s own
+  "Commands" row for why an established call is deliberately
+  unaffected today).
 - `devices`'s device-name granularity is exactly baresip's own module
   set for this spike build (`ausine`/`aufile`, see `core/BUILD.md`
   "Module selection") — real per-device enumeration (actual microphone/

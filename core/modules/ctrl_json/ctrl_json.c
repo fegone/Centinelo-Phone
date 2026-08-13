@@ -783,6 +783,257 @@ static int build_pbx_ext_uri(struct ua *ua, const char *ext,
 }
 
 
+/* ------------------------------------------------------------------- */
+/* Codecs (v1.6 - see PROTOCOL.md "codecs"/"set_codecs")                */
+
+/*
+ * Shared by emit_codecs() (the standalone "codecs" event) and
+ * emit_result()'s CENT_CMD_CODECS enrichment - same "one fill function,
+ * two call sites" shape fill_devices_fields() already uses for
+ * "devices"/"set_device".
+ *
+ * "available": every audio codec *this build* actually has compiled in
+ * (baresip_aucodecl() - the global registry every codec module's own
+ * CMakeLists.txt/aucodec_register() populates at startup; see
+ * PROTOCOL.md's "codecs" row for why this - not a hardcoded list - is
+ * what a shell/UI should paint its picker from). One entry per
+ * registered aucodec, in registration order (this build's MODULES=
+ * list order, see BUILD.md), each `{"name":...,"srate":...,"ch":...}` -
+ * srate/ch are included because a real codec list can carry more than
+ * one entry with the same name at different rates (this build's own
+ * g711 module registers exactly one pcmu/pcma each at 8000/1, but
+ * nothing about this protocol should assume that never changes).
+ *
+ * "active": the account's own *effective*, ordered codec-preference
+ * list - account_aucodecl() (src/account.c) already implements exactly
+ * the right fallback: the account's own explicit set_codecs/
+ * audio_codecs= list if one was ever set, otherwise the same global
+ * baresip_aucodecl() "available" list verbatim (never an empty active
+ * list on a freshly started engine that never called set_codecs - see
+ * PROTOCOL.md "set_codecs" for why that fallback is deliberately
+ * reused here rather than re-derived). Just names, in effective offer
+ * order - a client comparing "active" against "available"'s names is
+ * exactly the picker UI this command exists for.
+ */
+static void fill_codecs_fields(struct odict *od)
+{
+	struct odict *available = NULL;
+	struct odict *active = NULL;
+	struct ua *ua = primary_ua();
+	struct account *acc = ua ? ua_account(ua) : NULL;
+	struct le *le;
+
+	if (odict_alloc(&available, 8) || odict_alloc(&active, 8)) {
+		mem_deref(available);
+		mem_deref(active);
+		return;
+	}
+
+	for (le = list_head(baresip_aucodecl()); le; le = le->next) {
+		const struct aucodec *ac = le->data;
+		struct odict *entry = NULL;
+
+		if (odict_alloc(&entry, 4))
+			continue;
+
+		(void)odict_entry_add(entry, "name", ODICT_STRING, ac->name);
+		(void)odict_entry_add(entry, "srate", ODICT_INT,
+				       (int64_t)ac->srate);
+		(void)odict_entry_add(entry, "ch", ODICT_INT,
+				       (int64_t)ac->ch);
+		(void)odict_entry_add(available, "codec", ODICT_OBJECT,
+				       entry);
+		mem_deref(entry);
+	}
+
+	for (le = list_head(account_aucodecl(acc)); le; le = le->next) {
+		const struct aucodec *ac = le->data;
+
+		(void)odict_entry_add(active, "codec", ODICT_STRING,
+				       ac->name);
+	}
+
+	(void)odict_entry_add(od, "available", ODICT_ARRAY, available);
+	(void)odict_entry_add(od, "active", ODICT_ARRAY, active);
+	mem_deref(available);
+	mem_deref(active);
+}
+
+
+static void emit_codecs(void)
+{
+	struct odict *od = NULL;
+
+	if (odict_alloc(&od, 4))
+		return;
+
+	(void)odict_entry_add(od, "event", ODICT_STRING, "codecs");
+	fill_codecs_fields(od);
+
+	emit(od);
+	mem_deref(od);
+}
+
+
+/*
+ * v1.6 "set_codecs" (see PROTOCOL.md "set_codecs"). Not call-scoped (no
+ * call_id) - like set_answer_mode, this flips a single per-account
+ * setting: fetch the one UA/account this engine runs, validate every
+ * requested name against baresip_aucodecl() (the *impure* half
+ * decode_codecs() in cmd.c deliberately couldn't do - see that
+ * function's own comment), then call baresip's own
+ * account_set_audio_codecs() with the comma-joined, order-preserved
+ * list.
+ *
+ * Why no re-register: account_set_audio_codecs() only mutates
+ * acc->aucodecl in memory - it is read fresh by call_streams_alloc()
+ * (core/deps/baresip/src/call.c) at the moment a *new* struct call is
+ * allocated (account_aucodecl(call->acc), passed straight into
+ * audio_alloc()), which happens on both cmd_dial() and an incoming
+ * INVITE, independent of REGISTER state entirely - a SIP REGISTER
+ * carries no SDP/codec information at all in this engine's flow. So the
+ * least-surprising, verified-by-reading-the-real-code behavior is:
+ * applies to the *next* call (dial or incoming) immediately, no
+ * re-register needed; an *already-established* call is completely
+ * unaffected - its struct audio was already allocated against whatever
+ * codec list was active at that moment, and this command never forces a
+ * re-INVITE/renegotiation on it (baresip has no "swap codec mid-call"
+ * primitive to hot-swap into even if this command wanted to - unlike
+ * set_device's audio_set_source()/audio_set_player() hot-swap, which
+ * operates on the *source/player*, not the negotiated codec itself).
+ * See PROTOCOL.md "set_codecs" for this same reasoning written up for a
+ * protocol consumer.
+ *
+ * **Real upstream footgun, found by reading account.c while building
+ * this (not theoretical) - every "name/srate/ch" component below is
+ * built explicit, never a bare name, and here's why that's load-bearing,
+ * not cosmetic:** account_set_audio_codecs() re-parses its `codecs`
+ * argument through the exact same audio_codecs_decode() a static
+ * accounts-file `audio_codecs=` line goes through - and that parser
+ * (core/deps/baresip/src/account.c) defaults a *bare* codec name (no
+ * "/srate/ch" suffix) to srate=8000/ch=1 before resolving it via
+ * aucodec_find(aucodecl, name, srate, ch), which rejects on ANY
+ * srate/ch mismatch (src/aucodec.c: `if (srate && srate != ac->srate)
+ * continue;`, same for ch). opus registers at 48000/2
+ * (modules/opus/opus.c), not 8000/1 - so a bare "opus" in this string
+ * silently fails to resolve (`warning("account: audio codec not
+ * found...")` + `continue`, no error return) and never enters
+ * acc->aucodecl at all. Worse, account_aucodecl() then falls back to
+ * the *entire* baresip_aucodecl() catalog the moment acc->aucodecl ends
+ * up empty (its whole point is "no explicit restriction ->
+ * unrestricted") - meaning a caller that thinks it just locked the
+ * account to opus-only would silently get an *unrestricted* account
+ * instead, with no error anywhere in this path. Building each
+ * component's exact "/srate/ch" from the same struct aucodec this
+ * function already resolved via aucodec_find() below sidesteps the
+ * bare-name default entirely - the string this function hands to
+ * account_set_audio_codecs() always fully pins the codec
+ * audio_codecs_decode() will find, for opus and for every other codec
+ * this build ever adds, not just a one-off pcmu/pcma special case (see
+ * BUILD.md "Findings" for this same writeup aimed at a build-config
+ * reader).
+ *
+ * Belt-and-suspenders: after account_set_audio_codecs() returns, this
+ * still re-reads account_aucodecl(acc) and checks its count matches
+ * cmd->codecs_len exactly - closing the upstream silent-fallback hole
+ * defensively rather than only avoiding it by construction, in case a
+ * future codec module, a typo in this function, or an upstream
+ * account.c change ever reintroduces a bare-name-shaped mismatch. A
+ * count mismatch here is treated as this function's own bug, not the
+ * caller's - reported as a plain internal error rather than ever
+ * emitting a "codecs" success event for a list that isn't actually what
+ * was requested.
+ *
+ * Emits a "codecs" event with the new effective "active" list after a
+ * successful apply - unlike set_answer_mode/set_device (ack'd only via
+ * the optional "id" correlation), the shell must not keep its own
+ * mirror of "what's the effective codec order now" (this workspace's
+ * own "fuente de verdad" rule - see PROTOCOL.md "codecs"); re-emitting
+ * the same event a bare "codecs" query would produce means a consumer
+ * never has to guess whether its local echo of what it just sent
+ * matches what the engine actually applied - it's always re-derived
+ * from account_aucodecl(), the engine's own live truth, never echoed
+ * from the request.
+ */
+static void cmd_set_codecs(const struct cent_cmd *cmd)
+{
+	struct ua *ua = primary_ua();
+	struct account *acc;
+	struct list *avail = baresip_aucodecl();
+	const struct aucodec *resolved[CENT_MAX_CODECS];
+	char buf[CENT_MAX_CODECS * (CENT_CODEC_NAME_SIZE + 16)] = "";
+	size_t i;
+	int err;
+
+	if (!ua) {
+		emit_error("set_codecs: no UA configured");
+		return;
+	}
+
+	acc = ua_account(ua);
+	if (!acc) {
+		emit_error("set_codecs: UA has no account");
+		return;
+	}
+
+	/* Resolve every name to its real, compiled-in aucodec (wildcard
+	 * srate=0/ch=0 - see aucodec_find()'s own "srate && srate !=
+	 * ac->srate" guard, 0 never mismatches) BEFORE building or applying
+	 * anything - all-or-nothing, an unknown codec leaves the account's
+	 * existing codec list completely untouched. */
+	for (i = 0; i < cmd->codecs_len; i++) {
+		resolved[i] = aucodec_find(avail, cmd->codecs[i], 0, 0);
+		if (!resolved[i]) {
+			emit_errorf("set_codecs: unknown codec '%s' (not"
+				    " compiled into this build - send"
+				    " 'codecs' first for the real available"
+				    " list)", cmd->codecs[i]);
+			return;
+		}
+	}
+
+	/* Explicit "name/srate/ch" per entry, taken from the resolved
+	 * aucodec itself (never the bare requested name) - see this
+	 * function's own top comment for why a bare name is a real,
+	 * silent-fallback bug, not just belt-and-suspenders caution. */
+	for (i = 0; i < cmd->codecs_len; i++) {
+		const struct aucodec *ac = resolved[i];
+		size_t len = strlen(buf);
+
+		if (re_snprintf(buf + len, sizeof(buf) - len, "%s%s/%u/%u",
+				 i > 0 ? "," : "", ac->name, ac->srate,
+				 ac->ch) < 0) {
+			emit_error("set_codecs: internal buffer overflow");
+			return;
+		}
+	}
+
+	err = account_set_audio_codecs(acc, buf);
+	if (err) {
+		emit_errorf("set_codecs failed (%m)", err);
+		return;
+	}
+
+	/* Defensive re-check - see this function's own top comment. Not
+	 * expected to ever trip given the explicit srate/ch construction
+	 * above, but a silent partial-apply here would be exactly the kind
+	 * of "reports success, isn't what was asked" bug this whole
+	 * function exists to close, so it's checked for real rather than
+	 * assumed. */
+	if (list_count(account_aucodecl(acc)) != cmd->codecs_len) {
+		emit_errorf("set_codecs: internal error - applied %u"
+			    " codec(s), expected %zu (this is a bug, not a"
+			    " bad request - the account's codec list was"
+			    " NOT left in the requested state)",
+			    list_count(account_aucodecl(acc)),
+			    cmd->codecs_len);
+		return;
+	}
+
+	emit_codecs();
+}
+
+
 /*
  * v1.1 request/response correlation (see PROTOCOL.md "result"). Only
  * ever called from process_line(), and only when the input command
@@ -834,6 +1085,9 @@ static void emit_result(const struct cent_cmd *cmd, enum cent_cmd_type type,
 	}
 	else if (type == CENT_CMD_DEVICES) {
 		fill_devices_fields(od);
+	}
+	else if (type == CENT_CMD_CODECS) {
+		fill_codecs_fields(od);
 	}
 
 	emit(od);
@@ -1753,6 +2007,14 @@ static void process_line(const char *line, size_t len)
 
 	case CENT_CMD_SET_ANSWER_MODE:
 		cmd_set_answer_mode(&cmd);
+		break;
+
+	case CENT_CMD_CODECS:
+		emit_codecs();
+		break;
+
+	case CENT_CMD_SET_CODECS:
+		cmd_set_codecs(&cmd);
 		break;
 
 	default:
