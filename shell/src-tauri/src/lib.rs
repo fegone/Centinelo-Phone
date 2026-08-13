@@ -39,7 +39,84 @@ pub fn run() {
             tray::show_and_focus(app);
         }))
         .plugin(tauri_plugin_deep_link::init())
-        .plugin(tauri_plugin_log::Builder::default().build())
+        // HIPAA remote-install hardening (2026-08-13, revised same day after
+        // two independent 4R findings on the first version of this fix -
+        // see git blame / PR #20 history for the full story, kept here so
+        // the *current* reasoning doesn't get re-litigated from scratch):
+        //
+        // `tauri_plugin_log::Builder::default()` (the previous code, before
+        // any of this) targets BOTH stdout AND `TargetKind::LogDir` - the
+        // OS-specific logs folder (`%LOCALAPPDATA%\...\logs` on Windows) -
+        // and several call sites across this crate log content that
+        // qualifies as PHI in the Neola Dental deployment this shell ships
+        // to: a caller's phone number/SIP URI (`sidecar.rs`'s verbatim
+        // `call_state`/`reg_state`/... event trace, `core/PROTOCOL.md`
+        // "Events") or their transcribed words, if transcription is ever
+        // turned on. A plain production install would otherwise
+        // accumulate that in a plaintext file on disk forever, independent
+        // of any Settings toggle - "PHI in a path nobody looks at."
+        //
+        // The *first* version of this fix excluded the two whole modules
+        // that contain those log sites (`app_lib::sidecar`,
+        // `app_lib::transcription`) from `LogDir` via `Target::filter`.
+        // Two 4R lenses (RESILIENCE, then RELIABILITY independently) found
+        // the same problem with that: `Target::filter` operates on
+        // `log::Metadata::target()`, which defaults to the *module path*,
+        // not the individual call site - so excluding a module excludes
+        // EVERY line it logs, PHI-bearing or not. Those two modules are
+        // exactly the ones that also carry this app's crash/restart/
+        // transport-fallback/device-enumeration diagnostics (see e.g.
+        // `sidecar.rs`'s `spawn_supervisor` retry-with-backoff loop and
+        // `choose_transport`'s wss->udp fallback) - on a release build,
+        // `main.rs`'s `windows_subsystem = "windows"` means there is no
+        // console for stdout to go to, so `LogDir` losing those lines
+        // means a remote Windows machine with no technical user in front
+        // of it has ZERO on-disk trail of "why did the sidecar restart" or
+        // "why did calls stop connecting" - worse than the PHI leak this
+        // was meant to fix, for a support team that can't otherwise see
+        // that machine.
+        //
+        // Fix (current): stop filtering by module. Only the specific log
+        // *lines* that actually carry a caller's identity or their words
+        // get an explicit `target: "app_lib::phi"` at their own call site
+        // (`sidecar.rs`'s `log::info!(target: "app_lib::phi", "sidecar
+        // event: {value}")` for the ctrl_json event trace, one more
+        // `sidecar.rs` site for a `call_state` event logged on a *missing*
+        // call_id - the event `Value` is still logged whole there, `peer`
+        // and all - and `transcription.rs`'s raw relay of the
+        // `centinelo-transcribe` child process's own stderr) - see each
+        // call site's own comment for why it, specifically, needs this.
+        // Every other line in those same modules keeps its normal
+        // `app_lib::sidecar`/`app_lib::transcription` target and reaches
+        // `LogDir` same as any other module - `is_call_content_log_target`
+        // below is now a single-target check, not a module prefix check.
+        //
+        // Two more call sites turned out to log a caller's dialed number
+        // directly - `bridge.rs`'s click-to-call HTTP handler and
+        // `deeplink.rs`'s `tel:`/`centinelo:` handler, both compiled into
+        // every release build (no `debug_assertions` gate, unlike
+        // `e2e.rs`'s driver, which logs raw SIP URIs but never ships).
+        // Those aren't excluded here at all - excluding either module
+        // would cost real diagnostics for a bridge/deep-link bug report
+        // ("is a request even arriving on that machine?") for no reason,
+        // since unlike a ctrl_json event or a transcript segment, a single
+        // dialed number is cheap to redact in place instead: see
+        // `bridge::redacted_log_number`'s doc, used at both call sites.
+        //
+        // Stdout keeps logging every line above unfiltered, exactly as
+        // before - the e2e/dev capture workflow in E2E.md/README.md
+        // (`RUST_LOG=info` + terminal capture) depends on that and isn't
+        // this task's concern; only the persistent `LogDir` copy is
+        // filtered.
+        .plugin(
+            tauri_plugin_log::Builder::default()
+                .targets([
+                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stdout),
+                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::LogDir { file_name: None })
+                        .filter(|metadata| !is_call_content_log_target(metadata.target())),
+                ])
+                .build(),
+        )
         // Auto-updater (roadmap debt fix, see shell/README.md
         // "Auto-updater") - endpoint/pubkey come from tauri.conf.json's
         // own `plugins.updater` block, nothing to configure here.
@@ -218,4 +295,95 @@ pub fn run() {
                 }
             }
         });
+}
+
+/// The one `log::Metadata::target()` value that marks a line as carrying
+/// call content (a caller's identity or their transcribed words) - see
+/// this file's own log-plugin setup comment for the full "why per-line, not
+/// per-module" story. A handful of `log::info!`/`log::warn!`/`log::debug!`
+/// call sites in `sidecar.rs`/`transcription.rs` pass `target:
+/// "app_lib::phi"` explicitly (overriding the macro's own default of the
+/// calling module's path) precisely so this function can single them out
+/// without taking every other diagnostic line in the same module down with
+/// them. **Any future log site that logs a caller's number, SIP URI, or
+/// transcribed speech text must do the same** (`log::info!(target:
+/// "app_lib::phi", ...)`) - nothing here can discover a new PHI-bearing
+/// call site automatically; see `phi_target_smoke_test` below for how far
+/// automated coverage of that actually goes (a canary on the target name
+/// itself, not on which sites use it).
+fn is_call_content_log_target(target: &str) -> bool {
+    target == "app_lib::phi"
+}
+
+#[cfg(test)]
+mod log_target_tests {
+    use super::*;
+
+    #[test]
+    fn the_phi_target_is_excluded() {
+        assert!(is_call_content_log_target("app_lib::phi"));
+    }
+
+    #[test]
+    fn a_diagnostic_line_from_the_same_module_is_kept() {
+        // The actual guarantee this whole mechanism exists for (RELIABILITY
+        // 4R fix-pass finding on PR #20's first version, which excluded by
+        // module and silently took the sidecar crash/restart/transport-
+        // fallback diagnostics down with the one PHI-bearing line): a
+        // `sidecar.rs` line logged at its module's own default target -
+        // e.g. `sidecar exited unexpectedly (...); attempt N/MAX` at
+        // `app_lib::sidecar`, or a `transcription.rs` line at
+        // `app_lib::transcription` - is NOT the phi target and must reach
+        // the persistent log file, even though it lives in the same file
+        // right next to a line that IS `app_lib::phi`.
+        assert!(!is_call_content_log_target("app_lib::sidecar"));
+        assert!(!is_call_content_log_target("app_lib::transcription"));
+    }
+
+    #[test]
+    fn unrelated_targets_are_kept() {
+        assert!(!is_call_content_log_target("app_lib::updater"));
+        assert!(!is_call_content_log_target("app_lib::activation"));
+        assert!(!is_call_content_log_target("app_lib::hid::device"));
+        assert!(!is_call_content_log_target("tauri"));
+    }
+
+    #[test]
+    fn a_target_that_merely_contains_the_word_is_not_a_false_positive() {
+        // Exact match, not substring/prefix match - `app_lib::phi_metrics`
+        // or `app_lib::graphify` must not be swept in by accident just
+        // because they share a prefix/substring with the real sentinel.
+        assert!(!is_call_content_log_target("app_lib::phi_metrics"));
+        assert!(!is_call_content_log_target("app_lib::graphify"));
+    }
+
+    /// Not a test of `is_call_content_log_target` itself (already covered
+    /// above) - a grep-based canary so that if a future edit ever
+    /// misspells the sentinel target string at one of the three real call
+    /// sites (`sidecar.rs`'s two, `transcription.rs`'s one), `cargo test`
+    /// fails instead of the mismatch silently reintroducing PHI-on-disk.
+    /// This is the honest answer to "a test that fails if a new PHI-
+    /// bearing log site skips registration": no such test is possible in
+    /// general (nothing distinguishes "call content" from any other string
+    /// interpolated into a `log::` call short of a human reading it) - what
+    /// IS checkable is that the sentinel string used here and the sentinel
+    /// string used at each known real call site stay byte-identical.
+    #[test]
+    fn phi_target_string_matches_the_known_call_sites() {
+        const SIDECAR_SRC: &str = include_str!("sidecar.rs");
+        const TRANSCRIPTION_SRC: &str = include_str!("transcription.rs");
+        let needle = "target: \"app_lib::phi\"";
+        assert!(
+            SIDECAR_SRC.matches(needle).count() >= 2,
+            "expected at least 2 target: \"app_lib::phi\" call sites in sidecar.rs \
+             (the ctrl_json event trace + the missing-call_id branch) - found {}",
+            SIDECAR_SRC.matches(needle).count()
+        );
+        assert!(
+            TRANSCRIPTION_SRC.matches(needle).count() >= 1,
+            "expected at least 1 target: \"app_lib::phi\" call site in transcription.rs \
+             (the centinelo-transcribe stderr relay) - found {}",
+            TRANSCRIPTION_SRC.matches(needle).count()
+        );
+    }
 }

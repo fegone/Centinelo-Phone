@@ -1008,7 +1008,20 @@ fn spawn_reader_and_finalize(inner: Arc<Inner>, ctx: FinalizeContext, mut child:
             std::thread::spawn(move || {
                 let reader = BufReader::new(stderr);
                 for line in reader.lines().map_while(Result::ok) {
-                    log::debug!("transcribe[{call_id}]: {line}");
+                    // `target: "app_lib::phi"` (HIPAA remote-install
+                    // hardening, 2026-08-13) - this relays
+                    // `centinelo-transcribe`'s own raw stderr unfiltered
+                    // (module doc's "Contract" section: only `stdout` is a
+                    // typed `segment`/`done`/`error` protocol this module
+                    // parses - `stderr` is whatever that third-party
+                    // whisper.cpp-backed binary chooses to print, not
+                    // controlled or reviewed here). Nothing confirms it
+                    // never echoes a decoded word or a file path built from
+                    // caller metadata, so this is treated as
+                    // potentially-PHI-bearing out of caution and kept off
+                    // the persistent log, same as `sidecar.rs`'s ctrl_json
+                    // event trace - see lib.rs's log-plugin setup comment.
+                    log::debug!(target: "app_lib::phi", "transcribe[{call_id}]: {line}");
                 }
             });
         }

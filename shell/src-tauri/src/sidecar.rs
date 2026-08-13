@@ -1161,8 +1161,15 @@ fn spawn_stdout_reader(
             // Evidence trail: every ctrl_json event line, verbatim, at INFO
             // so `shell/E2E.md` can cite real captured output (see PROTOCOL.md
             // "v0 events" - this mirrors how core/BUILD.md's own testing
-            // narrative captured stdout with `grep '^{'`).
-            log::info!("sidecar event: {value}");
+            // narrative captured stdout with `grep '^{'`). `target:
+            // "app_lib::phi"` (HIPAA remote-install hardening, 2026-08-13) -
+            // `value` can carry `call_state`'s `peer` field, the caller's
+            // real SIP URI/phone number (`core/PROTOCOL.md` "Events") -
+            // this is what keeps it out of the persistent on-disk log
+            // while every OTHER sidecar.rs line (still logged at this
+            // module's own default `app_lib::sidecar` target) keeps
+            // reaching it - see lib.rs's `is_call_content_log_target`.
+            log::info!(target: "app_lib::phi", "sidecar event: {value}");
             let event_name = value.get("event").and_then(Value::as_str).unwrap_or("");
 
             if event_name == "ready" {
@@ -1285,8 +1292,15 @@ fn spawn_stdout_reader(
                     // has_active_call() would stay stuck reporting `true`
                     // forever. Loud (not silent) so a future engine-side
                     // protocol regression is visible instead of quietly
-                    // reintroducing this class of bug.
-                    log::warn!("sidecar: call_state event missing call_id, phase not updated: {value}");
+                    // reintroducing this class of bug. `target:
+                    // "app_lib::phi"` (HIPAA remote-install hardening,
+                    // 2026-08-13 audit sweep) - `value` is the full event,
+                    // `peer` field and all, same PHI concern as the
+                    // "sidecar event" trace above; this branch fires on a
+                    // malformed/unexpected event specifically, so it can't
+                    // be dropped in favor of that line the way a
+                    // duplicate could - it needs its own target.
+                    log::warn!(target: "app_lib::phi", "sidecar: call_state event missing call_id, phase not updated: {value}");
                 }
                 if let Some(t) = shared.transcription.lock_or_recover().as_ref() {
                     t.on_call_state(&value);
