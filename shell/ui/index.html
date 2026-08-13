@@ -3,7 +3,16 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:">
+<!--
+  CSP — NO declarar Content-Security-Policy en este archivo.
+  La política vive en shell/src-tauri/tauri.conf.json (app.security.csp); Tauri la inyecta por
+  cabecera HTTP en tiempo de ejecución, y esa es la fuente única de verdad.
+  Si se vuelve a añadir un <meta http-equiv="Content-Security-Policy"> aquí, el navegador aplicará
+  la INTERSECCIÓN de la cabecera y el meta (la más restrictiva), anulando silenciosamente toda
+  directiva que solo exista en la configuración. Esto ya rompió el cliente de Windows una vez:
+  el meta carecía de connect-src, bloqueaba http://ipc.localhost (canal IPC de Tauri) y la interfaz
+  se dibujaba pero no respondía a teclado, botones ni a la pantalla de Configuración.
+-->
 <title>Centinelo Phone</title>
 <link rel="stylesheet" href="css/tokens.css">
 <link rel="stylesheet" href="css/app.css">
