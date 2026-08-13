@@ -161,7 +161,14 @@ it could produce a false result).
 **v1.6 status: two new commands, `codecs` (query) and `set_codecs`
 (apply) — unit-tested (`cmd.c` parsing, `test/test_main.c`, 300/300
 checks, ASan-clean) AND e2e-verified against the real test PBX
-(2026-08-13, dual-contact ext 1100, `*43` echo).** v1.6 is **fully
+(2026-08-13, ext 1100, `*43` echo), the latter by an independent
+qa-e2e pass (`core/E2E-F1.md` "F8") — not just the paragraph below,
+which is core-engine's own same-session self-report and per this
+workspace's own rule doesn't count as evidence on its own; see F8 for
+the cross-checked PBX-side numbers, the mid-call-untouched/no-re-
+register proof, the bare-name-bug provocation (not reproduced), and
+one real non-engine finding (ext 1100's endpoint doesn't allow `pcma`
+alone — SIP `488`, not a bug).** v1.6 is **fully
 backward compatible with v1.5**: every existing command/event is
 byte-for-byte unchanged; v1.6 only *adds* `codecs`, `set_codecs`, and
 the `codecs` event. This version also adds a second audio codec
