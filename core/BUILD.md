@@ -176,60 +176,73 @@ Homebrew's prefix on this platform. Confirmed `MODULES_DETECTED` (see
 "Confirmed green run" below for the mechanism) includes `opus` in a full
 local build; `ctrl_json` compiles clean against it with no new warnings.
 
-**Windows: no confirmed path yet — needs vcpkg, and needs release-ci to
-actually run it on a Windows runner.** `FindOPUS.cmake` skips
-`pkg-config` entirely on `WIN32` and only looks at `OPUS_HINTS`/`OPUS_
-INCLUDE_DIRS`/`OPUS_LIBRARY_DIRS` plus a couple of Unix-only fallback
-paths that don't exist on Windows — so, unlike mac, there is no
-"already works" default here; something has to hand it real `opus.h`/
-`opus.lib`. No Chocolatey `opus` package was found during this
-investigation (`choco search opus` — the existing Windows job's own
-OpenSSL install already goes through Chocolatey, see "What's actually
-different on Windows" below, so that was the first thing checked); the
-real path is **vcpkg**:
+**Windows: real path confirmed via vcpkg, verified on two live
+`windows-latest` runs (release-ci, 2026-08-13, PR #22).** `FindOPUS.cmake`
+skips `pkg-config` entirely on `WIN32` and only looks at `OPUS_HINTS`/
+`OPUS_INCLUDE_DIRS`/`OPUS_LIBRARY_DIRS` plus a couple of Unix-only
+fallback paths that don't exist on Windows — so, unlike mac, there is no
+"already works" default here. No Chocolatey `opus` package exists
+(confirmed against Chocolatey's own package API, empty feed); the real
+path is **vcpkg**, with a **static** triplet
+(`opus:x64-windows-static-md`, not the dynamic default `x64-windows`) so
+opus never needs a DLL staged alongside `baresip.exe`/the installer —
+zero change to `scripts/package-official.sh`:
 
 ```bash
-# One-time bootstrap (a runner-persistent step, see caching note below)
-git clone https://github.com/microsoft/vcpkg
-./vcpkg/bootstrap-vcpkg.bat        # (or .sh on a non-Windows shell, N/A here)
-./vcpkg/vcpkg.exe install opus:x64-windows
+# Pinned tag (not master - release-pipeline reproducibility), cached via
+# actions/cache keyed on the tag + triplet + a port-version suffix:
+git clone --branch 2026.07.29 --depth 1 https://github.com/microsoft/vcpkg
+./vcpkg/bootstrap-vcpkg.bat -disableMetrics
+./vcpkg/vcpkg.exe install opus:x64-windows-static-md
 
-# Then, at baresip's own configure step, point FindOPUS.cmake straight
-# at what vcpkg installed - no full vcpkg-toolchain integration needed
-# (this build already resolves RE_LIBRARY/RE_INCLUDE_DIR/OPENSSL_ROOT_DIR
-# by hand for other reasons - see "What's actually different on
-# Windows" below - so a second, small explicit hint fits the existing
-# pattern rather than introducing a second, competing dependency-
-# resolution mechanism, i.e. CMAKE_TOOLCHAIN_FILE, that could shift how
-# every *other* find_package() in this configure step resolves too):
 cmake -S core/deps/baresip -B core/deps/baresip/build \
   ... (existing flags unchanged) ...
-  -DOPUS_HINTS="$(pwd -W)/vcpkg/installed/x64-windows" \
+  -DOPUS_HINTS="$(pwd -W)/vcpkg/installed/x64-windows-static-md" \
   -DMODULES="account;g711;opus;auconv;auresamp;ausine;aufile;ice;dtls_srtp;menu;wasapi"
 ```
 
-This is **written up, not applied to `.github/workflows/core-build.yml`**
-by this version — the Windows job's `MODULES`/sanity-check lines are
-release-ci's own territory (see that workflow file's Windows job), and
-getting a vcpkg bootstrap + its own caching right on a fresh
-`windows-latest` runner (a real, runner-specific concern — vcpkg's own
-`git clone` + first `vcpkg install` is slow enough on a cold runner that
-it needs `actions/cache` keyed on the vcpkg commit + triplet, or every
-CI run pays that cost again) is genuinely outside what this session
-could verify without a Windows runner to iterate against, unlike the mac
-half above, which was verified with a real local build. **What release-ci
-needs to do**, concretely: add the bootstrap+install block above (as a
-cacheable step) to the Windows job, add `-DOPUS_HINTS=...` to that job's
-existing baresip configure step, add `opus` to `-DMODULES=`, and add
-`opus` to the job's own `MODULES_DETECTED` assertion loop (the same
-mechanism that already catches `ausine`/`aufile`/`ice`/`dtls_srtp`/
-`wasapi` silently dropping out — see "What's actually different on
-Windows" > point 4 below) so a future silent Windows-side opus drop
-fails CI loudly instead of shipping a build that's missing it. The macOS
-job's own `MODULES`/sanity-check *was* updated by this version (see
-".github/workflows/core-build.yml" — verified against a real local
-build first, same toolchain the file's own header cites) — only the
-Windows half is left for release-ci, per this task's own scope split.
+This is **implemented in `.github/workflows/release.yml`'s
+`build-windows` job**, not `core-build.yml` (release-ci's own territory,
+same split as the rest of "What's actually different on Windows" below)
+— `opus` is now in that job's `-DMODULES=`, `-DOPUS_HINTS=` is wired to
+the vcpkg install path above, its own `MODULES_DETECTED` assertion loop
+(the same mechanism that already catches `ausine`/`aufile`/`ice`/
+`dtls_srtp`/`wasapi` silently dropping out — see "What's actually
+different on Windows" > point 4 below) now also checks for `opus`, and a
+new regression guard fails the job if any `opus*.dll` turns up inside the
+extracted MSI (symmetric to the existing Community-edition
+`centinelo_premium.dll` filter guard) — a belt-and-suspenders check that
+the static triplet is actually static, in case the triplet ever gets
+changed back by mistake.
+
+**Real evidence, not "should work"**: `release.yml`'s `build-windows` is
+tag-gated (`workflow_dispatch` needs an already-pushed `centinelo-v*`
+tag; this task was explicitly not allowed to create one), so release-ci
+verified via a temporary push-triggered workflow replicating the new
+steps, run twice on real `windows-latest` runners, then deleted before
+merge:
+- **Cold cache**: [`31676380450`](https://github.com/fegone/Centinelo-Phone/actions/runs/31676380450)
+  — every step green, including the opus configure/build/sanity steps.
+  Real log line: `-- Found OPUS: D:/a/Centinelo-Phone/Centinelo-Phone/
+  vcpkg/installed/x64-windows-static-md/lib/opus.lib` and
+  `MODULES_DETECTED=account;g711;opus;auconv;auresamp;ausine;aufile;ice;
+  dtls_srtp;menu;wasapi;ctrl_json`.
+- **Warm cache**: [`31676733660`](https://github.com/fegone/Centinelo-Phone/actions/runs/31676733660)
+  — the `Bootstrap vcpkg + install opus` step reports `skipped` (a real
+  cache hit, not just "nothing broke"), confirming `actions/cache`
+  actually saves the ~10min cold-runner vcpkg-clone-and-build cost on
+  every run after the first.
+
+**Not yet run**: the real `build-windows` job end-to-end against an
+actual `centinelo-v*` tag (needs creating/moving a tag, outside this
+investigation's scope) — the anti-DLL MSI guard above is written and
+`actionlint`-clean but only executes against a real MSI the next time
+`build-windows` runs for a real release. See
+`.claude/reports/release-ci-2026-08-13-opus-windows-ci.md` (workspace,
+private) for the full writeup, including the `dumpbin`-unavailable
+non-fatal skip and the PR (`fegone/Centinelo-Phone#22`,
+`feature/codecs-windows-ci` → `feature/codecs-core`, **not yet merged —
+pending 4R**).
 
 ## Codecs (G.722 — not in this build)
 
