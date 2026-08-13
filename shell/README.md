@@ -877,9 +877,52 @@ Everything below is what `ui/js/app.js`'s updater code and
 publish pipeline (a separate release-ci task) needs to produce exactly
 this, nothing here needs to change on the app side to match it.
 
-**Endpoint** (already set): `https://github.com/fegone/Centinelo-Phone/releases/latest/download/latest.json`
-— GitHub's "latest release" redirect, so this URL never changes across
-releases; only the release itself does.
+**Endpoints** (already set, two, tried in order — `tauri-plugin-updater`
+falls through to the next on ANY failure, `updater.rs:412-518`):
+
+1. `https://github.com/fegone/Centinelo-Phone/releases/latest/download/latest.json`
+   — GitHub's "latest release" redirect, so this URL never changes across
+   releases; only the release itself does. **GitHub excludes prereleases
+   from this alias, always, no exception** — while 2.0.x ships as a
+   prerelease (the default — see `release.yml`'s `prerelease` input and
+   its top-of-file "Prerelease default" comment), this endpoint 404s for
+   every installed client. That's expected, not a bug, until 2.0 leaves
+   beta and a release is explicitly published with `--latest`.
+2. `https://raw.githubusercontent.com/fegone/Centinelo-Phone/updater-manifest/latest.json`
+   — a plain branch file, not a GitHub Release at all, so prerelease/draft
+   status is irrelevant to it. `release.yml`'s "Publish latest.json to the
+   updater-manifest branch" step pushes the just-published release's
+   `latest.json` here on every release, so this is the endpoint that
+   actually works **today**, while 2.0.x stays prerelease. That branch
+   carries ONLY `latest.json`, on purpose — nothing internal, nothing
+   else, ever (this repo is public).
+
+**Publishing is opt-in while 2.0 is beta.** `release.yml`'s `prerelease`
+input defaults to `true`, and a plain `git push --tags` (no input to set
+at all) is treated the same way — so every ordinary release, on either
+trigger path, publishes as a GitHub prerelease. The **only** way to
+publish a release marked "Latest" (taking 2.0 out of beta) is running
+`release.yml` via `workflow_dispatch` with the `prerelease` checkbox
+explicitly unchecked. This is deliberate: publishing to the world is a
+one-input action someone has to choose, never a side effect of tagging a
+release as usual.
+
+**Rolling back a bad release is two steps, not one.** Deleting the
+GitHub Release (`gh release delete <tag>`) is not enough by itself: the
+`updater-manifest` branch (endpoint 2 above) keeps serving whatever
+`latest.json` the last successful release pushed there, independent of
+whether that release's GitHub Release still exists. If the deleted
+release's *assets* are gone but its `latest.json` is still what the
+branch serves, an installed client's `check()` still resolves 200 with
+that (now-broken) version, `download()` then 404s against a
+release/asset that no longer exists, and — unlike a `check()`
+failure — a `download()` failure is **not** excluded from the
+main-window banner (`ui/js/updater.js`'s `shouldShowBanner`). That is a
+persistent "Retry" button that fails forever, on a machine with no one
+technical nearby to explain it away. Always update or revert
+`updater-manifest`'s `latest.json` (to the previous good release, or to
+whatever the next real fix publishes) in the same breath as deleting a
+release.
 
 **`latest.json`** — uploaded as a release asset literally named
 `latest.json`, on every release:
