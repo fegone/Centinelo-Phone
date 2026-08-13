@@ -1141,21 +1141,14 @@ jobs:
             --notes-file dist/release-notes.txt \
             "${ASSETS[@]}"
 
-      - name: Resolve real asset URLs from GitHub and build latest.json
-        # GitHub silently replaces spaces in uploaded asset filenames with
-        # periods (confirmed empirically against this repo, 2026-07-17 -
-        # a probe draft release uploaded "Test File_1.0.0_aarch64.app.tar.gz"
-        # and GitHub served it back as "Test.File_1.0.0_aarch64.app.tar.gz").
-        # tauri.conf.json's productName is "Centinelo Phone" - WITH a space
-        # - so every asset this pipeline produces hits this exact
-        # transform. Building latest.json's URLs by string-concatenating
-        # the LOCAL file's basename (this workflow's first draft did
-        # exactly that) would have shipped a manifest whose URLs 404 for
-        # every real install. Querying the draft's own asset list back
-        # from the GitHub API and matching by the stable part of each
-        # name (the file extension, which the mangling never touches -
-        # confirmed by the same probe: ".app.tar.gz" survived intact)
-        # sidesteps re-implementing GitHub's undocumented transform at all.
+      - name: Resolve real asset names from GitHub and build latest.json
+        # GitHub replaces spaces in asset filenames with periods, and a
+        # DRAFT release's `.url` from the API is a placeholder
+        # (`releases/download/untagged-<hash>/<name>`) that never becomes
+        # correct once published. So: never read `.url` from the API -
+        # take only the real `.name` and build `releases/download/<tag>/
+        # <name>` ourselves, deterministically, from the tag already
+        # resolved above.
         env:
           VERSION: ${{ needs.preflight.outputs.version }}
           TAG: ${{ needs.preflight.outputs.tag }}
@@ -1163,18 +1156,25 @@ jobs:
         run: |
           set -euo pipefail
           gh release view "$TAG" --repo fegone/Centinelo-Phone --json assets \
-            --jq '.assets[] | "\(.name)\t\(.url)"' > dist/real-asset-urls.tsv
-          echo "-- real asset URLs GitHub assigned --"
-          cat dist/real-asset-urls.tsv
+            --jq '.assets[] | .name' > dist/real-asset-names.txt
+          echo "-- real asset names GitHub assigned --"
+          cat dist/real-asset-names.txt
 
-          find_real_url() {
-            # $1: regex suffix to match against the NAME column
-            # (case-sensitive, matches this repo's own asset naming).
-            # Fails on zero OR more-than-one match - a duplicate match
-            # would otherwise silently concatenate two URLs into one
-            # multi-line jq --arg value below, producing a syntactically
-            # "valid" but garbage latest.json instead of a clean failure.
-            awk -F'\t' -v suffix="$1" '$1 ~ (suffix "$"){print $2; n++} END{exit (n == 1) ? 0 : 1}' dist/real-asset-urls.tsv
+          find_real_name() {
+            # $1: regex suffix to match against each name (case-sensitive,
+            # matches this repo's own asset naming). Fails on zero OR
+            # more-than-one match - a duplicate match would otherwise
+            # silently pick an arbitrary one instead of failing loudly.
+            awk -v suffix="$1" '$0 ~ (suffix "$"){print; n++} END{exit (n == 1) ? 0 : 1}' dist/real-asset-names.txt
+          }
+
+          download_url_for_name() {
+            # Deterministic construction (see step comment above for why):
+            # never derived from the API's `.url`, only from the tag this
+            # job already resolved in preflight and the asset's real name.
+            local name="$1" encoded
+            encoded="$(jq -rn --arg n "$name" '$n | @uri')"
+            printf 'https://github.com/fegone/Centinelo-Phone/releases/download/%s/%s' "$TAG" "$encoded"
           }
 
           PLATFORMS='{}'
@@ -1183,7 +1183,8 @@ jobs:
             SIG="$(find dist/macos -maxdepth 1 -name '*.app.tar.gz.sig' | head -n1)"
             [[ -n "$SIG" ]] || { echo "::error::macOS assets downloaded but .app.tar.gz.sig missing locally" >&2; exit 1; }
             SIGNATURE="$(cat "$SIG")"
-            URL="$(find_real_url '\.app\.tar\.gz')" || { echo "::error::no uploaded release asset ends with .app.tar.gz - macOS updater artifact did not actually upload" >&2; exit 1; }
+            NAME="$(find_real_name '\.app\.tar\.gz')" || { echo "::error::no uploaded release asset ends with .app.tar.gz - macOS updater artifact did not actually upload" >&2; exit 1; }
+            URL="$(download_url_for_name "$NAME")"
             PLATFORMS="$(jq --arg sig "$SIGNATURE" --arg url "$URL" '. + {"darwin-aarch64": {signature: $sig, url: $url}}' <<<"$PLATFORMS")"
             echo "-- darwin-aarch64 -> $URL"
           fi
@@ -1196,7 +1197,8 @@ jobs:
             # ends in .sig, not .exe, so it actually would NOT match -
             # but excluding it explicitly keeps this immune to a future
             # sig-naming change instead of relying on that distinction).
-            URL="$(awk -F'\t' '$1 ~ /\.exe$/ && $1 !~ /\.exe\.sig$/{print $2; n++} END{exit (n == 1) ? 0 : 1}' dist/real-asset-urls.tsv)" || { echo "::error::no uploaded release asset ends with .exe (excluding .exe.sig), or more than one did - Windows updater artifact did not actually upload cleanly" >&2; exit 1; }
+            NAME="$(awk '/\.exe$/ && !/\.exe\.sig$/{print; n++} END{exit (n == 1) ? 0 : 1}' dist/real-asset-names.txt)" || { echo "::error::no uploaded release asset ends with .exe (excluding .exe.sig), or more than one did - Windows updater artifact did not actually upload cleanly" >&2; exit 1; }
+            URL="$(download_url_for_name "$NAME")"
             PLATFORMS="$(jq --arg sig "$SIGNATURE" --arg url "$URL" '. + {"windows-x86_64": {signature: $sig, url: $url}}' <<<"$PLATFORMS")"
             echo "-- windows-x86_64 -> $URL"
           fi
@@ -1242,40 +1244,23 @@ jobs:
             echo "OK: windows-x86_64 signature matches"
           fi
 
-      - name: Upload latest.json to the draft
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ needs.preflight.outputs.tag }}
-        run: |
-          set -euo pipefail
-          # Retry with backoff (2026-07-17, 4R resilience fix) - see the
-          # "Create the release as a DRAFT" step above for the full
-          # rationale. This one matters most: a Release that's published
-          # WITHOUT latest.json breaks the auto-updater for every installed
-          # client, and this upload happens after the draft already has the
-          # platform installers on it, so it's exactly the kind of
-          # mid-publish step a transient timeout must not be allowed to
-          # skip silently.
-          retry_gh() {
-            local attempt=1 max=3 delay=5
-            until "$@"; do
-              if (( attempt >= max )); then
-                echo "::error::gh command failed after $max attempts: $*" >&2
-                return 1
-              fi
-              echo "-- attempt $attempt/$max failed ($*), retrying in ${delay}s..." >&2
-              sleep "$delay"
-              delay=$(( delay * 3 ))
-              attempt=$(( attempt + 1 ))
-            done
-          }
-          retry_gh gh release upload "$TAG" --repo fegone/Centinelo-Phone dist/latest.json
-
-      - name: Publish the release (flips it live - the one moment it becomes public)
-        # Everything above ran against a DRAFT, invisible to the update
-        # endpoint and the public releases page alike. This is the single
-        # step that makes it real - only reached once every asset,
-        # signature, and the manifest itself have all been verified.
+      - name: Publish the release with binaries only (latest.json comes later, see next steps)
+        # Publishing BEFORE latest.json is uploaded is deliberate (2026-08-12
+        # RESILIENCE fix-pass): the URL construction above is already
+        # deterministic from tag+name, so nothing requires latest.json to
+        # exist before the release goes live. Publishing the binaries first
+        # lets the next step verify their REAL download URLs - the exact
+        # ones about to go into latest.json - against the real, published
+        # release, before that manifest is the one artifact every installed
+        # client's auto-updater trusts. If the verify step fails, the
+        # release sits published with installers but no latest.json: a
+        # missing/unfetchable manifest makes the plugin's own `check()`
+        # reject with `Error::ReleaseNotFound` (tauri-plugin-updater
+        # 2.10.1's updater.rs, `remote_release.ok_or(...)`) - the app
+        # surfaces that as a quiet Settings-only status (`shouldShowBanner`
+        # in shell/ui/js/updater.js excludes check-origin errors from the
+        # main-window banner) and retries on the next check, never a
+        # broken "update available" that 404s on download.
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.preflight.outputs.tag }}
@@ -1297,10 +1282,7 @@ jobs:
           fi
           # Retry with backoff (2026-07-17, 4R resilience fix) - see the
           # "Create the release as a DRAFT" step above for the full
-          # rationale. This is the step that flips the release live; a
-          # transient failure HERE (after latest.json is already uploaded
-          # and verified) would otherwise leave a fully-populated but
-          # still-draft release sitting invisible to the update endpoint.
+          # rationale. This is the step that flips the release live.
           retry_gh() {
             local attempt=1 max=3 delay=5
             until "$@"; do
@@ -1315,6 +1297,80 @@ jobs:
             done
           }
           retry_gh gh release edit "$TAG" --repo fegone/Centinelo-Phone "${FLAGS[@]}"
+
+      - name: Verify latest.json download URLs resolve (HTTP 200)
+        # Trip-wire for the exact class of bug this pipeline shipped twice
+        # in prod before 2026-08-12 (centinelo-v2.0.0, centinelo-v2.0.1): a
+        # manifest that LOOKS well-formed but whose URL(s) 404 for every
+        # real installed client. Runs AFTER "Publish the release" and
+        # BEFORE "Upload latest.json" on purpose - `releases/download/
+        # <tag>/<name>` is only guaranteed to resolve once the release is
+        # published, and checking a URL before the manifest carrying it is
+        # even uploaded means a failure here never leaves a broken
+        # manifest live (see the previous step's comment for what a
+        # missing manifest does instead). URLs are read straight from the
+        # `dist/latest.json` this job already built (not re-derived from
+        # `dist/macos`/`dist/windows` a third time), so this can never
+        # silently diverge from what will actually be uploaded. A GitHub
+        # asset that was JUST published can take a few seconds to become
+        # servable from the CDN edge, hence retry with backoff.
+        env:
+          TAG: ${{ needs.preflight.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mapfile -t urls < <(jq -r '.platforms[].url' dist/latest.json)
+          [[ "${#urls[@]}" -gt 0 ]] || { echo "::error::latest.json has no platform URLs to verify - should be unreachable, publish-release already refused an empty platforms map earlier" >&2; exit 1; }
+
+          fail=0
+          for url in "${urls[@]}"; do
+            code="000"
+            max=5
+            delay=5
+            for (( attempt=1; attempt<=max; attempt++ )); do
+              code="$(curl -sL --connect-timeout 5 --max-time 15 -o /dev/null -w '%{http_code}' "$url" || echo 000)"
+              [[ "$code" == "200" ]] && break
+              if (( attempt < max )); then
+                echo "-- attempt $attempt/$max: $url -> HTTP $code, retrying in ${delay}s..." >&2
+                sleep "$delay"
+                delay=$(( delay * 2 ))
+              fi
+            done
+            if [[ "$code" != "200" ]]; then
+              echo "::error::latest.json URL unreachable after $max attempts (HTTP $code): $url - this is the auto-updater endpoint every installed client will hit. The release $TAG is now published WITHOUT latest.json (a broken-but-not-misleading state, see the publish step's comment - no client sees a fake update). This job's own 'Clean up a leftover DRAFT' step at the top of this SAME job refuses to touch a published release, so a plain re-run of this workflow for $TAG will fail there too. To retry: first delete this release (the git tag itself is untouched) with 'gh release delete $TAG --repo fegone/Centinelo-Phone --yes', THEN re-run this workflow for $TAG (workflow_dispatch, or move/re-push the tag)." >&2
+              fail=1
+            else
+              echo "OK: $url -> HTTP 200"
+            fi
+          done
+          [[ "$fail" -eq 0 ]] || exit 1
+
+      - name: Upload latest.json to the published release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # Retry with backoff (2026-07-17, 4R resilience fix) - see the
+          # "Create the release as a DRAFT" step above for the full
+          # rationale. `gh release upload` works identically against an
+          # already-published release as it did against the draft this
+          # step used to run before - only the ORDER changed (2026-08-12
+          # RESILIENCE fix-pass, see "Publish the release" step's comment),
+          # not the upload mechanics themselves.
+          retry_gh() {
+            local attempt=1 max=3 delay=5
+            until "$@"; do
+              if (( attempt >= max )); then
+                echo "::error::gh command failed after $max attempts: $*" >&2
+                return 1
+              fi
+              echo "-- attempt $attempt/$max failed ($*), retrying in ${delay}s..." >&2
+              sleep "$delay"
+              delay=$(( delay * 3 ))
+              attempt=$(( attempt + 1 ))
+            done
+          }
+          retry_gh gh release upload "$TAG" --repo fegone/Centinelo-Phone dist/latest.json
 
       - name: Job summary
         env:
