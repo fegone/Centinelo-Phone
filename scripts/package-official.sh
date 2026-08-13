@@ -82,6 +82,7 @@ PREMIUM_CONSOLE_ASSETS=""
 OUTPUT_DIR=""
 OPENSSL_DLL_DIR=""
 SKIP_OPENSSL_DLLS=0
+NO_UPDATER_ARTIFACTS=0
 
 # Self-contained --help text (4R/READABILITY fix 2026-07-16: this used to be
 # `sed -n '2,55p' "$0"` against the header comment above — fragile hardcoded
@@ -179,6 +180,23 @@ Options:
                                    this for a build meant to run on a real
                                    machine. Mutually exclusive with
                                    --openssl-dll-dir.
+  --no-updater-artifacts           CI-only: pass tauri.ci.conf.json
+                                   (bundle.createUpdaterArtifacts=false) into the internal
+                                   `tauri build`, so it skips producing the updater
+                                   .tar.gz/.zip + .sig that needs the production
+                                   TAURI_SIGNING_PRIVATE_KEY. tauri.conf.json has the production
+                                   updater pubkey but CI never holds the matching secret, so without
+                                   this flag tauri build hard-fails on the signer with
+                                   "A public key has been found, but no private key". CI
+                                   verification jobs (e.g. windows-installer.yml's smoke test)
+                                   pass this; release.yml (which holds the real signing key)
+                                   NEVER does - it must keep producing signed updater artifacts.
+                                   Everything ELSE the build verifies (full release compile, .app /
+                                   .exe / .msi bundling, entitlements, bundle.resources) is
+                                   unaffected - only the updater-artifact step is skipped. If you
+                                   add a NEW packaging job that runs `tauri build` (directly or via
+                                   this script) WITHOUT the production signing key, you MUST pass
+                                   this flag / --config src-tauri/tauri.ci.conf.json too.
   -h, --help                      Show this help.
 
 Secrets/paths are ALWAYS CLI flags or env, NEVER hardcoded. This script
@@ -221,6 +239,8 @@ while [[ $# -gt 0 ]]; do
             OPENSSL_DLL_DIR="$2"; shift 2 ;;
         --skip-openssl-dlls)
             SKIP_OPENSSL_DLLS=1; shift ;;
+        --no-updater-artifacts)
+            NO_UPDATER_ARTIFACTS=1; shift ;;
         -h|--help)
             usage; exit 0 ;;
         *)
@@ -591,7 +611,19 @@ if [[ "$TARGET" == "macos" ]]; then
         echo "-- Skipping shell build (--skip-shell-build)"
     else
         echo "-- Building shell/ (tauri build, release, macOS .app bundle)"
-        (cd shell && npm install && npx tauri build --bundles app)
+        # --no-updater-artifacts: CI builds that lack the production signing
+        # key add --config src-tauri/tauri.ci.conf.json
+        # (bundle.createUpdaterArtifacts=false) so tauri build does NOT try
+        # to sign the updater .tar.gz+.sig and hard-fail on "A public key
+        # has been found, but no private key". Everything else (full release
+        # compile, .app bundle, entitlements) is still produced and verified.
+        # release.yml never sets this flag - it holds the real key and MUST
+        # keep producing signed updater artifacts.
+        if [[ "$NO_UPDATER_ARTIFACTS" -eq 1 ]]; then
+            (cd shell && npm install && npx tauri build --bundles app --config src-tauri/tauri.ci.conf.json)
+        else
+            (cd shell && npm install && npx tauri build --bundles app)
+        fi
     fi
 else
     echo "-- Windows: shell build deferred to step 9b (after premium artifacts are staged)"
@@ -908,8 +940,26 @@ if [[ "$TARGET" == "windows" ]]; then
     else
         echo
         generate_windows_resources_config
-        echo "-- Building the Windows installer (tauri build --config tauri.official.generated.json, nsis+msi)"
-        (cd shell && npm install && npx tauri build --config src-tauri/tauri.official.generated.json --bundles nsis,msi)
+        # --no-updater-artifacts: appends a SECOND --config
+        # (src-tauri/tauri.ci.conf.json, createUpdaterArtifacts=false) which
+        # Tauri deep-merges AFTER tauri.official.generated.json. The official
+        # generated config only carries bundle.resources; it leaves
+        # createUpdaterArtifacts at tauri.conf.json's default (true), which is
+        # why every CI run of this script since 2026-07-18 hard-failed on the
+        # signer ("public key found, no private key") - tauri.conf.json has the
+        # production pubkey but no secret is on CI. The second --config turns
+        # off ONLY the updater-artifact step; the NSIS .exe + MSI .msi are
+        # still produced and the smoke test still verifies bundle.resources
+        # rode into both (that is the whole point of this job). release.yml
+        # never passes --no-updater-artifacts, so its signed updater artifacts
+        # stay on.
+        if [[ "$NO_UPDATER_ARTIFACTS" -eq 1 ]]; then
+            echo "-- Building the Windows installer (tauri build --config tauri.official.generated.json + --config tauri.ci.conf.json [updater artifacts OFF], nsis+msi)"
+            (cd shell && npm install && npx tauri build --config src-tauri/tauri.official.generated.json --config src-tauri/tauri.ci.conf.json --bundles nsis,msi)
+        else
+            echo "-- Building the Windows installer (tauri build --config tauri.official.generated.json, nsis+msi)"
+            (cd shell && npm install && npx tauri build --config src-tauri/tauri.official.generated.json --bundles nsis,msi)
+        fi
         NSIS_OUT_DIR="$REPO_ROOT/shell/src-tauri/target/release/bundle/nsis"
         MSI_OUT_DIR="$REPO_ROOT/shell/src-tauri/target/release/bundle/msi"
         # 4R/RESILIENCE fix 2026-07-16: `tauri build` exiting 0 is not proof

@@ -1,5 +1,32 @@
 name: windows installer (F5 packaging)
 
+# ──────────────────────────────────────────────────────────────────────
+# CI-ONLY SIGNING NOTE (read this before adding any packaging job).
+#
+# tauri.conf.json ships bundle.createUpdaterArtifacts=true AND the real
+# production updater pubkey (plugins.updater.pubkey) - both are CORRECT for
+# releases. But producing the updater .tar.gz+.sig needs the offline
+# TAURI_SIGNING_PRIVATE_KEY, which ONLY lives in release.yml. Any OTHER
+# workflow that runs `tauri build` (directly, or via
+# scripts/package-official.sh) will hard-fail on the signer:
+#     "A public key has been found, but no private key. Make sure to set
+#      TAURI_SIGNING_PRIVATE_KEY environment variable."
+# That is exactly what broke THIS workflow (and shell-build.yml) for every
+# commit since 2026-07-18, when the production pubkey landed.
+#
+# THE RULE: a packaging job that does NOT hold the production signing key
+# must turn off ONLY the updater-artifact step - nothing else - so it still
+# verifies the full compile + .exe/.msi/.app bundling + bundle.resources.
+#   - Direct `tauri build` jobs -> add: --config src-tauri/tauri.ci.conf.json
+#     (this is what shell-build.yml does).
+#   - package-official.sh callers -> add: --no-updater-artifacts
+#     (this is what THIS workflow does; the flag appends that same config
+#      inside the script - see package-official.sh --help).
+# The CI config sets bundle.createUpdaterArtifacts=false and is deep-merged,
+# so EVERYTHING else is verified exactly as before. Do NOT do this in
+# release.yml: that one owns the real key and MUST keep signing.
+# ──────────────────────────────────────────────────────────────────────
+
 # Builds the actual Windows installer (.msi via WiX + .exe via NSIS) for
 # Centinelo Phone, using shell/src-tauri/tauri.official.conf.json's
 # `bundle.resources` override (filtered per-run by scripts/package-
@@ -187,7 +214,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ARGS=(--target windows --skip-core-build --openssl-dll-dir "$PWD/fake-openssl-dlls" --output-dir "dist/windows-${{ matrix.combo }}")
+          # --no-updater-artifacts: see the CI-ONLY SIGNING NOTE at the top
+          # of this file. This job has NO production signing key on CI, so
+          # package-official.sh must skip the updater-artifact signing step
+          # (which would hard-fail the whole matrix on the signer). It still
+          # produces the NSIS .exe + MSI .msi and the steps below still prove
+          # bundle.resources really rode into both - that is what this job is
+          # FOR, and it is unaffected by turning off updater artifacts.
+          ARGS=(--target windows --skip-core-build --no-updater-artifacts --openssl-dll-dir "$PWD/fake-openssl-dlls" --output-dir "dist/windows-${{ matrix.combo }}")
           if [[ "${{ matrix.combo }}" != "community" ]]; then
             ARGS+=(--premium-dylib "$PWD/fake-premium/centinelo_premium.dll" --premium-sig "$PWD/fake-premium/centinelo_premium.dll.sig")
           fi

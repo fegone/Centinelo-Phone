@@ -14,6 +14,25 @@ name: shell build (v2 desktop shell)
 # it does NOT build core/, since shell/'s sidecar binary path is resolved
 # at runtime (see src-tauri/src/sidecar.rs resolve_core_binary), not a
 # compile-time dependency. core/ has its own CI in core-build.yml.
+#
+# --- Why `--config src-tauri/tauri.ci.conf.json` on the build steps ---
+# tauri.conf.json has bundle.createUpdaterArtifacts=true AND the real
+# production updater pubkey (plugins.updater.pubkey) — both are correct
+# for RELEASES (release.yml builds updater artifacts and signs them with
+# the offline TAURI_SIGNING_PRIVATE_KEY). But on every ordinary push this
+# CI job only verifies that the app *compiles and bundles*; it produces no
+# distributable artifact, so it must never hold the production signing
+# key. Without that key, tauri build's signer fails hard:
+#   "A public key has been found, but no private key. Make sure to set
+#    TAURI_SIGNING_PRIVATE_KEY environment variable."
+# That broke every run since the production pubkey landed (2026-07-18).
+# The fix: pass a CI-only config (src-tauri/tauri.ci.conf.json) that sets
+# createUpdaterArtifacts=false. It is DEEP-MERGED onto tauri.conf.json by
+# the Tauri CLI, so EVERYTHING else (the full Rust release compile, the
+# static frontend, the .app / .exe bundling, the macOS entitlements,
+# windows webview/nsis config) is verified exactly as before — only the
+# updater .tar.gz/.zip + .sig (the sole step that needs the private key)
+# is skipped. The pubkey in tauri.conf.json is left untouched.
 
 on:
   push:
@@ -64,12 +83,13 @@ jobs:
         working-directory: shell/src-tauri
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: Build the Tauri app (.app bundle, unsigned)
+      - name: Build the Tauri app (.app bundle, no updater signing)
         # --bundles app (not the default "all"): DMG creation shells out to
         # Finder/AppleScript to lay out the installer window, which is
         # unnecessary flakiness for a routine build-verification job - a
         # release workflow can build the full DMG separately.
-        run: npx tauri build --bundles app
+        # --config disables updater-artifact signing for CI (see header).
+        run: npx tauri build --bundles app --config src-tauri/tauri.ci.conf.json
 
   windows:
     name: Windows (experimental, allowed to fail)
@@ -97,8 +117,11 @@ jobs:
         working-directory: shell/src-tauri
         run: cargo check --all-targets
 
-      - name: Build the Tauri app (NSIS installer, unsigned)
+      - name: Build the Tauri app (NSIS installer, no updater signing)
         # "app" is a macOS-only bundle type; nsis is Windows' equivalent
         # default. Unverified on real Windows this session - this whole
         # job is continue-on-error for exactly that reason.
-        run: npx tauri build --bundles nsis
+        # --config disables updater-artifact signing for CI (see header):
+        # without it the same "public key found, no private key" error
+        # that broke macOS would break Windows too.
+        run: npx tauri build --bundles nsis --config src-tauri/tauri.ci.conf.json
