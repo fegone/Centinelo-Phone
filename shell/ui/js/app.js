@@ -1947,6 +1947,7 @@ function remoteSttProbeText(result) {
 }
 
 async function openSettings() {
+  let settingsLoadFailed = false;
   try {
     const [account, theme, corePath, adminStatus, favorites, bridge, license, availability] = await Promise.all([
       invoke("get_account_settings"),
@@ -1995,7 +1996,23 @@ async function openSettings() {
     $("save-status").textContent = "";
     $("save-status").className = "status";
   } catch (e) {
+    // Do NOT swallow this. Every field on this screen is populated from the
+    // calls above; if they fail we still reveal the screen below, and the
+    // operator gets a blank page with no explanation - reported from the
+    // field 2026-08-13 as "Settings opens white". Surface it instead: a
+    // visible banner, and a line in the on-disk log (console.error alone is
+    // invisible in a packaged build - there is no console to read).
     console.error("openSettings load failed", e);
+    settingsLoadFailed = true;
+    try {
+      showBanner(t("settings.loadFailed"), "error");
+    } catch (_) { /* banner is best-effort; never block opening the screen */ }
+    try {
+      invoke("log_frontend_error", {
+        kind: "settings_load_failed",
+        message: String(e && e.message ? e.message : e),
+      });
+    } catch (_) { /* logging is best-effort */ }
   }
   renderUpdaterUI();
   applyLockUI();
