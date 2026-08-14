@@ -1174,6 +1174,28 @@ pub fn open_console(app: tauri::AppHandle) -> Result<(), String> {
     crate::console::open_or_focus(&app)
 }
 
+/// Console window's counterpart to `frontend_log::log_frontend_error` -
+/// invoked by `INDEX_HTML`'s early inline capture script the instant a
+/// fatal pre-render failure happens (a vendored console-ui script/style
+/// failing to load, or any uncaught exception/rejection before `mount()`
+/// completes). See `console.rs::report_frontend_fatal` - unlike the main
+/// window's version this one can actually close the window, since a
+/// `.decorations(false)` window with broken content has no other way for
+/// the operator to dismiss it.
+#[tauri::command(rename_all = "snake_case")]
+pub fn console_frontend_fatal(app: tauri::AppHandle, report: crate::frontend_log::FrontendErrorReport) {
+    crate::console::report_frontend_fatal(&app, report);
+}
+
+/// Called once by `INDEX_HTML`'s `mount()` after the console-ui bundle
+/// actually rendered - disarms the load-timeout watchdog and the
+/// fatal-error window-close path for the rest of this window's lifetime.
+/// See `console.rs::mark_ready`.
+#[tauri::command(rename_all = "snake_case")]
+pub fn console_frontend_ready() {
+    crate::console::mark_ready();
+}
+
 // ---- EngineBridge verbs (console) -------------------------------------
 //
 // One thin command per core/PROTOCOL.md verb, matching this file's

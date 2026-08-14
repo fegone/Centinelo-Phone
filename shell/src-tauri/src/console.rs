@@ -44,9 +44,12 @@
 
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
-use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
+use crate::frontend_log::{self, FrontendErrorReport};
 use crate::premium::{CapabilityStatusView, PremiumHandle};
 
 /// Custom URI scheme the "console" window loads from - see this module's
@@ -65,6 +68,120 @@ const CAPABILITY: &str = "blf_console";
 
 const ASSETS_DIR_ENV: &str = "CENTINELO_PREMIUM_ASSETS_DIR";
 const ASSETS_DIR_NAME: &str = "premium-console-assets";
+
+/// Log target for everything console-window-specific, deliberately
+/// distinct from `frontend_log.rs`'s `"app_lib::frontend"` (the *main*
+/// window's own crash-report target). Born from a real mix-up during this
+/// bug's own diagnosis: an earlier session remote-debugged a window titled
+/// "Centinelo Console" believing it was the main window, which cost hours.
+/// Every log line this module emits also starts with the literal
+/// `[console]` tag for the same reason, in case a future reader is
+/// scanning a flat log file without `RUST_LOG` target filtering.
+const LOG_TARGET: &str = "app_lib::console";
+
+/// How long [`open_or_focus`] waits for the console-ui bundle to call
+/// [`mark_ready`] (`console_frontend_ready`, wired at the end of
+/// `INDEX_HTML`'s `mount()`) before concluding the window is never going
+/// to render anything and closing it - see this module's "trapped window"
+/// doc on [`open_or_focus`] for why an undecorated window that fails to
+/// load must never just sit there. Generous on purpose: `get_favorites`
+/// (the one IPC round-trip `boot()` waits on before `mount()`) is a local
+/// settings-file read, not a network call, so a healthy boot finishes in
+/// well under a second - this is sized for a cold machine under load, not
+/// the happy path.
+const LOAD_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Whether the console-ui bundle has confirmed it actually rendered
+/// (`mark_ready`) for the *current* window instance - reset to `false`
+/// every time [`open_or_focus`] builds a fresh window. A plain module-level
+/// flag is enough because [`WINDOW_LABEL`] is a singleton: `open_or_focus`
+/// itself never creates a second "console" window, it finds-or-focuses the
+/// existing one instead.
+static READY: AtomicBool = AtomicBool::new(false);
+
+/// Whether this window instance's "never leave the operator trapped"
+/// handling has already fired - guards [`close_after_failure`] against
+/// running twice (a fatal frontend report racing the [`LOAD_TIMEOUT`]
+/// watchdog, or either racing a window the operator already closed
+/// themselves via Escape) and, separately, suppresses a spurious
+/// load-failure banner when the window closes normally before ever
+/// signalling ready (see the `Destroyed` handler in [`open_or_focus`]).
+static FAILURE_HANDLED: AtomicBool = AtomicBool::new(false);
+
+/// Marks the current console window as having actually rendered -
+/// `commands::console_frontend_ready` (invoked by `INDEX_HTML`'s
+/// `mount()`, both on a real roster and on the `get_favorites` failure
+/// fallback - an empty roster still means the window itself works) calls
+/// this. Disarms both the load-timeout watchdog and
+/// [`report_frontend_fatal`]'s window-closing behavior for the rest of
+/// this window's lifetime - a *later* JS error (e.g. a runtime bridge hiccup
+/// once the operator is already using the console) is a bug worth logging,
+/// not a reason to slam a working window shut.
+pub fn mark_ready() {
+    READY.store(true, Ordering::SeqCst);
+    log::info!(target: LOG_TARGET, "[console] frontend signalled ready");
+}
+
+/// `commands::console_frontend_fatal` - the console window's counterpart to
+/// `frontend_log::log_frontend_error`, reached by the early inline capture
+/// script at the top of `INDEX_HTML` (armed before any vendored console-ui
+/// script runs, same "before ANYTHING else can fail" reasoning as
+/// `ui/js/error-capture.js`'s own doc comment). Unlike the main window's
+/// version, this one can actually act: a pre-`mark_ready` report means the
+/// console-ui bundle failed to boot, and this undecorated window has no OS
+/// chrome of its own to fall back on - see [`close_after_failure`].
+pub fn report_frontend_fatal(app: &AppHandle, report: FrontendErrorReport) {
+    let line = frontend_log::format_log_line(&report);
+    log::error!(target: LOG_TARGET, "[console] {line}");
+    if !READY.load(Ordering::SeqCst) {
+        close_after_failure(app, "frontend_error");
+    }
+}
+
+/// Closes the console window and tells the main window why, exactly once
+/// per window instance ([`FAILURE_HANDLED`]) - the shared tail end of both
+/// [`report_frontend_fatal`] and the [`LOAD_TIMEOUT`] watchdog in
+/// [`open_or_focus`]. `ui/js/app.js` listens for `"console-load-failed"`
+/// (mirrors `tray.rs`'s `sync_availability_menu` broadcast-and-let-the-
+/// window-that-cares-listen pattern) and shows a banner - the console
+/// itself cannot, by construction, since the whole point is that its own
+/// content never rendered.
+fn close_after_failure(app: &AppHandle, reason: &str) {
+    if FAILURE_HANDLED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    if let Some(window) = app.get_webview_window(WINDOW_LABEL) {
+        let _ = window.close();
+    }
+    let _ = app.emit(
+        "console-load-failed",
+        serde_json::json!({ "reason": reason }),
+    );
+}
+
+/// Spawned once per fresh window build in [`open_or_focus`] - same
+/// plain-thread-plus-flag shape as `sidecar.rs`'s
+/// `arm_force_kill_watchdog` (this crate's existing convention for "wait,
+/// then act only if nothing cleared the flag in time" rather than pulling
+/// in an async timer). If [`mark_ready`] never fires within
+/// [`LOAD_TIMEOUT`] - no error was even thrown, the bundle just silently
+/// never got there - this is the backstop that guarantees the window
+/// closes anyway; [`report_frontend_fatal`] and the operator's own Escape
+/// key (wired client-side in `INDEX_HTML`) are the two faster paths that
+/// usually win the race.
+fn spawn_load_watchdog(app: &AppHandle) {
+    let app = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(LOAD_TIMEOUT);
+        if !READY.load(Ordering::SeqCst) {
+            log::error!(
+                target: LOG_TARGET,
+                "[console] frontend did not signal ready within {LOAD_TIMEOUT:?} — closing the window instead of leaving an undecorated, uncloseable blank window onscreen"
+            );
+            close_after_failure(&app, "timeout");
+        }
+    });
+}
 
 /// Whether a [`CapabilityStatusView`] means "the console-ui feature this
 /// shell implements should be offered" - i.e. whether the premium license
@@ -138,6 +255,40 @@ pub fn is_unlocked(premium: &PremiumHandle) -> bool {
 /// devtools) even with the button hidden - the *window itself* is the
 /// thing that must never appear unlicensed, not merely the button that
 /// usually opens it.
+///
+/// # The trapped-window problem this also guards against
+///
+/// `.decorations(false)` below means this window has **no OS titlebar at
+/// all** - its close/minimize controls are hand-drawn DOM elements wired
+/// by `INDEX_HTML`'s own JS (see that constant's `mount()`). If the
+/// console-ui bundle this window loads over [`ASSET_SCHEME`] fails to
+/// render for any reason (a missing/corrupt `premium-console-assets/`
+/// file, a runtime exception in one of the vendored scripts, anything),
+/// there is nothing else in the window an operator could click, drag, or
+/// even see - a completely blank, completely uncloseable window sitting on
+/// top of the app, recoverable only via Alt+F4/Cmd+Q, which no user is
+/// going to guess. Three independent, redundant safety nets exist so this
+/// can never actually happen, listed fastest-to-slowest:
+///
+/// 1. **Escape key** - wired in `INDEX_HTML`'s very first inline
+///    `<script>`, before any vendored console-ui file is even requested.
+///    Works even if every single one of those files 404s.
+/// 2. **[`report_frontend_fatal`]** - the same early script's
+///    `window.addEventListener("error"/"unhandledrejection", ..., true)`
+///    reports the first fatal failure (a failed script/style load, or an
+///    uncaught exception/rejection) straight to Rust, which closes the
+///    window immediately and tells the main window why.
+/// 3. **[`spawn_load_watchdog`]** - the backstop for the case where
+///    neither of the above fires at all (e.g. the webview's JS engine
+///    itself never runs anything) - closes the window unconditionally
+///    after [`LOAD_TIMEOUT`] if [`mark_ready`] never arrived.
+///
+/// None of this changes anything about how the window looks or behaves
+/// when the console-ui bundle actually loads (the common case, and the one
+/// the Vigilia mockup's fidelity criteria apply to) - `mark_ready` disarms
+/// both (2) and (3) for the rest of that window's lifetime the moment
+/// `mount()` finishes, and (1) never had any visible side effect to begin
+/// with.
 pub fn open_or_focus(app: &AppHandle) -> Result<(), String> {
     let premium = app
         .try_state::<PremiumHandle>()
@@ -152,12 +303,21 @@ pub fn open_or_focus(app: &AppHandle) -> Result<(), String> {
         return Ok(());
     }
 
+    log::info!(
+        target: LOG_TARGET,
+        "[console] opening window; assets_dir = {:?}",
+        assets_dir()
+    );
+
+    READY.store(false, Ordering::SeqCst);
+    FAILURE_HANDLED.store(false, Ordering::SeqCst);
+
     let url = WebviewUrl::CustomProtocol(
         format!("{ASSET_SCHEME}://localhost/index.html")
             .parse()
             .expect("static console URL is always a valid Url"),
     );
-    WebviewWindowBuilder::new(app, WINDOW_LABEL, url)
+    let window = WebviewWindowBuilder::new(app, WINDOW_LABEL, url)
         .title("Centinelo Console")
         .inner_size(1100.0, 720.0)
         .min_inner_size(900.0, 600.0)
@@ -165,6 +325,18 @@ pub fn open_or_focus(app: &AppHandle) -> Result<(), String> {
         .decorations(false)
         .build()
         .map_err(|e| e.to_string())?;
+
+    // A window the operator (or one of the safety nets above) closed
+    // normally, before `mark_ready` ever fired, is not a load failure -
+    // don't let a watchdog that's still mid-sleep pop a stale "console
+    // failed to load" banner over it after the fact.
+    window.on_window_event(|event| {
+        if matches!(event, tauri::WindowEvent::Destroyed) {
+            FAILURE_HANDLED.store(true, Ordering::SeqCst);
+        }
+    });
+
+    spawn_load_watchdog(app);
     Ok(())
 }
 
@@ -195,45 +367,107 @@ fn assets_dir() -> Option<PathBuf> {
 /// tags, never user input, but a local protocol handler reading arbitrary
 /// files off disk earns the same "verify, don't assume" care `premium.rs`
 /// gives the dylib load path).
+///
+/// Every outcome is logged at [`LOG_TARGET`] - a blank-console bug report
+/// with nothing but "it's blank" in it is nearly undiagnosable otherwise
+/// (this is exactly the failure mode `README.md`'s "Frontend error
+/// logging" section describes for the *main* window, which had zero
+/// tracing for a day before that history repeated itself here). A real
+/// Windows repro's log now says definitively whether the protocol handler
+/// ever ran at all, whether `assets_dir()` resolved, and which specific
+/// file 404'd - see this function's own log lines below rather than
+/// guessing from the frontend's own (best-effort, only reachable if *some*
+/// JS ran at all) [`report_frontend_fatal`] reports.
+///
+/// # CSP: investigated, ruled out
+///
+/// It's tempting to suspect `tauri.conf.json`'s `app.security.csp` here -
+/// this window's origin (`premium-console://localhost`) is a different
+/// scheme than the main window's, and CSP-blocked IPC was exactly
+/// `README.md`'s "Content-Security-Policy and the IPC startup watchdog"
+/// 2026-08-13 hotfix, one window class of bug up from this one. Traced
+/// through `tauri` 2.11.5's own source to be sure rather than guessing
+/// twice in this codebase: the configured CSP is only ever injected as an
+/// HTML `<meta>` tag by `AppManager::get_asset` (`tauri::manager::mod`),
+/// which is exclusively the code path behind `frontendDist`/`WebviewUrl::App`
+/// windows (the main window). A window built with `WebviewUrl::CustomProtocol`
+/// against an app-registered scheme - this window - never calls that
+/// function; nothing in `tauri`, `tauri-runtime-wry`, or `wry` itself
+/// injects a `Content-Security-Policy` header or meta tag into a plain
+/// `register_uri_scheme_protocol` response. So: no CSP applies to this
+/// window at all, in either direction (nothing to loosen, and nothing to
+/// blame here). If a future Tauri upgrade ever changes that, the symptom
+/// would most likely be `INDEX_HTML`'s big inline boot `<script>` refusing
+/// to run at all (CSP blocks inline scripts without `'unsafe-inline'`/a
+/// nonce) - which the early inline capture script (armed first, see
+/// [`open_or_focus`]'s doc) would report as an `unhandledrejection`-free,
+/// silent failure... except a CSP violation doesn't fire `window.onerror`
+/// either. Worth remembering if this bug ever resurfaces after a Tauri
+/// bump: check the WebView2/WKWebView devtools console directly for a
+/// `Content-Security-Policy` violation line, the same way `README.md`'s
+/// hotfix section was originally diagnosed.
 pub fn asset_protocol_handler(
     _ctx: tauri::UriSchemeContext<'_, tauri::Wry>,
     request: tauri::http::Request<Vec<u8>>,
 ) -> tauri::http::Response<Cow<'static, [u8]>> {
     let raw_path = request.uri().path();
     let route = raw_path.trim_start_matches('/');
-    let route = if route.is_empty() { "index.html" } else { route };
+    let route = if route.is_empty() {
+        "index.html"
+    } else {
+        route
+    };
 
     if route == "index.html" {
+        log::info!(target: LOG_TARGET, "[console] serving embedded index.html");
         return html_response(INDEX_HTML);
     }
 
     let Some(dir) = assets_dir() else {
+        log::error!(
+            target: LOG_TARGET,
+            "[console] 404 {route:?}: no premium-console-assets directory resolved (checked ${ASSETS_DIR_ENV} and <exe dir>/{ASSETS_DIR_NAME})"
+        );
         return not_found();
     };
     let Ok(canonical_dir) = dir.canonicalize() else {
+        log::error!(target: LOG_TARGET, "[console] 404 {route:?}: assets dir {dir:?} failed to canonicalize");
         return not_found();
     };
     let candidate = dir.join(route);
     let Ok(canonical) = candidate.canonicalize() else {
+        log::error!(target: LOG_TARGET, "[console] 404 {route:?}: {candidate:?} does not exist (or failed to canonicalize)");
         return not_found();
     };
     if !canonical.starts_with(&canonical_dir) {
-        log::warn!("premium console: asset request escaped assets dir: {route:?}");
+        log::warn!(target: LOG_TARGET, "[console] 404 {route:?}: asset request escaped assets dir");
         return not_found();
     }
 
     match std::fs::read(&canonical) {
-        Ok(bytes) => tauri::http::Response::builder()
-            .header(tauri::http::header::CONTENT_TYPE, content_type_for(&canonical))
-            .body(Cow::Owned(bytes))
-            .unwrap_or_else(|_| not_found()),
-        Err(_) => not_found(),
+        Ok(bytes) => {
+            log::info!(target: LOG_TARGET, "[console] served {route:?} ({} bytes)", bytes.len());
+            tauri::http::Response::builder()
+                .header(
+                    tauri::http::header::CONTENT_TYPE,
+                    content_type_for(&canonical),
+                )
+                .body(Cow::Owned(bytes))
+                .unwrap_or_else(|_| not_found())
+        }
+        Err(e) => {
+            log::error!(target: LOG_TARGET, "[console] 404 {route:?}: read of {canonical:?} failed: {e}");
+            not_found()
+        }
     }
 }
 
 fn html_response(body: &'static str) -> tauri::http::Response<Cow<'static, [u8]>> {
     tauri::http::Response::builder()
-        .header(tauri::http::header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .header(
+            tauri::http::header::CONTENT_TYPE,
+            "text/html; charset=utf-8",
+        )
         .body(Cow::Borrowed(body.as_bytes()))
         .expect("static index.html response is well-formed")
 }
@@ -269,9 +503,99 @@ const INDEX_HTML: &str = r##"<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Centinelo Console</title>
+<style>html,body{margin:0;height:100%;overflow:hidden}#console-host{height:100vh}</style>
+
+<!-- Trapped-window prevention (see console.rs's open_or_focus doc,
+     "The trapped-window problem this also guards against") - deliberately
+     the very first thing in <head>, before the stylesheets and every
+     vendored console-ui script below, same "armed before ANYTHING else
+     can fail" reasoning as the main window's ui/js/error-capture.js. This
+     window has .decorations(false) (no OS titlebar) and its own
+     close/minimize controls are hand-drawn DOM the vendored bundle below
+     wires up in mount() - if that bundle never runs, this script is the
+     only thing standing between the operator and an uncloseable blank
+     window. Inline, not an external <script src>, on purpose: unlike the
+     main window, no CSP is ever applied to this one (console.rs's own doc
+     traces through Tauri's source to confirm this precisely, so it isn't
+     blocked the way an inline script would be over there) - and an
+     external file would itself be one more premium-console-assets/ file
+     that could go missing, defeating the entire point. -->
+<script>
+(function () {
+  "use strict";
+  var reported = false;
+
+  function invoke(cmd, args) {
+    try {
+      return window.__TAURI__.core.invoke(cmd, args || {});
+    } catch (e) {
+      return Promise.reject(e);
+    }
+  }
+
+  function closeThisWindow() {
+    try { window.__TAURI__.window.getCurrentWindow().close(); } catch (e) { /* nothing else to do */ }
+  }
+
+  // Escape always closes this window, full stop - independent of whether
+  // console-ui's own titlebar close button (wired only once mount() below
+  // succeeds) ever exists.
+  document.addEventListener("keydown", function (ev) {
+    if (ev.key === "Escape" || ev.key === "Esc") closeThisWindow();
+  });
+
+  function reportFatal(kind, fields) {
+    if (reported) return; // one report is enough while the window unwinds
+    reported = true;
+    invoke("console_frontend_fatal", {
+      report: {
+        kind: kind,
+        level: "error",
+        message: String((fields && fields.message) || ""),
+        source: (fields && fields.source) || null,
+        line: (fields && fields.line) || null,
+        col: (fields && fields.col) || null,
+        stack: (fields && fields.stack) || null,
+      },
+    }).catch(function () { /* the Rust side's own watchdog is the backstop */ });
+  }
+
+  // Same capture-phase pattern as ui/js/error-capture.js: catches both a
+  // failed <script>/<link> load (non-bubbling, capture-phase-only event)
+  // and any uncaught exception thrown by a vendored script below.
+  window.addEventListener(
+    "error",
+    function (ev) {
+      var target = ev.target;
+      if (target && target !== window && target.tagName) {
+        reportFatal("resource", {
+          message: target.tagName + " failed to load: " + (target.src || target.href || ""),
+          source: target.src || target.href || "",
+        });
+        return;
+      }
+      reportFatal("error", {
+        message: ev.message,
+        source: ev.filename,
+        line: ev.lineno,
+        col: ev.colno,
+        stack: ev.error && ev.error.stack,
+      });
+    },
+    true
+  );
+  window.addEventListener("unhandledrejection", function (ev) {
+    var reason = ev.reason;
+    reportFatal("unhandledrejection", {
+      message: (reason && reason.message) || String(reason),
+      stack: reason && reason.stack,
+    });
+  });
+})();
+</script>
+
 <link rel="stylesheet" href="tokens.css">
 <link rel="stylesheet" href="console.css">
-<style>html,body{margin:0;height:100%;overflow:hidden}#console-host{height:100vh}</style>
 </head>
 <body>
 <div id="console-host"></div>
@@ -384,6 +708,14 @@ const INDEX_HTML: &str = r##"<!doctype html>
     }
 
     window.addEventListener("beforeunload", function () { app.destroy(); });
+
+    // Disarms the Rust-side load-timeout watchdog and the fatal-error
+    // window-close path (see console.rs's mark_ready doc) - the bundle
+    // reached this point, so the window is no longer at risk of being a
+    // blank, uncloseable trap. Fires on both the real-roster path and the
+    // get_favorites-failed fallback below (mount([])) - an empty roster
+    // still means the console itself rendered successfully.
+    invoke("console_frontend_ready").catch(function () { /* best-effort */ });
   }
 
   boot();

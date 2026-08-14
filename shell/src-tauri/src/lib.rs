@@ -285,6 +285,8 @@ pub fn run() {
             commands::premium_capability_status,
             commands::premium_diagnostic,
             commands::open_console,
+            commands::console_frontend_fatal,
+            commands::console_frontend_ready,
             commands::sidecar_hold,
             commands::sidecar_resume,
             commands::sidecar_mute,
