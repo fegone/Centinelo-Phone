@@ -19,6 +19,7 @@
 #define CENTINELO_CTRL_JSON_CMD_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 struct odict;   /* re_odict.h - forward declared so this header stays
                  * dependency-free; every real caller already has re.h. */
@@ -94,6 +95,31 @@ enum {
 				      *  with a clear error instead of letting
 				      *  account_set_audio_codecs() silently
 				      *  truncate it. */
+};   /* close the anonymous CENT_* enum above */
+
+/**
+ * A resolved audio codec's identity - the three fields set_codecs needs
+ * from a real baresip struct aucodec to build the fully-pinned
+ * "name/srate/ch" string account_set_audio_codecs()/audio_codecs_decode()
+ * resolves unambiguously. Dependency-free (no baresip.h) so the builder
+ * (cent_build_codecs_string(), below) is unit-testable in the standalone
+ * test binary; ctrl_json.c's cmd_set_codecs() adapts each resolved
+ * struct aucodec into one of these before calling the builder.
+ *
+ * Why srate/ch live here and not just .name: a BARE name ("opus") handed
+ * to account_set_audio_codecs() is a real, silent-fallback bug - opus
+ * registers at 48000/2, not the parser's 8000/1 bare-name default, so the
+ * bare name never resolves and account_aucodecl() then falls back to the
+ * ENTIRE compiled-in catalog (see ctrl_json.c cmd_set_codecs()'s top
+ * comment + core/BUILD.md "Findings"). Pinning the suffix here from the
+ * resolved aucodec closes that hole by construction - which is exactly
+ * what the unit test for cent_build_codecs_string() guards against a
+ * regression of.
+ */
+struct cent_codec_spec {
+	const char *name;   /**< codec name, e.g. "opus"/"pcmu"/"pcma"      */
+	uint32_t   srate;   /**< sample rate, e.g. opus 48000 / g711 8000   */
+	uint8_t    ch;      /**< channel count, e.g. opus 2 / g711 1        */
 };
 
 /**
@@ -200,5 +226,29 @@ struct cent_cmd {
 enum cent_cmd_type cent_cmd_decode(struct cent_cmd *out,
 				    const struct odict *od,
 				    const char **errmsg);
+
+/**
+ * Build the comma-separated "name/srate/ch,name/srate/ch,..." string
+ * account_set_audio_codecs() consumes, from already-resolved codec specs.
+ *
+ * Every srate/ch in the output is taken from the passed-in specs (which
+ * ctrl_json.c fills from the real struct aucodec it resolved via
+ * aucodec_find()) - NEVER a bare requested name and NEVER the 8000/1
+ * bare-name default audio_codecs_decode() would otherwise assume. That is
+ * the whole point of this function: it is the unit-tested guard against
+ * the silent-fallback bug (see struct cent_codec_spec's own comment).
+ *
+ * @param specs  Resolved codecs (each .name/.srate/.ch from a real struct
+ *               aucodec); may be NULL only if n == 0.
+ * @param n      Number of entries in specs (0 .. CENT_MAX_CODECS).
+ * @param buf    Output buffer; always NUL-terminated on return.
+ * @param sz     Size of buf in bytes.
+ *
+ * @return 0 on success, -1 if the result would not fit (treated by the
+ *         only caller as an internal/buffer error - the inputs are already
+ *         length-capped at this layer, so overflow is a bug, not bad input).
+ */
+int cent_build_codecs_string(const struct cent_codec_spec *specs, size_t n,
+			     char *buf, size_t sz);
 
 #endif /* CENTINELO_CTRL_JSON_CMD_H */

@@ -455,6 +455,96 @@ static void test_cmd_codecs_and_set_codecs(void)
 }
 
 
+/*
+ * v1.6 set_codecs: cent_build_codecs_string() (cmd.c) is the baresip-free
+ * half of cmd_set_codecs()'s defence against the bare-name silent-fallback
+ * bug - see cmd.h struct cent_codec_spec + core/BUILD.md "Findings" for the
+ * full writeup. The whole point is that it builds the fully-pinned
+ * "name/srate/ch" string from the RESOLVED codec's real srate/ch, not the
+ * bare requested name and not the 8000/1 bare-name default
+ * audio_codecs_decode() would otherwise assume. These checks pin exactly
+ * that property: revert the builder to emit a bare name (or a hard-coded
+ * 8000/1 suffix) and the opus assertions below fail - that is what makes
+ * this a real regression guard, not an existence test.
+ *
+ * Why opus specifically: it is the codec whose real registration
+ * (48000/2) does NOT match the parser's bare-name 8000/1 default, so it is
+ * the exact codec the bug bites (a bare "opus" never resolves, the account
+ * list ends up empty, and account_aucodecl() falls back to the ENTIRE
+ * catalog - the opposite of the requested restriction, silently).
+ */
+static void test_build_codecs_string(void)
+{
+	char buf[256];
+	int rc;
+
+	/* opus alone: the bug-shaped codec. A bare "opus" or "opus/8000/1"
+	 * would both be wrong here - this is what a reintroduction of the bug
+	 * would actually produce. */
+	rc = cent_build_codecs_string(
+		&(struct cent_codec_spec){"opus", 48000, 2}, 1, buf, sizeof(buf));
+	CHECK(rc == 0, "opus single: returns 0");
+	CHECK_STREQ(buf, "opus/48000/2",
+		    "opus single: fully-pinned 48000/2 from resolved aucodec");
+	CHECK(strcmp(buf, "opus") != 0,
+	      "opus single: NOT bare 'opus' (the bare-name bug)");
+	CHECK(strcmp(buf, "opus/8000/1") != 0,
+	      "opus single: NOT the 8000/1 bare-name default");
+
+	/* the real run-spike.sh / e2e order: opus, pcmu, pcma. pcmu/pcma
+	 * happen to match the 8000/1 default, so a buggy bare-name builder
+	 * would coincidentally produce the right suffix for those two - but
+	 * opus must still read 48000/2 in the joined string, which catches
+	 * the regression even in the presence of the masking G.711 entries. */
+	rc = cent_build_codecs_string(
+		(struct cent_codec_spec[]){{"opus", 48000, 2},
+					   {"pcmu", 8000, 1},
+					   {"pcma", 8000, 1}},
+		3, buf, sizeof(buf));
+	CHECK(rc == 0, "opus+pcmu+pcma: returns 0");
+	CHECK_STREQ(buf, "opus/48000/2,pcmu/8000/1,pcma/8000/1",
+		    "opus+pcmu+pcma: exact comma-joined string");
+
+	/* a wideband mono codec (16000/1) and a stereo codec (48000/2):
+	 * neither matches 8000/1, so both must be emitted verbatim, proving
+	 * the suffix comes from the spec and is never defaulted/dropped. */
+	rc = cent_build_codecs_string(
+		&(struct cent_codec_spec){"g722", 16000, 1}, 1, buf, sizeof(buf));
+	CHECK(rc == 0, "g722 single: returns 0");
+	CHECK_STREQ(buf, "g722/16000/1", "g722 single: 16000/1 verbatim");
+
+	rc = cent_build_codecs_string(
+		&(struct cent_codec_spec){"stereo", 48000, 2}, 1, buf, sizeof(buf));
+	CHECK(rc == 0, "stereo single: returns 0");
+	CHECK_STREQ(buf, "stereo/48000/2", "stereo single: ch=2 verbatim");
+
+	/* comma separation only BETWEEN entries - a single entry has no comma
+	 * at all (the joined opus+pcmu+pcma string above already covers the
+	 * between-only case for >1 entry). */
+	CHECK(strstr(buf, ",") == NULL, "single entry: no comma anywhere");
+
+	/* empty list -> empty string, still NUL-terminated, success (this
+	 * path is never reached from set_codecs - cmd.c rejects an empty
+	 * codecs array at decode time - but building "" rather than UB is the
+	 * correct, defensive behaviour). */
+	buf[0] = 'X';
+	rc = cent_build_codecs_string(NULL, 0, buf, sizeof(buf));
+	CHECK(rc == 0, "empty list: returns 0");
+	CHECK(buf[0] == '\0', "empty list: empty string written");
+
+	/* overflow: a buffer too small for even one entry must fail (-1) and
+	 * leave buf NUL-terminated - never a truncated partial like "opu" that
+	 * account_set_audio_codecs() could mis-resolve to some other codec.
+	 * re_snprintf's _s (safe) variant returns -1 on truncation, which is
+	 * exactly what this exercises. */
+	buf[0] = 'X';
+	rc = cent_build_codecs_string(
+		&(struct cent_codec_spec){"opus", 48000, 2}, 1, buf, 4);
+	CHECK(rc == -1, "overflow: returns -1");
+	CHECK(buf[0] == '\0', "overflow: buf NUL-terminated, not truncated");
+}
+
+
 static void test_cmd_unknown_and_malformed(void)
 {
 	struct cent_cmd cmd;
@@ -1522,6 +1612,7 @@ int main(void)
 	test_cmd_id_correlation();
 	test_cmd_devices_and_set_device();
 	test_cmd_codecs_and_set_codecs();
+	test_build_codecs_string();
 	test_cmd_tap();
 
 	test_pathsafe_component();

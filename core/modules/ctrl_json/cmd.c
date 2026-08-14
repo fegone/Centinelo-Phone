@@ -337,3 +337,46 @@ enum cent_cmd_type cent_cmd_decode(struct cent_cmd *out,
 
 	return out->type;
 }
+
+/*
+ * Build the account_set_audio_codecs() input string from resolved codec
+ * specs. Extracted from ctrl_json.c's cmd_set_codecs() (which used to do
+ * this inline) precisely so it lives in this pure, baresip-free,
+ * unit-tested translation unit - see cmd.h struct cent_codec_spec's
+ * comment for why the explicit "/srate/ch" suffix is load-bearing (it is
+ * the guard against the bare-name silent-fallback bug), and
+ * test_main.c's test_build_codecs_string() for the regression test.
+ *
+ * Mirrors the original inline loop exactly: comma-separated, each entry
+ * "<name>/<srate>/<ch>" from the resolved spec, re_snprintf's < 0
+ * (truncation/error) reported as -1. The empty-list case yields the empty
+ * string (account_set_audio_codecs() with "" is never reached from
+ * set_codecs - cmd.c rejects an empty codecs array at decode time - but
+ * building "" rather than UB is still the correct, defensive behaviour
+ * here).
+ */
+int cent_build_codecs_string(const struct cent_codec_spec *specs, size_t n,
+			     char *buf, size_t sz)
+{
+	size_t i;
+
+	if (!buf || sz == 0)
+		return -1;
+
+	buf[0] = '\0';
+
+	if (n && !specs)
+		return -1;
+
+	for (i = 0; i < n; i++) {
+		size_t len = strlen(buf);
+
+		if (re_snprintf(buf + len, sz - len, "%s%s/%u/%u",
+				i > 0 ? "," : "",
+				specs[i].name, specs[i].srate,
+				(uint32_t)specs[i].ch) < 0)
+			return -1;
+	}
+
+	return 0;
+}

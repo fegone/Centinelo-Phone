@@ -995,14 +995,21 @@ static void cmd_set_codecs(const struct cent_cmd *cmd)
 	/* Explicit "name/srate/ch" per entry, taken from the resolved
 	 * aucodec itself (never the bare requested name) - see this
 	 * function's own top comment for why a bare name is a real,
-	 * silent-fallback bug, not just belt-and-suspenders caution. */
-	for (i = 0; i < cmd->codecs_len; i++) {
-		const struct aucodec *ac = resolved[i];
-		size_t len = strlen(buf);
-
-		if (re_snprintf(buf + len, sizeof(buf) - len, "%s%s/%u/%u",
-				 i > 0 ? "," : "", ac->name, ac->srate,
-				 ac->ch) < 0) {
+	 * silent-fallback bug, not just belt-and-suspenders caution. The
+	 * string itself is built by cent_build_codecs_string() (cmd.c), the
+	 * baresip-free half of this logic so it is covered by the standalone
+	 * unit-test binary (test_main.c test_build_codecs_string()) - here we
+	 * only adapt each resolved struct aucodec into a struct cent_codec_spec.
+	 * Behavior is identical to the previous inline re_snprintf loop. */
+	{
+		struct cent_codec_spec specs[CENT_MAX_CODECS];
+		for (i = 0; i < cmd->codecs_len; i++) {
+			specs[i].name  = resolved[i]->name;
+			specs[i].srate = resolved[i]->srate;
+			specs[i].ch    = resolved[i]->ch;
+		}
+		if (cent_build_codecs_string(specs, cmd->codecs_len, buf,
+					     sizeof(buf))) {
 			emit_error("set_codecs: internal buffer overflow");
 			return;
 		}
