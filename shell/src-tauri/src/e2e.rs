@@ -259,7 +259,9 @@ pub fn maybe_run_e2e_script(app: &AppHandle) {
                 let settings: tauri::State<std::sync::Arc<crate::settings::SettingsStore>> = app.state();
                 // NOT admin-gated (codecs-shell feature - settings.rs
                 // CodecSettings's own doc) - no admin_set_password needed
-                // first, unlike set_device just below.
+                // first, same as set_device just below (audio-device-picker
+                // feature, 2026-08-13 - see commands.rs save_audio_settings's
+                // own doc for why that one flipped too).
                 let input = commands::SaveCodecsInput {
                     codecs: rest.split(',').map(str::to_string).collect(),
                 };
@@ -269,7 +271,6 @@ pub fn maybe_run_e2e_script(app: &AppHandle) {
                 }
             } else if let Some(rest) = step.strip_prefix("set_device:") {
                 let settings: tauri::State<std::sync::Arc<crate::settings::SettingsStore>> = app.state();
-                let admin: tauri::State<crate::settings::AdminSession> = app.state();
                 let Some((kind, name)) = rest.split_once(':') else {
                     log::warn!("e2e: set_device step needs '<input|output>:<name>', got '{rest}'");
                     continue;
@@ -278,7 +279,7 @@ pub fn maybe_run_e2e_script(app: &AppHandle) {
                     input_device: (kind == "input").then(|| name.to_string()),
                     output_device: (kind == "output").then(|| name.to_string()),
                 };
-                match commands::save_audio_settings(settings, admin, sidecar, input) {
+                match commands::save_audio_settings(settings, sidecar, input) {
                     Ok(()) => log::info!("e2e: set_device({kind}, {name}) -> ok"),
                     Err(e) => log::error!("e2e: set_device({kind}, {name}) -> err: {e}"),
                 }

@@ -709,6 +709,73 @@ const ENTRIES = [
     "No se pudo aplicar el cambio de códec: {message}",
   ],
 
+  // -- settings / microphone & speaker (Plate 10) -------------------------
+  // Verbatim from premium/design/notes/settings-devices.md's own "Strings
+  // para i18n.js" table (creative-vigilia, PR #10, design/settings-devices)
+  // - not re-translated. `settings.microphoneLabel`/`settings.speakerLabel`
+  // above (Plate 09's own table) are reused for the row labels rather than
+  // adding near-duplicate `deviceMicLabel`/`deviceSpeakerLabel` keys — same
+  // English/PT-BR/ES text either way. See ui/js/device-settings.js for
+  // where each key below is used. The three audio-check strings the design
+  // note also lists (level meter, speaker chime, 5s loopback) are NOT
+  // included here — that part of Plate 10 needs a shell/core-engine
+  // decision this pass didn't make (see this workspace's shell-tauri
+  // report); adding their copy now, unattached to any working control,
+  // would be dead strings no control ever reaches.
+  [
+    "settings.devicesHeading",
+    "Microphone & speaker",
+    "Microfone e alto-falante",
+    "Micrófono y altavoz",
+  ],
+  [
+    "settings.devicesIntro",
+    "Pick your headset by name. “System default” follows this computer's sound settings — and a newly plugged-in webcam or monitor can quietly change what that means.",
+    "Escolha seu headset pelo nome. “Padrão do sistema” segue as configurações de som deste computador — e uma webcam ou um monitor recém-conectado pode mudar isso sem avisar.",
+    "Elige tus auriculares por nombre. “Predeterminado del sistema” sigue la configuración de sonido de este equipo — y una webcam o un monitor recién conectado puede cambiarla sin avisar.",
+  ],
+  [
+    "settings.devicesInstantNotice",
+    "Changes here take effect the moment you choose. On a call, your device switches instantly — nothing to apply, nothing to restart.",
+    "As mudanças aqui valem no momento em que você escolhe. Em uma chamada, o dispositivo troca na hora — nada para aplicar, nada para reiniciar.",
+    "Los cambios aquí toman efecto en el momento en que eliges. En una llamada, el dispositivo cambia al instante — nada que aplicar, nada que reiniciar.",
+  ],
+  ["settings.deviceSystemDefault", "System default", "Padrão do sistema", "Predeterminado del sistema"],
+  [
+    "settings.deviceSystemDefaultHint",
+    "Follows this computer's sound settings.",
+    "Segue as configurações de som deste computador.",
+    "Sigue la configuración de sonido de este equipo.",
+  ],
+  ["settings.micSwitchedLive", "Microphone switched to {name}.", "Microfone alterado para {name}.", "Micrófono cambiado a {name}."],
+  ["settings.speakerSwitchedLive", "Speaker switched to {name}.", "Alto-falante alterado para {name}.", "Altavoz cambiado a {name}."],
+  [
+    "settings.micSwitchedInCallLive",
+    "Microphone switched — your current call is using it now.",
+    "Microfone alterado — sua chamada atual já está usando o novo.",
+    "Micrófono cambiado — tu llamada actual ya lo está usando.",
+  ],
+  [
+    "settings.speakerSwitchedInCallLive",
+    "Speaker switched — your current call is using it now.",
+    "Alto-falante alterado — sua chamada atual já está usando o novo.",
+    "Altavoz cambiado — tu llamada actual ya lo está usando.",
+  ],
+  [
+    "settings.devicesFootnote",
+    "This list shows the devices connected to this computer right now — plug one in and it appears.",
+    "Esta lista mostra os dispositivos conectados a este computador agora — conecte um e ele aparece.",
+    "Esta lista muestra los dispositivos conectados a este equipo ahora mismo — conecta uno y aparece.",
+  ],
+  [
+    "settings.devicesSaveFailed",
+    "Couldn't switch the device: {message}",
+    "Não foi possível trocar o dispositivo: {message}",
+    "No se pudo cambiar el dispositivo: {message}",
+  ],
+  ["settings.micSelAria", "Microphone, choose a device", "Microfone, escolher um dispositivo", "Micrófono, elegir un dispositivo"],
+  ["settings.speakerSelAria", "Speaker, choose a device", "Alto-falante, escolher um dispositivo", "Altavoz, elegir un dispositivo"],
+
   // -- auto-updater (roadmap debt fix) -----------------------------------
   // Settings > About status line (renderUpdaterAboutStatus, app.js) and the
   // non-intrusive main-window banner (renderUpdateBanner, ui/js/updater.js)

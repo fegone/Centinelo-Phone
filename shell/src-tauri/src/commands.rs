@@ -300,17 +300,32 @@ pub fn set_blf_enabled(
     settings.update_blf_enabled(enabled).map_err(|e| e.to_string())
 }
 
-// ---- audio devices (real-audio-devices fix) --------------------------
+// ---- audio devices (real-audio-devices fix; NOT admin-gated as of the
+// audio-device-picker feature, 2026-08-13 - see below) ---------------------
 //
-// Free-tier readable (mic/speaker choice isn't sensitive the way the SIP
-// account or a call-center's favorites roster is), but only admin-unlocked
-// callers can change it - same rationale as HidSettings just below and
-// favorites above: an agent shouldn't be able to silently repoint the app
-// at a different device than the one an admin verified works against the
-// test PBX. See settings.rs `AudioSettings`'s doc for the persisted shape
-// and sidecar.rs `audio_config_lines` for exactly how these values (or
-// their absence) become the engine's `audio_source`/`audio_player`/
-// `audio_alert` config lines.
+// Free-tier readable AND free-tier writable. This flips the original
+// real-audio-devices-fix decision (kept below for the historical record):
+// this command used to `require_unlocked()`, on the reasoning that "an
+// agent shouldn't be able to silently repoint the app at a different device
+// than the one an admin verified works against the test PBX". The approved
+// Plate 10 design (premium/design/notes/settings-devices.md "Dónde vive y
+// para quién") deliberately reverses that call, for the same reason
+// `save_codec_settings` below is also free-tier: the real scenario this
+// panel exists for is a remote receptionist wearing the wrong headset
+// (Windows defaulted to the webcam mic) with NO admin password in hand,
+// being walked through "open Settings, pick your headset" by phone support.
+// Gating the ONE fix for that behind a password an agent doesn't have would
+// turn the #1 softphone complaint into an escalated ticket. Picking a
+// device exposes no secret/patient data, and a wrong pick is self-diagnosing
+// on the very same screen (the level-meter/loopback audio checks - see this
+// workspace's shell-tauri report for their own, separate, engine-dependency
+// status). index.html's own markup comment documents the matching visual
+// change (this section moved outside `.settings-locked-region`).
+//
+// See settings.rs `AudioSettings`'s doc for the persisted shape and
+// sidecar.rs `audio_config_lines` for exactly how these values (or their
+// absence) become the engine's `audio_source`/`audio_player`/`audio_alert`
+// config lines.
 
 #[tauri::command(rename_all = "snake_case")]
 pub fn get_audio_settings(settings: State<Arc<SettingsStore>>) -> settings::AudioSettings {
@@ -426,15 +441,17 @@ fn apply_live_device(sidecar: &SidecarHandle, kind: &str, previous: &Option<Stri
 
 /// Persists the operator's device choice, merged onto whatever was already
 /// saved (A3 - see `merge_device_choice`), and best-effort applies each
-/// *changed* direction live (A5 - see `apply_live_device`).
+/// *changed* direction live (A5 - see `apply_live_device`). NOT
+/// admin-gated (audio-device-picker feature, 2026-08-13) - see this
+/// function's own section header comment above for why that's a deliberate
+/// reversal of this command's original admin-lock decision, not an
+/// oversight.
 #[tauri::command(rename_all = "snake_case")]
 pub fn save_audio_settings(
     settings: State<Arc<SettingsStore>>,
-    admin: State<AdminSession>,
     sidecar: State<SidecarHandle>,
     input: SaveAudioInput,
 ) -> Result<(), String> {
-    require_unlocked(&admin)?;
     let previous = settings.snapshot().audio;
     let updated = settings::AudioSettings {
         input_device: merge_device_choice(previous.input_device.clone(), input.input_device)?,

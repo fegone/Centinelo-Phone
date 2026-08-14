@@ -304,6 +304,62 @@
         </div>
       </div>
 
+      <!-- ================= Audio & devices → Microphone & speaker (Plate 10) =================
+           Adapted from premium/design/mockups/settings-devices.html (creative-vigilia,
+           PR #10 design/settings-devices) - see ui/js/device-settings.js's header comment
+           for the full fidelity/behavior notes (no apply bar - set_device hot-swaps live
+           AND persists, "System default" is a UI-added row, engine's own `devices` event
+           is the only source of truth for the real device list/which is active).
+
+           Same "outside .settings-locked-region, NOT admin-gated" placement as the Audio
+           codecs section right below (see that section's own comment, and
+           commands.rs save_audio_settings's doc, for the full reasoning - Plate 10's
+           design note explicitly mirrors Plate 09's already-approved decision here).
+
+           The level-meter / speaker-chime / 5-second-loopback audio checks Plate 10 also
+           designs are DELIBERATELY NOT in this markup - see this workspace's shell-tauri
+           report: the level meter needs the engine to expose live mic-level frames (no
+           such event exists in core/PROTOCOL.md today) and the chime/loopback need a
+           shell-side audio-capture/playback path (no such dependency exists in this crate
+           today) - both need a real decision (core-engine work, or a new shell-side audio
+           crate) before any of that markup would do anything real. Device pick/apply/
+           persist alone already closes the case this task exists for (wrong device
+           selected, no way to fix it) - the meter/chime/loopback are the NEXT increment. -->
+      <div class="sect"><h3 data-i18n="settings.devicesHeading">Microphone &amp; speaker</h3></div>
+      <p class="introp" data-i18n="settings.devicesIntro">Pick your headset by name. &ldquo;System default&rdquo; follows this computer's sound settings — and a newly plugged-in webcam or monitor can quietly change what that means.</p>
+      <div class="notice">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13 3L5.5 13.5H11L10 21l7.7-10.5H12L13 3z"/></svg>
+        <p data-i18n="settings.devicesInstantNotice">Changes here take effect the moment you choose. On a call, your device switches instantly — nothing to apply, nothing to restart.</p>
+      </div>
+      <div class="rows">
+        <div class="devrow">
+          <div class="devtop">
+            <span class="rx"><b id="mic-label" data-i18n="settings.microphoneLabel">Microphone</b></span>
+            <div class="selwrap">
+              <button type="button" class="sel" id="mic-sel" aria-haspopup="listbox" aria-expanded="false" data-i18n-aria-label="settings.micSelAria" aria-label="Microphone, choose a device">
+                <span class="selname" id="mic-selname"></span>
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9.5l6 6 6-6"/></svg>
+              </button>
+              <div class="pop" id="mic-pop" role="listbox" data-i18n-aria-label="settings.microphoneLabel" aria-label="Microphone"></div>
+            </div>
+          </div>
+        </div>
+        <div class="devrow">
+          <div class="devtop">
+            <span class="rx"><b id="spk-label" data-i18n="settings.speakerLabel">Speaker</b></span>
+            <div class="selwrap">
+              <button type="button" class="sel" id="spk-sel" aria-haspopup="listbox" aria-expanded="false" data-i18n-aria-label="settings.speakerSelAria" aria-label="Speaker, choose a device">
+                <span class="selname" id="spk-selname"></span>
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9.5l6 6 6-6"/></svg>
+              </button>
+              <div class="pop" id="spk-pop" role="listbox" data-i18n-aria-label="settings.speakerLabel" aria-label="Speaker"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <p class="footnote" data-i18n="settings.devicesFootnote">This list shows the devices connected to this computer right now — plug one in and it appears.</p>
+      <span class="sr-only" aria-live="polite" id="devices-live"></span>
+
       <!-- ================= Audio & devices → Audio codecs (Plate 09) =================
            Adapted from premium/design/mockups/settings-codecs.html (creative-vigilia,
            PR #6 design/settings-codecs) - see ui/js/codec-settings.js's header comment
