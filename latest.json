@@ -1,11 +1,11 @@
 {
-  "version": "2.0.5",
-  "notes": "Centinelo Phone 2.0.5.",
-  "pub_date": "2026-08-13T22:51:56Z",
+  "version": "2.0.6",
+  "notes": "Centinelo Phone 2.0.6.",
+  "pub_date": "2026-08-14T16:26:48Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTMlFhLzdkUy9XVGVzN3RDSnVxMThpMUVqNWMyQ2ZvR0xIaWwrdy9ValAxdk8vOVFqRnF3ZUVjNjc5OFo3Z3hEVmFxUi9IeW9YNTBGakZYTmU2TnhDYkhCeEttMVpZa1FBPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg2NjYxNDg4CWZpbGU6Q2VudGluZWxvIFBob25lXzIuMC41X3g2NC1zZXR1cC5leGUKSHhGZS9uSjl3THNyZUJOb3J0Q0RiMmwyMjFHT3BpSFRmVkpSM0lGb0dPS0JTZDdMY0xORG91OTdVWFBaN2FMSGcrN3pOMjJuaVBnWHRHNlZkNzIzQUE9PQo=",
-      "url": "https://github.com/fegone/Centinelo-Phone/releases/download/centinelo-v2.0.5/Centinelo.Phone_2.0.5_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTMlFhLzdkUy9XVFpPaUxYZUQwM29EQkl2ZkRIaGZheTFjU3kxeXYzbm1VVXZ1anRibjdJeHFnS3RKclBqcTJGVUZTNjR1bVZrK01KOG5idEpoUjJJYUI2ck0zb2plZ2dRPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg2NzI0Nzc0CWZpbGU6Q2VudGluZWxvIFBob25lXzIuMC42X3g2NC1zZXR1cC5leGUKNjJ0Y0w4UWJwWXNnVTd5aW5lTHRLVG1rVlhscjJ6ZUFjWmVGbFA5VHRHRjRHYUdOVTM5QjdmRGtxb3RYUW5mVHp2RmNzWlVWVVV1KzI1UzY0R3BiRFE9PQo=",
+      "url": "https://github.com/fegone/Centinelo-Phone/releases/download/centinelo-v2.0.6/Centinelo.Phone_2.0.6_x64-setup.exe"
     }
   }
 }
