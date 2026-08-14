@@ -837,6 +837,12 @@ const ENTRIES = [
   ["sidecar.engineStopped", "The phone engine stopped working.", "O motor do telefone parou de funcionar.", "El motor del teléfono dejó de funcionar."],
   ["sidecar.somethingWrong", "Something went wrong.", "Algo deu errado.", "Algo salió mal."],
   [
+    "console.loadFailed",
+    "The receptionist console failed to load and was closed. Check the log for details.",
+    "O console da recepção falhou ao carregar e foi fechado. Verifique o log para mais detalhes.",
+    "La consola de recepción no pudo cargar y se cerró. Consulta el registro para más detalles.",
+  ],
+  [
     "app.ipcUnreachable",
     "Could not reach the app's backend. Please restart Centinelo Phone; if this keeps happening, reinstall the latest version.",
     "Não foi possível acessar o backend do aplicativo. Reinicie o Centinelo Phone; se isso continuar acontecendo, reinstale a versão mais recente.",

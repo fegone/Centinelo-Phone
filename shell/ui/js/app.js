@@ -2976,6 +2976,11 @@ async function attachTauriListeners() {
   await listen("sidecar-status", (e) => handleSidecarStatus(e.payload));
   await listen("sidecar-event", (e) => handleSidecarEvent(e.payload));
   await listen("click-to-call", (e) => handleClickToCall(e.payload));
+  // console.rs's own trapped-window safety nets (report_frontend_fatal /
+  // the load-timeout watchdog) already closed the console window itself
+  // by the time this fires - the console can't show its own failure, so
+  // the main window does it instead. See console.rs::close_after_failure.
+  await listen("console-load-failed", () => showBanner(t("console.loadFailed"), "err"));
   await listen("transcription://segment", (e) => handleTranscriptSegment(e.payload));
   await listen("transcription://done", (e) => handleTranscriptDone(e.payload));
   await listen("transcription://error", (e) => handleTranscriptError(e.payload));
