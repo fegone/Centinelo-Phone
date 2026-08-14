@@ -3,7 +3,29 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:">
+<!--
+  Frontend error capture — deliberately the very first thing this page
+  loads, before even the stylesheets below. A plain classic (non-module,
+  non-async, non-defer) same-origin <script src> blocks HTML parsing until
+  it runs, so its window.onerror-equivalent/unhandledrejection/resource-
+  load-failure listeners are armed before anything after this line — the
+  stylesheets, js/app.js, all of it — has a chance to fail uncaught. See
+  js/error-capture.js's own doc for the full story (a day lost to a
+  Windows-only "paints but never responds" bug with zero trace anywhere).
+  Must stay a plain <script src>, not inline: the CSP below (default-src
+  'self', no 'unsafe-inline' for scripts) blocks inline script content.
+-->
+<script src="js/error-capture.js"></script>
+<!--
+  CSP — NO declarar Content-Security-Policy en este archivo.
+  La política vive en shell/src-tauri/tauri.conf.json (app.security.csp); Tauri la inyecta por
+  cabecera HTTP en tiempo de ejecución, y esa es la fuente única de verdad.
+  Si se vuelve a añadir un <meta http-equiv="Content-Security-Policy"> aquí, el navegador aplicará
+  la INTERSECCIÓN de la cabecera y el meta (la más restrictiva), anulando silenciosamente toda
+  directiva que solo exista en la configuración. Esto ya rompió el cliente de Windows una vez:
+  el meta carecía de connect-src, bloqueaba http://ipc.localhost (canal IPC de Tauri) y la interfaz
+  se dibujaba pero no respondía a teclado, botones ni a la pantalla de Configuración.
+-->
 <title>Centinelo Phone</title>
 <link rel="stylesheet" href="css/tokens.css">
 <link rel="stylesheet" href="css/app.css">

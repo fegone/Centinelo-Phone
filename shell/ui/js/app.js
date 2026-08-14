@@ -62,6 +62,7 @@ import {
   shouldShowInterimConnecting,
   reduceRegResult,
 } from "./reg-status.js";
+import { logMilestone } from "./error-reporting.js";
 
 // `Channel` (updater download progress) and `Resource` both live on
 // window.__TAURI__.core alongside `invoke` - withGlobalTauri bundles the
@@ -71,6 +72,15 @@ const { invoke, Channel } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 const { getCurrentWindow } = window.__TAURI__.window;
 const { getVersion } = window.__TAURI__.app;
+
+// Boot-milestone breadcrumb #1 — this module's own top-level code (imports
+// + the destructuring above) ran to completion. Cheap but not free: a
+// syntax error or a failed import anywhere above never reaches this line,
+// so its ABSENCE from the log is itself informative (paired with
+// js/error-capture.js's own report of whatever actually failed, from
+// outside this module). See error-reporting.js's doc for why there are
+// only four of these across the whole file.
+logMilestone("app_js_evaluated");
 
 const win = getCurrentWindow();
 
@@ -2090,6 +2100,7 @@ function remoteSttProbeText(result) {
 }
 
 async function openSettings() {
+  let settingsLoadFailed = false;
   try {
     const [account, theme, corePath, adminStatus, favorites, bridge, license, availability] = await Promise.all([
       invoke("get_account_settings"),
@@ -2138,7 +2149,23 @@ async function openSettings() {
     $("save-status").textContent = "";
     $("save-status").className = "status";
   } catch (e) {
+    // Do NOT swallow this. Every field on this screen is populated from the
+    // calls above; if they fail we still reveal the screen below, and the
+    // operator gets a blank page with no explanation - reported from the
+    // field 2026-08-13 as "Settings opens white". Surface it instead: a
+    // visible banner, and a line in the on-disk log (console.error alone is
+    // invisible in a packaged build - there is no console to read).
     console.error("openSettings load failed", e);
+    settingsLoadFailed = true;
+    try {
+      showBanner(t("settings.loadFailed"), "error");
+    } catch (_) { /* banner is best-effort; never block opening the screen */ }
+    try {
+      invoke("log_frontend_error", {
+        kind: "settings_load_failed",
+        message: String(e && e.message ? e.message : e),
+      });
+    } catch (_) { /* logging is best-effort */ }
   }
   renderUpdaterUI();
   applyLockUI();
@@ -3105,6 +3132,11 @@ async function attachTauriListeners() {
   await listen("sidecar-status", (e) => handleSidecarStatus(e.payload));
   await listen("sidecar-event", (e) => handleSidecarEvent(e.payload));
   await listen("click-to-call", (e) => handleClickToCall(e.payload));
+  // console.rs's own trapped-window safety nets (report_frontend_fatal /
+  // the load-timeout watchdog) already closed the console window itself
+  // by the time this fires - the console can't show its own failure, so
+  // the main window does it instead. See console.rs::close_after_failure.
+  await listen("console-load-failed", () => showBanner(t("console.loadFailed"), "err"));
   await listen("transcription://segment", (e) => handleTranscriptSegment(e.payload));
   await listen("transcription://done", (e) => handleTranscriptDone(e.payload));
   await listen("transcription://error", (e) => handleTranscriptError(e.payload));
@@ -3184,6 +3216,15 @@ async function boot() {
   wireStaticHandlers();
   wireCodecsHandlers();
   wireDeviceHandlers();
+  // Boot-milestone breadcrumb #2 - title-bar buttons, Settings, and every
+  // other click handler are now wired. This is also the exact threshold
+  // js/error-capture.js uses to decide whether an uncaught error still
+  // earns its on-screen fallback banner: before this line the window can
+  // reproduce today's bug (paints, responds to nothing); after it, the
+  // interface is at least interactive even if something downstream in
+  // boot() still fails.
+  logMilestone("handlers_wired");
+  if (typeof window.__centineloMarkBooted === "function") window.__centineloMarkBooted();
 
   // Locale first, before any other render below reads t() - "auto" (the
   // default, matching an unconfigured settings.json) resolves against this
@@ -3207,6 +3248,12 @@ async function boot() {
     ]);
     state.localePref = localePref || "auto";
     setLocale(state.localePref);
+    // Boot-milestone breadcrumb #3 - the very first shell<->core-adjacent
+    // IPC round-trip (see the comment above) actually completed. Its
+    // ABSENCE, paired with the ipc_timeout banner below, is what would have
+    // made the CSP bug this comment already describes obvious immediately
+    // instead of after a day of remote debugging.
+    logMilestone("first_ipc_ok");
   } catch (e) {
     console.error("get_locale failed", e);
     setLocale("auto");
@@ -3299,6 +3346,15 @@ async function boot() {
   // on a network round trip here.
   maybeCheckForUpdatesOnStartup();
   scheduleUpdatePeriodicRecheck();
+  // Boot-milestone breadcrumb #4 (last of the four - see error-reporting.js's
+  // doc) - every await in boot() above resolved (each already has its own
+  // try/catch, so reaching this line doesn't mean all of them succeeded,
+  // only that boot() itself didn't die partway through).
+  logMilestone("ui_ready");
 }
 
+// Not wrapped in a local try/catch - an exception here already becomes an
+// unhandled promise rejection (boot() is async), which
+// js/error-capture.js's own window "unhandledrejection" listener catches
+// and logs regardless of anything in this module; see that file's doc.
 boot();

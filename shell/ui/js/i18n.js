@@ -192,6 +192,7 @@ const ENTRIES = [
   // -- settings screen ------------------------------------------------
   ["settings.backAria", "Back", "Voltar", "Atrás"],
   ["settings.title", "Settings", "Configurações", "Configuración"],
+  ["settings.loadFailed", "Couldn't load your settings. Some fields may be blank — close and open Settings again.", "Não foi possível carregar suas configurações. Alguns campos podem aparecer vazios — feche e abra as Configurações novamente.", "No se pudieron cargar tus ajustes. Puede que algunos campos salgan vacíos: cierra y vuelve a abrir Configuración."],
   ["settings.general", "General", "Geral", "General"],
   ["settings.displayNameLabel", "Display name", "Nome de exibição", "Nombre para mostrar"],
   ["settings.displayNamePlaceholder", "Front desk", "Recepção", "Recepción"],
@@ -902,6 +903,12 @@ const ENTRIES = [
   ["transcript.callWord", "call", "chamada", "llamada"],
   ["sidecar.engineStopped", "The phone engine stopped working.", "O motor do telefone parou de funcionar.", "El motor del teléfono dejó de funcionar."],
   ["sidecar.somethingWrong", "Something went wrong.", "Algo deu errado.", "Algo salió mal."],
+  [
+    "console.loadFailed",
+    "The receptionist console failed to load and was closed. Check the log for details.",
+    "O console da recepção falhou ao carregar e foi fechado. Verifique o log para mais detalhes.",
+    "La consola de recepción no pudo cargar y se cerró. Consulta el registro para más detalles.",
+  ],
   [
     "app.ipcUnreachable",
     "Could not reach the app's backend. Please restart Centinelo Phone; if this keeps happening, reinstall the latest version.",

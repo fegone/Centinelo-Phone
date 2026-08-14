@@ -5,6 +5,7 @@ mod console;
 mod deeplink;
 #[cfg(debug_assertions)]
 mod e2e;
+mod frontend_log;
 mod hid;
 mod premium;
 mod profile_cleanup;
@@ -284,6 +285,8 @@ pub fn run() {
             commands::premium_capability_status,
             commands::premium_diagnostic,
             commands::open_console,
+            commands::console_frontend_fatal,
+            commands::console_frontend_ready,
             commands::sidecar_hold,
             commands::sidecar_resume,
             commands::sidecar_mute,
@@ -313,6 +316,7 @@ pub fn run() {
             hid::commands::hid_list_devices,
             hid::commands::get_hid_settings,
             hid::commands::save_hid_settings,
+            frontend_log::log_frontend_error,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
