@@ -1,6 +1,6 @@
 {
   "name": "centinelo-phone-shell",
-  "version": "2.0.0",
+  "version": "2.0.8",
   "private": true,
   "type": "module",
   "description": "Centinelo Phone 2.0 - Tauri desktop shell around the core/ baresip sidecar",
