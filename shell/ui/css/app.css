@@ -246,6 +246,18 @@ html[data-os="mac"] .settings-header { padding-left: 78px; }
 .field input::placeholder { color: var(--text-3); font-family: var(--font-ui); }
 .field input:focus-visible { outline: none; border-color: var(--amber-fill); }
 .field .hint { font: 400 10.5px/1.4 var(--font-ui); color: var(--text-3); }
+/* per-field "this didn't load" state (openSettings' allSettled degrade,
+   app.js's markFieldLoadFailed/clearFieldLoadFailed) - same --st-busy error
+   color every other error surface here already uses (banner.err, .lock-card
+   .err, .save-bar .status.err); never amber, that stays reserved for
+   ringing per Vigilia. */
+.field input.field-load-error { border-color: var(--st-busy); }
+.field input.field-load-error::placeholder { color: var(--st-busy); }
+.hint.err { color: var(--st-busy); }
+/* persistent "some settings couldn't load" notice (#settings-load-errors) -
+   sits above the first card, not inside a .field, so it needs its own
+   spacing rather than relying on .field .hint's. */
+#settings-load-errors { display: block; margin: 0 0 10px; }
 
 .transports { display: flex; flex-direction: column; gap: 6px; }
 .tcard { position: relative; text-align: left; width: 100%; background: var(--bg-1); border: 1px solid var(--border-1); border-radius: var(--r-2); box-shadow: var(--edge), var(--shadow-1); padding: 9px 10px; display: flex; flex-direction: column; gap: 3px; transition: background var(--t-fast) var(--ease); }

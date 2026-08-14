@@ -62,7 +62,8 @@ import {
   shouldShowInterimConnecting,
   reduceRegResult,
 } from "./reg-status.js";
-import { logMilestone } from "./error-reporting.js";
+import { logMilestone, reportFrontendIssue } from "./error-reporting.js";
+import { SETTINGS_FIELD_GROUPS, summarizeSettledResults } from "./settings-load.js";
 
 // `Channel` (updater download progress) and `Resource` both live on
 // window.__TAURI__.core alongside `invoke` - withGlobalTauri bundles the
@@ -2099,74 +2100,140 @@ function remoteSttProbeText(result) {
   return headline;
 }
 
-async function openSettings() {
-  let settingsLoadFailed = false;
-  try {
-    const [account, theme, corePath, adminStatus, favorites, bridge, license, availability] = await Promise.all([
-      invoke("get_account_settings"),
-      invoke("get_theme"),
-      invoke("get_core_binary_path"),
-      invoke("admin_status"),
-      invoke("get_favorites"),
-      invoke("get_bridge_settings"),
-      invoke("get_license_settings"),
-      invoke("get_availability_settings"),
-    ]);
-    state.account = { ...state.account, ...account };
-    state.adminConfigured = adminStatus.configured;
-    state.adminUnlocked = adminStatus.unlocked;
-    state.bridge = bridge;
-    // 4R RELIABILITY fix (2026-07-18): re-fetch rather than trust whatever
-    // state.availability already held - boot()'s own copy can be stale by
-    // the time Settings is opened (e.g. a tray toggle that landed before
-    // the availability-changed listener existed, or simply this window
-    // having been backgrounded through a change made from elsewhere before
-    // this fix's event wiring). Cheap (one extra command in the same
-    // Promise.all batch) and matches every other field in this list, which
-    // is already a fresh re-fetch on every open, not a state.* reuse.
-    state.availability = { available: !!availability.available, autoAnswer: !!availability.auto_answer };
+/// Flags a text input as "failed to load" instead of leaving it looking
+/// like a normal empty value. A blank input with its usual placeholder
+/// reads as "this is genuinely configured empty" - exactly the lie
+/// requirement #3 (task brief, 2026-08-14) exists to prevent. Reuses the
+/// same --st-busy error color every other error surface in this file
+/// already uses (banner.err, .lock-card .err, .save-bar .status.err) -
+/// see app.css's `.field-load-error`/`.hint.err` rules. Vigilia-compliant:
+/// amber stays reserved for ringing, this never touches it.
+function markFieldLoadFailed(inputId) {
+  const el = $(inputId);
+  el.value = "";
+  el.placeholder = t("settings.fieldLoadFailed");
+  el.classList.add("field-load-error");
+  el.setAttribute("aria-invalid", "true");
+}
 
+/// Undoes markFieldLoadFailed. Restores the input's normal i18n placeholder
+/// from its own `data-i18n-placeholder` attribute (already present on every
+/// field this is called for), so this stays generic instead of needing a
+/// per-field restore value. Called on every successful load so a field
+/// flagged by a previous open doesn't stay flagged after a later retry
+/// succeeds.
+function clearFieldLoadFailed(inputId) {
+  const el = $(inputId);
+  el.classList.remove("field-load-error");
+  el.removeAttribute("aria-invalid");
+  if (el.dataset.i18nPlaceholder) el.placeholder = t(el.dataset.i18nPlaceholder);
+}
+
+/// Renders (or hides) the persistent "some settings couldn't load" notice
+/// at the top of the Settings screen - the truthful-degrade counterpart to
+/// markFieldLoadFailed for the sections that don't have a single text
+/// input to flag (favorites/bridge/license/availability/theme/admin).
+/// Persistent, not a showBanner() toast: those auto-dismiss after ~4.5s,
+/// which would let a user forget mid-edit that part of what they're
+/// looking at didn't actually load this time. Cleared when `failed` is
+/// empty, covering "closed Settings, backend recovered, reopened".
+function renderSettingsLoadErrors(failed) {
+  const el = $("settings-load-errors");
+  if (!failed.length) {
+    el.hidden = true;
+    el.textContent = "";
+    return;
+  }
+  const names = failed.map((f) => t(f.labelKey)).join(", ");
+  el.textContent = t("settings.loadFailedSome", { fields: names });
+  el.hidden = false;
+}
+
+async function openSettings() {
+  // 4R RELIABILITY fix (2026-08-14): this used to be a single Promise.all
+  // over all 8 commands below, which rejects the WHOLE batch the instant
+  // any ONE of them fails - reported from the field 2026-08-13 as "Settings
+  // opens white" even when most of the backend calls actually succeeded.
+  // Promise.allSettled + summarizeSettledResults (settings-load.js) lets
+  // one broken command degrade only its own field/section; everything else
+  // still populates normally.
+  const results = await Promise.allSettled(SETTINGS_FIELD_GROUPS.map((g) => invoke(g.cmd)));
+  const { values, failed } = summarizeSettledResults(results);
+  const { account, theme, corePath, adminStatus, favorites, bridge, license, availability } = values;
+
+  // Log every failure with the command name + error (never a field value -
+  // see frontend_log.rs's own "no call content" rule, which this reuses
+  // rather than inventing a second logging path) and surface a persistent,
+  // truthful notice - console.error alone is invisible in a packaged build.
+  failed.forEach((f) => {
+    console.error(`openSettings: ${f.cmd} failed`, f.error);
+    reportFrontendIssue("settings_field_load_failed", { message: `${f.cmd}: ${f.error}` });
+  });
+  renderSettingsLoadErrors(failed);
+
+  if (account) {
+    clearFieldLoadFailed("in-display-name");
+    clearFieldLoadFailed("in-host");
+    clearFieldLoadFailed("in-ext");
+    $("secret-hint").classList.remove("err");
+    state.account = { ...state.account, ...account };
     $("in-display-name").value = account.display_name || "";
     $("in-host").value = account.host || "";
     $("in-ext").value = account.ext || "";
     $("in-secret").value = "";
     $("secret-hint").textContent = account.secret_set ? t("settings.secretCurrentlySet") : t("settings.secretNotSet");
-    $("in-core-path").value = corePath || "";
     setTransportUI(account.transport_priority || "auto");
-    setThemeUI(theme || "auto");
-    document.querySelectorAll("#locale-row button").forEach((b) => {
-      b.classList.toggle("on", b.dataset.localeChoice === state.localePref);
-    });
-    renderFavoritesFields(favorites);
-    renderBridgeFields(bridge);
-    renderLicenseFields(license);
-    await openTranscriptionSettingsSection();
-    setBoolRowUI("updater-check-on-startup-row", state.updaterCheckOnStartup);
-    // renderAvailabilityUI (not just setAvailabilityFieldsUI) so the
-    // titlebar dot is re-synced too, not only the Settings pane rows -
-    // belt-and-suspenders alongside the availability-changed listener.
-    renderAvailabilityUI();
-    $("save-status").textContent = "";
-    $("save-status").className = "status";
-  } catch (e) {
-    // Do NOT swallow this. Every field on this screen is populated from the
-    // calls above; if they fail we still reveal the screen below, and the
-    // operator gets a blank page with no explanation - reported from the
-    // field 2026-08-13 as "Settings opens white". Surface it instead: a
-    // visible banner, and a line in the on-disk log (console.error alone is
-    // invisible in a packaged build - there is no console to read).
-    console.error("openSettings load failed", e);
-    settingsLoadFailed = true;
-    try {
-      showBanner(t("settings.loadFailed"), "error");
-    } catch (_) { /* banner is best-effort; never block opening the screen */ }
-    try {
-      invoke("log_frontend_error", {
-        kind: "settings_load_failed",
-        message: String(e && e.message ? e.message : e),
-      });
-    } catch (_) { /* logging is best-effort */ }
+  } else {
+    markFieldLoadFailed("in-display-name");
+    markFieldLoadFailed("in-host");
+    markFieldLoadFailed("in-ext");
+    $("secret-hint").classList.add("err");
+    $("secret-hint").textContent = t("settings.fieldLoadFailed");
   }
+
+  if (theme !== undefined) setThemeUI(theme || "auto");
+
+  if (corePath !== undefined) {
+    clearFieldLoadFailed("in-core-path");
+    $("in-core-path").value = corePath || "";
+  } else {
+    markFieldLoadFailed("in-core-path");
+  }
+
+  if (adminStatus) {
+    state.adminConfigured = adminStatus.configured;
+    state.adminUnlocked = adminStatus.unlocked;
+  }
+
+  document.querySelectorAll("#locale-row button").forEach((b) => {
+    b.classList.toggle("on", b.dataset.localeChoice === state.localePref);
+  });
+  if (favorites !== undefined) renderFavoritesFields(favorites);
+  if (bridge !== undefined) {
+    state.bridge = bridge;
+    renderBridgeFields(bridge);
+  }
+  if (license !== undefined) renderLicenseFields(license);
+  await openTranscriptionSettingsSection();
+  setBoolRowUI("updater-check-on-startup-row", state.updaterCheckOnStartup);
+  // 4R RELIABILITY fix (2026-07-18): re-fetch rather than trust whatever
+  // state.availability already held - boot()'s own copy can be stale by
+  // the time Settings is opened (e.g. a tray toggle that landed before
+  // the availability-changed listener existed, or simply this window
+  // having been backgrounded through a change made from elsewhere before
+  // this fix's event wiring). Only apply it when the fetch actually
+  // succeeded - state.availability already holds the last-known value
+  // otherwise, which is a better degrade than clobbering it.
+  if (availability !== undefined) {
+    state.availability = { available: !!availability.available, autoAnswer: !!availability.auto_answer };
+  }
+  // renderAvailabilityUI (not just setAvailabilityFieldsUI) so the
+  // titlebar dot is re-synced too, not only the Settings pane rows -
+  // belt-and-suspenders alongside the availability-changed listener.
+  renderAvailabilityUI();
+  $("save-status").textContent = "";
+  $("save-status").className = "status";
+
   renderUpdaterUI();
   applyLockUI();
   renderCodecsSection(); // paints whatever the last `codecs` event carried (may be empty this early)
