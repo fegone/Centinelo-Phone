@@ -438,6 +438,96 @@ narrowest possible additions, never `*` or `'unsafe-eval'`:
    the regression test for "IPC breaks again in the future and nobody
    notices."
 
+## Frontend error logging (2026-08-14)
+
+Direct sequel to the CSP hotfix above, and the reason it took three shipped
+attempts to actually fix that bug: `ui/js/` had **zero** crash reporting.
+No `window.onerror`, no `unhandledrejection` listener, no resource-load-
+failure listener — an uncaught exception, a failed `<script>`/`<link>`
+load, or an unhandled promise rejection anywhere in the frontend left no
+trace on screen, in the log, or anywhere else. Diagnosing the CSP bug meant
+remote-debugging a real Windows machine from scratch each time, and two of
+the three fix attempts were verified against the wrong target and reported
+false green, purely for lack of a log line to check.
+
+**What was added:**
+
+- **`ui/js/error-capture.js`** — a plain classic (non-module) `<script src>`,
+  loaded from `ui/index.html`'s `<head>` **before the stylesheets and before
+  `js/app.js`'s own `<script type="module">`**. That ordering is the whole
+  point: its `window.addEventListener("error", ..., true)` (catches both
+  uncaught exceptions AND, via the capture phase, non-bubbling resource-
+  load-failure events on `<script>`/`<link>`/etc.) and
+  `window.addEventListener("unhandledrejection", ...)` are armed before
+  ANYTHING else on the page — including `app.js` itself — can fail. Must
+  stay a plain external `<script src>`, not inline: `tauri.conf.json`'s CSP
+  (`default-src 'self'`, no `'unsafe-inline'` for scripts) blocks inline
+  script content outright. Sends straight to
+  `invoke("log_frontend_error", { report })` with zero dependency on any
+  other script on the page having loaded — no dynamic `import()`, which
+  would leave an async gap during exactly the failure window this exists to
+  close.
+- **`ui/js/error-reporting.js`** — the testable half (`error-reporting.test.js`,
+  `npm test`): pure report-shaping (`buildErrorReport`, `capText`,
+  `levelForKind`) plus `reportFrontendIssue`/`logMilestone`, which
+  `js/app.js` imports for its own boot-milestone breadcrumbs. Same module,
+  same URL either way — browsers dedupe by specifier, so
+  `error-capture.js`'s raw `invoke()` calls and `app.js`'s imports of this
+  file never double-register anything.
+- **`frontend_log.rs`** (`log_frontend_error` Tauri command) — receives the
+  report, re-applies its own truncation (300 chars message / 800 chars
+  stack) and digit-run redaction (any run of 6+ ASCII digits collapses to
+  `<N digits>`, mirroring `bridge.rs`'s `redacted_log_number` in spirit) and
+  writes to the same persistent `LogDir` file every other diagnostic in
+  this crate uses, at `target: "app_lib::frontend"`. Never trusts the JS
+  side's own caps as the last word — the frontend isn't a trust boundary
+  this crate otherwise treats as safe for plaintext-on-disk content (see
+  `lib.rs`'s `is_call_content_log_target` doc for the same stance applied
+  everywhere else). Pure-logic unit tests live in that file's own `tests`
+  module (`cargo test --lib frontend_log`).
+- **Four boot-milestone breadcrumbs** in `app.js`'s `boot()` — deliberately
+  few: `app_js_evaluated` (this module's own top-level code, including every
+  `import`, finished), `handlers_wired` (`wireStaticHandlers()` returned —
+  title-bar buttons and Settings now respond to input), `first_ipc_ok` (the
+  very first shell↔core-adjacent `invoke()` round-trip succeeded), `ui_ready`
+  (`boot()` ran to completion). Would have made the CSP bug's actual failure
+  point ("`handlers_wired` logged, `first_ipc_ok` never did") obvious from
+  the first report instead of a day of remote debugging.
+- **On-screen fallback for a fatal pre-boot failure** — `error-capture.js`
+  tracks a `booted` flag, flipped by `app.js` calling
+  `window.__centineloMarkBooted()` right after `wireStaticHandlers()` (the
+  `handlers_wired` milestone above). Any `error`/`resource`/
+  `unhandledrejection` report that arrives while still `!booted` also
+  renders a plain-DOM banner ("Centinelo Phone failed to start. Check the
+  log for details.") directly into `#banner-slot` — or, if `app.css` itself
+  failed to load, an inline-styled fallback appended to `<body>`. Extends
+  the IPC-watchdog banner's own criterion (previous section) to the wider
+  case: not just "the engine channel never responded" but "the frontend
+  died before it could even tell you that."
+
+**Redaction, not just truncation**: an error message or stack trace can
+carry along a caller's dialed number (e.g. from `bridge.rs`'s click-to-call
+path or `sidecar_dial`) purely by accident — a thrown error that happened
+to interpolate it. `frontend_log.rs::redact_digit_runs` collapses every run
+of 6+ digits to a length marker before anything reaches disk; nothing here
+attempts a general "is this PHI" classifier (impossible in general, same
+honest limit `lib.rs`'s own PHI-log doc admits for its `app_lib::phi`
+target) — when in doubt, the design favors "type and location of the error,
+not a raw dump" per this feature's own instructions.
+
+**Verified 2026-08-14**: a deliberate `throw new Error(...)` placed at
+`app.js`'s top level (temporary, reverted before commit) produced, in
+`~/Library/Logs/com.centinelo.phone/Centinelo Phone.log` under `cargo tauri
+dev` on macOS:
+
+```
+[2026-08-14][06:55:51][app_lib::frontend][ERROR] frontend error: Error: deliberate-test-error-2026-08-14 (at http://127.0.0.1:1430/js/app.js:82:54)
+@http://127.0.0.1:1430/js/app.js:82:18
+```
+
+Exactly the trace that would have made this feature's own motivating bug a
+five-minute fix instead of a day.
+
 ## Design fidelity notes
 
 `ui/css/tokens.css` is `TOKENS.md` section 9 copied verbatim (no
