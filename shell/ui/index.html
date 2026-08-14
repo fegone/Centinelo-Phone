@@ -248,6 +248,13 @@
 
     <div class="settings-body" id="settings-body">
 
+      <!-- Truthful partial-load notice - see app.js's renderSettingsLoadErrors.
+           Hidden by default; shown only when openSettings' Promise.allSettled
+           batch had at least one failed command, naming exactly which
+           section(s) are stale/unpopulated rather than letting a blank
+           section read as "configured empty" (task brief 2026-08-14). -->
+      <p class="hint err" id="settings-load-errors" role="status" hidden></p>
+
       <h2 data-i18n="settings.general">General</h2>
       <div class="settings-card">
         <div class="field">
