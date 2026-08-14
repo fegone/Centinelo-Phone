@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Centinelo Phone",
-  "version": "2.0.0",
+  "version": "2.0.8",
   "identifier": "com.centinelo.phone",
   "build": {
     "frontendDist": "../ui"
@@ -53,7 +53,9 @@
       },
       "nsis": {
         "installMode": "currentUser",
-        "languages": ["English"],
+        "languages": [
+          "English"
+        ],
         "displayLanguageSelector": false
       },
       "wix": {
@@ -64,7 +66,10 @@
   "plugins": {
     "deep-link": {
       "desktop": {
-        "schemes": ["centinelo", "tel"]
+        "schemes": [
+          "centinelo",
+          "tel"
+        ]
       }
     },
     "updater": {
