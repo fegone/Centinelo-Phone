@@ -192,6 +192,7 @@ const ENTRIES = [
   // -- settings screen ------------------------------------------------
   ["settings.backAria", "Back", "Voltar", "Atrás"],
   ["settings.title", "Settings", "Configurações", "Configuración"],
+  ["settings.loadFailed", "Couldn't load your settings. Some fields may be blank — close and open Settings again.", "Não foi possível carregar suas configurações. Alguns campos podem aparecer vazios — feche e abra as Configurações novamente.", "No se pudieron cargar tus ajustes. Puede que algunos campos salgan vacíos: cierra y vuelve a abrir Configuración."],
   ["settings.general", "General", "Geral", "General"],
   ["settings.displayNameLabel", "Display name", "Nome de exibição", "Nombre para mostrar"],
   ["settings.displayNamePlaceholder", "Front desk", "Recepção", "Recepción"],

@@ -121,7 +121,12 @@ html[data-os="mac"] .titlebar #btn-close { display: none; }
 
 /* == dial display ========================================================= */
 .display { flex: none; display: flex; align-items: center; gap: 8px; padding: 12px 4px 8px; border-bottom: 1px solid var(--border-1); margin: 2px 2px 8px; min-height: 30px; }
-.display .num { font: 500 25px/1 var(--font-mono); letter-spacing: .02em; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* flex:1 + min-width:0 are load-bearing, not cosmetic: this span is a flex item
+   inside .display, and without them it collapses to its min-content width while
+   `overflow:hidden` clips everything past it. Measured before the fix: 1072px of
+   row available, 18px rendered, 171px of actual text - the operator typed a full
+   number and saw a single digit. Reported from the field 2026-08-13. */
+.display .num { flex: 1 1 auto; min-width: 0; font: 500 25px/1 var(--font-mono); letter-spacing: .02em; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 /* Translated via the element's own data-empty-placeholder attribute (set
    by app.js renderDial()/i18n.js applyStaticI18n path), not a literal CSS
    string - a pure ::before content: "..." can't be localized (F4 i18n
