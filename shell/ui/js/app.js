@@ -175,6 +175,23 @@ const state = {
   // `devices` event (device-settings.js's own "fuente de verdad" doc); no
   // saved/current split like codecs above, since there's no apply bar - see
   // device-settings.js's header comment for why selecting IS applying.
+  //
+  // This placeholder is deliberately NOT `buildDeviceOptions([])` (which
+  // would be the "correct" shape - see that function's own doc, "System
+  // default" row always present). Calling it here, at module-load time,
+  // would freeze `t("settings.deviceSystemDefault")` under whatever locale
+  // i18n.js defaults to before boot()'s setLocale() ever runs (`"en"`,
+  // i18n.js `activeLocale`'s own module-scope initializer) - wrong for
+  // every non-English install until the very first `devices` event landed.
+  // boot() overwrites this with the real `buildDeviceOptions([])` shape
+  // right after setLocale() resolves (see its own comment, "before any
+  // other render below reads t()") - correct locale, still self-heals to
+  // the real device list on the first `devices` event exactly as before.
+  // The empty-array shape below is a narrow window that can only be
+  // observed if openSettings somehow runs before that reset (e.g. mid
+  // ipc_timeout race) - device-settings.js `activeDeviceLabel` is hardened
+  // to handle it rather than throw, so that race degrades to a generic
+  // label instead of a dead Settings screen.
   devices: {
     input: { options: [], activeId: "" },
     output: { options: [], activeId: "" },
@@ -3503,6 +3520,15 @@ async function boot() {
       showBanner(t("app.ipcUnreachable"), "err", 0);
     }
   }
+  // Restores the devices-state invariant `buildDeviceOptions` documents for
+  // itself ("System default" row always present) now that setLocale() has
+  // resolved either way (try or catch above) - the module-load placeholder
+  // (state literal above, see its own comment) couldn't call
+  // `buildDeviceOptions([])` itself without baking today's `t()` output
+  // under the wrong locale. Runs before applyStaticI18n() below, matching
+  // this same block's "before any other render below reads t()" rule.
+  state.devices.input = buildDeviceOptions([]);
+  state.devices.output = buildDeviceOptions([]);
   applyStaticI18n();
 
   try {

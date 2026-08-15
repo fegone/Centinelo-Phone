@@ -109,3 +109,17 @@ test("activeDeviceLabel: falls back to System default's own name for an unmatche
   const { options } = buildDeviceOptions([{ name: "coreaudio,Headset Mic", active: false }]);
   assert.equal(activeDeviceLabel(options, "coreaudio,Nonexistent"), options[0].name);
 });
+
+// Regression (2.1.0): opening Settings before the engine's first `devices`
+// event ever lands used to hand this function `options: []` (app.js's
+// own state.devices placeholder, before boot() restores the "System
+// default" row invariant - see that literal's own comment) and it threw
+// `Cannot read properties of undefined (reading 'name')` reading
+// `options[0].name`, killing the whole Settings screen. This is the exact
+// shape openSettings's synchronous "paint whatever's cached" step can see
+// on a fresh app launch - must never throw, and must return a real,
+// translated label rather than blank.
+test("activeDeviceLabel: never throws on an empty options list (pre-first-devices-event) and falls back to the System default label", () => {
+  assert.equal(activeDeviceLabel([], ""), "System default");
+  assert.equal(activeDeviceLabel([], "anything"), "System default");
+});
