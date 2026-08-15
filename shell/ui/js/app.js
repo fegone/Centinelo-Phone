@@ -63,6 +63,7 @@ import {
   reduceRegResult,
 } from "./reg-status.js";
 import { logMilestone, reportFrontendIssue } from "./error-reporting.js";
+import { initConsolePanel, openConsolePanel, closeConsolePanel } from "./console-panel.js";
 import { SETTINGS_FIELD_GROUPS, summarizeSettledResults } from "./settings-load.js";
 
 // `Channel` (updater download progress) and `Resource` both live on
@@ -2722,6 +2723,11 @@ function wireStaticHandlers() {
   $("btn-console").addEventListener("click", () => {
     invoke("open_console").catch((e) => showBanner(String(e), "err"));
   });
+  // Panel close = the Settings/transcript back-button pattern: the Rust
+  // open already re-checked the license and sized the window; the back
+  // button is the only close path (closeConsolePanel destroys the mounted
+  // package and tells Rust via console_panel_closed to restore size).
+  $("console-back").addEventListener("click", closeConsolePanel);
 
   $("btn-transcript").addEventListener("click", openTranscriptScreen);
   $("transcript-back").addEventListener("click", closeTranscriptScreen);
@@ -3204,6 +3210,11 @@ async function attachTauriListeners() {
   // by the time this fires - the console can't show its own failure, so
   // the main window does it instead. See console.rs::close_after_failure.
   await listen("console-load-failed", () => showBanner(t("console.loadFailed"), "err"));
+  // Inline console panel (docs/console-inline-panel-decision.md): Rust's
+  // open_panel emits this only AFTER re-checking the blf_console license
+  // and growing this window to PANEL_TARGET_SIZE - the same event the
+  // legacy separate window would have answered to by being created.
+  await listen("console-open-panel", () => openConsolePanel());
   await listen("transcription://segment", (e) => handleTranscriptSegment(e.payload));
   await listen("transcription://done", (e) => handleTranscriptDone(e.payload));
   await listen("transcription://error", (e) => handleTranscriptError(e.payload));
@@ -3280,6 +3291,10 @@ async function applyPremiumUI() {
 
 async function boot() {
   document.documentElement.dataset.os = detectOS();
+  // Console panel gets its Tauri bindings + UI surfaces injected (rather
+  // than touching window.__TAURI__ itself) so its pure helpers stay
+  // testable without a webview - see console-panel.js's doc.
+  initConsolePanel({ invoke, listen, showBanner, reportFrontendIssue });
   wireStaticHandlers();
   wireCodecsHandlers();
   wireDeviceHandlers();
