@@ -1,8 +1,8 @@
 //! Static invariant checks on `capabilities/*.json`.
 //!
-//! Two things are checked here, both deliberately **capability-file
-//! parse tests, not runtime ACL-resolution tests**: they assert on the
-//! JSON `tauri-build` reads at compile time, not on what
+//! Both things checked here are deliberately **capability-file parse
+//! tests, not runtime ACL-resolution tests**: they assert on the JSON
+//! `tauri-build` reads at compile time, not on what
 //! `tauri::ipc::InvokeRequest` resolution actually decides for a real
 //! invoke at runtime. Reaching a true runtime test would mean standing
 //! up a `tauri::test` mock app with both windows and asserting on
@@ -17,20 +17,30 @@
 //!    future edits do to `capabilities/console.json`.
 //! 2. Every command a shipped frontend file actually calls must have a
 //!    matching `allow-<slug>` grant in `capabilities/default.json` -
-//!    checked by DERIVING the invoked-command set straight out of
-//!    `shell/ui/js/*.js` (three extraction passes: literal
-//!    `invoke("...")` calls, `console-panel.js`'s
-//!    `CONSOLE_DISPATCH_TABLE`, and `settings-load.js`'s
-//!    `SETTINGS_FIELD_GROUPS`) rather than a hand-copied list that can
-//!    silently drift out of sync with the frontend the moment someone
-//!    adds a new `invoke()` call and forgets the capability grant - the
-//!    exact silent-failure shape this whole project has paid for
-//!    eleven times before (see phone/CLAUDE.md's Windows postmortem).
+//!    checked TWO independent ways on purpose (RELIABILITY 4R round-4
+//!    finding: round 2 let the second way REPLACE the first instead of
+//!    supplementing it, silently dropping a fixed guarantee). Way (a) is
+//!    DERIVED from `shell/ui/js/**/*.js` (recursively, three extraction
+//!    passes: literal `invoke("...")`/`invoke('...')`/`` invoke(`...`) ``
+//!    calls, `console-panel.js`'s `CONSOLE_DISPATCH_TABLE`, and
+//!    `settings-load.js`'s `SETTINGS_FIELD_GROUPS`) - catches a
+//!    genuinely new command the frontend starts calling without an ACL
+//!    grant, the exact silent-failure shape this whole project has paid
+//!    for eleven times before (see phone/CLAUDE.md's Windows
+//!    postmortem). Way (b) is a FIXED list of this app's own
+//!    threat-model-sensitive commands (admin/license/provisioning/
+//!    settings + the inline console panel's call-control surface) that
+//!    must be granted on `main` regardless of how - or whether - way
+//!    (a)'s scraper currently sees them called. Way (b) is what protects
+//!    a sensitive command the day someone moves its call site into a
+//!    THIRD dynamic dispatch table this module doesn't know to parse -
+//!    this codebase already has two (`CONSOLE_DISPATCH_TABLE`,
+//!    `SETTINGS_FIELD_GROUPS`), so a third isn't hypothetical.
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
     use std::fs;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     const DEFAULT_CAPABILITY_JSON: &str = include_str!("../capabilities/default.json");
     const CONSOLE_CAPABILITY_JSON: &str = include_str!("../capabilities/console.json");
@@ -102,14 +112,20 @@ mod tests {
                 .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
     }
 
-    /// Pass 1: every literal `invoke("command")` / `invoke('command')`
-    /// call in `source` (also matches `deps.invoke(...)`,
-    /// `tauri.core.invoke(...)` - anything ending in `invoke(` followed,
-    /// after optional whitespace, directly by a quote). Calls where the
-    /// first argument is a variable/expression (`invoke(g.cmd)`,
-    /// `invoke(entry[0], ...)`) are invisible to this pass by
-    /// construction - those are the dynamic paths covered by passes 2
-    /// and 3 below, not something a literal-string scan can ever see.
+    /// Pass 1: every literal `invoke("command")` / `invoke('command')` /
+    /// `` invoke(`command`) `` call in `source` (also matches
+    /// `deps.invoke(...)`, `tauri.core.invoke(...)` - anything ending in
+    /// `invoke(` followed, after optional whitespace, directly by a
+    /// quote - `"`, `'`, or a template-literal backtick). RELIABILITY 4R
+    /// round-4 finding: the backtick case was missing - zero backticks
+    /// exist in `shell/ui` today, so it was a false-negative-in-waiting
+    /// rather than a live bug, but a future `` invoke(`sidecar_dial`) ``
+    /// would have silently vanished from the required set instead of
+    /// being caught. Calls where the first argument is a
+    /// variable/expression (`invoke(g.cmd)`, `invoke(entry[0], ...)`)
+    /// are invisible to this pass by construction - those are the
+    /// dynamic paths covered by passes 2 and 3 below, not something a
+    /// literal-string scan can ever see.
     fn literal_invoke_commands(source: &str) -> Vec<String> {
         let bytes = source.as_bytes();
         let mut out = Vec::new();
@@ -119,7 +135,7 @@ mod tests {
             while i < bytes.len() && (bytes[i] as char).is_whitespace() {
                 i += 1;
             }
-            if i < bytes.len() && (bytes[i] == b'"' || bytes[i] == b'\'') {
+            if i < bytes.len() && matches!(bytes[i], b'"' | b'\'' | b'`') {
                 let quote = bytes[i];
                 let start = i + 1;
                 if let Some(end_rel) = source[start..].find(quote as char) {
@@ -178,26 +194,47 @@ mod tests {
         out
     }
 
-    /// Every command any shipped `shell/ui/js/*.js` file invokes on the
-    /// `main` window, derived (not hand-listed) from the three passes
-    /// above. `*.test.js` files are excluded - they mock `invoke` with
-    /// spy assertions that don't imply the real app calls that name.
+    /// Recursively collects every non-test `.js` file under `dir`.
+    /// RELIABILITY 4R round-4 finding: a plain (non-recursive)
+    /// `fs::read_dir` on `shell/ui/js` made a future
+    /// `shell/ui/js/panels/foo.js` invisible to every extraction pass
+    /// above - zero subdirectories exist under `ui/js` today, so this
+    /// was another false-negative-in-waiting, not a live bug.
+    /// `*.test.js` files are excluded at every depth - they mock
+    /// `invoke` with spy assertions that don't imply the real app calls
+    /// that name.
+    fn collect_js_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        let entries =
+            fs::read_dir(dir).unwrap_or_else(|e| panic!("failed to read {}: {e}", dir.display()));
+        for entry in entries {
+            let entry = entry.expect("readdir entry");
+            let path = entry.path();
+            let file_type = entry.file_type().expect("file_type");
+            if file_type.is_dir() {
+                collect_js_files(&path, out);
+                continue;
+            }
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name.ends_with(".js") && !name.ends_with(".test.js") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// Every command any shipped `shell/ui/js/**/*.js` file invokes on
+    /// the `main` window, derived (not hand-listed) from the three
+    /// passes above.
     fn frontend_invoked_commands() -> HashSet<String> {
         let ui_js_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../ui/js");
+        let mut files = Vec::new();
+        collect_js_files(&ui_js_dir, &mut files);
+
         let mut commands = HashSet::new();
         let mut settings_load_seen = false;
         let mut console_panel_seen = false;
 
-        let entries = fs::read_dir(&ui_js_dir).unwrap_or_else(|e| {
-            panic!("failed to read {}: {e}", ui_js_dir.display())
-        });
-        for entry in entries {
-            let entry = entry.expect("readdir entry");
-            let path = entry.path();
+        for path in files {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if !name.ends_with(".js") || name.ends_with(".test.js") {
-                continue;
-            }
             let source = fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
 
@@ -205,17 +242,38 @@ mod tests {
 
             if name == "console-panel.js" {
                 console_panel_seen = true;
-                commands.extend(bracketed_first_string_after_colon(&source));
+                let dispatch_commands = bracketed_first_string_after_colon(&source);
+                // RELIABILITY 4R round-4 finding: checking only that the
+                // FILE exists (see the asserts below) let this pass
+                // degrade to zero silently - a formatting change
+                // (prettier dropping the space after `:`, say) would
+                // shrink the required set and the test would pass
+                // MORE easily, with LESS coverage, and say nothing.
+                assert!(
+                    !dispatch_commands.is_empty(),
+                    "console-panel.js's CONSOLE_DISPATCH_TABLE pass (the `: [\"cmd\"` pattern) \
+                     found zero commands - the pattern probably stopped matching (formatting or \
+                     quote-style changed?), which would otherwise silently shrink the required \
+                     set instead of failing loudly"
+                );
+                commands.extend(dispatch_commands);
             }
             if name == "settings-load.js" {
                 settings_load_seen = true;
-                commands.extend(settings_field_group_commands(&source));
+                let field_group_commands = settings_field_group_commands(&source);
+                assert!(
+                    !field_group_commands.is_empty(),
+                    "settings-load.js's SETTINGS_FIELD_GROUPS pass (the `cmd: \"...\"` pattern) \
+                     found zero commands - the pattern probably stopped matching, which would \
+                     otherwise silently shrink the required set instead of failing loudly"
+                );
+                commands.extend(field_group_commands);
             }
         }
 
         // If either file gets renamed/moved, its dynamic-dispatch pass
-        // silently stops running and this whole test quietly loses
-        // coverage instead of failing - fail loudly instead.
+        // never runs at all - fail loudly instead of quietly losing
+        // coverage.
         assert!(
             console_panel_seen,
             "expected to find ui/js/console-panel.js (CONSOLE_DISPATCH_TABLE pass) - did it move?"
@@ -281,8 +339,8 @@ mod tests {
         );
     }
 
-    /// The real protection this module exists for: every command
-    /// `shell/ui/js/*.js` actually invokes (literal calls +
+    /// Protection (a) from this module's doc comment: every command
+    /// `shell/ui/js/**/*.js` actually invokes (literal calls +
     /// `CONSOLE_DISPATCH_TABLE` + `SETTINGS_FIELD_GROUPS`, all derived
     /// from the source, not hand-copied) must have a matching
     /// `allow-<slug>` in `capabilities/default.json`. Add a new
@@ -291,7 +349,9 @@ mod tests {
     /// command - the exact gap the RELIABILITY lens flagged in the
     /// hand-enumerated version of this test (it only checked 18 of 64
     /// granted commands, so 46 had zero coverage against frontend
-    /// drift).
+    /// drift). See `main_window_grants_the_sensitive_commands_unconditionally`
+    /// below for protection (b), the fixed backstop this test does NOT
+    /// replace.
     #[test]
     fn every_frontend_invoked_command_is_granted_on_main() {
         let granted = granted_app_command_slugs(DEFAULT_CAPABILITY_JSON);
@@ -314,6 +374,57 @@ mod tests {
              in production the moment a user hits it (the invoke() rejects and the .catch() \
              swallows it, per this project's own history of exactly this failure mode)"
         );
+    }
+
+    /// Protection (b) from this module's doc comment: a FIXED,
+    /// hand-maintained list of this app's own threat-model-sensitive
+    /// commands that must be granted on `main` no matter how - or
+    /// whether - `every_frontend_invoked_command_is_granted_on_main`'s
+    /// scraper currently sees them called.
+    ///
+    /// RELIABILITY 4R round-4 finding: round 2 REPLACED this exact test
+    /// (then named `main_window_has_the_admin_and_console_panel_surface`)
+    /// with the derived scraper test above instead of keeping both -
+    /// an outright regression the round-2 report never mentioned (it
+    /// was only caught because the reviewer had to explain why the
+    /// total test count still landed on 430 despite the round adding
+    /// tests). The derived test protects against a NEW command silently
+    /// missing a grant; this one protects against an EXISTING sensitive
+    /// command silently losing its grant the day its call site moves
+    /// into a dynamic dispatch table this module doesn't parse - this
+    /// codebase already has two of those (`CONSOLE_DISPATCH_TABLE`,
+    /// `SETTINGS_FIELD_GROUPS`), so a third holding e.g. `admin_unlock`
+    /// tomorrow is a real, not hypothetical, way to lose coverage.
+    #[test]
+    fn main_window_grants_the_sensitive_commands_unconditionally() {
+        let granted = granted_app_command_slugs(DEFAULT_CAPABILITY_JSON);
+        for cmd in [
+            "admin_unlock",
+            "admin_set_password",
+            "admin_status",
+            "activate_license",
+            "get_license_settings",
+            "provisioning_apply",
+            "set_core_binary_path",
+            "updater_download",
+            "updater_install",
+            "sidecar_hold",
+            "sidecar_resume",
+            "sidecar_mute",
+            "sidecar_blind_transfer",
+            "sidecar_attended_transfer",
+            "sidecar_complete_transfer",
+            "sidecar_abort_transfer",
+            "sidecar_blf_subscribe",
+            "sidecar_blf_unsubscribe",
+        ] {
+            assert!(
+                granted.contains(&slug(cmd)),
+                "capabilities/default.json is missing allow-{} - a real feature would silently \
+                 die in production the moment the frontend called it",
+                slug(cmd)
+            );
+        }
     }
 
     /// Commands that are wired into `generate_handler!` (and therefore
@@ -356,5 +467,78 @@ mod tests {
                 "allow-{s} is granted on `console` but no shipped frontend invokes {cmd}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Unit tests for the extraction helpers themselves (not the real
+    // shell/ui/js tree) - fixtures for the specific false-negative shapes
+    // RELIABILITY 4R round 4 flagged: template literals, and recursion
+    // into subdirectories.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn literal_invoke_commands_handles_double_single_and_backtick_quotes() {
+        let source = r#"
+            invoke("double_quoted_cmd");
+            invoke('single_quoted_cmd');
+            invoke(`template_literal_cmd`);
+        "#;
+        let found: HashSet<String> = literal_invoke_commands(source).into_iter().collect();
+        assert_eq!(
+            found,
+            ["double_quoted_cmd", "single_quoted_cmd", "template_literal_cmd"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        );
+    }
+
+    /// Creates an empty, uniquely-named scratch directory under the OS
+    /// temp dir for a single test to write fixture files into. No
+    /// `tempfile` crate dependency (this crate has none, deliberately -
+    /// see Cargo.toml) - process id + a nanosecond timestamp is unique
+    /// enough for tests that never run two copies in the exact same
+    /// nanosecond, and callers remove the directory themselves when done.
+    fn make_scratch_dir(name_hint: &str) -> PathBuf {
+        let unique = format!(
+            "centinelo-acl-capabilities-test-{name_hint}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock before UNIX epoch")
+                .as_nanos()
+        );
+        let dir = std::env::temp_dir().join(unique);
+        fs::create_dir_all(&dir).expect("create scratch dir");
+        dir
+    }
+
+    #[test]
+    fn collect_js_files_recurses_into_subdirectories_and_skips_test_files() {
+        let root = make_scratch_dir("recurse");
+        fs::write(root.join("top.js"), "invoke(\"top_level_cmd\")").expect("write top.js");
+        fs::write(root.join("top.test.js"), "invoke(\"should_be_excluded\")")
+            .expect("write top.test.js");
+        let sub = root.join("panels");
+        fs::create_dir_all(&sub).expect("create panels/");
+        fs::write(sub.join("nested.js"), "invoke(\"nested_cmd\")").expect("write nested.js");
+        fs::write(sub.join("nested.test.js"), "invoke(\"should_also_be_excluded\")")
+            .expect("write nested.test.js");
+
+        let mut files = Vec::new();
+        collect_js_files(&root, &mut files);
+        let names: HashSet<String> = files
+            .iter()
+            .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
+            .map(str::to_string)
+            .collect();
+
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(
+            names,
+            ["top.js", "nested.js"].into_iter().map(str::to_string).collect(),
+            "expected top.js and the nested panels/nested.js, excluding both *.test.js files"
+        );
     }
 }

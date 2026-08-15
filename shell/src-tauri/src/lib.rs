@@ -8,6 +8,8 @@ mod deeplink;
 #[cfg(debug_assertions)]
 mod e2e;
 mod frontend_log;
+#[cfg(test)]
+mod generate_handler_parser_tests;
 mod hid;
 mod premium;
 mod profile_cleanup;
