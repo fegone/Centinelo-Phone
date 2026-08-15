@@ -410,3 +410,53 @@ test("P4 reopen during the close's IPC round-trip: the click opens, and no ack c
     s.teardown();
   }
 });
+
+test("P5 superseded open events still update the session the eventual close acks", async () => {
+  // The half of openConsolePanel's payload bookkeeping P4 cannot pin: P4
+  // opens at most once per cycle, but Rust does no open-dedupe of its own
+  // (the mirror is gone), so a double click - or button + tray menu firing
+  // console-open-panel twice - reaches this module as TWO events with
+  // different session ids. The second is an OPEN no-op in both shapes it
+  // can arrive in: while the first open is still loading (attaches to the
+  // in-flight openingPromise) or once the panel is fully open (the
+  // isConsolePanelOpen() early-return). In BOTH shapes openSession must
+  // still advance, because the eventual closeConsolePanel() acks whatever
+  // openSession holds - if it names the superseded session, Rust's
+  // panel_closed classifies it stale and the main window stays grown
+  // forever. Reordering the session update below either early-return
+  // ("simplifying" it into the branch that actually opens) is exactly the
+  // mutation this test exists to kill.
+  const s = setupStateful();
+  try {
+    // Timing 1 - second event while the first open is still loading:
+    // isConsolePanelOpen() is false, so the no-op shape is "attach to the
+    // in-flight open". The session must still advance to 2.
+    const first = openConsolePanel({ session: 1 });
+    const second = openConsolePanel({ session: 2 });
+    assert.equal(second, first, "the superseded call attaches to the in-flight open, no second mount");
+    await first;
+    closeConsolePanel();
+    assert.deepEqual(
+      s.deps.invokeCalls.filter(([cmd]) => cmd === "console_panel_closed").map(([, args]) => args),
+      [{ session: 2 }],
+      "the close acks the LATEST stamped session, not the one whose open did the loading"
+    );
+
+    // Timing 2 - second event once the panel is fully OPEN: now the
+    // isConsolePanelOpen() early-return is what makes the call a no-op,
+    // and it is the early-return a reorder would strand the session
+    // update behind. Reopen (fresh cycle, session 3), then a superseded
+    // event (session 4) lands on the already-open panel.
+    await openConsolePanel({ session: 3 });
+    assert.equal(s.ui.mounts.length, 2, "the reopen after close is a fresh mount (assets cached)");
+    openConsolePanel({ session: 4 }); // already open: pure no-op - session must STILL advance
+    assert.equal(s.ui.mounts.length, 2, "the superseded event must not mount anything");
+    closeConsolePanel();
+    const acks = s.deps.invokeCalls
+      .filter(([cmd]) => cmd === "console_panel_closed")
+      .map(([, args]) => args);
+    assert.deepEqual(acks, [{ session: 2 }, { session: 4 }], "each close acks the session Rust considers live at that moment, never a superseded one");
+  } finally {
+    s.teardown();
+  }
+});
