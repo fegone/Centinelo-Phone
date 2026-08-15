@@ -2188,29 +2188,24 @@ async function openSettings() {
     reportFrontendIssue("settings_field_load_failed", { message: `${f.cmd}: ${f.error}` });
   });
 
-  // 4R RELIABILITY fix (2026-08-15, defect A): the fix above only isolates
-  // failures in the 8 backend invoke() calls. Everything from here down
-  // used to be one flat, unguarded sequence that PAINTS those results into
-  // the DOM - ~90 lines ending in the `$("screen-settings").hidden = false`
-  // reveal at the very bottom. A throw anywhere in that sequence (a missing
-  // element, a malformed value from a group that "fulfilled" with junk,
-  // ...) aborted the whole function before the reveal ever ran. Reported
-  // from the field 2026-08-15: clicking Settings did nothing at all - no
-  // banner, no screen, no trace of why.
+  // 4R RELIABILITY fix (2026-08-15, defect A). Ronda 2: the reveal
+  // guarantee below used to be app.js's own `try`/`finally` - real, but
+  // unverifiable, since this file is DOM/webview-only and this project has
+  // no way to unit-test it (see settings-load.js's own convention). Moved
+  // into runSettingsPaintSteps itself so the guarantee has a real,
+  // mutation-tested regression test (settings-load.test.js) instead of
+  // resting on inspection - see that function's header comment for the
+  // full contract, including what happens if `reveal` itself throws.
   //
-  // runSettingsPaintSteps (settings-load.js) gives this phase the same
-  // per-unit isolation summarizeSettledResults already gives the load
-  // phase: every step below runs regardless of an earlier one throwing, so
-  // one broken section shows up broken (via markFieldLoadFailed's sibling
-  // pattern where applicable, or simply as "that section didn't update")
-  // instead of taking the whole screen down with it. The `try`/`finally`
-  // around the whole block is the outermost guarantee - even a throw
-  // runSettingsPaintSteps itself somehow didn't catch (or one from
-  // openTranscriptionSettingsSection's await, which sits outside the
-  // synchronous step list because it's async) still can't skip the reveal.
-  let paintFailed = [];
-  try {
-    paintFailed = runSettingsPaintSteps([
+  // This call site is deliberately the ONLY place `$("screen-settings")`
+  // gets revealed, and it happens INSIDE runSettingsPaintSteps, as the
+  // very last thing that function does - there is no statement below this
+  // call that the reveal is waiting on. openTranscriptionSettingsSection
+  // (async, so it can't be part of the synchronous step list above) and
+  // the two fire-and-forget invokes further down all run AFTER the screen
+  // is already visible, never before it.
+  const paintFailed = runSettingsPaintSteps(
+    [
       {
         name: "account",
         run: () => {
@@ -2309,34 +2304,37 @@ async function openSettings() {
       { name: "lockUI", run: () => applyLockUI() },
       { name: "codecsSection", run: () => renderCodecsSection() }, // paints whatever the last `codecs` event carried (may be empty this early)
       { name: "devicesSection", run: () => renderDevicesSection() }, // same "paint whatever's cached, then re-query fresh" shape, for devices
-    ]);
+    ],
+    () => { $("screen-settings").hidden = false; }, // the reveal - see runSettingsPaintSteps' contract for exactly when/how this runs
+  );
 
-    paintFailed.forEach((f) => {
-      console.error(`openSettings: paint step "${f.name}" failed`, f.error);
-      reportFrontendIssue("settings_paint_step_failed", { message: `${f.name}: ${f.error}` });
-    });
-    renderSettingsLoadErrors(failed, paintFailed);
+  paintFailed.forEach((f) => {
+    console.error(`openSettings: paint step "${f.name}" failed`, f.error);
+    reportFrontendIssue("settings_paint_step_failed", { message: `${f.name}: ${f.error}` });
+  });
+  renderSettingsLoadErrors(failed, paintFailed);
 
-    try {
-      await openTranscriptionSettingsSection();
-    } catch (e) {
-      console.error("openTranscriptionSettingsSection failed", e);
-      reportFrontendIssue("settings_paint_step_failed", { message: `transcription: ${describeError(e)}` });
-    }
-
-    // Fire-and-forget re-query, same "always re-fetch fresh on open"
-    // pattern the rest of this function follows for account/bridge/
-    // availability/... - the resulting `codecs`/`devices` event
-    // (handleCodecsEvent/handleDevicesEvent) repaints each pane once it
-    // lands, same as every other sidecar-event-driven surface here.
-    invoke("sidecar_list_codecs").catch((e) => console.error("sidecar_list_codecs failed", e));
-    invoke("sidecar_list_devices").catch((e) => console.error("sidecar_list_devices failed", e));
-  } finally {
-    // Unconditional reveal: whatever happened above, the operator must
-    // always get a screen back for their click - never the silent dead
-    // button this whole fix exists to make impossible.
-    $("screen-settings").hidden = false;
+  // Deliberately AFTER the reveal above, not before: this is async (an
+  // invoke() round-trip) and used to be awaited before the old reveal line
+  // ran, which meant a slow or hung get_transcription_settings delayed the
+  // whole screen. Now the screen is already visible by the time this
+  // starts - the transcription section populates in place once this
+  // resolves, same "reveal what's ready now, keep filling in the rest"
+  // shape the codecs/devices fire-and-forget calls below already used.
+  try {
+    await openTranscriptionSettingsSection();
+  } catch (e) {
+    console.error("openTranscriptionSettingsSection failed", e);
+    reportFrontendIssue("settings_paint_step_failed", { message: `transcription: ${describeError(e)}` });
   }
+
+  // Fire-and-forget re-query, same "always re-fetch fresh on open" pattern
+  // the rest of this function follows for account/bridge/availability/...
+  // - the resulting `codecs`/`devices` event (handleCodecsEvent/
+  // handleDevicesEvent) repaints each pane once it lands, same as every
+  // other sidecar-event-driven surface here.
+  invoke("sidecar_list_codecs").catch((e) => console.error("sidecar_list_codecs failed", e));
+  invoke("sidecar_list_devices").catch((e) => console.error("sidecar_list_devices failed", e));
 }
 
 /// Populates and reveals #transcription-section, or keeps it absent - see

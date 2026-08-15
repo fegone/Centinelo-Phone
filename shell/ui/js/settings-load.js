@@ -72,16 +72,31 @@ export function summarizeSettledResults(results) {
   return { values, failed };
 }
 
-/// Paint-phase counterpart to summarizeSettledResults. The load-phase fix
-/// above (Promise.allSettled) only isolates failures in the 8 backend
-/// invoke() calls - openSettings() then spends ~15 more statements PAINTING
-/// those results into the DOM (setTransportUI, renderCodecsSection,
-/// applyLockUI, ...), and until this existed that paint phase was one flat
-/// synchronous sequence ending in the screen's reveal line. A throw
-/// anywhere in it (a missing element, a malformed value from a group that
-/// "fulfilled" with junk, ...) aborted the whole function before the
-/// reveal ever ran - reported from the field 2026-08-15 as "clicking
-/// Settings does nothing at all, no banner, no screen".
+/// Paint-phase counterpart to summarizeSettledResults, AND the owner of the
+/// one guarantee this whole module exists for: Settings must always end up
+/// visible, no matter how many paint steps failed.
+///
+/// History: the load-phase fix above (Promise.allSettled) only isolates
+/// failures in the 8 backend invoke() calls - openSettings() then spends
+/// ~15 more statements PAINTING those results into the DOM
+/// (setTransportUI, renderCodecsSection, applyLockUI, ...), and until this
+/// existed that paint phase was one flat synchronous sequence ending in
+/// the screen's reveal line. A throw anywhere in it (a missing element, a
+/// malformed value from a group that "fulfilled" with junk, ...) aborted
+/// the whole function before the reveal ever ran - reported from the field
+/// 2026-08-15 as "clicking Settings does nothing at all, no banner, no
+/// screen". A first pass fixed that by isolating each paint step (this
+/// function, then named `runSettingsPaintSteps`) but left the actual
+/// reveal call sitting in app.js's own `try/finally` - which is real, but
+/// which this project has NO way to unit-test (app.js is DOM/webview-only
+/// by convention; see this module's header comment on why the pure logic
+/// always lives here instead). A `try/finally` verified only by reading it
+/// is exactly the kind of "critical invariant held together by inspection"
+/// this project has spent months paying for (2026-08-13/14 postmortem).
+/// This second pass moves the reveal call itself in here, so the
+/// invariant - not just the per-step isolation - has a real,
+/// mutation-verified test (see settings-load.test.js's "always reveals"
+/// suite).
 ///
 /// `steps` is an array of `{ name, run }`; `run` is a zero-arg closure
 /// (the DOM/state access it needs comes from its caller's closure, same as
@@ -89,10 +104,30 @@ export function summarizeSettledResults(results) {
 /// regardless of an earlier step throwing - each failure is caught,
 /// tagged with its step's `name` and a stringified error (never the raw
 /// thrown value, same "no call content forwarded" contract
-/// summarizeSettledResults follows), and collected in the returned
-/// `failed` array instead of escaping. The caller can then still reach its
-/// own "reveal the screen" line unconditionally.
-export function runSettingsPaintSteps(steps) {
+/// summarizeSettledResults follows), and collected into `failed`.
+///
+/// `reveal` is a zero-arg closure (app.js passes
+/// `() => { $("screen-settings").hidden = false; }`) called EXACTLY ONCE,
+/// unconditionally, after every step has had its turn - whether zero,
+/// some, or ALL of them failed. Reveal is "make the screen visible", not
+/// "make the screen visible if painting went well": a broken paint step
+/// must degrade its own section, never the operator's ability to see the
+/// screen at all.
+///
+/// The ugly case: if `reveal` itself throws, that is a DIFFERENT and
+/// rarer failure than a paint step failing - the mechanism that shows the
+/// screen is broken, not a section that failed to paint. This function
+/// deliberately does NOT catch that, does NOT retry `reveal`, and does NOT
+/// swallow it into a silent success: the exception propagates to the
+/// caller as-is, and the `failed` array already collected for the paint
+/// steps is lost along with it (there is nothing left to hand it to once
+/// the reveal step itself is what's broken). This is a conscious choice,
+/// not an oversight - the entire point of this task was refusing to trade
+/// "some failures are invisible" for a different invisible failure at the
+/// reveal step; a `reveal`-throws bug needs to be loud, not caught here
+/// and quietly forgotten. The caller (openSettings's own defensive
+/// `.catch` in wireStaticHandlers) is what's left to log it.
+export function runSettingsPaintSteps(steps, reveal) {
   const failed = [];
   for (const step of steps) {
     try {
@@ -101,5 +136,6 @@ export function runSettingsPaintSteps(steps) {
       failed.push({ name: step.name, error: describeError(e) });
     }
   }
+  reveal();
   return failed;
 }
