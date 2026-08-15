@@ -116,6 +116,20 @@ export function renderDeviceOptionsHtml(options, activeId) {
 /// option's `id === activeId` - falls back to the System default row's own
 /// name (`options[0]`, always present - see `buildDeviceOptions`) if
 /// `activeId` somehow doesn't match anything, rather than rendering blank.
+///
+/// `options` is documented above as never empty, but this function doesn't
+/// get to assume its callers keep that promise - app.js's `state.devices`
+/// briefly held a hand-rolled `{options: [], activeId: ""}` placeholder
+/// that broke it (2.1.0, "Cannot read properties of undefined (reading
+/// 'name')" - `options[0]` was `undefined`), and nothing stops some future
+/// caller from reintroducing the same shape. Same "fuente de verdad" rule
+/// this whole module follows for the device LIST also applies to this
+/// function's own OWN documented contract: if it can't honor "always
+/// returns a name", it falls back to the System default row's label by
+/// calling `t()` directly rather than reading `options[0]` - visibly a
+/// real, translated string instead of a thrown TypeError or a blank
+/// button.
 export function activeDeviceLabel(options, activeId) {
-  return (options.find((o) => o.id === activeId) || options[0]).name;
+  const match = (options || []).find((o) => o.id === activeId) || options?.[0];
+  return match ? match.name : t("settings.deviceSystemDefault");
 }
