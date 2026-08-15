@@ -140,6 +140,18 @@ export function initConsolePanel(d) {
   deps = d;
 }
 
+/// Test-only: console-panel.test.js's stateful-half tests reset this
+/// module's singletons (deps, in-flight open, assets cache, mounted
+/// instance) so each open/close scenario runs in isolation. Never call
+/// from app.js.
+export function resetConsolePanelStateForTests() {
+  deps = null;
+  openingPromise = null;
+  assetsPromise = null;
+  mounted = null;
+  loadedAssets.clear();
+}
+
 export function isConsolePanelOpen() {
   const el = document.getElementById("screen-console");
   return !!el && !el.hidden;
