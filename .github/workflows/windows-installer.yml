@@ -249,15 +249,39 @@ jobs:
           }
 
       - name: Stamp a fixture-only productName/identifier (collision guard, see job header comment)
-        # MUTATION TEST IN PROGRESS (temporary, will be reverted): this
-        # step's body is disabled so tauri.conf.json keeps its PRODUCTION
-        # productName/identifier through packaging, to prove the "Verify
-        # installer identity is fixture-only, not production" step below
-        # actually catches that and fails the job - not just that it looks
-        # like it would. Do not merge this state.
+        # Same technique scripts/set-release-version.sh already uses to
+        # stamp the release version into this exact file - jq edits the
+        # CHECKED-OUT copy of tauri.conf.json in place, nothing is
+        # committed, and tauri.conf.json stays the only place
+        # productName/identifier are defined. This must run BEFORE
+        # package-official.sh so `tauri build` picks up the fixture
+        # identity, not the production one.
         shell: bash
         run: |
-          echo "MUTATION TEST: stamp intentionally skipped - tauri.conf.json keeps its production productName/identifier."
+          set -euo pipefail
+          TAURI_CONF="shell/src-tauri/tauri.conf.json"
+          FIXTURE_PRODUCT_NAME="Centinelo Phone CI-FIXTURE DO NOT INSTALL"
+          FIXTURE_IDENTIFIER="com.centinelo.phone.ci-fixture"
+
+          orig_name="$(jq -r '.productName' "$TAURI_CONF")"
+          orig_id="$(jq -r '.identifier' "$TAURI_CONF")"
+
+          tmp="$(mktemp)"
+          jq --arg name "$FIXTURE_PRODUCT_NAME" --arg id "$FIXTURE_IDENTIFIER" \
+            '.productName = $name | .identifier = $id' "$TAURI_CONF" > "$tmp"
+          mv "$tmp" "$TAURI_CONF"
+
+          echo "productName: '$orig_name' -> '$FIXTURE_PRODUCT_NAME'"
+          echo "identifier:  '$orig_id' -> '$FIXTURE_IDENTIFIER'"
+
+          # Fail loudly here rather than downstream if jq silently no-op'd
+          # (e.g. wrong key names after a future schema change).
+          new_name="$(jq -r '.productName' "$TAURI_CONF")"
+          new_id="$(jq -r '.identifier' "$TAURI_CONF")"
+          if [[ "$new_name" == "$orig_name" || "$new_id" == "$orig_id" ]]; then
+            echo "::error::fixture productName/identifier stamp did not take effect - refusing to build with a possibly-production identity" >&2
+            exit 1
+          fi
 
       - name: Run scripts/package-official.sh --target windows (${{ matrix.combo }})
         shell: bash
