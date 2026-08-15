@@ -3213,8 +3213,10 @@ async function attachTauriListeners() {
   // Inline console panel (docs/console-inline-panel-decision.md): Rust's
   // open_panel emits this only AFTER re-checking the blf_console license
   // and growing this window to PANEL_TARGET_SIZE - the same event the
-  // legacy separate window would have answered to by being created.
-  await listen("console-open-panel", () => openConsolePanel());
+  // legacy separate window would have answered to by being created. The
+  // payload's session id is what closeConsolePanel echoes back, so Rust
+  // can tell this open's close ack from one a newer open superseded.
+  await listen("console-open-panel", (e) => openConsolePanel(e.payload));
   await listen("transcription://segment", (e) => handleTranscriptSegment(e.payload));
   await listen("transcription://done", (e) => handleTranscriptDone(e.payload));
   await listen("transcription://error", (e) => handleTranscriptError(e.payload));

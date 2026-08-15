@@ -1199,13 +1199,17 @@ pub fn open_console(app: tauri::AppHandle) -> Result<(), String> {
 /// The panel side's goodbye: `ui/js/console-panel.js` invokes this after
 /// hiding `#screen-console` and destroying the mounted console-ui, so Rust
 /// can restore the main window's pre-panel size and minimum (see
-/// `console.rs::panel_closed`). Carries no license check on purpose - it
-/// only ever shrinks a window back, and must stay callable even if the
-/// license vanished mid-session, or a licensed-then-unlicensed operator
-/// would be stuck with an oversized window.
+/// `console.rs::panel_closed`). `session` echoes the id `open_panel`
+/// stamped into the `console-open-panel` event the panel is closing, so a
+/// close ack that lost a race against a newer open is recognized as stale
+/// instead of restoring the window size under the freshly opened panel.
+/// Carries no license check on purpose - it only ever shrinks a window
+/// back, and must stay callable even if the license vanished mid-session,
+/// or a licensed-then-unlicensed operator would be stuck with an
+/// oversized window.
 #[tauri::command(rename_all = "snake_case")]
-pub fn console_panel_closed(app: tauri::AppHandle) {
-    crate::console::panel_closed(&app);
+pub fn console_panel_closed(app: tauri::AppHandle, session: Option<u64>) {
+    crate::console::panel_closed(&app, session);
 }
 
 /// Console window's counterpart to `frontend_log::log_frontend_error` -

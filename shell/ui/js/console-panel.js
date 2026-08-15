@@ -22,8 +22,10 @@
 //     chrome (no watchdog / close-on-failure / mark_ready dance needed),
 //   - closing the panel is `hidden = true` + `app.destroy()` (the
 //     package's own teardown: store stop, BLF unsubscriptions, tick
-//     interval), plus `console_panel_closed` so Rust restores the main
-//     window's pre-panel size (console.rs::panel_closed),
+//     interval), plus `console_panel_closed` carrying the open event's
+//     session id, so Rust restores the main window's pre-panel size only
+//     when this close is still the live one (console.rs::panel_closed
+//     classifies a superseded session's ack as stale and ignores it),
 //   - CSP: tauri.conf.json allows `premium-console:` in script-src and
 //     style-src; every byte still passes console.rs's license-gated
 //     handler (404 unless blf_console is licensed).
@@ -133,6 +135,11 @@ let assetsPromise = null; // one load of styles+scripts per session (reset on fa
 const loadedAssets = new Set(); // asset URLs with a live node in <head> - lets a retry resume past what already loaded
 let openingPromise = null; // the in-flight openConsolePanel() run - see openConsolePanel()'s doc
 let mounted = null; // the ConsoleApp.mount() return value ({ store, element, destroy }) while the panel shows
+// Session id from the last received "console-open-panel" event payload
+// (console.rs stamps a fresh monotonic id into every emission). Echoed
+// back by closeConsolePanel so Rust can tell this panel's close ack from
+// one a newer open already superseded. null = no open event seen yet.
+let openSession = null;
 
 /// Hands this module its Tauri bindings + UI surfaces. Called once from
 /// app.js's boot(), before any panel can open.
@@ -149,6 +156,7 @@ export function resetConsolePanelStateForTests() {
   openingPromise = null;
   assetsPromise = null;
   mounted = null;
+  openSession = null;
   loadedAssets.clear();
 }
 
@@ -172,11 +180,22 @@ export function isConsolePanelOpen() {
 /// a double click ran two ConsoleApp.mount()s, each with its own
 /// EngineBridge `deps.listen("sidecar-event", ...)`: duplicated BLF
 /// subscriptions, duplicated dispatch, and only the last mount
-/// teardown-able. console.rs::open_panel holds its own open state and
-/// drops duplicate events the same way, so this does not depend on the
-/// frontend alone.
-export function openConsolePanel() {
-  if (!deps || isConsolePanelOpen()) return Promise.resolve();
+/// teardown-able. This guard is the AUTHORITATIVE open-dedupe - Rust
+/// keeps no "panel is open" mirror of its own (an earlier
+/// PANEL_OPEN_PENDING bool there learned "closed" only via the
+/// console_panel_closed round-trip and spent that whole window silently
+/// eating the operator's reopen click), so `payload` ({ session }) is
+/// only sizing bookkeeping: it identifies WHICH open a later close acks.
+export function openConsolePanel(payload) {
+  if (!deps) return Promise.resolve();
+  // Track the LATEST session Rust has stamped, even when this call turns
+  // out to be a no-op (panel already open or opening): the eventual close
+  // must ack the session Rust currently considers live, or Rust would
+  // classify the ack as stale and never restore the window size.
+  if (payload && Number.isInteger(payload.session)) {
+    openSession = payload.session;
+  }
+  if (isConsolePanelOpen()) return Promise.resolve();
   if (!openingPromise) openingPromise = runConsoleOpen();
   return openingPromise;
 }
@@ -205,8 +224,9 @@ async function runConsoleOpen() {
 /// Hides the panel and tears the mounted console down. The package's
 /// destroy() unsubscribes its BLF lines and stops its tick interval;
 /// `console_panel_closed` then lets Rust restore the main window's
-/// pre-panel size (console.rs::panel_closed). Safe to call with nothing
-/// mounted (the failure path relies on that).
+/// pre-panel size (console.rs::panel_closed) - carrying the session id of
+/// the open being closed so a late ack can never act on stale state.
+/// Safe to call with nothing mounted (the failure path relies on that).
 export function closeConsolePanel() {
   const screen = document.getElementById("screen-console");
   if (screen) screen.hidden = true;
@@ -219,7 +239,13 @@ export function closeConsolePanel() {
     mounted = null;
   }
   if (deps) {
-    deps.invoke("console_panel_closed").catch((e) => console.error("console_panel_closed failed", e));
+    // Fire-and-forget is sound BY CONSTRUCTION now, not by timing: the
+    // ack names the session it closes, so even if it lands after a newer
+    // reopen, Rust identifies it as stale (console.rs::panel_closed)
+    // instead of restoring the window size under the new panel - and the
+    // reopen itself can no longer be eaten by Rust-side state, because
+    // there is no Rust-side pending flag left to veto the click.
+    deps.invoke("console_panel_closed", { session: openSession }).catch((e) => console.error("console_panel_closed failed", e));
   }
 }
 

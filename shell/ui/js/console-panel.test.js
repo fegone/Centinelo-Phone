@@ -365,3 +365,48 @@ test("P3-4 retry after failure resumes: no re-injected or re-executed assets", a
     s.teardown();
   }
 });
+
+test("P4 reopen during the close's IPC round-trip: the click opens, and no ack can clobber the newer session", async () => {
+  // PR #45's last open finding: closeConsolePanel() fires
+  // console_panel_closed fire-and-forget, so there is a round-trip window
+  // where the panel is already closed but Rust has not processed the ack.
+  // This test pins BOTH halves of the contract that makes that window
+  // harmless by construction:
+  //   1. the frontend side - an immediate reopen must mount a fresh
+  //      console, never a swallowed click (Rust keeps no pending flag
+  //      that could veto the second open event), and
+  //   2. the protocol side - each close ack carries the session id of the
+  //      open it closes, so Rust can classify ack #1 as stale (superseded
+  //      by open #2) instead of restoring the window size under the
+  //      freshly reopened panel.
+  // If someone reintroduces a Rust- or JS-side "pending" mirror that
+  // swallows the reopen, assertion (a) fails; if the session echo is
+  // dropped, assertion (b) fails.
+  const s = setupStateful();
+  try {
+    await openConsolePanel({ session: 1 });
+    assert.equal(s.dom.screen.hidden, false);
+    closeConsolePanel(); // hides + destroys synchronously; ack in flight, NOT awaited
+    // THE RACE: the operator clicks console again before Rust could have
+    // processed console_panel_closed (session 1). Rust emits a fresh open
+    // event (session 2) - this must open, not no-op.
+    await openConsolePanel({ session: 2 });
+    assert.equal(s.dom.screen.hidden, false, "(a) the reopen during the close's round-trip must reveal the panel");
+    assert.equal(s.ui.mounts.length, 2, "a fresh mount, not a swallowed click");
+    assert.equal(s.ui.mounted.filter((m) => !m.destroyed).length, 1, "exactly one live mount");
+    assert.equal(s.ui.mounted[0].destroyed, true, "cycle 1's teardown really ran");
+
+    // Closing cycle 2 must ack session 2 - Rust's LIVE session - so the
+    // restore is honored; ack #1 (session 1) is already identifiable as
+    // stale by inequality in Rust's PanelSizeState (pinned Rust-side in
+    // console.rs's stale_ack_superseded_by_a_newer_open_never_restores).
+    closeConsolePanel();
+    const acks = s.deps.invokeCalls
+      .filter(([cmd]) => cmd === "console_panel_closed")
+      .map(([, args]) => args);
+    assert.deepEqual(acks, [{ session: 1 }, { session: 2 }], "(b) each close acks its own open's session id");
+    assert.equal(s.ui.mounted.filter((m) => !m.destroyed).length, 0);
+  } finally {
+    s.teardown();
+  }
+});

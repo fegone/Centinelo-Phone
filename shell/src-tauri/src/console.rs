@@ -99,7 +99,10 @@ pub const SEPARATE_WINDOW_ENV: &str = "CENTINELO_CONSOLE_SEPARATE_WINDOW";
 /// Event [`open_panel`] emits (app-wide) to tell the main window to show
 /// the inline console panel. `ui/js/console-panel.js` listens for it; only
 /// [`open`] ever emits it, always after its own license re-check, so no
-/// other code path can talk the frontend into opening the panel.
+/// other code path can talk the frontend into opening the panel. The
+/// payload carries a monotonic `session` id which the panel echoes back in
+/// `console_panel_closed`, so a close ack can always be told apart from a
+/// newer open - see [`PanelSizeState`].
 pub const PANEL_OPEN_EVENT: &str = "console-open-panel";
 
 /// Logical size the main window is grown to when the console panel opens,
@@ -122,22 +125,101 @@ const PANEL_MIN_SIZE: (f64, f64) = (760.0, 520.0);
 /// config and [`PANEL_MIN_SIZE`] below.
 const MAIN_DEFAULT_MIN_SIZE: (f64, f64) = (340.0, 560.0);
 
-/// Logical size the main window had before the console panel grew it,
-/// restored by [`panel_closed`]. `None` = panel not open / window not
-/// grown, which also makes a second `open_console` while the panel is
-/// already showing a sizing no-op (the remembered pre-panel size must not
-/// be overwritten with the already-grown one).
-static PANEL_RESTORE_SIZE: Mutex<Option<(f64, f64)>> = Mutex::new(None);
+/// Everything Rust remembers about the inline panel, in one guarded
+/// struct - and deliberately NOT a "panel is open" flag. The
+/// authoritative source of that fact is the main window's own frontend:
+/// `ui/js/console-panel.js`'s `openConsolePanel()` refuses to start a
+/// second open while one is in flight or showing **synchronously**
+/// (`openingPromise` is stored before its first `await` can yield, so JS
+/// run-to-completion makes check-and-set atomic; `isConsolePanelOpen`
+/// covers the already-showing case), and that guard is pinned by tests
+/// (console-panel.test.js P3-2/P3-3/P4). This module used to ALSO keep a
+/// `PANEL_OPEN_PENDING` bool as "defense in depth", but such a bool is a
+/// *mirror* of the frontend's state, and a lagging one: it only ever
+/// learned "closed" via the `console_panel_closed` round-trip, so for
+/// that entire round-trip it held `true` while the panel was already
+/// gone - and `open_panel`, trusting the mirror over the source, answered
+/// the operator's reopen click with a silent no-op. That is the exact
+/// shape of the BLF teardown bug this project already paid for (trusting
+/// a NOTIFY cache over the authoritative source), so the mirror is gone:
+/// `open_panel` always emits, and the frontend's guard is the one and
+/// only open-dedupe.
+///
+/// What Rust genuinely must remember is *sizing* - grow the window on
+/// open, restore it on close - and sizing still has to learn "closed"
+/// across the `console_panel_closed` round-trip. That residual race is
+/// closed with identity, not timing: every open stamps a fresh session
+/// id into the event payload, the close ack echoes it back, and
+/// [`panel_closed`] ignores any ack naming a session a newer open has
+/// already superseded (a late ack would otherwise shrink the window
+/// right back under a freshly reopened panel and consume the restore
+/// baseline while at it). See [`CloseOutcome`].
+struct PanelSizeState {
+    /// Session id stamped into the last [`PANEL_OPEN_EVENT`] payload
+    /// (`0` = never opened). Monotonic: advanced on every open and on
+    /// every honored close, so a given ack matches at most one close.
+    session: u64,
+    /// Logical size the main window had before the panel grew it,
+    /// restored by [`panel_closed`]. `None` = nothing to restore, which
+    /// also makes a second `open_console` before any close a sizing no-op
+    /// (the first pre-panel size is the one true baseline; it must not be
+    /// overwritten with the already-grown size).
+    restore: Option<(f64, f64)>,
+}
 
-/// Whether [`PANEL_OPEN_EVENT`] has been emitted without a
-/// [`panel_closed`] since - i.e. an inline-panel open is in flight or
-/// showing. [`open_panel`] refuses to emit a second event while this is
-/// set, so a double click on the console button cannot make the frontend
-/// mount console-ui twice (duplicated BLF subscriptions, duplicated
-/// dispatch) even if the frontend's own in-flight guard were ever
-/// removed. The frontend's every exit path - close button, load failure
-/// - calls `console_panel_closed`, which clears this and re-arms opens.
-static PANEL_OPEN_PENDING: Mutex<bool> = Mutex::new(false);
+static PANEL_SIZE_STATE: Mutex<PanelSizeState> = Mutex::new(PanelSizeState {
+    session: 0,
+    restore: None,
+});
+
+/// Pure decision half of [`panel_closed`] - what a close ack means for
+/// [`PanelSizeState`], with no window access, so the interleaving
+/// invariants are unit-testable (`mod tests`).
+#[derive(Debug, PartialEq)]
+enum CloseOutcome {
+    /// The ack names the live session: reset the window minimum and
+    /// restore this size (`None` = the open never captured a size; the
+    /// minimum reset still applies). Advances the session so a duplicate
+    /// ack is stale, never a second restore.
+    Restore(Option<(f64, f64)>),
+    /// The ack names a session a newer open already superseded: the
+    /// window that newer open grew must NOT be shrunk back under it.
+    Stale { ack: u64, current: u64 },
+    /// The ack carried no session identity (a defensive close with
+    /// nothing ever opened - the frontend never saw an open event, so
+    /// nothing was ever grown on its behalf).
+    Anonymous,
+}
+
+impl PanelSizeState {
+    /// Pure half of `open_panel`'s grow: stamp the next session id and
+    /// remember the pre-panel baseline exactly once per grow era - a
+    /// reopen before any close (the exact window this module's history is
+    /// about) keeps the FIRST baseline, since the window is still grown
+    /// from it.
+    fn begin_open(&mut self, current: Option<(f64, f64)>) -> u64 {
+        self.session += 1;
+        if self.restore.is_none() {
+            self.restore = current;
+        }
+        self.session
+    }
+
+    /// Pure half of `panel_closed` - see [`CloseOutcome`].
+    fn close(&mut self, ack: Option<u64>) -> CloseOutcome {
+        let Some(ack) = ack else {
+            return CloseOutcome::Anonymous;
+        };
+        if ack != self.session {
+            return CloseOutcome::Stale {
+                ack,
+                current: self.session,
+            };
+        }
+        self.session += 1;
+        CloseOutcome::Restore(self.restore.take())
+    }
+}
 
 /// Log target for everything console-window-specific, deliberately
 /// distinct from `frontend_log.rs`'s `"app_lib::frontend"` (the *main*
@@ -338,11 +420,19 @@ fn separate_window_mode() -> bool {
 /// [`open_or_focus`] - the button and tray item are hidden without it,
 /// but `open_console` is still a plain IPC command any webview can
 /// invoke), grow the main window to the console's layout floor, then emit
-/// [`PANEL_OPEN_EVENT`]. Loading the assets and mounting console-ui is
-/// `ui/js/console-panel.js`'s job; every request it makes for console-ui
-/// code goes back through [`asset_protocol_handler`], which enforces the
-/// same license gate again - defense in depth: absent button, gated
-/// command, gated bytes.
+/// [`PANEL_OPEN_EVENT`] with a fresh session id. Loading the assets and
+/// mounting console-ui is `ui/js/console-panel.js`'s job; every request
+/// it makes for console-ui code goes back through
+/// [`asset_protocol_handler`], which enforces the same license gate again
+/// - defense in depth: absent button, gated command, gated bytes.
+///
+/// There is deliberately NO Rust-side open-dedupe here: "the panel is
+/// open" is a fact about the frontend, and the frontend's own
+/// single-flight guard decides it authoritatively (see
+/// [`PanelSizeState`]'s doc). The old `PANEL_OPEN_PENDING` mirror used to
+/// answer a reopen click with a silent `Ok(())` whenever the close ack
+/// was still crossing IPC - the "button does nothing" window this
+/// module must never have.
 fn open_panel(app: &AppHandle) -> Result<(), String> {
     let premium = app
         .try_state::<PremiumHandle>()
@@ -350,45 +440,43 @@ fn open_panel(app: &AppHandle) -> Result<(), String> {
     if !is_unlocked(&premium) {
         return Err("premium console is not licensed".to_string());
     }
-    {
-        let mut pending = PANEL_OPEN_PENDING
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if *pending {
-            // An open is already in flight (assets loading) or showing -
-            // re-emitting would race a second ConsoleApp.mount() in the
-            // frontend. Idempotent Ok: the click still "worked".
-            log::info!(target: LOG_TARGET, "[console] inline panel already open/opening - dropping duplicate open");
-            return Ok(());
-        }
-        *pending = true;
-    }
     log::info!(target: LOG_TARGET, "[console] opening inline panel");
-    grow_main_window_for_panel(app);
-    if let Err(e) = app.emit(PANEL_OPEN_EVENT, ()) {
-        // Release the slot: with no event emitted there will be no
-        // console_panel_closed, and a stuck `true` would dead the button
-        // for the rest of the session.
-        *PANEL_OPEN_PENDING
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
-        return Err(e.to_string());
-    }
-    Ok(())
+    let session = grow_main_window_for_panel(app);
+    app.emit(PANEL_OPEN_EVENT, serde_json::json!({ "session": session }))
+        .map_err(|e| e.to_string())
 }
 
 /// Called by `commands::console_panel_closed` once the frontend has hidden
 /// the inline panel (after its own `app.destroy()` teardown of the mounted
 /// console-ui: store stop, BLF unsubscriptions, tick interval): restores
 /// the main window's pre-panel size and its configured minimum.
-pub fn panel_closed(app: &AppHandle) {
-    *PANEL_OPEN_PENDING
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
-    let restore = PANEL_RESTORE_SIZE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .take();
+/// `session` is the id [`open_panel`] stamped into the open event being
+/// closed; an ack naming a session a newer open already superseded is
+/// ignored (and logged) instead of restoring - see [`PanelSizeState`].
+pub fn panel_closed(app: &AppHandle, session: Option<u64>) {
+    let outcome = {
+        let mut state = PANEL_SIZE_STATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.close(session)
+    };
+    let restore = match outcome {
+        CloseOutcome::Restore(restore) => restore,
+        CloseOutcome::Stale { ack, current } => {
+            log::info!(
+                target: LOG_TARGET,
+                "[console] panel-closed ack for superseded session {ack} (current {current}) ignored - a newer open already re-grew the window"
+            );
+            return;
+        }
+        CloseOutcome::Anonymous => {
+            log::info!(
+                target: LOG_TARGET,
+                "[console] panel-closed ack carried no session id - nothing to restore"
+            );
+            return;
+        }
+    };
     let Some(window) = app.get_webview_window("main") else {
         return;
     };
@@ -403,34 +491,40 @@ pub fn panel_closed(app: &AppHandle) {
 
 /// Grows the main window to [`PANEL_TARGET_SIZE`] and lifts its minimum to
 /// [`PANEL_MIN_SIZE`] for as long as the console panel is open - see
-/// [`PANEL_TARGET_SIZE`]'s doc for why the panel needs the room. Records
-/// the pre-open size exactly once per open, in logical pixels, so the
-/// restore is exact on any display scale factor.
-fn grow_main_window_for_panel(app: &AppHandle) {
-    let Some(window) = app.get_webview_window("main") else {
-        return;
-    };
-    let mut restore = PANEL_RESTORE_SIZE
+/// [`PANEL_TARGET_SIZE`]'s doc for why the panel needs the room. Stamps
+/// and returns the new session id for [`PANEL_OPEN_EVENT`]'s payload,
+/// recording the pre-open baseline exactly once per grow era, in logical
+/// pixels, so the restore is exact on any display scale factor. The state
+/// lock is held across the window calls too: [`panel_closed`] takes the
+/// same lock, so a close ack can never interleave between this stamp and
+/// the grow it belongs to - the two sides' size changes are submitted in
+/// a well-defined order.
+fn grow_main_window_for_panel(app: &AppHandle) -> u64 {
+    let mut state = PANEL_SIZE_STATE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let scale = window.scale_factor().unwrap_or(1.0);
-    let current = window.inner_size().ok().map(|phys| {
-        let logical: tauri::LogicalSize<f64> = phys.to_logical(scale);
-        (logical.width, logical.height)
+    let window = app.get_webview_window("main");
+    let current = window.as_ref().and_then(|w| {
+        let scale = w.scale_factor().unwrap_or(1.0);
+        w.inner_size().ok().map(|phys| {
+            let logical: tauri::LogicalSize<f64> = phys.to_logical(scale);
+            (logical.width, logical.height)
+        })
     });
-    if restore.is_none() {
-        *restore = current;
+    let session = state.begin_open(current);
+    if let Some(window) = window {
+        let _ = window.set_min_size(Some(tauri::LogicalSize::new(
+            PANEL_MIN_SIZE.0,
+            PANEL_MIN_SIZE.1,
+        )));
+        if let Some((w, h)) = current {
+            let _ = window.set_size(tauri::LogicalSize::new(
+                w.max(PANEL_TARGET_SIZE.0),
+                h.max(PANEL_TARGET_SIZE.1),
+            ));
+        }
     }
-    let _ = window.set_min_size(Some(tauri::LogicalSize::new(
-        PANEL_MIN_SIZE.0,
-        PANEL_MIN_SIZE.1,
-    )));
-    if let Some((w, h)) = current {
-        let _ = window.set_size(tauri::LogicalSize::new(
-            w.max(PANEL_TARGET_SIZE.0),
-            h.max(PANEL_TARGET_SIZE.1),
-        ));
-    }
+    session
 }
 
 /// Finds the already-open console window and focuses it, or builds a
@@ -945,3 +1039,117 @@ const INDEX_HTML: &str = r##"<!doctype html>
 </body>
 </html>
 "##;
+
+#[cfg(test)]
+mod tests {
+    //! The inline panel's sizing/session state machine - the pure half of
+    //! `open_panel`/`panel_closed`, exercised with no AppHandle so every
+    //! interleaving that matters can be pinned deterministically. The
+    //! stateful frontend half of the same contract (reopen during the
+    //! close's IPC round-trip must work) is pinned in
+    //! `ui/js/console-panel.test.js` ("P4").
+    use super::{CloseOutcome, PanelSizeState};
+
+    fn fresh() -> PanelSizeState {
+        PanelSizeState {
+            session: 0,
+            restore: None,
+        }
+    }
+
+    #[test]
+    fn honored_ack_restores_its_own_eras_baseline() {
+        let mut s = fresh();
+        let first = s.begin_open(Some((380.0, 560.0)));
+        assert_eq!(first, 1, "session ids start at 1 (0 = never opened)");
+        assert_eq!(
+            s.close(Some(first)),
+            CloseOutcome::Restore(Some((380.0, 560.0)))
+        );
+        // Baseline consumed: the next grow era records a fresh one. The
+        // new id is 3, not 2 - the honored close advanced the session to
+        // make acks one-shot, and begin_open steps past it.
+        let second = s.begin_open(Some((900.0, 640.0)));
+        assert_eq!(second, first + 2);
+        assert_eq!(
+            s.close(Some(second)),
+            CloseOutcome::Restore(Some((900.0, 640.0)))
+        );
+    }
+
+    #[test]
+    fn stale_ack_superseded_by_a_newer_open_never_restores() {
+        // THE interleaving this PR closes: close(session 1) is still
+        // crossing IPC when the operator's reopen click runs open_panel
+        // again (session 2, window re-grown from the same baseline). The
+        // late ack for session 1 must be identified as stale and ignored -
+        // honoring it would shrink the window right back under the
+        // freshly reopened panel AND consume the baseline the live
+        // session's own close still needs.
+        let mut s = fresh();
+        let first = s.begin_open(Some((380.0, 560.0)));
+        let second = s.begin_open(None); // reopen before any close ack landed
+        assert_eq!(
+            s.restore, Some((380.0, 560.0)),
+            "a reopen before any close must keep the FIRST baseline, not overwrite it with the grown size"
+        );
+        assert_eq!(
+            s.close(Some(first)),
+            CloseOutcome::Stale {
+                ack: first,
+                current: second
+            }
+        );
+        assert_eq!(
+            s.restore,
+            Some((380.0, 560.0)),
+            "a stale ack must not consume the baseline"
+        );
+        assert_eq!(
+            s.close(Some(second)),
+            CloseOutcome::Restore(Some((380.0, 560.0))),
+            "the live session's close still restores the one true baseline"
+        );
+    }
+
+    #[test]
+    fn duplicate_ack_is_stale_not_a_second_restore() {
+        let mut s = fresh();
+        let id = s.begin_open(Some((380.0, 560.0)));
+        assert!(matches!(s.close(Some(id)), CloseOutcome::Restore(_)));
+        assert_eq!(
+            s.close(Some(id)),
+            CloseOutcome::Stale {
+                ack: id,
+                current: id + 1
+            },
+            "an honored close advances the session, so a replayed ack cannot restore twice"
+        );
+    }
+
+    #[test]
+    fn anonymous_and_future_acks_do_nothing() {
+        let mut s = fresh();
+        assert!(matches!(s.close(None), CloseOutcome::Anonymous));
+        let id = s.begin_open(Some((380.0, 560.0)));
+        // An ack naming a session that was never emitted (defensive
+        // frontend, corrupted state) must not restore either.
+        assert!(matches!(
+            s.close(Some(id + 5)),
+            CloseOutcome::Stale { .. }
+        ));
+        assert_eq!(s.restore, Some((380.0, 560.0)), "untouched");
+    }
+
+    #[test]
+    fn session_ids_are_strictly_monotonic_across_eras() {
+        let mut s = fresh();
+        let mut prev = 0;
+        for _ in 0..3 {
+            let id = s.begin_open(None);
+            assert!(id > prev, "each open stamps a fresh, larger session id");
+            assert!(matches!(s.close(Some(id)), CloseOutcome::Restore(_)));
+            prev = id;
+        }
+    }
+}
