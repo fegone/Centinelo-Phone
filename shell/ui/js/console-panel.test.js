@@ -22,7 +22,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  CONSOLE_ASSET_ORIGIN,
+  ASSET_SCHEME,
+  resolveConsoleAssetOrigin,
   CONSOLE_STYLES,
   CONSOLE_SCRIPTS,
   assetUrl,
@@ -35,10 +36,45 @@ import {
   resetConsolePanelStateForTests,
 } from "./console-panel.js";
 
-test("CONSOLE_ASSET_ORIGIN pins the premium-console:// scheme host", () => {
-  // Must stay in lockstep with console.rs::ASSET_SCHEME + the host its
-  // handler serves (and therefore with tauri.conf.json's CSP entry).
-  assert.equal(CONSOLE_ASSET_ORIGIN, "premium-console://localhost/");
+// The origin shape a Tauri `convertFileSrc`-alike returns on macOS/Linux
+// vs. Windows/Android (tauri 2.11.5's scripts/core.js). Fake spies below
+// mimic exactly that contract instead of asserting one hardcoded literal
+// - the bug this module used to have (see resolveConsoleAssetOrigin's doc)
+// was pinning ONLY the macOS/Linux shape as ground truth.
+const MACOS_LINUX_ORIGIN = "premium-console://localhost/";
+const WINDOWS_ANDROID_ORIGIN = "http://premium-console.localhost/";
+const fakeConvertFileSrcMacLinux = (path, protocol) => `${protocol}://localhost/${path}`;
+const fakeConvertFileSrcWindowsAndroid = (path, protocol) => `http://${protocol}.localhost/${path}`;
+
+test("ASSET_SCHEME pins the scheme name console.rs::ASSET_SCHEME must match", () => {
+  assert.equal(ASSET_SCHEME, "premium-console");
+});
+
+test("resolveConsoleAssetOrigin: macOS/Linux shape (scheme://localhost/)", () => {
+  assert.equal(resolveConsoleAssetOrigin(fakeConvertFileSrcMacLinux), MACOS_LINUX_ORIGIN);
+});
+
+test("resolveConsoleAssetOrigin: Windows/Android shape (http://scheme.localhost/)", () => {
+  // THE regression this module exists to fix: a hardcoded macOS/Linux
+  // literal here silently broke Windows for months (see git history /
+  // docs/console-inline-panel-decision.md's addendum). This assertion
+  // fails if resolveConsoleAssetOrigin ever goes back to ignoring the
+  // platform it's told about.
+  assert.equal(resolveConsoleAssetOrigin(fakeConvertFileSrcWindowsAndroid), WINDOWS_ANDROID_ORIGIN);
+});
+
+test("resolveConsoleAssetOrigin forwards an empty path and the exact scheme name", () => {
+  // Empty path matters: convertFileSrc percent-encodes its filePath as one
+  // opaque segment (encodeURIComponent escapes "/" too), which would
+  // corrupt multi-segment asset paths like "components/dom-utils.js" -
+  // encodeURIComponent("") is "", so an empty path is the only call shape
+  // that yields a clean bare origin. See resolveConsoleAssetOrigin's doc.
+  const calls = [];
+  resolveConsoleAssetOrigin((path, protocol) => {
+    calls.push([path, protocol]);
+    return "unused";
+  });
+  assert.deepEqual(calls, [["", "premium-console"]]);
 });
 
 test("CONSOLE_STYLES: tokens.css before console.css (custom-property order)", () => {
@@ -58,9 +94,13 @@ test("CONSOLE_SCRIPTS: dependency order, dom-utils first and console-app last", 
   assert.equal(CONSOLE_SCRIPTS.length, 11);
 });
 
-test("assetUrl joins origin + path without double slashes", () => {
-  assert.equal(assetUrl("console-app.js"), "premium-console://localhost/console-app.js");
-  assert.equal(assetUrl("components/icons.js"), "premium-console://localhost/components/icons.js");
+test("assetUrl joins an explicit origin + path without double slashes, on both platform shapes", () => {
+  // origin is a required argument, never a module default - see
+  // assetUrl's doc for why (the same hardcoded-shape bug
+  // resolveConsoleAssetOrigin fixes one level up).
+  assert.equal(assetUrl(MACOS_LINUX_ORIGIN, "console-app.js"), "premium-console://localhost/console-app.js");
+  assert.equal(assetUrl(MACOS_LINUX_ORIGIN, "components/icons.js"), "premium-console://localhost/components/icons.js");
+  assert.equal(assetUrl(WINDOWS_ANDROID_ORIGIN, "console-app.js"), "http://premium-console.localhost/console-app.js");
 });
 
 test("favoritesToRoster: keeps ext-bearing favorites, trims, falls back to Ext label", () => {
@@ -234,9 +274,20 @@ function installFakeDeps() {
     listen(event, handler) { d.listenCalls.push([event, handler]); },
     showBanner(message, kind) { d.showBannerCalls.push([message, kind]); },
     reportFrontendIssue(kind, data) { d.reportCalls.push([kind, data]); },
+    // Fixed to the macOS/Linux shape - the stateful tests below don't
+    // exercise platform selection (that's resolveConsoleAssetOrigin's
+    // own tests above); they just need SOME origin initConsolePanel can
+    // resolve, consistently, so assetUrl(TEST_ORIGIN, path) below matches
+    // what the module under test actually requests.
+    convertFileSrc: fakeConvertFileSrcMacLinux,
   };
   return d;
 }
+
+/// The origin installFakeDeps's convertFileSrc resolves to - matches what
+/// initConsolePanel(deps) computes internally, so tests can build the
+/// exact URLs the module will fetch without hardcoding a separate literal.
+const TEST_ORIGIN = MACOS_LINUX_ORIGIN;
 
 /// One stateful scenario: swap in fresh document/window doubles (saving
 /// whatever was there), reset the module's singletons, silence the
@@ -270,7 +321,7 @@ function setupStateful({ failUrls = [] } = {}) {
 test("P3-1 asset load failure: panel NEVER reveals, error banner + report fire instead", async () => {
   // THE anti-white-screen regression test: if a future refactor reveals
   // #screen-console before the assets are guaranteed loaded, this fails.
-  const failAt = assetUrl(CONSOLE_SCRIPTS[0]); // both styles load, first script 404s
+  const failAt = assetUrl(TEST_ORIGIN, CONSOLE_SCRIPTS[0]); // both styles load, first script 404s
   const s = setupStateful({ failUrls: [failAt] });
   try {
     await openConsolePanel();
@@ -283,8 +334,8 @@ test("P3-1 asset load failure: panel NEVER reveals, error banner + report fire i
     // unwind tells Rust, so the window-size restore still happens
     assert.ok(s.deps.invokeCalls.some(([cmd]) => cmd === "console_panel_closed"));
     // the two styles that DID load are live exactly once; the failed script left no dead node
-    assert.equal(s.dom.liveNodesFor(assetUrl(CONSOLE_STYLES[0])).length, 1);
-    assert.equal(s.dom.liveNodesFor(assetUrl(CONSOLE_STYLES[1])).length, 1);
+    assert.equal(s.dom.liveNodesFor(assetUrl(TEST_ORIGIN, CONSOLE_STYLES[0])).length, 1);
+    assert.equal(s.dom.liveNodesFor(assetUrl(TEST_ORIGIN, CONSOLE_STYLES[1])).length, 1);
     assert.equal(s.dom.liveNodesFor(failAt).length, 0, "failed node removed, not stacked for the retry");
   } finally {
     s.teardown();
@@ -345,7 +396,7 @@ test("P3-4 retry after failure resumes: no re-injected or re-executed assets", a
   // The P2 contract: failure at script 1, outage "fixed", next open must
   // not re-run the two styles that already loaded (they'd execute twice
   // / stack duplicate nodes), only fetch what never landed.
-  const firstScript = assetUrl(CONSOLE_SCRIPTS[0]);
+  const firstScript = assetUrl(TEST_ORIGIN, CONSOLE_SCRIPTS[0]);
   const s = setupStateful({ failUrls: [firstScript] });
   try {
     await openConsolePanel(); // fails at the first script
@@ -355,10 +406,10 @@ test("P3-4 retry after failure resumes: no re-injected or re-executed assets", a
     assert.equal(s.dom.screen.hidden, false, "retry succeeds and reveals");
     assert.equal(s.ui.mounts.length, 1, "the retry mounts exactly once");
     for (const style of CONSOLE_STYLES) {
-      assert.equal(s.dom.liveNodesFor(assetUrl(style)).length, 1, style + " live exactly once - never duplicated by the retry");
+      assert.equal(s.dom.liveNodesFor(assetUrl(TEST_ORIGIN, style)).length, 1, style + " live exactly once - never duplicated by the retry");
     }
     for (const script of CONSOLE_SCRIPTS) {
-      assert.equal(s.dom.liveNodesFor(assetUrl(script)).length, 1, script + " live exactly once");
+      assert.equal(s.dom.liveNodesFor(assetUrl(TEST_ORIGIN, script)).length, 1, script + " live exactly once");
     }
     assert.equal(s.dom.head.children.length, CONSOLE_STYLES.length + CONSOLE_SCRIPTS.length, "head holds one node per asset, no dead leftovers");
   } finally {

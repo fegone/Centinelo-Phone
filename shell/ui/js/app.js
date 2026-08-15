@@ -70,7 +70,7 @@ import { SETTINGS_FIELD_GROUPS, summarizeSettledResults, runSettingsPaintSteps, 
 // window.__TAURI__.core alongside `invoke` - withGlobalTauri bundles the
 // WHOLE @tauri-apps/api/core module, not a curated subset (verified
 // against tauri's own scripts/bundle.global.js, 2.11.5).
-const { invoke, Channel } = window.__TAURI__.core;
+const { invoke, Channel, convertFileSrc } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 const { getCurrentWindow } = window.__TAURI__.window;
 const { getVersion } = window.__TAURI__.app;
@@ -3468,8 +3468,12 @@ async function boot() {
   document.documentElement.dataset.os = detectOS();
   // Console panel gets its Tauri bindings + UI surfaces injected (rather
   // than touching window.__TAURI__ itself) so its pure helpers stay
-  // testable without a webview - see console-panel.js's doc.
-  initConsolePanel({ invoke, listen, showBanner, reportFrontendIssue });
+  // testable without a webview - see console-panel.js's doc. convertFileSrc
+  // is what lets it resolve the right asset origin for THIS platform
+  // (premium-console://localhost/ on macOS/Linux, http://premium-console
+  // .localhost/ on Windows) instead of a hardcoded one - see
+  // resolveConsoleAssetOrigin's doc in console-panel.js.
+  initConsolePanel({ invoke, listen, showBanner, reportFrontendIssue, convertFileSrc });
   wireStaticHandlers();
   wireCodecsHandlers();
   wireDeviceHandlers();

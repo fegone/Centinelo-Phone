@@ -40,11 +40,56 @@
 
 import { t } from "./i18n.js";
 
-/// Base URL every console-ui asset is served from — matches
-/// console.rs::ASSET_SCHEME + the host its handler serves (the same URL
-/// the legacy separate window loaded). Pinned here so the test can pin
-/// the shell↔scheme contract in one place.
-export const CONSOLE_ASSET_ORIGIN = "premium-console://localhost/";
+/// Scheme name console-ui assets are served under — must match
+/// console.rs::ASSET_SCHEME verbatim (also the scheme tauri.conf.json's
+/// CSP has to list, in BOTH origin shapes — see resolveConsoleAssetOrigin's
+/// doc). Exported so the origin resolver and tests share one source
+/// instead of each hardcoding the string.
+export const ASSET_SCHEME = "premium-console";
+
+/// Resolves the origin every console-ui asset request must be built
+/// against, for THIS platform. There is no single answer: per Tauri's own
+/// docs (verified against tauri 2.11.5's `src/app.rs` doc comment and its
+/// `scripts/core.js` — the file that implements this exact behavior for
+/// its own `convertFileSrc`), `register_uri_scheme_protocol` schemes are
+/// reachable at
+///   - `<scheme>://localhost/<path>` on macOS, iOS, Linux
+///   - `http://<scheme>.localhost/<path>` on Windows and Android
+/// A prior version of this module hardcoded the first form — the
+/// scheme's own handler in console.rs never saw a Windows request at all,
+/// because WebView2 doesn't resolve `premium-console://` as navigable and
+/// the request died inside the webview before reaching Rust (see
+/// docs/console-inline-panel-decision.md's addendum for the Windows log
+/// evidence: zero handler log lines, ever).
+///
+/// Rather than re-implement that OS branch (fragile — `navigator.userAgent`
+/// sniffing, or guessing at a `target_os` equivalent with no compile-time
+/// help in a webview), this delegates to Tauri's OWN already-verified
+/// platform detection: `convertFileSrc(filePath, protocol)` is built for
+/// exactly this ("the URL that can be used as source on the webview" for
+/// a custom-protocol asset), and it computes precisely the two forms
+/// above internally. Passing an EMPTY path matters: `convertFileSrc`
+/// percent-encodes its `filePath` argument as a single opaque segment
+/// (via `encodeURIComponent`, which also escapes `/`) — fine for a real
+/// filesystem path (the whole thing is one decoded unit on the Rust
+/// side), but wrong for our multi-segment asset paths like
+/// "components/dom-utils.js" (console.rs::asset_protocol_handler does a
+/// literal `dir.join(route)` against the RAW, un-decoded request path —
+/// see its doc — so an encoded `%2F` there would 404, not resolve).
+/// `encodeURIComponent("")` is `""`, so calling it with an empty path
+/// yields exactly the bare origin with no encoding artifact, and
+/// `assetUrl` below does its own plain string join for every real asset
+/// path — literal slashes, matching what the handler expects.
+export function resolveConsoleAssetOrigin(convertFileSrc) {
+  return convertFileSrc("", ASSET_SCHEME);
+}
+
+/// Absolute URL for one console-ui asset path (e.g. "console-app.js"),
+/// joined against an explicit `origin`. `origin` is deliberately a
+/// parameter, never a module-level constant: which literal string is
+/// correct depends on the platform (see resolveConsoleAssetOrigin), and a
+/// hardcoded default here is exactly how this module picked the wrong
+/// one for Windows before.
 
 /// Stylesheets, in the same order the package's own dev/mock.html loads
 /// them (tokens first: console.css consumes its custom properties).
@@ -71,8 +116,8 @@ export const CONSOLE_SCRIPTS = Object.freeze([
 ]);
 
 /// Absolute URL for one console-ui asset path (e.g. "console-app.js").
-export function assetUrl(path) {
-  return CONSOLE_ASSET_ORIGIN + path;
+export function assetUrl(origin, path) {
+  return origin + path;
 }
 
 /// Maps the operator's configured favorites (commands::get_favorites —
@@ -130,7 +175,8 @@ export function makeConsoleDispatcher(invoke) {
 // stateful half — runs in the webview only
 // ---------------------------------------------------------------------------
 
-let deps = null; // set by initConsolePanel: { invoke, listen, showBanner, reportFrontendIssue }
+let deps = null; // set by initConsolePanel: { invoke, listen, showBanner, reportFrontendIssue, convertFileSrc }
+let assetOrigin = null; // resolveConsoleAssetOrigin(deps.convertFileSrc), cached once per initConsolePanel call
 let assetsPromise = null; // one load of styles+scripts per session (reset on failure so a retry is possible)
 const loadedAssets = new Set(); // asset URLs with a live node in <head> - lets a retry resume past what already loaded
 let openingPromise = null; // the in-flight openConsolePanel() run - see openConsolePanel()'s doc
@@ -142,17 +188,23 @@ let mounted = null; // the ConsoleApp.mount() return value ({ store, element, de
 let openSession = null;
 
 /// Hands this module its Tauri bindings + UI surfaces. Called once from
-/// app.js's boot(), before any panel can open.
+/// app.js's boot(), before any panel can open. Resolves `assetOrigin`
+/// right away (not lazily): the platform doesn't change mid-session, and
+/// resolving it here — once — means every asset load reuses the exact
+/// same string rather than recomputing it (and risking a different
+/// answer) per request.
 export function initConsolePanel(d) {
   deps = d;
+  assetOrigin = resolveConsoleAssetOrigin(d.convertFileSrc);
 }
 
 /// Test-only: console-panel.test.js's stateful-half tests reset this
-/// module's singletons (deps, in-flight open, assets cache, mounted
-/// instance) so each open/close scenario runs in isolation. Never call
-/// from app.js.
+/// module's singletons (deps, resolved origin, in-flight open, assets
+/// cache, mounted instance) so each open/close scenario runs in
+/// isolation. Never call from app.js.
 export function resetConsolePanelStateForTests() {
   deps = null;
+  assetOrigin = null;
   openingPromise = null;
   assetsPromise = null;
   mounted = null;
@@ -319,7 +371,7 @@ async function loadConsoleAssets() {
 /// the resume half of ensureAssetsLoaded's retry contract. Marks the URL
 /// loaded only on success.
 async function loadAssetOnce(load, path) {
-  const url = assetUrl(path);
+  const url = assetUrl(assetOrigin, path);
   if (loadedAssets.has(url)) return;
   await load(url);
   loadedAssets.add(url);
