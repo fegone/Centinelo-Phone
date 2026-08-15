@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "console",
-  "description": "Capabilities for the premium receptionist console window - close/minimize (wired to the console-ui package's own titlebar buttons, see console.rs) + dragging (no data-tauri-drag-region attribute possible on its JS-constructed DOM).",
+  "description": "Capabilities for the LEGACY premium receptionist console window (console.rs's SEPARATE_WINDOW_ENV path, kept during the transition to the inline #screen-console panel - see docs/console-inline-panel-decision.md). Deliberately the narrowest capability in this app: close/minimize/dragging (its JS-constructed DOM, wired to console.rs's own embedded INDEX_HTML titlebar) plus the exact command set that same embedded HTML invokes - call control (sidecar_dial/answer/hangup/hold/resume/mute/*_transfer), the BLF roster (get_favorites, sidecar_blf_subscribe/unsubscribe) and its two lifecycle pings (console_frontend_ready/fatal). This window MUST NEVER be granted admin_unlock, admin_set_password, admin_lock, admin_status, activate_license, get_license_settings, set_core_binary_path, provisioning_*, save_account_settings/save_*_settings or updater_* - it renders third-party-adjacent console-ui content behind a license gate, not a trusted settings surface, and every one of those commands lets a compromised console panel do things (unlock the app, rewrite the SIP account, ship a new core binary path, flip provisioning) with consequences well past the console's own job. See capabilities/default.json for the main window's much larger grant, which DOES include the admin/license/provisioning/settings surface.",
   "windows": [
     "console"
   ],
@@ -12,6 +12,22 @@
     "core:window:allow-hide",
     "core:window:allow-show",
     "core:window:allow-set-focus",
-    "core:window:allow-start-dragging"
+    "core:window:allow-start-dragging",
+    "allow-console-frontend-fatal",
+    "allow-console-frontend-ready",
+    "allow-get-favorites",
+    "allow-sidecar-abort-transfer",
+    "allow-sidecar-answer",
+    "allow-sidecar-attended-transfer",
+    "allow-sidecar-blf-subscribe",
+    "allow-sidecar-blf-unsubscribe",
+    "allow-sidecar-blind-transfer",
+    "allow-sidecar-complete-transfer",
+    "allow-sidecar-dial",
+    "allow-sidecar-hangup",
+    "allow-sidecar-hold",
+    "allow-sidecar-mute",
+    "allow-sidecar-resume",
+    "allow-sidecar-restart"
   ]
 }
