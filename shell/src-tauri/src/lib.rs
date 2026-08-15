@@ -1,4 +1,6 @@
 mod activation;
+#[cfg(test)]
+mod acl_capabilities;
 mod bridge;
 mod commands;
 mod console;
