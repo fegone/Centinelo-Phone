@@ -127,15 +127,47 @@ export function summarizeSettledResults(results) {
 /// reveal step; a `reveal`-throws bug needs to be loud, not caught here
 /// and quietly forgotten. The caller (openSettings's own defensive
 /// `.catch` in wireStaticHandlers) is what's left to log it.
+///
+/// `reveal()` runs in a `finally`, wrapping the ENTIRE loop above, not
+/// just placed after it (ronda 3, coordinator finding, reproduced live: a
+/// thrown value whose `.message` getter itself throws makes
+/// `describeError(e)` - called FROM INSIDE the per-step `catch` block -
+/// throw a second time; that second throw happens outside the per-step
+/// try/catch's protection, so it used to escape the loop entirely and
+/// skip a bare `reveal()` call sitting after it, leaving the screen
+/// hidden. `finally` is what turns "reveal always runs" from "true as
+/// long as nothing else in this function's error handling ever fails
+/// either" into a structural guarantee that doesn't depend on that -
+/// exactly the class of assumption that left the field with a two-day
+/// blank screen. See settings-load.test.js's "getter-throws" test, which
+/// reproduces the coordinator's exact repro.
+///
+/// The double-throw case this creates: if the loop is ALREADY propagating
+/// an exception (the getter-throws scenario above, or any other bug this
+/// function's own error handling didn't anticipate) and `reveal()` ALSO
+/// throws, JavaScript's `finally` semantics mean reveal's exception
+/// REPLACES the pending one - the original is lost, not chained. Rather
+/// than leave that to whatever the language happens to do, it's the
+/// deliberate choice here too: reveal's exception is the one that must
+/// surface, because "the mechanism that shows the screen is now ALSO
+/// broken" is a strictly more urgent problem than whatever caused the
+/// first throw, and the "ugly case" reasoning two paragraphs up already
+/// commits to reveal failures being loud above everything else. `reveal`
+/// is still only ever attempted once in this case, same as every other
+/// path through this function. See settings-load.test.js's
+/// "loop-and-reveal-both-throw" test.
 export function runSettingsPaintSteps(steps, reveal) {
   const failed = [];
-  for (const step of steps) {
-    try {
-      step.run();
-    } catch (e) {
-      failed.push({ name: step.name, error: describeError(e) });
+  try {
+    for (const step of steps) {
+      try {
+        step.run();
+      } catch (e) {
+        failed.push({ name: step.name, error: describeError(e) });
+      }
     }
+  } finally {
+    reveal();
   }
-  reveal();
   return failed;
 }

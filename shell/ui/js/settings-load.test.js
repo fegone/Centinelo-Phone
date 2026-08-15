@@ -267,3 +267,55 @@ test("runSettingsPaintSteps: reveal(4), the ugly case: reveal() itself throws ->
   // than one (silently retried after failing).
   assert.equal(revealAttempts, 1);
 });
+
+test("runSettingsPaintSteps: reveal(5), ronda 3 reproduction (getter-throws): a thrown value whose .message getter itself throws -> reveal is still called exactly once (mutation target for the finally guarantee)", () => {
+  // Exact reproduction from the coordinator's ronda 3 finding: `nasty` is
+  // thrown by the step, caught by the per-step try/catch, and then
+  // describeError(e) - which reads `e.message` - triggers the getter,
+  // which throws a SECOND time. That second throw happens from inside the
+  // catch block, i.e. outside the per-step try/catch's own protection, so
+  // it escapes the loop. Before this fix, a bare `reveal()` call placed
+  // after the loop (not in a `finally`) was skipped entirely in this
+  // case - "reveal llamado: 0" in the coordinator's repro output. Wrapping
+  // the loop in try/finally is what makes this pass: mutate
+  // runSettingsPaintSteps back to a bare `reveal()` after the loop (no
+  // finally) and this is the assertion that catches it.
+  const reveal = countingReveal();
+  const nasty = {
+    get message() {
+      throw new Error("boom desde el getter");
+    },
+  };
+  assert.throws(
+    () => runSettingsPaintSteps([{ name: "paso", run: () => { throw nasty; } }], reveal),
+    /boom desde el getter/,
+  );
+  assert.equal(reveal.calls, 1);
+});
+
+test("runSettingsPaintSteps: reveal(6), the double-throw case: the loop is already propagating an exception AND reveal() also throws -> reveal's exception is what surfaces (deliberate, not left to JS's finally semantics by accident), reveal was still attempted exactly once", () => {
+  // Documented behavior (see runSettingsPaintSteps' own header comment):
+  // JavaScript's `finally` semantics would already make reveal's throw
+  // replace the loop's pending exception here, silently discarding the
+  // original - this test exists so that behavior is asserted deliberately
+  // rather than left as an accident of the language. The reasoning: once
+  // `reveal` is ALSO broken, "the mechanism that shows the screen is now
+  // broken too" is a strictly more urgent problem than whatever the loop
+  // was already failing on, and reveal(4) above already commits to reveal
+  // failures needing to be the loudest thing in the room.
+  let revealAttempts = 0;
+  const explodingReveal = () => {
+    revealAttempts += 1;
+    throw new Error("reveal itself is broken");
+  };
+  const nasty = {
+    get message() {
+      throw new Error("boom desde el getter");
+    },
+  };
+  assert.throws(
+    () => runSettingsPaintSteps([{ name: "paso", run: () => { throw nasty; } }], explodingReveal),
+    /reveal itself is broken/,
+  );
+  assert.equal(revealAttempts, 1);
+});
