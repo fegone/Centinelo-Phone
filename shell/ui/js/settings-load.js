@@ -71,3 +71,35 @@ export function summarizeSettledResults(results) {
   });
   return { values, failed };
 }
+
+/// Paint-phase counterpart to summarizeSettledResults. The load-phase fix
+/// above (Promise.allSettled) only isolates failures in the 8 backend
+/// invoke() calls - openSettings() then spends ~15 more statements PAINTING
+/// those results into the DOM (setTransportUI, renderCodecsSection,
+/// applyLockUI, ...), and until this existed that paint phase was one flat
+/// synchronous sequence ending in the screen's reveal line. A throw
+/// anywhere in it (a missing element, a malformed value from a group that
+/// "fulfilled" with junk, ...) aborted the whole function before the
+/// reveal ever ran - reported from the field 2026-08-15 as "clicking
+/// Settings does nothing at all, no banner, no screen".
+///
+/// `steps` is an array of `{ name, run }`; `run` is a zero-arg closure
+/// (the DOM/state access it needs comes from its caller's closure, same as
+/// every other paint call in openSettings). Every step's `run` is invoked
+/// regardless of an earlier step throwing - each failure is caught,
+/// tagged with its step's `name` and a stringified error (never the raw
+/// thrown value, same "no call content forwarded" contract
+/// summarizeSettledResults follows), and collected in the returned
+/// `failed` array instead of escaping. The caller can then still reach its
+/// own "reveal the screen" line unconditionally.
+export function runSettingsPaintSteps(steps) {
+  const failed = [];
+  for (const step of steps) {
+    try {
+      step.run();
+    } catch (e) {
+      failed.push({ name: step.name, error: describeError(e) });
+    }
+  }
+  return failed;
+}

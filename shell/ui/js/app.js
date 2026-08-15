@@ -64,7 +64,7 @@ import {
 } from "./reg-status.js";
 import { logMilestone, reportFrontendIssue } from "./error-reporting.js";
 import { initConsolePanel, openConsolePanel, closeConsolePanel } from "./console-panel.js";
-import { SETTINGS_FIELD_GROUPS, summarizeSettledResults } from "./settings-load.js";
+import { SETTINGS_FIELD_GROUPS, summarizeSettledResults, runSettingsPaintSteps, describeError } from "./settings-load.js";
 
 // `Channel` (updater download progress) and `Resource` both live on
 // window.__TAURI__.core alongside `invoke` - withGlobalTauri bundles the
@@ -2130,23 +2130,40 @@ function clearFieldLoadFailed(inputId) {
   if (el.dataset.i18nPlaceholder) el.placeholder = t(el.dataset.i18nPlaceholder);
 }
 
-/// Renders (or hides) the persistent "some settings couldn't load" notice
-/// at the top of the Settings screen - the truthful-degrade counterpart to
-/// markFieldLoadFailed for the sections that don't have a single text
-/// input to flag (favorites/bridge/license/availability/theme/admin).
-/// Persistent, not a showBanner() toast: those auto-dismiss after ~4.5s,
-/// which would let a user forget mid-edit that part of what they're
-/// looking at didn't actually load this time. Cleared when `failed` is
+/// Renders (or hides) the persistent "some settings couldn't load/display"
+/// notice at the top of the Settings screen - the truthful-degrade
+/// counterpart to markFieldLoadFailed for the sections that don't have a
+/// single text input to flag (favorites/bridge/license/availability/theme/
+/// admin). Persistent, not a showBanner() toast: those auto-dismiss after
+/// ~4.5s, which would let a user forget mid-edit that part of what they're
+/// looking at didn't actually load this time. Cleared when both lists are
 /// empty, covering "closed Settings, backend recovered, reopened".
-function renderSettingsLoadErrors(failed) {
+///
+/// Takes two independent lists because openSettings has two independent
+/// failure phases now (2026-08-15, defect A fix): `loadFailed` entries come
+/// from summarizeSettledResults (the 8 backend invoke() calls, each with a
+/// real i18n labelKey - see SETTINGS_FIELD_GROUPS) and `paintFailed`
+/// entries come from runSettingsPaintSteps (the DOM-painting steps that run
+/// after, tagged only with an internal step name - not translated, since
+/// these are debugging identifiers rather than user-facing section labels).
+/// Either list alone still renders correctly; both together are joined into
+/// one notice rather than two competing banners.
+function renderSettingsLoadErrors(loadFailed, paintFailed = []) {
   const el = $("settings-load-errors");
-  if (!failed.length) {
+  if (!loadFailed.length && !paintFailed.length) {
     el.hidden = true;
     el.textContent = "";
     return;
   }
-  const names = failed.map((f) => t(f.labelKey)).join(", ");
-  el.textContent = t("settings.loadFailedSome", { fields: names });
+  const parts = [];
+  if (loadFailed.length) {
+    const names = loadFailed.map((f) => t(f.labelKey)).join(", ");
+    parts.push(t("settings.loadFailedSome", { fields: names }));
+  }
+  if (paintFailed.length) {
+    parts.push(t("settings.paintFailedSome"));
+  }
+  el.textContent = parts.join(" ");
   el.hidden = false;
 }
 
@@ -2170,83 +2187,156 @@ async function openSettings() {
     console.error(`openSettings: ${f.cmd} failed`, f.error);
     reportFrontendIssue("settings_field_load_failed", { message: `${f.cmd}: ${f.error}` });
   });
-  renderSettingsLoadErrors(failed);
 
-  if (account) {
-    clearFieldLoadFailed("in-display-name");
-    clearFieldLoadFailed("in-host");
-    clearFieldLoadFailed("in-ext");
-    $("secret-hint").classList.remove("err");
-    state.account = { ...state.account, ...account };
-    $("in-display-name").value = account.display_name || "";
-    $("in-host").value = account.host || "";
-    $("in-ext").value = account.ext || "";
-    $("in-secret").value = "";
-    $("secret-hint").textContent = account.secret_set ? t("settings.secretCurrentlySet") : t("settings.secretNotSet");
-    setTransportUI(account.transport_priority || "auto");
-  } else {
-    markFieldLoadFailed("in-display-name");
-    markFieldLoadFailed("in-host");
-    markFieldLoadFailed("in-ext");
-    $("secret-hint").classList.add("err");
-    $("secret-hint").textContent = t("settings.fieldLoadFailed");
+  // 4R RELIABILITY fix (2026-08-15, defect A): the fix above only isolates
+  // failures in the 8 backend invoke() calls. Everything from here down
+  // used to be one flat, unguarded sequence that PAINTS those results into
+  // the DOM - ~90 lines ending in the `$("screen-settings").hidden = false`
+  // reveal at the very bottom. A throw anywhere in that sequence (a missing
+  // element, a malformed value from a group that "fulfilled" with junk,
+  // ...) aborted the whole function before the reveal ever ran. Reported
+  // from the field 2026-08-15: clicking Settings did nothing at all - no
+  // banner, no screen, no trace of why.
+  //
+  // runSettingsPaintSteps (settings-load.js) gives this phase the same
+  // per-unit isolation summarizeSettledResults already gives the load
+  // phase: every step below runs regardless of an earlier one throwing, so
+  // one broken section shows up broken (via markFieldLoadFailed's sibling
+  // pattern where applicable, or simply as "that section didn't update")
+  // instead of taking the whole screen down with it. The `try`/`finally`
+  // around the whole block is the outermost guarantee - even a throw
+  // runSettingsPaintSteps itself somehow didn't catch (or one from
+  // openTranscriptionSettingsSection's await, which sits outside the
+  // synchronous step list because it's async) still can't skip the reveal.
+  let paintFailed = [];
+  try {
+    paintFailed = runSettingsPaintSteps([
+      {
+        name: "account",
+        run: () => {
+          if (account) {
+            clearFieldLoadFailed("in-display-name");
+            clearFieldLoadFailed("in-host");
+            clearFieldLoadFailed("in-ext");
+            $("secret-hint").classList.remove("err");
+            state.account = { ...state.account, ...account };
+            $("in-display-name").value = account.display_name || "";
+            $("in-host").value = account.host || "";
+            $("in-ext").value = account.ext || "";
+            $("in-secret").value = "";
+            $("secret-hint").textContent = account.secret_set ? t("settings.secretCurrentlySet") : t("settings.secretNotSet");
+            setTransportUI(account.transport_priority || "auto");
+          } else {
+            markFieldLoadFailed("in-display-name");
+            markFieldLoadFailed("in-host");
+            markFieldLoadFailed("in-ext");
+            $("secret-hint").classList.add("err");
+            $("secret-hint").textContent = t("settings.fieldLoadFailed");
+          }
+        },
+      },
+      { name: "theme", run: () => { if (theme !== undefined) setThemeUI(theme || "auto"); } },
+      {
+        name: "corePath",
+        run: () => {
+          if (corePath !== undefined) {
+            clearFieldLoadFailed("in-core-path");
+            $("in-core-path").value = corePath || "";
+          } else {
+            markFieldLoadFailed("in-core-path");
+          }
+        },
+      },
+      {
+        name: "adminStatus",
+        run: () => {
+          if (adminStatus) {
+            state.adminConfigured = adminStatus.configured;
+            state.adminUnlocked = adminStatus.unlocked;
+          }
+        },
+      },
+      {
+        name: "localeButtons",
+        run: () => {
+          document.querySelectorAll("#locale-row button").forEach((b) => {
+            b.classList.toggle("on", b.dataset.localeChoice === state.localePref);
+          });
+        },
+      },
+      { name: "favorites", run: () => { if (favorites !== undefined) renderFavoritesFields(favorites); } },
+      {
+        name: "bridge",
+        run: () => {
+          if (bridge !== undefined) {
+            state.bridge = bridge;
+            renderBridgeFields(bridge);
+          }
+        },
+      },
+      { name: "license", run: () => { if (license !== undefined) renderLicenseFields(license); } },
+      {
+        name: "availability",
+        run: () => {
+          // 4R RELIABILITY fix (2026-07-18): re-fetch rather than trust
+          // whatever state.availability already held - boot()'s own copy
+          // can be stale by the time Settings is opened (e.g. a tray
+          // toggle that landed before the availability-changed listener
+          // existed, or simply this window having been backgrounded
+          // through a change made from elsewhere before this fix's event
+          // wiring). Only apply it when the fetch actually succeeded -
+          // state.availability already holds the last-known value
+          // otherwise, which is a better degrade than clobbering it.
+          if (availability !== undefined) {
+            state.availability = { available: !!availability.available, autoAnswer: !!availability.auto_answer };
+          }
+          // renderAvailabilityUI (not just setAvailabilityFieldsUI) so the
+          // titlebar dot is re-synced too, not only the Settings pane rows
+          // - belt-and-suspenders alongside the availability-changed
+          // listener.
+          renderAvailabilityUI();
+        },
+      },
+      {
+        name: "saveStatus",
+        run: () => {
+          $("save-status").textContent = "";
+          $("save-status").className = "status";
+        },
+      },
+      { name: "updaterCheckRow", run: () => setBoolRowUI("updater-check-on-startup-row", state.updaterCheckOnStartup) },
+      { name: "updaterUI", run: () => renderUpdaterUI() },
+      { name: "lockUI", run: () => applyLockUI() },
+      { name: "codecsSection", run: () => renderCodecsSection() }, // paints whatever the last `codecs` event carried (may be empty this early)
+      { name: "devicesSection", run: () => renderDevicesSection() }, // same "paint whatever's cached, then re-query fresh" shape, for devices
+    ]);
+
+    paintFailed.forEach((f) => {
+      console.error(`openSettings: paint step "${f.name}" failed`, f.error);
+      reportFrontendIssue("settings_paint_step_failed", { message: `${f.name}: ${f.error}` });
+    });
+    renderSettingsLoadErrors(failed, paintFailed);
+
+    try {
+      await openTranscriptionSettingsSection();
+    } catch (e) {
+      console.error("openTranscriptionSettingsSection failed", e);
+      reportFrontendIssue("settings_paint_step_failed", { message: `transcription: ${describeError(e)}` });
+    }
+
+    // Fire-and-forget re-query, same "always re-fetch fresh on open"
+    // pattern the rest of this function follows for account/bridge/
+    // availability/... - the resulting `codecs`/`devices` event
+    // (handleCodecsEvent/handleDevicesEvent) repaints each pane once it
+    // lands, same as every other sidecar-event-driven surface here.
+    invoke("sidecar_list_codecs").catch((e) => console.error("sidecar_list_codecs failed", e));
+    invoke("sidecar_list_devices").catch((e) => console.error("sidecar_list_devices failed", e));
+  } finally {
+    // Unconditional reveal: whatever happened above, the operator must
+    // always get a screen back for their click - never the silent dead
+    // button this whole fix exists to make impossible.
+    $("screen-settings").hidden = false;
   }
-
-  if (theme !== undefined) setThemeUI(theme || "auto");
-
-  if (corePath !== undefined) {
-    clearFieldLoadFailed("in-core-path");
-    $("in-core-path").value = corePath || "";
-  } else {
-    markFieldLoadFailed("in-core-path");
-  }
-
-  if (adminStatus) {
-    state.adminConfigured = adminStatus.configured;
-    state.adminUnlocked = adminStatus.unlocked;
-  }
-
-  document.querySelectorAll("#locale-row button").forEach((b) => {
-    b.classList.toggle("on", b.dataset.localeChoice === state.localePref);
-  });
-  if (favorites !== undefined) renderFavoritesFields(favorites);
-  if (bridge !== undefined) {
-    state.bridge = bridge;
-    renderBridgeFields(bridge);
-  }
-  if (license !== undefined) renderLicenseFields(license);
-  await openTranscriptionSettingsSection();
-  setBoolRowUI("updater-check-on-startup-row", state.updaterCheckOnStartup);
-  // 4R RELIABILITY fix (2026-07-18): re-fetch rather than trust whatever
-  // state.availability already held - boot()'s own copy can be stale by
-  // the time Settings is opened (e.g. a tray toggle that landed before
-  // the availability-changed listener existed, or simply this window
-  // having been backgrounded through a change made from elsewhere before
-  // this fix's event wiring). Only apply it when the fetch actually
-  // succeeded - state.availability already holds the last-known value
-  // otherwise, which is a better degrade than clobbering it.
-  if (availability !== undefined) {
-    state.availability = { available: !!availability.available, autoAnswer: !!availability.auto_answer };
-  }
-  // renderAvailabilityUI (not just setAvailabilityFieldsUI) so the
-  // titlebar dot is re-synced too, not only the Settings pane rows -
-  // belt-and-suspenders alongside the availability-changed listener.
-  renderAvailabilityUI();
-  $("save-status").textContent = "";
-  $("save-status").className = "status";
-
-  renderUpdaterUI();
-  applyLockUI();
-  renderCodecsSection(); // paints whatever the last `codecs` event carried (may be empty this early)
-  renderDevicesSection(); // same "paint whatever's cached, then re-query fresh" shape, for devices
-  // Fire-and-forget re-query, same "always re-fetch fresh on open" pattern
-  // the rest of this function follows for account/bridge/availability/... -
-  // the resulting `codecs`/`devices` event (handleCodecsEvent/
-  // handleDevicesEvent) repaints each pane once it lands, same as every
-  // other sidecar-event-driven surface here.
-  invoke("sidecar_list_codecs").catch((e) => console.error("sidecar_list_codecs failed", e));
-  invoke("sidecar_list_devices").catch((e) => console.error("sidecar_list_devices failed", e));
-  $("screen-settings").hidden = false;
 }
 
 /// Populates and reveals #transcription-section, or keeps it absent - see
@@ -2704,7 +2794,24 @@ async function saveAccountSettings() {
 function wireStaticHandlers() {
   $("btn-minimize").addEventListener("click", () => win.minimize());
   $("btn-close").addEventListener("click", () => win.hide());
-  $("btn-settings").addEventListener("click", openSettings);
+  // openSettings() now catches and degrades every load/paint failure it
+  // can anticipate internally (see its own header comment), always
+  // reaching the reveal line. This .catch is the last line of defense for
+  // whatever it can't anticipate (a bug in the fix itself, a TypeError from
+  // code neither of us wrote) - without it, an async listener passed
+  // directly to addEventListener turns any escaping throw into a silent
+  // unhandled rejection: the exact "click does nothing, no banner, no
+  // screen" shape this whole task exists to make impossible. Same reason
+  // setup-open-settings below gets the same treatment - it's the identical
+  // button, just reached from the first-run empty state instead of the
+  // titlebar.
+  $("btn-settings").addEventListener("click", () => {
+    openSettings().catch((e) => {
+      console.error("openSettings failed unexpectedly", e);
+      reportFrontendIssue("settings_open_failed", { message: describeError(e) });
+      showBanner(t("settings.openFailed"), "err");
+    });
+  });
   $("settings-back").addEventListener("click", closeSettings);
   // Availability indicator doubles as a toggle (shell task) - same
   // set_available command + optimistic-then-reconciled-by-render pattern
@@ -2760,7 +2867,13 @@ function wireStaticHandlers() {
     }
   });
 
-  $("setup-open-settings").addEventListener("click", openSettings);
+  $("setup-open-settings").addEventListener("click", () => {
+    openSettings().catch((e) => {
+      console.error("openSettings failed unexpectedly", e);
+      reportFrontendIssue("settings_open_failed", { message: describeError(e) });
+      showBanner(t("settings.openFailed"), "err");
+    });
+  });
 
   document.querySelectorAll("#dialpad .key").forEach((key) => {
     key.addEventListener("click", () => appendDigit(key.dataset.digit));
@@ -2913,14 +3026,25 @@ function wireStaticHandlers() {
     }
   });
 
+  // Bug class fix (task brief 2026-08-15, defect C): this used to be a bare
+  // `await invoke(...)` with no try/catch - a rejected admin_unlock (backend
+  // unreachable, IPC error, anything short of "wrong password", which is a
+  // normal Ok(false) return, not a rejection) escaped as an unhandled
+  // promise rejection. The click looked like it did nothing: no error text,
+  // no re-enabled state, same silent-button failure class as the
+  // openSettings bug this session also fixed.
   $("btn-unlock").addEventListener("click", async () => {
     const pw = $("unlock-password").value;
-    const ok = await invoke("admin_unlock", { password: pw });
-    if (ok) {
-      state.adminUnlocked = true;
-      applyLockUI();
-    } else {
-      $("unlock-error").textContent = t("settings.incorrectPassword");
+    try {
+      const ok = await invoke("admin_unlock", { password: pw });
+      if (ok) {
+        state.adminUnlocked = true;
+        applyLockUI();
+      } else {
+        $("unlock-error").textContent = t("settings.incorrectPassword");
+      }
+    } catch (e) {
+      $("unlock-error").textContent = String(e);
     }
   });
   $("unlock-password").addEventListener("keydown", (e) => {

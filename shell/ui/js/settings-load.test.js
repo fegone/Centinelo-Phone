@@ -7,7 +7,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { SETTINGS_FIELD_GROUPS, describeError, summarizeSettledResults } from "./settings-load.js";
+import { SETTINGS_FIELD_GROUPS, describeError, summarizeSettledResults, runSettingsPaintSteps } from "./settings-load.js";
 
 function fulfilled(value) {
   return { status: "fulfilled", value };
@@ -106,4 +106,70 @@ test("summarizeSettledResults: every SETTINGS_FIELD_GROUPS entry has a unique ke
   const cmds = SETTINGS_FIELD_GROUPS.map((g) => g.cmd);
   assert.equal(new Set(keys).size, keys.length);
   assert.equal(new Set(cmds).size, cmds.length);
+});
+
+// ---------------------------------------------------------------------
+// runSettingsPaintSteps
+//
+// Regression coverage for the field defect this task fixes: openSettings()
+// used to run its DOM-painting steps as one flat unguarded sequence ending
+// in the screen's reveal line, so a throw partway through (a missing
+// element, a bad value, ...) skipped the reveal entirely - "click Settings,
+// nothing happens, no banner, no screen". These tests exercise the actual
+// bug: a step in the middle of the list throws, and the contract that
+// matters is (a) every OTHER step still runs (so the rest of the screen
+// still paints) and (b) the failure is reported back to the caller instead
+// of escaping - never that the caller's later reveal line runs, since that
+// line lives in app.js, not here; app.js's own try/finally is what turns
+// "failure reported" into "screen still opens", and that finally block is
+// unconditional by construction (nothing here could make it skip).
+// ---------------------------------------------------------------------
+
+test("runSettingsPaintSteps: every step runs even when one throws (mutation target)", () => {
+  const ran = [];
+  const failed = runSettingsPaintSteps([
+    { name: "a", run: () => ran.push("a") },
+    {
+      name: "b",
+      run: () => {
+        ran.push("b-before-throw");
+        throw new TypeError("cannot read property 'value' of null");
+      },
+    },
+    { name: "c", run: () => ran.push("c") },
+  ]);
+  // The step AFTER the throwing one still ran - this is the exact
+  // guarantee that keeps one broken renderer from blanking the rest of
+  // Settings. Mutate runSettingsPaintSteps to `return steps.map(s =>
+  // s.run())` (no try/catch) and this assertion is what breaks: "c" never
+  // gets pushed because the throw from "b" would escape the loop instead
+  // of being caught per-step.
+  assert.deepEqual(ran, ["a", "b-before-throw", "c"]);
+  assert.equal(failed.length, 1);
+  assert.equal(failed[0].name, "b");
+});
+
+test("runSettingsPaintSteps: no failures when every step succeeds", () => {
+  const failed = runSettingsPaintSteps([{ name: "a", run: () => {} }, { name: "b", run: () => {} }]);
+  assert.deepEqual(failed, []);
+});
+
+test("runSettingsPaintSteps: a thrown value is stringified, never forwarded raw", () => {
+  const err = new Error("boom");
+  err.secretField = "must not leak";
+  const failed = runSettingsPaintSteps([{ name: "x", run: () => { throw err; } }]);
+  assert.equal(typeof failed[0].error, "string");
+  assert.equal(failed[0].error, "boom");
+});
+
+test("runSettingsPaintSteps: multiple independent throws are all reported, each tagged with its own step name", () => {
+  const failed = runSettingsPaintSteps([
+    { name: "one", run: () => { throw new Error("first"); } },
+    { name: "two", run: () => {} },
+    { name: "three", run: () => { throw new Error("second"); } },
+  ]);
+  assert.deepEqual(
+    failed.map((f) => f.name),
+    ["one", "three"],
+  );
 });
