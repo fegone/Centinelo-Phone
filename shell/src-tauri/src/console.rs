@@ -22,6 +22,26 @@
 //! the window is never created in the first place (see
 //! [`open_or_focus`]'s gating).
 //!
+//! # The inline panel is the default now (2026-02)
+//!
+//! [`open`] - what `commands::open_console` and the tray both call - by
+//! default tells the MAIN window to show the console as an in-app panel
+//! (`#screen-console`, the exact `#screen-settings` pattern in
+//! `ui/index.html`) instead of building a second window. Root cause this
+//! retires: the separate window went blank on the owner's Windows machine
+//! for two days while Settings - same webview, same document, just a
+//! `div` - kept working, so the console now lives in that same document.
+//! The panel loads the same runtime assets over this same scheme
+//! (`tauri.conf.json`'s `script-src`/`style-src` allow `premium-console:`;
+//! see `docs/console-inline-panel-decision.md` for the full option
+//! analysis), and the license gate moved INTO
+//! [`asset_protocol_handler`] - a 404 for unlicensed requests, strictly
+//! stronger than the window era's "the window is never created" argument,
+//! which an inline panel wouldn't have had. [`SEPARATE_WINDOW_ENV`]`=1`
+//! opts back into the old separate window during the transition:
+//! [`open_or_focus`] and everything it documents (the watchdog, the
+//! trapped-window safety nets, [`INDEX_HTML`]) are kept intact for it.
+//!
 //! Only `index.html` is NOT read from that directory: it's a small,
 //! wholly-generic wrapper (a handful of `<script src>` tags in
 //! `dev/mock.html`'s own documented dependency order, plus the
@@ -45,6 +65,7 @@
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
@@ -68,6 +89,137 @@ const CAPABILITY: &str = "blf_console";
 
 const ASSETS_DIR_ENV: &str = "CENTINELO_PREMIUM_ASSETS_DIR";
 const ASSETS_DIR_NAME: &str = "premium-console-assets";
+
+/// Opts back into the legacy separate console window during the
+/// transition - see this module's "inline panel is the default" doc. Only
+/// the exact value `1` counts; anything else (including unset) means the
+/// inline panel.
+pub const SEPARATE_WINDOW_ENV: &str = "CENTINELO_CONSOLE_SEPARATE_WINDOW";
+
+/// Event [`open_panel`] emits (app-wide) to tell the main window to show
+/// the inline console panel. `ui/js/console-panel.js` listens for it; only
+/// [`open`] ever emits it, always after its own license re-check, so no
+/// other code path can talk the frontend into opening the panel. The
+/// payload carries a monotonic `session` id which the panel echoes back in
+/// `console_panel_closed`, so a close ack can always be told apart from a
+/// newer open - see [`PanelSizeState`].
+pub const PANEL_OPEN_EVENT: &str = "console-open-panel";
+
+/// Logical size the main window is grown to when the console panel opens,
+/// if it is currently smaller (a larger window is never shrunk). Sized
+/// for the console-ui package's own layout: `rail` 56px + a `main` grid
+/// of `minmax(150px,1fr)` tiles + `side` 288px (its console.css) - at the
+/// main window's 380px default that layout collapses to a zero-width
+/// grid, which is why the panel grows the window it lives in. See
+/// `docs/console-inline-panel-decision.md` §6.
+const PANEL_TARGET_SIZE: (f64, f64) = (900.0, 640.0);
+
+/// Minimum logical size forced on the main window while the panel is open
+/// - the console-ui package's own `.cent-console.win` floor, verbatim.
+const PANEL_MIN_SIZE: (f64, f64) = (760.0, 520.0);
+
+/// The main window's configured minimum (`tauri.conf.json` `windows[0]`
+/// `minWidth`/`minHeight`), restored when the panel closes. Tauri exposes
+/// no getter for a window's live min constraints, so the restore value is
+/// this mirror; the only writers of min-size besides this module are that
+/// config and [`PANEL_MIN_SIZE`] below.
+const MAIN_DEFAULT_MIN_SIZE: (f64, f64) = (340.0, 560.0);
+
+/// Everything Rust remembers about the inline panel, in one guarded
+/// struct - and deliberately NOT a "panel is open" flag. The
+/// authoritative source of that fact is the main window's own frontend:
+/// `ui/js/console-panel.js`'s `openConsolePanel()` refuses to start a
+/// second open while one is in flight or showing **synchronously**
+/// (`openingPromise` is stored before its first `await` can yield, so JS
+/// run-to-completion makes check-and-set atomic; `isConsolePanelOpen`
+/// covers the already-showing case), and that guard is pinned by tests
+/// (console-panel.test.js P3-2/P3-3/P4). This module used to ALSO keep a
+/// `PANEL_OPEN_PENDING` bool as "defense in depth", but such a bool is a
+/// *mirror* of the frontend's state, and a lagging one: it only ever
+/// learned "closed" via the `console_panel_closed` round-trip, so for
+/// that entire round-trip it held `true` while the panel was already
+/// gone - and `open_panel`, trusting the mirror over the source, answered
+/// the operator's reopen click with a silent no-op. That is the exact
+/// shape of the BLF teardown bug this project already paid for (trusting
+/// a NOTIFY cache over the authoritative source), so the mirror is gone:
+/// `open_panel` always emits, and the frontend's guard is the one and
+/// only open-dedupe.
+///
+/// What Rust genuinely must remember is *sizing* - grow the window on
+/// open, restore it on close - and sizing still has to learn "closed"
+/// across the `console_panel_closed` round-trip. That residual race is
+/// closed with identity, not timing: every open stamps a fresh session
+/// id into the event payload, the close ack echoes it back, and
+/// [`panel_closed`] ignores any ack naming a session a newer open has
+/// already superseded (a late ack would otherwise shrink the window
+/// right back under a freshly reopened panel and consume the restore
+/// baseline while at it). See [`CloseOutcome`].
+struct PanelSizeState {
+    /// Session id stamped into the last [`PANEL_OPEN_EVENT`] payload
+    /// (`0` = never opened). Monotonic: advanced on every open and on
+    /// every honored close, so a given ack matches at most one close.
+    session: u64,
+    /// Logical size the main window had before the panel grew it,
+    /// restored by [`panel_closed`]. `None` = nothing to restore, which
+    /// also makes a second `open_console` before any close a sizing no-op
+    /// (the first pre-panel size is the one true baseline; it must not be
+    /// overwritten with the already-grown size).
+    restore: Option<(f64, f64)>,
+}
+
+static PANEL_SIZE_STATE: Mutex<PanelSizeState> = Mutex::new(PanelSizeState {
+    session: 0,
+    restore: None,
+});
+
+/// Pure decision half of [`panel_closed`] - what a close ack means for
+/// [`PanelSizeState`], with no window access, so the interleaving
+/// invariants are unit-testable (`mod tests`).
+#[derive(Debug, PartialEq)]
+enum CloseOutcome {
+    /// The ack names the live session: reset the window minimum and
+    /// restore this size (`None` = the open never captured a size; the
+    /// minimum reset still applies). Advances the session so a duplicate
+    /// ack is stale, never a second restore.
+    Restore(Option<(f64, f64)>),
+    /// The ack names a session a newer open already superseded: the
+    /// window that newer open grew must NOT be shrunk back under it.
+    Stale { ack: u64, current: u64 },
+    /// The ack carried no session identity (a defensive close with
+    /// nothing ever opened - the frontend never saw an open event, so
+    /// nothing was ever grown on its behalf).
+    Anonymous,
+}
+
+impl PanelSizeState {
+    /// Pure half of `open_panel`'s grow: stamp the next session id and
+    /// remember the pre-panel baseline exactly once per grow era - a
+    /// reopen before any close (the exact window this module's history is
+    /// about) keeps the FIRST baseline, since the window is still grown
+    /// from it.
+    fn begin_open(&mut self, current: Option<(f64, f64)>) -> u64 {
+        self.session += 1;
+        if self.restore.is_none() {
+            self.restore = current;
+        }
+        self.session
+    }
+
+    /// Pure half of `panel_closed` - see [`CloseOutcome`].
+    fn close(&mut self, ack: Option<u64>) -> CloseOutcome {
+        let Some(ack) = ack else {
+            return CloseOutcome::Anonymous;
+        };
+        if ack != self.session {
+            return CloseOutcome::Stale {
+                ack,
+                current: self.session,
+            };
+        }
+        self.session += 1;
+        CloseOutcome::Restore(self.restore.take())
+    }
+}
 
 /// Log target for everything console-window-specific, deliberately
 /// distinct from `frontend_log.rs`'s `"app_lib::frontend"` (the *main*
@@ -246,6 +398,135 @@ pub fn is_unlocked(premium: &PremiumHandle) -> bool {
     unlocks_console(premium.capability_status(CAPABILITY))
 }
 
+/// Entry point for both console surfaces (the tray menu item and
+/// `commands::open_console`): routes to the inline panel (default) or the
+/// legacy separate window ([`SEPARATE_WINDOW_ENV`]), re-checking the
+/// license gate either way - see [`open_or_focus`]'s doc for why a plain
+/// IPC command must never trust that its caller already checked.
+pub fn open(app: &AppHandle) -> Result<(), String> {
+    if separate_window_mode() {
+        open_or_focus(app)
+    } else {
+        open_panel(app)
+    }
+}
+
+/// Whether [`SEPARATE_WINDOW_ENV`] opts into the legacy separate window.
+fn separate_window_mode() -> bool {
+    std::env::var(SEPARATE_WINDOW_ENV).is_ok_and(|v| v == "1")
+}
+
+/// Inline-panel path: re-check the license (same reasoning as
+/// [`open_or_focus`] - the button and tray item are hidden without it,
+/// but `open_console` is still a plain IPC command any webview can
+/// invoke), grow the main window to the console's layout floor, then emit
+/// [`PANEL_OPEN_EVENT`] with a fresh session id. Loading the assets and
+/// mounting console-ui is `ui/js/console-panel.js`'s job; every request
+/// it makes for console-ui code goes back through
+/// [`asset_protocol_handler`], which enforces the same license gate again
+/// - defense in depth: absent button, gated command, gated bytes.
+///
+/// There is deliberately NO Rust-side open-dedupe here: "the panel is
+/// open" is a fact about the frontend, and the frontend's own
+/// single-flight guard decides it authoritatively (see
+/// [`PanelSizeState`]'s doc). The old `PANEL_OPEN_PENDING` mirror used to
+/// answer a reopen click with a silent `Ok(())` whenever the close ack
+/// was still crossing IPC - the "button does nothing" window this
+/// module must never have.
+fn open_panel(app: &AppHandle) -> Result<(), String> {
+    let premium = app
+        .try_state::<PremiumHandle>()
+        .ok_or_else(|| "premium module not initialized".to_string())?;
+    if !is_unlocked(&premium) {
+        return Err("premium console is not licensed".to_string());
+    }
+    log::info!(target: LOG_TARGET, "[console] opening inline panel");
+    let session = grow_main_window_for_panel(app);
+    app.emit(PANEL_OPEN_EVENT, serde_json::json!({ "session": session }))
+        .map_err(|e| e.to_string())
+}
+
+/// Called by `commands::console_panel_closed` once the frontend has hidden
+/// the inline panel (after its own `app.destroy()` teardown of the mounted
+/// console-ui: store stop, BLF unsubscriptions, tick interval): restores
+/// the main window's pre-panel size and its configured minimum.
+/// `session` is the id [`open_panel`] stamped into the open event being
+/// closed; an ack naming a session a newer open already superseded is
+/// ignored (and logged) instead of restoring - see [`PanelSizeState`].
+pub fn panel_closed(app: &AppHandle, session: Option<u64>) {
+    let outcome = {
+        let mut state = PANEL_SIZE_STATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.close(session)
+    };
+    let restore = match outcome {
+        CloseOutcome::Restore(restore) => restore,
+        CloseOutcome::Stale { ack, current } => {
+            log::info!(
+                target: LOG_TARGET,
+                "[console] panel-closed ack for superseded session {ack} (current {current}) ignored - a newer open already re-grew the window"
+            );
+            return;
+        }
+        CloseOutcome::Anonymous => {
+            log::info!(
+                target: LOG_TARGET,
+                "[console] panel-closed ack carried no session id - nothing to restore"
+            );
+            return;
+        }
+    };
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    let _ = window.set_min_size(Some(tauri::LogicalSize::new(
+        MAIN_DEFAULT_MIN_SIZE.0,
+        MAIN_DEFAULT_MIN_SIZE.1,
+    )));
+    if let Some((w, h)) = restore {
+        let _ = window.set_size(tauri::LogicalSize::new(w, h));
+    }
+}
+
+/// Grows the main window to [`PANEL_TARGET_SIZE`] and lifts its minimum to
+/// [`PANEL_MIN_SIZE`] for as long as the console panel is open - see
+/// [`PANEL_TARGET_SIZE`]'s doc for why the panel needs the room. Stamps
+/// and returns the new session id for [`PANEL_OPEN_EVENT`]'s payload,
+/// recording the pre-open baseline exactly once per grow era, in logical
+/// pixels, so the restore is exact on any display scale factor. The state
+/// lock is held across the window calls too: [`panel_closed`] takes the
+/// same lock, so a close ack can never interleave between this stamp and
+/// the grow it belongs to - the two sides' size changes are submitted in
+/// a well-defined order.
+fn grow_main_window_for_panel(app: &AppHandle) -> u64 {
+    let mut state = PANEL_SIZE_STATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let window = app.get_webview_window("main");
+    let current = window.as_ref().and_then(|w| {
+        let scale = w.scale_factor().unwrap_or(1.0);
+        w.inner_size().ok().map(|phys| {
+            let logical: tauri::LogicalSize<f64> = phys.to_logical(scale);
+            (logical.width, logical.height)
+        })
+    });
+    let session = state.begin_open(current);
+    if let Some(window) = window {
+        let _ = window.set_min_size(Some(tauri::LogicalSize::new(
+            PANEL_MIN_SIZE.0,
+            PANEL_MIN_SIZE.1,
+        )));
+        if let Some((w, h)) = current {
+            let _ = window.set_size(tauri::LogicalSize::new(
+                w.max(PANEL_TARGET_SIZE.0),
+                h.max(PANEL_TARGET_SIZE.1),
+            ));
+        }
+    }
+    session
+}
+
 /// Finds the already-open console window and focuses it, or builds a
 /// fresh one. Re-checks the license gate itself (not just trusting that a
 /// caller already checked) - the tray menu item and the main window's
@@ -406,10 +687,44 @@ fn assets_dir() -> Option<PathBuf> {
 /// bump: check the WebView2/WKWebView devtools console directly for a
 /// `Content-Security-Policy` violation line, the same way `README.md`'s
 /// hotfix section was originally diagnosed.
+///
+/// That analysis covers the legacy separate window. Since the
+/// inline-panel migration (this module's doc) the MAIN window also
+/// loads console-ui code over this scheme, and the main window DOES
+/// carry `tauri.conf.json`'s CSP - which is why that config now lists
+/// `premium-console:` in `script-src` and `style-src` (and only
+/// there: `connect-src` is untouched, the lesson of the 2.0.3 IPC
+/// hotfix; no `font-src`/`img-src` entries needed - the console-ui
+/// stylesheets reference no `url()`/`@font-face` at all). The full
+/// option trade-off - why same-origin interception isn't implementable
+/// with Tauri's public API and why a `blob:` approach would weaken the
+/// CSP more - is `docs/console-inline-panel-decision.md` §1.
 pub fn asset_protocol_handler(
-    _ctx: tauri::UriSchemeContext<'_, tauri::Wry>,
+    ctx: tauri::UriSchemeContext<'_, tauri::Wry>,
     request: tauri::http::Request<Vec<u8>>,
 ) -> tauri::http::Response<Cow<'static, [u8]>> {
+    // License gate FIRST, before any disk access. Since the inline-panel
+    // migration the MAIN window loads its console <script>/<link> tags
+    // over this same scheme (see this module's doc), so the window-era
+    // argument this handler used to lean on - "the only requester, the
+    // console window, is never created unlicensed" - no longer covers
+    // every request. Unlicensed requests get the same 404 a Community
+    // build with no assets directory produces, so a webview that shows
+    // the panel DOM by force (devtools) still never receives a byte of
+    // console-ui code. A missing PremiumHandle state fails closed.
+    let unlocked = ctx
+        .app_handle()
+        .try_state::<PremiumHandle>()
+        .map(|premium| is_unlocked(&premium))
+        .unwrap_or(false);
+    if !unlocked {
+        log::warn!(
+            target: LOG_TARGET,
+            "[console] 404: blf_console not licensed - refusing asset request"
+        );
+        return not_found();
+    }
+
     let raw_path = request.uri().path();
     let route = raw_path.trim_start_matches('/');
     let route = if route.is_empty() {
@@ -724,3 +1039,117 @@ const INDEX_HTML: &str = r##"<!doctype html>
 </body>
 </html>
 "##;
+
+#[cfg(test)]
+mod tests {
+    //! The inline panel's sizing/session state machine - the pure half of
+    //! `open_panel`/`panel_closed`, exercised with no AppHandle so every
+    //! interleaving that matters can be pinned deterministically. The
+    //! stateful frontend half of the same contract (reopen during the
+    //! close's IPC round-trip must work) is pinned in
+    //! `ui/js/console-panel.test.js` ("P4").
+    use super::{CloseOutcome, PanelSizeState};
+
+    fn fresh() -> PanelSizeState {
+        PanelSizeState {
+            session: 0,
+            restore: None,
+        }
+    }
+
+    #[test]
+    fn honored_ack_restores_its_own_eras_baseline() {
+        let mut s = fresh();
+        let first = s.begin_open(Some((380.0, 560.0)));
+        assert_eq!(first, 1, "session ids start at 1 (0 = never opened)");
+        assert_eq!(
+            s.close(Some(first)),
+            CloseOutcome::Restore(Some((380.0, 560.0)))
+        );
+        // Baseline consumed: the next grow era records a fresh one. The
+        // new id is 3, not 2 - the honored close advanced the session to
+        // make acks one-shot, and begin_open steps past it.
+        let second = s.begin_open(Some((900.0, 640.0)));
+        assert_eq!(second, first + 2);
+        assert_eq!(
+            s.close(Some(second)),
+            CloseOutcome::Restore(Some((900.0, 640.0)))
+        );
+    }
+
+    #[test]
+    fn stale_ack_superseded_by_a_newer_open_never_restores() {
+        // THE interleaving this PR closes: close(session 1) is still
+        // crossing IPC when the operator's reopen click runs open_panel
+        // again (session 2, window re-grown from the same baseline). The
+        // late ack for session 1 must be identified as stale and ignored -
+        // honoring it would shrink the window right back under the
+        // freshly reopened panel AND consume the baseline the live
+        // session's own close still needs.
+        let mut s = fresh();
+        let first = s.begin_open(Some((380.0, 560.0)));
+        let second = s.begin_open(None); // reopen before any close ack landed
+        assert_eq!(
+            s.restore, Some((380.0, 560.0)),
+            "a reopen before any close must keep the FIRST baseline, not overwrite it with the grown size"
+        );
+        assert_eq!(
+            s.close(Some(first)),
+            CloseOutcome::Stale {
+                ack: first,
+                current: second
+            }
+        );
+        assert_eq!(
+            s.restore,
+            Some((380.0, 560.0)),
+            "a stale ack must not consume the baseline"
+        );
+        assert_eq!(
+            s.close(Some(second)),
+            CloseOutcome::Restore(Some((380.0, 560.0))),
+            "the live session's close still restores the one true baseline"
+        );
+    }
+
+    #[test]
+    fn duplicate_ack_is_stale_not_a_second_restore() {
+        let mut s = fresh();
+        let id = s.begin_open(Some((380.0, 560.0)));
+        assert!(matches!(s.close(Some(id)), CloseOutcome::Restore(_)));
+        assert_eq!(
+            s.close(Some(id)),
+            CloseOutcome::Stale {
+                ack: id,
+                current: id + 1
+            },
+            "an honored close advances the session, so a replayed ack cannot restore twice"
+        );
+    }
+
+    #[test]
+    fn anonymous_and_future_acks_do_nothing() {
+        let mut s = fresh();
+        assert!(matches!(s.close(None), CloseOutcome::Anonymous));
+        let id = s.begin_open(Some((380.0, 560.0)));
+        // An ack naming a session that was never emitted (defensive
+        // frontend, corrupted state) must not restore either.
+        assert!(matches!(
+            s.close(Some(id + 5)),
+            CloseOutcome::Stale { .. }
+        ));
+        assert_eq!(s.restore, Some((380.0, 560.0)), "untouched");
+    }
+
+    #[test]
+    fn session_ids_are_strictly_monotonic_across_eras() {
+        let mut s = fresh();
+        let mut prev = 0;
+        for _ in 0..3 {
+            let id = s.begin_open(None);
+            assert!(id > prev, "each open stamps a fresh, larger session id");
+            assert!(matches!(s.close(Some(id)), CloseOutcome::Restore(_)));
+            prev = id;
+        }
+    }
+}

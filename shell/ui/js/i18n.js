@@ -910,6 +910,8 @@ const ENTRIES = [
   ["transcript.callWord", "call", "chamada", "llamada"],
   ["sidecar.engineStopped", "The phone engine stopped working.", "O motor do telefone parou de funcionar.", "El motor del teléfono dejó de funcionar."],
   ["sidecar.somethingWrong", "Something went wrong.", "Algo deu errado.", "Algo salió mal."],
+  ["console.title", "Console", "Console", "Consola"],
+  ["console.backAria", "Back", "Voltar", "Atrás"],
   [
     "console.loadFailed",
     "The receptionist console failed to load and was closed. Check the log for details.",

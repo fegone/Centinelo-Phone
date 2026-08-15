@@ -226,12 +226,12 @@ html[data-os="mac"] .titlebar #btn-close { display: none; }
    mockups/onboarding.html's field/transport-card language - see README
    "Design fidelity notes" for why this isn't the literal 940x640 2-pane
    plate: this shell's real surface is the 380px main window.) =========== */
-.settings-screen { position: absolute; inset: 0; z-index: 30; background: var(--bg-0); display: flex; flex-direction: column; animation: fadeSlide var(--t-med) var(--ease) both; }
-.settings-header { flex: none; height: 38px; display: flex; align-items: center; gap: 8px; padding: 0 10px; border-bottom: 1px solid var(--border-1); -webkit-app-region: drag; }
-html[data-os="mac"] .settings-header { padding-left: 78px; }
-.settings-header .back { -webkit-app-region: no-drag; width: 28px; height: 28px; display: grid; place-items: center; border-radius: 7px; color: var(--text-2); }
-.settings-header .back:hover { background: var(--bg-3); color: var(--text-1); }
-.settings-header h1 { margin: 0; font: 650 13.5px/1 var(--font-ui); letter-spacing: -.01em; }
+.settings-screen, .console-screen { position: absolute; inset: 0; z-index: 30; background: var(--bg-0); display: flex; flex-direction: column; animation: fadeSlide var(--t-med) var(--ease) both; }
+.settings-header, .console-header { flex: none; height: 38px; display: flex; align-items: center; gap: 8px; padding: 0 10px; border-bottom: 1px solid var(--border-1); -webkit-app-region: drag; }
+html[data-os="mac"] .settings-header, html[data-os="mac"] .console-header { padding-left: 78px; }
+.settings-header .back, .console-header .back { -webkit-app-region: no-drag; width: 28px; height: 28px; display: grid; place-items: center; border-radius: 7px; color: var(--text-2); }
+.settings-header .back:hover, .console-header .back:hover { background: var(--bg-3); color: var(--text-1); }
+.settings-header h1, .console-header h1 { margin: 0; font: 650 13.5px/1 var(--font-ui); letter-spacing: -.01em; }
 .settings-body { flex: 1; overflow: auto; padding: 14px 16px 90px; position: relative; }
 .settings-body h2 { margin: 18px 0 4px; font: 700 10px/1 var(--font-mono); letter-spacing: .16em; color: var(--text-3); text-transform: uppercase; }
 .settings-body h2:first-child { margin-top: 2px; }
@@ -454,3 +454,26 @@ button.sw[aria-checked=true] .tgl::after { transform: translateX(14px); backgrou
 .applybar .mchip { align-self: center; }
 .quietbtn { font: 500 11.5px/1 var(--font-ui); color: var(--text-3); }
 .quietbtn:hover { color: var(--text-1); text-decoration: underline; text-underline-offset: 3px; }
+
+/* ================= receptionist console panel (inline, premium) =================
+   The .console-screen / .console-header rows above reuse the Settings
+   selectors verbatim (same panel feel, per the product owner's ask);
+   only what's specific to hosting the console-ui package lives here.
+   The package draws its own "window" chrome (.cent-console.win) built
+   for a standalone 1100x720 window - the overrides below neutralize the
+   window-isms (its 760x520 floor, rounded corners, drop shadow, and its
+   own titlebar, which .console-header replaces) so it reads as a pane of
+   THIS window. Rust grows this window to >=900x640 while the panel is
+   open (console.rs::PANEL_TARGET_SIZE) precisely because that layout
+   needs the room. Selector names (.cent-console/.titlebar) are the
+   package's documented embedding surface - the same selectors the
+   public console.rs INDEX_HTML glue already wires against. No new amber
+   on the shell side: amber stays exclusively ringing (Vigilia). */
+.console-body { flex: 1; min-height: 0; overflow: hidden; }
+.console-body > #console-host { height: 100%; }
+#screen-console .cent-console.win { min-width: 0; min-height: 0; border-radius: 0; box-shadow: none; }
+/* The package's own titlebar (brand + window buttons) is replaced by the
+   panel's Settings-style header above it; hidden rather than removed -
+   its .brand element stays in the DOM because the package's own health
+   watcher toggles classes on it. */
+#screen-console .cent-console .titlebar { display: none; }

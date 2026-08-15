@@ -826,6 +826,35 @@
     <div class="transcript-body" id="transcript-body"></div>
   </div>
 
+  <!-- ================= receptionist console (premium, inline panel) =================
+       The BLF console as an in-app panel - the exact #screen-settings /
+       #screen-transcript pattern (absolute inset:0, header with back
+       arrow), NOT a separate window. Shown only via the
+       "console-open-panel" event, which only commands::open_console
+       emits after re-checking the blf_console license (console.rs::
+       open_panel); the entry points (titlebar button, tray item) are
+       themselves absent until licensed. Everything inside #console-host
+       is mounted at runtime by ui/js/console-panel.js from the PRIVATE
+       console-ui package, served over the license-gated
+       premium-console:// scheme - no premium code ships in this repo.
+       The header mirrors .settings-header exactly (same height, back
+       button, drag region, mac traffic-light padding) so the console
+       feels like the same "menu on the right" as Settings, per the
+       product owner's ask. No Esc-to-close on purpose: the console's own
+       keyboard contract uses Esc internally ("Esc cancel" in its
+       sidetip); closing is the back button, like Settings. -->
+  <div class="console-screen" id="screen-console" hidden>
+    <div class="console-header" data-tauri-drag-region>
+      <button class="back" id="console-back" aria-label="Back" data-i18n-aria-label="console.backAria">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 6l-6 6 6 6"/></svg>
+      </button>
+      <h1 data-i18n="console.title">Console</h1>
+    </div>
+    <div class="console-body" id="console-body">
+      <div id="console-host"></div>
+    </div>
+  </div>
+
   <!-- ================= dial confirmation (favorites + click-to-call + centinelo/tel deep links) =================
        Shares the admin-lock overlay's visual language (icon + heading +
        description + buttons) - see shell/README.md "Design fidelity notes"
