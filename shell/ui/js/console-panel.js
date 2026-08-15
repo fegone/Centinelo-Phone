@@ -130,6 +130,7 @@ export function makeConsoleDispatcher(invoke) {
 
 let deps = null; // set by initConsolePanel: { invoke, listen, showBanner, reportFrontendIssue }
 let assetsPromise = null; // one load of styles+scripts per session (reset on failure so a retry is possible)
+const loadedAssets = new Set(); // asset URLs with a live node in <head> - lets a retry resume past what already loaded
 let openingPromise = null; // the in-flight openConsolePanel() run - see openConsolePanel()'s doc
 let mounted = null; // the ConsoleApp.mount() return value ({ store, element, destroy }) while the panel shows
 
@@ -227,7 +228,12 @@ function loadStyle(url) {
     link.rel = "stylesheet";
     link.href = url;
     link.onload = () => resolve();
-    link.onerror = () => reject(new Error("stylesheet failed to load: " + url));
+    link.onerror = () => {
+      // A node that failed to load is dead weight in <head>: drop it now
+      // so the retry's fresh node does not stack duplicates.
+      link.remove();
+      reject(new Error("stylesheet failed to load: " + url));
+    };
     document.head.appendChild(link);
   });
 }
@@ -237,26 +243,48 @@ function loadScript(url) {
     const script = document.createElement("script");
     script.src = url;
     script.onload = () => resolve();
-    script.onerror = () => reject(new Error("script failed to load: " + url));
+    script.onerror = () => {
+      script.remove(); // same as loadStyle: no dead nodes left for the retry to pile onto
+      reject(new Error("script failed to load: " + url));
+    };
     document.head.appendChild(script);
   });
 }
 
 /// Injects the package's stylesheets + scripts into THIS document, once
 /// per session. Sequential on purpose — see CONSOLE_SCRIPTS' doc. A
-/// rejected load resets `assetsPromise` so the next open retries from
-/// the top instead of caching the failure.
+/// rejected load resets `assetsPromise` so the next open retries instead
+/// of caching the failure — and the retry RESUMES, not restarts: URLs
+/// whose node is already live (tracked in `loadedAssets`) are skipped, so
+/// a failure at script 7 of 11 neither re-executes scripts 1-6 (their
+/// classic-script module bodies would run again: store/bridge
+/// singletons rebuilt while the old ones are still referenced) nor
+/// stacks duplicate <link>/<script> nodes in <head>. Only the exact URL
+/// that failed is retried. openConsolePanel's single-flight guarantees
+/// at most one pass is ever in progress.
 function ensureAssetsLoaded() {
   if (!assetsPromise) {
-    assetsPromise = (async () => {
-      for (const style of CONSOLE_STYLES) await loadStyle(assetUrl(style));
-      for (const script of CONSOLE_SCRIPTS) await loadScript(assetUrl(script));
-    })();
+    assetsPromise = loadConsoleAssets();
     assetsPromise.catch(() => {
       assetsPromise = null;
     });
   }
   return assetsPromise;
+}
+
+async function loadConsoleAssets() {
+  for (const style of CONSOLE_STYLES) await loadAssetOnce(loadStyle, style);
+  for (const script of CONSOLE_SCRIPTS) await loadAssetOnce(loadScript, script);
+}
+
+/// One asset, unless a previous (partial) pass already made it live —
+/// the resume half of ensureAssetsLoaded's retry contract. Marks the URL
+/// loaded only on success.
+async function loadAssetOnce(load, path) {
+  const url = assetUrl(path);
+  if (loadedAssets.has(url)) return;
+  await load(url);
+  loadedAssets.add(url);
 }
 
 /// Bridge + roster + mount — the same wiring the legacy INDEX_HTML glue
