@@ -198,6 +198,18 @@ const ENTRIES = [
     "Não foi possível carregar: {fields}. Eles podem mostrar valores desatualizados ou vazios — tente fechar e abrir as Configurações novamente.",
     "No se pudo cargar: {fields}. Puede que muestren valores desactualizados o vacíos — cierra y vuelve a abrir Configuración.",
   ],
+  [
+    "settings.paintFailedSome",
+    "Part of this screen didn't display correctly. Try closing and opening Settings again.",
+    "Parte desta tela não foi exibida corretamente. Tente fechar e abrir as Configurações novamente.",
+    "Parte de esta pantalla no se mostró correctamente. Cierra y vuelve a abrir Configuración.",
+  ],
+  [
+    "settings.openFailed",
+    "Settings couldn't open. Check the log for details.",
+    "Não foi possível abrir as Configurações. Verifique o log para mais detalhes.",
+    "No se pudo abrir Configuración. Consulta el registro para más detalles.",
+  ],
   ["settings.fieldLoadFailed", "Couldn't load", "Não foi possível carregar", "No se pudo cargar"],
   ["settings.fieldGroup.account", "Account", "Conta", "Cuenta"],
   ["settings.general", "General", "Geral", "General"],
@@ -912,11 +924,19 @@ const ENTRIES = [
   ["sidecar.somethingWrong", "Something went wrong.", "Algo deu errado.", "Algo salió mal."],
   ["console.title", "Console", "Console", "Consola"],
   ["console.backAria", "Back", "Voltar", "Atrás"],
+  // Shown for two different failure paths (see console-panel.js's
+  // failConsolePanel and console.rs's close_after_failure): the default
+  // inline-panel path, where nothing was ever a separate window to
+  // "close", and the legacy separate-window path (opt-in via
+  // CENTINELO_CONSOLE_SEPARATE_WINDOW, diagnostics only). "Failed to load and
+  // was closed" used to describe the window path specifically and read as
+  // a lie on the panel path - reworded to a phrasing that's true either
+  // way, without claiming a window closed that never opened.
   [
     "console.loadFailed",
-    "The receptionist console failed to load and was closed. Check the log for details.",
-    "O console da recepção falhou ao carregar e foi fechado. Verifique o log para mais detalhes.",
-    "La consola de recepción no pudo cargar y se cerró. Consulta el registro para más detalles.",
+    "The receptionist console couldn't be displayed. Check the log for details.",
+    "O console da recepção não pôde ser exibido. Verifique o log para mais detalhes.",
+    "La consola de recepción no pudo mostrarse. Consulta el registro para más detalles.",
   ],
   [
     "app.ipcUnreachable",
