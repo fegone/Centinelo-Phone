@@ -150,6 +150,35 @@ jobs:
   # Pro-without-console cases at all - both of which hard-failed against
   # that static template's unconditional resource declarations (the actual
   # blocker this matrix closes).
+  #
+  # RISK fix 2026-08-15 (real-machine incident): this job builds an actual
+  # NSIS/MSI installer, and it used to inherit shell/src-tauri/tauri.conf.
+  # json's REAL productName ("Centinelo Phone") and identifier
+  # ("com.centinelo.phone") unchanged. NSIS's `installMode: currentUser`
+  # (see that file) resolves its install directory FROM productName alone
+  # - and MSI derives its UpgradeCode (the GUID Windows Installer uses to
+  # detect "is this the same product, do a major upgrade in place") from
+  # identifier. Same productName + same identifier as a real install means
+  # Windows treats a synthetic-fixture installer as an in-place upgrade of
+  # the real one: someone downloaded this job's artifact and ran it on a
+  # machine with a real install, and it silently overwrote four real
+  # premium-console assets with 40-byte fixture files and left a 39-byte
+  # baresip.exe in place of the real engine - no prompt, no warning,
+  # because from Windows Installer's point of view that is exactly what an
+  # upgrade is supposed to do. The "Stamp a fixture-only productName /
+  # identifier" step below mutates the CHECKED-OUT (this run's ephemeral
+  # copy of) tauri.conf.json in place before packaging - same technique
+  # scripts/set-release-version.sh already uses to stamp the release
+  # version into this same file, so this isn't a new mechanism, and it
+  # does not create a second place productName/identifier are defined:
+  # tauri.conf.json stays the only source of truth, this job's checkout of
+  # it is just never the one that gets committed. The "Verify installer
+  # identity is fixture-only" step reads the ACTUAL productName back out
+  # of the built .exe's version resource and the built .msi's own Property
+  # table (not a re-derivation, not trusting the stamping step's exit
+  # code) and fails the job if it ever again matches production - so a
+  # revert of the stamping step, or any change that stops it from taking
+  # effect, breaks this job instead of shipping quietly.
   # ---------------------------------------------------------------------
   resources-mechanism-smoke-test:
     name: NSIS/MSI resources mechanism (${{ matrix.combo }}, synthetic fixtures)
@@ -219,6 +248,41 @@ jobs:
             "FAKE-FIXTURE-CENTINELO-STORE-MARKER" | Out-File -Encoding ascii "fake-console-ui\store\ConsoleStore.js"
           }
 
+      - name: Stamp a fixture-only productName/identifier (collision guard, see job header comment)
+        # Same technique scripts/set-release-version.sh already uses to
+        # stamp the release version into this exact file - jq edits the
+        # CHECKED-OUT copy of tauri.conf.json in place, nothing is
+        # committed, and tauri.conf.json stays the only place
+        # productName/identifier are defined. This must run BEFORE
+        # package-official.sh so `tauri build` picks up the fixture
+        # identity, not the production one.
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAURI_CONF="shell/src-tauri/tauri.conf.json"
+          FIXTURE_PRODUCT_NAME="Centinelo Phone CI-FIXTURE DO NOT INSTALL"
+          FIXTURE_IDENTIFIER="com.centinelo.phone.ci-fixture"
+
+          orig_name="$(jq -r '.productName' "$TAURI_CONF")"
+          orig_id="$(jq -r '.identifier' "$TAURI_CONF")"
+
+          tmp="$(mktemp)"
+          jq --arg name "$FIXTURE_PRODUCT_NAME" --arg id "$FIXTURE_IDENTIFIER" \
+            '.productName = $name | .identifier = $id' "$TAURI_CONF" > "$tmp"
+          mv "$tmp" "$TAURI_CONF"
+
+          echo "productName: '$orig_name' -> '$FIXTURE_PRODUCT_NAME'"
+          echo "identifier:  '$orig_id' -> '$FIXTURE_IDENTIFIER'"
+
+          # Fail loudly here rather than downstream if jq silently no-op'd
+          # (e.g. wrong key names after a future schema change).
+          new_name="$(jq -r '.productName' "$TAURI_CONF")"
+          new_id="$(jq -r '.identifier' "$TAURI_CONF")"
+          if [[ "$new_name" == "$orig_name" || "$new_id" == "$orig_id" ]]; then
+            echo "::error::fixture productName/identifier stamp did not take effect - refusing to build with a possibly-production identity" >&2
+            exit 1
+          fi
+
       - name: Run scripts/package-official.sh --target windows (${{ matrix.combo }})
         shell: bash
         run: |
@@ -244,6 +308,50 @@ jobs:
         run: |
           Get-ChildItem -Recurse "shell\src-tauri\target\release\bundle\nsis"
           Get-ChildItem -Recurse "shell\src-tauri\target\release\bundle\msi"
+
+      - name: Verify installer identity is fixture-only, not production (collision guard)
+        # Reads the identity BACK OUT of the built artifacts themselves -
+        # the .exe's own Win32 version resource, and the .msi's own
+        # Property table via the Windows Installer COM API - rather than
+        # trusting that the stamping step above ran/worked. This is the
+        # invariant that makes the fix in this job's header comment
+        # tamper-evident: revert or bypass the stamping step and THIS
+        # check fails the job, instead of the job going quietly back to
+        # shipping a same-identity installer.
+        shell: pwsh
+        run: |
+          $prodName = "Centinelo Phone"
+
+          $nsis = Get-ChildItem "shell\src-tauri\target\release\bundle\nsis\*.exe" | Select-Object -First 1
+          $nsisProductName = (Get-Item $nsis.FullName).VersionInfo.ProductName
+          Write-Host "NSIS installer VersionInfo.ProductName: '$nsisProductName'"
+          if ($nsisProductName -eq $prodName) {
+            Write-Error "NSIS installer productName equals the PRODUCTION name '$prodName' - installing this build would collide with (and silently overwrite, via NSIS's currentUser install-dir-by-productName resolution) a real install. The fixture-stamping step earlier in this job must have failed to take effect."
+            exit 1
+          }
+          if (-not $nsisProductName -or $nsisProductName -notmatch "CI-FIXTURE") {
+            Write-Error "NSIS installer productName ('$nsisProductName') does not carry the expected CI-FIXTURE marker - refusing to trust this as a safe synthetic build."
+            exit 1
+          }
+
+          $msi = Get-ChildItem "shell\src-tauri\target\release\bundle\msi\*.msi" | Select-Object -First 1
+          $installer = New-Object -ComObject WindowsInstaller.Installer
+          $database = $installer.OpenDatabase($msi.FullName, 0)
+          $view = $database.OpenView("SELECT Value FROM Property WHERE Property='ProductName'")
+          $view.Execute()
+          $record = $view.Fetch()
+          $msiProductName = $record.StringData(1)
+          Write-Host "MSI ProductName property: '$msiProductName'"
+          if ($msiProductName -eq $prodName) {
+            Write-Error "MSI installer ProductName property equals the PRODUCTION name '$prodName' - this build's UpgradeCode (derived from identifier) would collide with a real install and MSI's own major-upgrade detection would silently replace it. The fixture-stamping step earlier in this job must have failed to take effect."
+            exit 1
+          }
+          if (-not $msiProductName -or $msiProductName -notmatch "CI-FIXTURE") {
+            Write-Error "MSI installer ProductName property ('$msiProductName') does not carry the expected CI-FIXTURE marker - refusing to trust this as a safe synthetic build."
+            exit 1
+          }
+
+          Write-Host "OK: both installers carry a fixture-only identity, distinct from production ('$prodName')."
 
       - name: Extract MSI (admin install, no actual install) and verify staged files are present
         shell: pwsh
