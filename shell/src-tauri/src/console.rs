@@ -96,6 +96,23 @@ const ASSETS_DIR_NAME: &str = "premium-console-assets";
 /// inline panel.
 pub const SEPARATE_WINDOW_ENV: &str = "CENTINELO_CONSOLE_SEPARATE_WINDOW";
 
+/// The [`ASSET_SCHEME`]-scoped URL the legacy separate window navigates
+/// to on first open, in the shape the current platform actually resolves.
+/// See [`open_or_focus`]'s doc for why a single hardcoded shape broke
+/// Windows. `windows_or_android_scheme_host` should always be
+/// `cfg!(any(target_os = "windows", target_os = "android"))` at the real
+/// call site; it's a parameter here purely so both branches are testable
+/// without cross-compiling (`cfg!` bakes in the CURRENT build's target,
+/// so a unit test running on macOS can never exercise the Windows arm any
+/// other way).
+fn console_index_url(windows_or_android_scheme_host: bool) -> String {
+    if windows_or_android_scheme_host {
+        format!("http://{ASSET_SCHEME}.localhost/index.html")
+    } else {
+        format!("{ASSET_SCHEME}://localhost/index.html")
+    }
+}
+
 /// Event [`open_panel`] emits (app-wide) to tell the main window to show
 /// the inline console panel. `ui/js/console-panel.js` listens for it; only
 /// [`open`] ever emits it, always after its own license re-check, so no
@@ -570,6 +587,32 @@ fn grow_main_window_for_panel(app: &AppHandle) -> u64 {
 /// both (2) and (3) for the rest of that window's lifetime the moment
 /// `mount()` finishes, and (1) never had any visible side effect to begin
 /// with.
+///
+/// # Origin shape: same bug this module's asset handler doc already
+/// documents, one layer up
+///
+/// This is the LEGACY path (only reachable behind
+/// `CENTINELO_CONSOLE_SEPARATE_WINDOW` since the 2.1.0 inline-panel
+/// migration made this module's doc's `#screen-console` panel the
+/// default) - but it has the identical origin-shape defect
+/// `console-panel.js`'s `resolveConsoleAssetOrigin` fixes for the inline
+/// panel: a `WebviewUrl::CustomProtocol` is just a `Url` handed straight
+/// to wry/webview2 (`tauri` 2.11.5's `manager/webview.rs`,
+/// `WebviewUrl::CustomProtocol(url) => url.clone()` with no per-OS
+/// rewriting anywhere in that path), so hardcoding the macOS/Linux
+/// `<scheme>://localhost/...` shape here means WebView2 never resolves it
+/// on Windows either, for the same reason the inline panel's asset
+/// requests never reached `asset_protocol_handler` at all. Fixed here the
+/// same way Tauri's own `convertFileSrc` picks the shape (see
+/// `console_index_url`'s doc) - Rust gets to do it at compile time
+/// instead of at runtime, since `target_os` is known here and a webview
+/// never needs to guess.
+///
+/// NOT verified against a real Windows build - this path is unused in
+/// the shipped 2.1.0 default (inline panel) and no Windows machine has
+/// exercised it since this fix. If `CENTINELO_CONSOLE_SEPARATE_WINDOW`
+/// is ever revived for real use, treat this as unconfirmed until someone
+/// actually opens the separate window on Windows and checks the log.
 pub fn open_or_focus(app: &AppHandle) -> Result<(), String> {
     let premium = app
         .try_state::<PremiumHandle>()
@@ -594,7 +637,7 @@ pub fn open_or_focus(app: &AppHandle) -> Result<(), String> {
     FAILURE_HANDLED.store(false, Ordering::SeqCst);
 
     let url = WebviewUrl::CustomProtocol(
-        format!("{ASSET_SCHEME}://localhost/index.html")
+        console_index_url(cfg!(any(target_os = "windows", target_os = "android")))
             .parse()
             .expect("static console URL is always a valid Url"),
     );
@@ -695,10 +738,18 @@ fn assets_dir() -> Option<PathBuf> {
 /// `premium-console:` in `script-src` and `style-src` (and only
 /// there: `connect-src` is untouched, the lesson of the 2.0.3 IPC
 /// hotfix; no `font-src`/`img-src` entries needed - the console-ui
-/// stylesheets reference no `url()`/`@font-face` at all). The full
-/// option trade-off - why same-origin interception isn't implementable
-/// with Tauri's public API and why a `blob:` approach would weaken the
-/// CSP more - is `docs/console-inline-panel-decision.md` §1.
+/// stylesheets reference no `url()`/`@font-face` at all). BOTH origin
+/// shapes are listed, not just one: `premium-console:` covers the
+/// macOS/Linux form (`premium-console://localhost/...`) and
+/// `http://premium-console.localhost` covers the Windows/Android form
+/// the frontend actually requests there (`console-panel.js`'s
+/// `resolveConsoleAssetOrigin` picks the shape at runtime via Tauri's
+/// own `convertFileSrc` - see its doc there); shipping only the first
+/// form again would trade the white-screen-on-Windows bug for a CSP
+/// violation on the exact platform the fix targets. The full option
+/// trade-off - why same-origin interception isn't implementable with
+/// Tauri's public API and why a `blob:` approach would weaken the CSP
+/// more - is `docs/console-inline-panel-decision.md` §1.
 pub fn asset_protocol_handler(
     ctx: tauri::UriSchemeContext<'_, tauri::Wry>,
     request: tauri::http::Request<Vec<u8>>,
@@ -1048,13 +1099,34 @@ mod tests {
     //! stateful frontend half of the same contract (reopen during the
     //! close's IPC round-trip must work) is pinned in
     //! `ui/js/console-panel.test.js` ("P4").
-    use super::{CloseOutcome, PanelSizeState};
+    use super::{console_index_url, CloseOutcome, PanelSizeState, ASSET_SCHEME};
 
     fn fresh() -> PanelSizeState {
         PanelSizeState {
             session: 0,
             restore: None,
         }
+    }
+
+    #[test]
+    fn console_index_url_macos_linux_shape() {
+        assert_eq!(
+            console_index_url(false),
+            format!("{ASSET_SCHEME}://localhost/index.html")
+        );
+    }
+
+    #[test]
+    fn console_index_url_windows_android_shape() {
+        // MUTATION TARGET: if the `if`/`else` branches of console_index_url
+        // ever get swapped, this and the macOS/Linux test above both still
+        // pass compilation but one of the two now asserts the wrong shape
+        // for its branch - together they pin BOTH arms, not just that the
+        // function returns *a* URL.
+        assert_eq!(
+            console_index_url(true),
+            format!("http://{ASSET_SCHEME}.localhost/index.html")
+        );
     }
 
     #[test]
