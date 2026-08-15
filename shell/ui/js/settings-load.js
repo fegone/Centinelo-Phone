@@ -98,13 +98,34 @@ export function summarizeSettledResults(results) {
 /// mutation-verified test (see settings-load.test.js's "always reveals"
 /// suite).
 ///
-/// `steps` is an array of `{ name, run }`; `run` is a zero-arg closure
-/// (the DOM/state access it needs comes from its caller's closure, same as
-/// every other paint call in openSettings). Every step's `run` is invoked
-/// regardless of an earlier step throwing - each failure is caught,
-/// tagged with its step's `name` and a stringified error (never the raw
-/// thrown value, same "no call content forwarded" contract
-/// summarizeSettledResults follows), and collected into `failed`.
+/// `buildSteps` is a ZERO-ARG closure that RETURNS an array of
+/// `{ name, run }` (app.js passes `() => buildSettingsPaintSteps(values)`,
+/// keeping the ~15-entry step list itself out of openSettings for
+/// readability - see that function's own header comment). It is a builder,
+/// not a plain array, and it is called from INSIDE the try below rather
+/// than by the caller before this function is even entered - ronda 4,
+/// coordinator caution: extracting the step list to its own function meant
+/// evaluating it as a call argument (`runSettingsPaintSteps(buildSteps(),
+/// reveal)`) would run it BEFORE this function's try/finally exists at
+/// all, so a throw while merely constructing the array (a typo'd variable
+/// reference, say) would skip `reveal()` entirely - the exact class of bug
+/// this whole file exists to close, reintroduced by the refactor meant to
+/// make it more readable. Taking a thunk and calling it inside the guarded
+/// region closes that: see settings-load.test.js's "buildSteps-throws"
+/// test. A thrown `buildSteps()` is caught, recorded as a single `failed`
+/// entry named `"buildSteps"`, and treated as "zero steps ran" (nothing
+/// painted, but `reveal` still fires and the function still returns
+/// normally, same as any other paint failure) - it is NOT treated like the
+/// `reveal`-throws case below, because it's still fundamentally "a step
+/// failed to run", just the earliest possible one.
+///
+/// Each of the returned steps' `run` is a zero-arg closure (the DOM/state
+/// access it needs comes from its caller's closure, same as every other
+/// paint call in openSettings). Every step's `run` is invoked regardless
+/// of an earlier step throwing - each failure is caught, tagged with its
+/// step's `name` and a stringified error (never the raw thrown value, same
+/// "no call content forwarded" contract summarizeSettledResults follows),
+/// and collected into `failed`.
 ///
 /// `reveal` is a zero-arg closure (app.js passes
 /// `() => { $("screen-settings").hidden = false; }`) called EXACTLY ONCE,
@@ -156,9 +177,16 @@ export function summarizeSettledResults(results) {
 /// is still only ever attempted once in this case, same as every other
 /// path through this function. See settings-load.test.js's
 /// "loop-and-reveal-both-throw" test.
-export function runSettingsPaintSteps(steps, reveal) {
+export function runSettingsPaintSteps(buildSteps, reveal) {
   const failed = [];
   try {
+    let steps;
+    try {
+      steps = buildSteps();
+    } catch (e) {
+      failed.push({ name: "buildSteps", error: describeError(e) });
+      steps = [];
+    }
     for (const step of steps) {
       try {
         step.run();

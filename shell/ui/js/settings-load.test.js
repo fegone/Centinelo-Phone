@@ -132,6 +132,14 @@ test("summarizeSettledResults: every SETTINGS_FIELD_GROUPS entry has a unique ke
 // every step has run, so THAT guarantee - not just step isolation - has a
 // real test here. A fake `reveal` (a counting/recording function, no DOM)
 // is what makes this testable without a webview.
+//
+// Ronda 4: `steps` became `buildSteps`, a zero-arg closure returning the
+// array rather than the array itself - see runSettingsPaintSteps' own
+// header comment for why (extracting app.js's step list to its own
+// function meant the array had to be built somewhere, and building it as
+// a call argument would have run it BEFORE this function's try/finally
+// existed, skipping reveal on a construction-time throw). Every test
+// below wraps its step array in `() => [...]` to match.
 // ---------------------------------------------------------------------
 
 function countingReveal() {
@@ -146,7 +154,7 @@ test("runSettingsPaintSteps: every step runs even when one throws (mutation targ
   const ran = [];
   const reveal = countingReveal();
   const failed = runSettingsPaintSteps(
-    [
+    () => [
       { name: "a", run: () => ran.push("a") },
       {
         name: "b",
@@ -172,21 +180,21 @@ test("runSettingsPaintSteps: every step runs even when one throws (mutation targ
 
 test("runSettingsPaintSteps: no failures when every step succeeds", () => {
   const reveal = countingReveal();
-  const failed = runSettingsPaintSteps([{ name: "a", run: () => {} }, { name: "b", run: () => {} }], reveal);
+  const failed = runSettingsPaintSteps(() => [{ name: "a", run: () => {} }, { name: "b", run: () => {} }], reveal);
   assert.deepEqual(failed, []);
 });
 
 test("runSettingsPaintSteps: a thrown value is stringified, never forwarded raw", () => {
   const err = new Error("boom");
   err.secretField = "must not leak";
-  const failed = runSettingsPaintSteps([{ name: "x", run: () => { throw err; } }], countingReveal());
+  const failed = runSettingsPaintSteps(() => [{ name: "x", run: () => { throw err; } }], countingReveal());
   assert.equal(typeof failed[0].error, "string");
   assert.equal(failed[0].error, "boom");
 });
 
 test("runSettingsPaintSteps: multiple independent throws are all reported, each tagged with its own step name", () => {
   const failed = runSettingsPaintSteps(
-    [
+    () => [
       { name: "one", run: () => { throw new Error("first"); } },
       { name: "two", run: () => {} },
       { name: "three", run: () => { throw new Error("second"); } },
@@ -204,7 +212,7 @@ test("runSettingsPaintSteps: multiple independent throws are all reported, each 
 test("runSettingsPaintSteps: reveal(1): ALL steps throw -> reveal is still called, exactly once (mutation target for the reveal guarantee)", () => {
   const reveal = countingReveal();
   const failed = runSettingsPaintSteps(
-    [
+    () => [
       { name: "a", run: () => { throw new Error("a broke"); } },
       { name: "b", run: () => { throw new Error("b broke"); } },
       { name: "c", run: () => { throw new Error("c broke"); } },
@@ -224,7 +232,7 @@ test("runSettingsPaintSteps: reveal(1): ALL steps throw -> reveal is still calle
 test("runSettingsPaintSteps: reveal(2): a mix of throwing and succeeding steps -> reveal is called, failed[] names only the ones that threw", () => {
   const reveal = countingReveal();
   const failed = runSettingsPaintSteps(
-    [
+    () => [
       { name: "ok1", run: () => {} },
       { name: "bad1", run: () => { throw new Error("bad1 broke"); } },
       { name: "ok2", run: () => {} },
@@ -241,7 +249,7 @@ test("runSettingsPaintSteps: reveal(2): a mix of throwing and succeeding steps -
 
 test("runSettingsPaintSteps: reveal(3): no step throws -> reveal is called once, zero failures", () => {
   const reveal = countingReveal();
-  const failed = runSettingsPaintSteps([{ name: "a", run: () => {} }, { name: "b", run: () => {} }], reveal);
+  const failed = runSettingsPaintSteps(() => [{ name: "a", run: () => {} }, { name: "b", run: () => {} }], reveal);
   assert.equal(reveal.calls, 1);
   assert.deepEqual(failed, []);
 });
@@ -260,7 +268,7 @@ test("runSettingsPaintSteps: reveal(4), the ugly case: reveal() itself throws ->
     throw new Error("reveal itself is broken");
   };
   assert.throws(
-    () => runSettingsPaintSteps([{ name: "a", run: () => {} }], explodingReveal),
+    () => runSettingsPaintSteps(() => [{ name: "a", run: () => {} }], explodingReveal),
     /reveal itself is broken/,
   );
   // Not retried: exactly one attempt, not zero (never called) and not more
@@ -287,7 +295,7 @@ test("runSettingsPaintSteps: reveal(5), ronda 3 reproduction (getter-throws): a 
     },
   };
   assert.throws(
-    () => runSettingsPaintSteps([{ name: "paso", run: () => { throw nasty; } }], reveal),
+    () => runSettingsPaintSteps(() => [{ name: "paso", run: () => { throw nasty; } }], reveal),
     /boom desde el getter/,
   );
   assert.equal(reveal.calls, 1);
@@ -314,8 +322,38 @@ test("runSettingsPaintSteps: reveal(6), the double-throw case: the loop is alrea
     },
   };
   assert.throws(
-    () => runSettingsPaintSteps([{ name: "paso", run: () => { throw nasty; } }], explodingReveal),
+    () => runSettingsPaintSteps(() => [{ name: "paso", run: () => { throw nasty; } }], explodingReveal),
     /reveal itself is broken/,
   );
   assert.equal(revealAttempts, 1);
+});
+
+test("runSettingsPaintSteps: reveal(7), ronda 4 extraction risk: buildSteps() itself throws (before any step even exists) -> reveal is still called exactly once, the throw is recorded as a failed entry, and the function does NOT propagate it", () => {
+  // This is the exact risk the coordinator flagged when asking for the
+  // step array to be extracted out of openSettings: if runSettingsPaintSteps
+  // took a plain array instead of a builder, the array would have to be
+  // built as a call argument - `runSettingsPaintSteps(buildSteps(), reveal)`
+  // - which runs BEFORE this function (and its try/finally) is even
+  // entered. A throw while merely constructing the step list (a typo'd
+  // variable reference in buildSettingsPaintSteps, say) would then skip
+  // reveal entirely, with no try/finally anywhere left to catch it.
+  // Accepting a zero-arg `buildSteps` closure and calling it INSIDE the
+  // try closes that: construction now happens under the same guarantee
+  // every individual step already had.
+  //
+  // Unlike the reveal-throws case (which propagates loudly, by design -
+  // see this function's header comment), a buildSteps() throw is treated
+  // as "the whole batch of steps failed to even start" - one more entry
+  // in `failed`, screen still revealed, function still returns normally.
+  // It is fundamentally still "something meant to paint the screen threw",
+  // just the earliest possible instance of that, not a new class of bug
+  // like a broken reveal mechanism is.
+  const reveal = countingReveal();
+  const failed = runSettingsPaintSteps(() => {
+    throw new Error("buildSettingsPaintSteps has a bug");
+  }, reveal);
+  assert.equal(reveal.calls, 1);
+  assert.equal(failed.length, 1);
+  assert.equal(failed[0].name, "buildSteps");
+  assert.match(failed[0].error, /buildSettingsPaintSteps has a bug/);
 });
