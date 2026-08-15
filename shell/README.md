@@ -1033,24 +1033,56 @@ publish pipeline (a separate release-ci task) needs to produce exactly
 this, nothing here needs to change on the app side to match it.
 
 **Endpoints** (already set, two, tried in order — `tauri-plugin-updater`
-falls through to the next on ANY failure, `updater.rs:412-518`):
+falls through to the next on ANY failure and **stops at the first
+success**, `for url in &self.endpoints { ... break` on a good response —
+vendored source at
+`~/.cargo/registry/.../tauri-plugin-updater-2.10.1/src/updater.rs:411-521`
+in this workspace's toolchain, not a line range in this repo):
 
-1. `https://github.com/fegone/Centinelo-Phone/releases/latest/download/latest.json`
-   — GitHub's "latest release" redirect, so this URL never changes across
-   releases; only the release itself does. **GitHub excludes prereleases
-   from this alias, always, no exception** — while 2.0.x ships as a
-   prerelease (the default — see `release.yml`'s `prerelease` input and
-   its top-of-file "Prerelease default" comment), this endpoint 404s for
-   every installed client. That's expected, not a bug, until 2.0 leaves
-   beta and a release is explicitly published with `--latest`.
-2. `https://raw.githubusercontent.com/fegone/Centinelo-Phone/updater-manifest/latest.json`
+1. `https://raw.githubusercontent.com/fegone/Centinelo-Phone/updater-manifest/latest.json`
    — a plain branch file, not a GitHub Release at all, so prerelease/draft
    status is irrelevant to it. `release.yml`'s "Publish latest.json to the
    updater-manifest branch" step pushes the just-published release's
    `latest.json` here on every release, so this is the endpoint that
    actually works **today**, while 2.0.x stays prerelease. That branch
    carries ONLY `latest.json`, on purpose — nothing internal, nothing
-   else, ever (this repo is public).
+   else, ever (this repo is public). Listed **first** (moved here
+   2026-08-15, was second) precisely because the plugin stops at the
+   first success: putting the endpoint that actually works in front
+   means a normal boot resolves the check on its first attempt and never
+   even reaches endpoint 2, so it logs no error at all. It was already
+   the de facto source of truth for every installed 2.0.x client — this
+   ordering just makes that explicit instead of routing every boot
+   through a guaranteed-404 detour first.
+2. `https://github.com/fegone/Centinelo-Phone/releases/latest/download/latest.json`
+   — GitHub's "latest release" redirect, so this URL never changes across
+   releases; only the release itself does. **GitHub excludes prereleases
+   from this alias, always, no exception** — while 2.0.x ships as a
+   prerelease (the default — see `release.yml`'s `prerelease` input and
+   its top-of-file "Prerelease default" comment), this endpoint 404s for
+   every installed client today. That's expected, not a bug, until 2.0
+   leaves beta and a release is explicitly published with `--latest`.
+   Kept as the second entry, not removed, so the day a release finally
+   publishes as "Latest" this starts working with zero app-side change —
+   no client update is needed to pick it up, it just starts succeeding
+   the next time endpoint 1 happens to fail (or, after 2.0 leaves beta,
+   this pair could be revisited: at that point endpoint 1 stops being a
+   pure placeholder and either ordering is defensible again).
+
+**Known risk this ordering does not fix**: the `updater-manifest` branch
+is a plain file a workflow step pushes to — nothing forces it to match
+whatever GitHub Release is actually current. If that push step is ever
+skipped, fails partway, or lands out of order with `release.yml`'s
+asset upload, endpoint 1 can serve a `latest.json` naming a version
+older, newer, or (worse) simply mismatched vs. reality, and — because
+it now succeeds first — the app will never even try endpoint 2 to
+notice the disagreement. This was already true before this change
+(endpoint 1 was already the only one that ever responded); moving it
+first does not introduce the staleness risk, it just means there is no
+implicit "try the official redirect too" second opinion happening on
+every boot. Mitigation is procedural, not code: the "Rolling back a bad
+release is two steps, not one" note below already covers keeping this
+branch in sync by hand; there is no automatic drift check today.
 
 **Publishing is opt-in while 2.0 is beta.** `release.yml`'s `prerelease`
 input defaults to `true`, and a plain `git push --tags` (no input to set
@@ -1064,7 +1096,7 @@ release as usual.
 
 **Rolling back a bad release is two steps, not one.** Deleting the
 GitHub Release (`gh release delete <tag>`) is not enough by itself: the
-`updater-manifest` branch (endpoint 2 above) keeps serving whatever
+`updater-manifest` branch (endpoint 1 above) keeps serving whatever
 `latest.json` the last successful release pushed there, independent of
 whether that release's GitHub Release still exists. If the deleted
 release's *assets* are gone but its `latest.json` is still what the
