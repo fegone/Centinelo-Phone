@@ -130,6 +130,7 @@ export function makeConsoleDispatcher(invoke) {
 
 let deps = null; // set by initConsolePanel: { invoke, listen, showBanner, reportFrontendIssue }
 let assetsPromise = null; // one load of styles+scripts per session (reset on failure so a retry is possible)
+let openingPromise = null; // the in-flight openConsolePanel() run - see openConsolePanel()'s doc
 let mounted = null; // the ConsoleApp.mount() return value ({ store, element, destroy }) while the panel shows
 
 /// Hands this module its Tauri bindings + UI surfaces. Called once from
@@ -149,14 +150,42 @@ export function isConsolePanelOpen() {
 /// (console.rs::open_panel); if the asset handler still refuses (license
 /// vanished mid-session, assets dir gone), the sequential loader rejects
 /// and failConsolePanel() unwinds everything, banner included.
-export async function openConsolePanel() {
-  if (!deps || isConsolePanelOpen()) return;
+///
+/// Reentrancy is impossible by construction, not by timing: the whole
+/// open is one in-flight promise (`openingPromise`) stored BEFORE its
+/// first `await` resolves. `isConsolePanelOpen()` stays false until the
+/// very last step, so on its own it guards nothing while
+/// ensureAssetsLoaded()/mountConsole() are pending - without this guard,
+/// a double click ran two ConsoleApp.mount()s, each with its own
+/// EngineBridge `deps.listen("sidecar-event", ...)`: duplicated BLF
+/// subscriptions, duplicated dispatch, and only the last mount
+/// teardown-able. console.rs::open_panel holds its own open state and
+/// drops duplicate events the same way, so this does not depend on the
+/// frontend alone.
+export function openConsolePanel() {
+  if (!deps || isConsolePanelOpen()) return Promise.resolve();
+  if (!openingPromise) openingPromise = runConsoleOpen();
+  return openingPromise;
+}
+
+/// The single open-in-flight. Its `openingPromise = runConsoleOpen()`
+/// assignment above is synchronous - no `await` between the
+/// `isConsolePanelOpen()` check and it - so two openConsolePanel() calls
+/// can never interleave past the guard (JS runs the caller to completion
+/// first); the second just gets the first's promise. Never rejects: a
+/// failed open is failConsolePanel()'s banner, not an unhandled rejection
+/// in every caller. The `finally` clears the guard so the next open - a
+/// retry after failure, a reopen after close - starts fresh instead of
+/// silently attaching to a dead promise.
+async function runConsoleOpen() {
   try {
     await ensureAssetsLoaded();
     await mountConsole();
     document.getElementById("screen-console").hidden = false;
   } catch (err) {
     failConsolePanel(err);
+  } finally {
+    openingPromise = null;
   }
 }
 

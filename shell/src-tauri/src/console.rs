@@ -129,6 +129,16 @@ const MAIN_DEFAULT_MIN_SIZE: (f64, f64) = (340.0, 560.0);
 /// be overwritten with the already-grown one).
 static PANEL_RESTORE_SIZE: Mutex<Option<(f64, f64)>> = Mutex::new(None);
 
+/// Whether [`PANEL_OPEN_EVENT`] has been emitted without a
+/// [`panel_closed`] since - i.e. an inline-panel open is in flight or
+/// showing. [`open_panel`] refuses to emit a second event while this is
+/// set, so a double click on the console button cannot make the frontend
+/// mount console-ui twice (duplicated BLF subscriptions, duplicated
+/// dispatch) even if the frontend's own in-flight guard were ever
+/// removed. The frontend's every exit path - close button, load failure
+/// - calls `console_panel_closed`, which clears this and re-arms opens.
+static PANEL_OPEN_PENDING: Mutex<bool> = Mutex::new(false);
+
 /// Log target for everything console-window-specific, deliberately
 /// distinct from `frontend_log.rs`'s `"app_lib::frontend"` (the *main*
 /// window's own crash-report target). Born from a real mix-up during this
@@ -340,9 +350,30 @@ fn open_panel(app: &AppHandle) -> Result<(), String> {
     if !is_unlocked(&premium) {
         return Err("premium console is not licensed".to_string());
     }
+    {
+        let mut pending = PANEL_OPEN_PENDING
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *pending {
+            // An open is already in flight (assets loading) or showing -
+            // re-emitting would race a second ConsoleApp.mount() in the
+            // frontend. Idempotent Ok: the click still "worked".
+            log::info!(target: LOG_TARGET, "[console] inline panel already open/opening - dropping duplicate open");
+            return Ok(());
+        }
+        *pending = true;
+    }
     log::info!(target: LOG_TARGET, "[console] opening inline panel");
     grow_main_window_for_panel(app);
-    app.emit(PANEL_OPEN_EVENT, ()).map_err(|e| e.to_string())?;
+    if let Err(e) = app.emit(PANEL_OPEN_EVENT, ()) {
+        // Release the slot: with no event emitted there will be no
+        // console_panel_closed, and a stuck `true` would dead the button
+        // for the rest of the session.
+        *PANEL_OPEN_PENDING
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
+        return Err(e.to_string());
+    }
     Ok(())
 }
 
@@ -351,6 +382,9 @@ fn open_panel(app: &AppHandle) -> Result<(), String> {
 /// console-ui: store stop, BLF unsubscriptions, tick interval): restores
 /// the main window's pre-panel size and its configured minimum.
 pub fn panel_closed(app: &AppHandle) {
+    *PANEL_OPEN_PENDING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
     let restore = PANEL_RESTORE_SIZE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
