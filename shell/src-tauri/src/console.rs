@@ -22,6 +22,26 @@
 //! the window is never created in the first place (see
 //! [`open_or_focus`]'s gating).
 //!
+//! # The inline panel is the default now (2026-02)
+//!
+//! [`open`] - what `commands::open_console` and the tray both call - by
+//! default tells the MAIN window to show the console as an in-app panel
+//! (`#screen-console`, the exact `#screen-settings` pattern in
+//! `ui/index.html`) instead of building a second window. Root cause this
+//! retires: the separate window went blank on the owner's Windows machine
+//! for two days while Settings - same webview, same document, just a
+//! `div` - kept working, so the console now lives in that same document.
+//! The panel loads the same runtime assets over this same scheme
+//! (`tauri.conf.json`'s `script-src`/`style-src` allow `premium-console:`;
+//! see `docs/console-inline-panel-decision.md` for the full option
+//! analysis), and the license gate moved INTO
+//! [`asset_protocol_handler`] - a 404 for unlicensed requests, strictly
+//! stronger than the window era's "the window is never created" argument,
+//! which an inline panel wouldn't have had. [`SEPARATE_WINDOW_ENV`]`=1`
+//! opts back into the old separate window during the transition:
+//! [`open_or_focus`] and everything it documents (the watchdog, the
+//! trapped-window safety nets, [`INDEX_HTML`]) are kept intact for it.
+//!
 //! Only `index.html` is NOT read from that directory: it's a small,
 //! wholly-generic wrapper (a handful of `<script src>` tags in
 //! `dev/mock.html`'s own documented dependency order, plus the
@@ -45,6 +65,7 @@
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
@@ -68,6 +89,45 @@ const CAPABILITY: &str = "blf_console";
 
 const ASSETS_DIR_ENV: &str = "CENTINELO_PREMIUM_ASSETS_DIR";
 const ASSETS_DIR_NAME: &str = "premium-console-assets";
+
+/// Opts back into the legacy separate console window during the
+/// transition - see this module's "inline panel is the default" doc. Only
+/// the exact value `1` counts; anything else (including unset) means the
+/// inline panel.
+pub const SEPARATE_WINDOW_ENV: &str = "CENTINELO_CONSOLE_SEPARATE_WINDOW";
+
+/// Event [`open_panel`] emits (app-wide) to tell the main window to show
+/// the inline console panel. `ui/js/console-panel.js` listens for it; only
+/// [`open`] ever emits it, always after its own license re-check, so no
+/// other code path can talk the frontend into opening the panel.
+pub const PANEL_OPEN_EVENT: &str = "console-open-panel";
+
+/// Logical size the main window is grown to when the console panel opens,
+/// if it is currently smaller (a larger window is never shrunk). Sized
+/// for the console-ui package's own layout: `rail` 56px + a `main` grid
+/// of `minmax(150px,1fr)` tiles + `side` 288px (its console.css) - at the
+/// main window's 380px default that layout collapses to a zero-width
+/// grid, which is why the panel grows the window it lives in. See
+/// `docs/console-inline-panel-decision.md` §6.
+const PANEL_TARGET_SIZE: (f64, f64) = (900.0, 640.0);
+
+/// Minimum logical size forced on the main window while the panel is open
+/// - the console-ui package's own `.cent-console.win` floor, verbatim.
+const PANEL_MIN_SIZE: (f64, f64) = (760.0, 520.0);
+
+/// The main window's configured minimum (`tauri.conf.json` `windows[0]`
+/// `minWidth`/`minHeight`), restored when the panel closes. Tauri exposes
+/// no getter for a window's live min constraints, so the restore value is
+/// this mirror; the only writers of min-size besides this module are that
+/// config and [`PANEL_MIN_SIZE`] below.
+const MAIN_DEFAULT_MIN_SIZE: (f64, f64) = (340.0, 560.0);
+
+/// Logical size the main window had before the console panel grew it,
+/// restored by [`panel_closed`]. `None` = panel not open / window not
+/// grown, which also makes a second `open_console` while the panel is
+/// already showing a sizing no-op (the remembered pre-panel size must not
+/// be overwritten with the already-grown one).
+static PANEL_RESTORE_SIZE: Mutex<Option<(f64, f64)>> = Mutex::new(None);
 
 /// Log target for everything console-window-specific, deliberately
 /// distinct from `frontend_log.rs`'s `"app_lib::frontend"` (the *main*
@@ -246,6 +306,99 @@ pub fn is_unlocked(premium: &PremiumHandle) -> bool {
     unlocks_console(premium.capability_status(CAPABILITY))
 }
 
+/// Entry point for both console surfaces (the tray menu item and
+/// `commands::open_console`): routes to the inline panel (default) or the
+/// legacy separate window ([`SEPARATE_WINDOW_ENV`]), re-checking the
+/// license gate either way - see [`open_or_focus`]'s doc for why a plain
+/// IPC command must never trust that its caller already checked.
+pub fn open(app: &AppHandle) -> Result<(), String> {
+    if separate_window_mode() {
+        open_or_focus(app)
+    } else {
+        open_panel(app)
+    }
+}
+
+/// Whether [`SEPARATE_WINDOW_ENV`] opts into the legacy separate window.
+fn separate_window_mode() -> bool {
+    std::env::var(SEPARATE_WINDOW_ENV).is_ok_and(|v| v == "1")
+}
+
+/// Inline-panel path: re-check the license (same reasoning as
+/// [`open_or_focus`] - the button and tray item are hidden without it,
+/// but `open_console` is still a plain IPC command any webview can
+/// invoke), grow the main window to the console's layout floor, then emit
+/// [`PANEL_OPEN_EVENT`]. Loading the assets and mounting console-ui is
+/// `ui/js/console-panel.js`'s job; every request it makes for console-ui
+/// code goes back through [`asset_protocol_handler`], which enforces the
+/// same license gate again - defense in depth: absent button, gated
+/// command, gated bytes.
+fn open_panel(app: &AppHandle) -> Result<(), String> {
+    let premium = app
+        .try_state::<PremiumHandle>()
+        .ok_or_else(|| "premium module not initialized".to_string())?;
+    if !is_unlocked(&premium) {
+        return Err("premium console is not licensed".to_string());
+    }
+    log::info!(target: LOG_TARGET, "[console] opening inline panel");
+    grow_main_window_for_panel(app);
+    app.emit(PANEL_OPEN_EVENT, ()).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Called by `commands::console_panel_closed` once the frontend has hidden
+/// the inline panel (after its own `app.destroy()` teardown of the mounted
+/// console-ui: store stop, BLF unsubscriptions, tick interval): restores
+/// the main window's pre-panel size and its configured minimum.
+pub fn panel_closed(app: &AppHandle) {
+    let restore = PANEL_RESTORE_SIZE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    let _ = window.set_min_size(Some(tauri::LogicalSize::new(
+        MAIN_DEFAULT_MIN_SIZE.0,
+        MAIN_DEFAULT_MIN_SIZE.1,
+    )));
+    if let Some((w, h)) = restore {
+        let _ = window.set_size(tauri::LogicalSize::new(w, h));
+    }
+}
+
+/// Grows the main window to [`PANEL_TARGET_SIZE`] and lifts its minimum to
+/// [`PANEL_MIN_SIZE`] for as long as the console panel is open - see
+/// [`PANEL_TARGET_SIZE`]'s doc for why the panel needs the room. Records
+/// the pre-open size exactly once per open, in logical pixels, so the
+/// restore is exact on any display scale factor.
+fn grow_main_window_for_panel(app: &AppHandle) {
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    let mut restore = PANEL_RESTORE_SIZE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let scale = window.scale_factor().unwrap_or(1.0);
+    let current = window.inner_size().ok().map(|phys| {
+        let logical: tauri::LogicalSize<f64> = phys.to_logical(scale);
+        (logical.width, logical.height)
+    });
+    if restore.is_none() {
+        *restore = current;
+    }
+    let _ = window.set_min_size(Some(tauri::LogicalSize::new(
+        PANEL_MIN_SIZE.0,
+        PANEL_MIN_SIZE.1,
+    )));
+    if let Some((w, h)) = current {
+        let _ = window.set_size(tauri::LogicalSize::new(
+            w.max(PANEL_TARGET_SIZE.0),
+            h.max(PANEL_TARGET_SIZE.1),
+        ));
+    }
+}
+
 /// Finds the already-open console window and focuses it, or builds a
 /// fresh one. Re-checks the license gate itself (not just trusting that a
 /// caller already checked) - the tray menu item and the main window's
@@ -406,10 +559,44 @@ fn assets_dir() -> Option<PathBuf> {
 /// bump: check the WebView2/WKWebView devtools console directly for a
 /// `Content-Security-Policy` violation line, the same way `README.md`'s
 /// hotfix section was originally diagnosed.
+///
+/// That analysis covers the legacy separate window. Since the
+/// inline-panel migration (this module's doc) the MAIN window also
+/// loads console-ui code over this scheme, and the main window DOES
+/// carry `tauri.conf.json`'s CSP - which is why that config now lists
+/// `premium-console:` in `script-src` and `style-src` (and only
+/// there: `connect-src` is untouched, the lesson of the 2.0.3 IPC
+/// hotfix; no `font-src`/`img-src` entries needed - the console-ui
+/// stylesheets reference no `url()`/`@font-face` at all). The full
+/// option trade-off - why same-origin interception isn't implementable
+/// with Tauri's public API and why a `blob:` approach would weaken the
+/// CSP more - is `docs/console-inline-panel-decision.md` §1.
 pub fn asset_protocol_handler(
-    _ctx: tauri::UriSchemeContext<'_, tauri::Wry>,
+    ctx: tauri::UriSchemeContext<'_, tauri::Wry>,
     request: tauri::http::Request<Vec<u8>>,
 ) -> tauri::http::Response<Cow<'static, [u8]>> {
+    // License gate FIRST, before any disk access. Since the inline-panel
+    // migration the MAIN window loads its console <script>/<link> tags
+    // over this same scheme (see this module's doc), so the window-era
+    // argument this handler used to lean on - "the only requester, the
+    // console window, is never created unlicensed" - no longer covers
+    // every request. Unlicensed requests get the same 404 a Community
+    // build with no assets directory produces, so a webview that shows
+    // the panel DOM by force (devtools) still never receives a byte of
+    // console-ui code. A missing PremiumHandle state fails closed.
+    let unlocked = ctx
+        .app_handle()
+        .try_state::<PremiumHandle>()
+        .map(|premium| is_unlocked(&premium))
+        .unwrap_or(false);
+    if !unlocked {
+        log::warn!(
+            target: LOG_TARGET,
+            "[console] 404: blf_console not licensed - refusing asset request"
+        );
+        return not_found();
+    }
+
     let raw_path = request.uri().path();
     let route = raw_path.trim_start_matches('/');
     let route = if route.is_empty() {

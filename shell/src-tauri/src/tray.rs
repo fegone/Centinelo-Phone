@@ -216,7 +216,7 @@ pub fn setup(app: &App, premium: &PremiumHandle) -> tauri::Result<()> {
             "toggle_available" => toggle_available(app),
             "toggle_auto_answer" => toggle_auto_answer(app),
             "console" => {
-                if let Err(e) = crate::console::open_or_focus(app) {
+                if let Err(e) = crate::console::open(app) {
                     log::warn!("tray: open console failed: {e}");
                 }
             }

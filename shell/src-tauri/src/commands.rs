@@ -1178,17 +1178,34 @@ pub fn premium_diagnostic(premium: State<PremiumHandle>) -> String {
     premium.diagnostic().to_string()
 }
 
-/// Opens (or focuses, if already open) the premium receptionist console
-/// window - see `console.rs::open_or_focus` for the license-gate
-/// re-check this delegates to. The tray menu entry and the main window's
-/// own button that call this are both already gated on
+/// Opens the premium receptionist console - by default as an in-app panel
+/// in the MAIN window (`console.rs::open_panel`: grow the window to the
+/// console's layout floor, emit `console::PANEL_OPEN_EVENT`), or as the
+/// legacy separate window when `console::SEPARATE_WINDOW_ENV` is set.
+/// Whatever path it takes, the license gate is re-checked inside
+/// `console.rs` - the tray menu entry and the main window's own button
+/// that call this are both already gated on
 /// `premium_capability_status`/`console::is_unlocked` before they're ever
-/// shown (`tray.rs`, `ui/js/app.js`) - this command re-checks anyway,
+/// shown (`tray.rs`, `ui/js/app.js`), but this command re-checks anyway,
 /// since it's reachable by any webview that can invoke it, hidden button
-/// or not.
+/// or not. `console.rs::asset_protocol_handler` enforces the same gate on
+/// the asset bytes themselves, so this command is one layer of three, not
+/// the only one.
 #[tauri::command(rename_all = "snake_case")]
 pub fn open_console(app: tauri::AppHandle) -> Result<(), String> {
-    crate::console::open_or_focus(&app)
+    crate::console::open(&app)
+}
+
+/// The panel side's goodbye: `ui/js/console-panel.js` invokes this after
+/// hiding `#screen-console` and destroying the mounted console-ui, so Rust
+/// can restore the main window's pre-panel size and minimum (see
+/// `console.rs::panel_closed`). Carries no license check on purpose - it
+/// only ever shrinks a window back, and must stay callable even if the
+/// license vanished mid-session, or a licensed-then-unlicensed operator
+/// would be stuck with an oversized window.
+#[tauri::command(rename_all = "snake_case")]
+pub fn console_panel_closed(app: tauri::AppHandle) {
+    crate::console::panel_closed(&app);
 }
 
 /// Console window's counterpart to `frontend_log::log_frontend_error` -

@@ -128,17 +128,20 @@ pub fn run() {
         // plugin beyond registering them).
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
-        // Serves the premium console UI (console-ui package) to the
-        // "console" webview window - see console.rs's module doc for why
-        // a custom protocol instead of a bundled frontendDist path (short
-        // version: the console-ui source is premium and must never ship
-        // in this public repo, so it can't live under `ui/`, the one
-        // directory tauri.conf.json's `frontendDist` bundles). Registered
+        // Serves the premium console UI (console-ui package) both to the
+        // main window's inline console panel (the default - see
+        // console.rs's module doc) and to the legacy separate "console"
+        // window (console.rs::SEPARATE_WINDOW_ENV). Why a custom protocol
+        // instead of a bundled frontendDist path, short version: the
+        // console-ui source is premium and must never ship in this public
+        // repo, so it can't live under `ui/`, the one directory
+        // tauri.conf.json's `frontendDist` bundles. Registered
         // unconditionally on the builder (Tauri requires protocol
-        // registration before `.build()`) - harmless when no premium
-        // assets directory exists, since the "console" window itself is
-        // only ever created when PremiumHandle reports the capability
-        // licensed (see commands::open_console / tray.rs).
+        // registration before `.build()`) - harmless when unlicensed or
+        // no premium assets directory exists: the handler itself 404s
+        // every request unless PremiumHandle reports `blf_console`
+        // licensed, and the panel/button/tray entry points are hidden
+        // anyway (see console.rs / commands::open_console / tray.rs).
         .register_uri_scheme_protocol(console::ASSET_SCHEME, console::asset_protocol_handler)
         .setup(|app| {
             let app_data_dir = app.path().app_data_dir()?;
@@ -285,6 +288,7 @@ pub fn run() {
             commands::premium_capability_status,
             commands::premium_diagnostic,
             commands::open_console,
+            commands::console_panel_closed,
             commands::console_frontend_fatal,
             commands::console_frontend_ready,
             commands::sidecar_hold,
