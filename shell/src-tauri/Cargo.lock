@@ -491,7 +491,7 @@ version = "0.1.0"
 
 [[package]]
 name = "centinelo-shell"
-version = "2.0.9"
+version = "2.1.0"
 dependencies = [
  "argon2",
  "base64 0.22.1",
