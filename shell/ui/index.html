@@ -899,24 +899,20 @@
       <div class="plate" id="prov-confirm-ext" style="font-size:13px;color:var(--text-2);letter-spacing:.02em;text-transform:none">—</div>
       <p class="hint" id="prov-confirm-transport"></p>
       <p class="hint" data-i18n="provisioning.passwordNeverShown">The password is applied but never shown here.</p>
-      <!-- Deep-link-only hardening (RISK 4R finding, 2026-08-16 -
-           commands::provisioning_apply's doc has the full threat model):
-           a centinelo://provision link is reachable from any email or
-           webpage, and on a not-yet-configured install there's no admin
-           password yet to gate it. Shown only when the pending config's
-           `from_deep_link` is true (see showProvisioningConfirm below) -
-           a manual paste never shows this, since pasting a link already
-           implies the operator trusted the source enough to copy it
-           themselves. The input starts empty on every show, never
-           pre-filled from the preview, so a single click through a
-           phishing link can't sail through this screen unread. This is
-           friction, not cryptography - see provisioning_apply's doc for
-           what it does and doesn't stop. -->
-      <div id="prov-confirm-deep-link-warning" hidden>
-        <p class="hint" data-i18n="provisioning.deepLinkWarning">This link came from outside the app. If you weren't told to expect it, don't continue.</p>
-        <label class="hint" for="prov-confirm-ext-check" data-i18n="provisioning.deepLinkConfirmExtLabel">Type the extension shown above to confirm:</label>
-        <input type="text" id="prov-confirm-ext-check" autocomplete="off" data-i18n-placeholder="provisioning.deepLinkConfirmExtPlaceholder" placeholder="Extension">
-      </div>
+      <!-- Deep-link-only informed-consent warning (RISK 4R finding,
+           2026-08-16, round 2 - commands::provisioning_apply's doc has the
+           full reasoning). Round 1 tried a typed "confirm the extension"
+           field; that was removed because `preview.ext` above comes from
+           the SAME attacker-controlled config the link carries, so typing
+           it back proved nothing an attacker's own phishing message
+           couldn't already supply. There is no technical check left here
+           on purpose: `#prov-confirm-host` above gets `.deep-link-warn`
+           (JS, not amber - amber stays reserved for ringing) to make the
+           one fact that actually matters - which server the phone is
+           about to be pointed at - hard to miss, and this text says
+           plainly that the link came from outside the app. That's
+           friction against a blind click-through, not authentication. -->
+      <p class="hint err" id="prov-confirm-deep-link-warning" hidden data-i18n="provisioning.deepLinkWarning">This link came from outside the app — if you weren't told to expect it, don't continue. Check the address above.</p>
       <div class="btnrow">
         <button class="primary" id="btn-prov-confirm" data-i18n="provisioning.connect">Connect</button>
         <button class="ghost" id="btn-prov-cancel" data-i18n="provisioning.cancel">Cancel</button>

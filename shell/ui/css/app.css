@@ -334,6 +334,18 @@ html[data-os="mac"] .settings-header, html[data-os="mac"] .console-header { padd
 .lock-card p { margin: 0; font: 400 11.5px/1.5 var(--font-ui); color: var(--text-2); }
 .lock-card .err { color: var(--st-busy); font: 500 11px/1.4 var(--font-ui); min-height: 14px; }
 
+/* Deep-link provisioning informed-consent warning (RISK 4R finding,
+   2026-08-16, round 2 - commands::provisioning_apply's doc has the full
+   reasoning): the host is the one fact that actually matters when a
+   centinelo://provision link arrives from outside the app, so make it
+   hard to miss - `--st-busy` (the same error/warning token every other
+   attention surface here uses: .banner.err, .hint.err, .lock-card .err),
+   never `--amber`, which stays reserved for ringing (premium/design/
+   TOKENS.md's "amber solo ringing" rule). Applied/removed by
+   ui/js/app.js's showProvisioningConfirm, matching #prov-confirm-host's
+   `from_deep_link` gating. */
+.plate.deep-link-warn { color: var(--st-busy); border: 1px solid var(--st-busy); border-radius: 6px; padding: 2px 6px; }
+
 /* == misc: banners, live region, sidecar status whisper ==================== */
 .banner { position: absolute; top: 6px; left: 8px; right: 8px; z-index: 40; padding: 8px 11px; border-radius: 9px; font: 500 11.5px/1.4 var(--font-ui); box-shadow: var(--shadow-2); animation: fadeSlide var(--t-fast) var(--ease) both; }
 .banner.err { background: var(--st-busy); color: var(--on-busy); }

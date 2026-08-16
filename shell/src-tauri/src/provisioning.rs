@@ -226,17 +226,29 @@ impl ProvisioningPending {
         *self.lock() = Some((config, true));
     }
 
+    /// Non-consuming read - see `commands::provisioning_apply` (R1: peek,
+    /// only `clear()` once the apply has actually succeeded, so a failed
+    /// apply leaves the config available to retry instead of forcing a
+    /// re-paste). `provisioning_apply` no longer needs the origin tag (see
+    /// that command's doc, round 2, 2026-08-16 - the confirm_ext check that
+    /// used to need it here turned out to check nothing an attacker didn't
+    /// already control), so this stays the plain accessor;
+    /// `peek_with_origin` below is `provisioning_pending_preview`'s.
+    pub fn peek(&self) -> Option<ProvisioningConfig> {
+        self.lock().clone().map(|(config, _)| config)
+    }
+
     /// Non-consuming read of the pending config plus whether it arrived via
     /// a `centinelo://provision` deep link, taken under a single lock
     /// acquisition so a caller that needs both never risks reading them
     /// from two different pending configs if a second resolve overwrites
-    /// the first in between - see `commands::provisioning_pending_preview`
+    /// the first in between. Used by `commands::provisioning_pending_preview`
     /// (R3: lets the frontend catch a preview whose event fired before any
-    /// listener attached) and `commands::provisioning_apply` (R1: peek,
-    /// only `clear()` once the apply has actually succeeded, so a failed
-    /// apply leaves the config available to retry instead of forcing a
-    /// re-paste; also the deep-link-confirmation enforcement's own read,
-    /// see that command's doc, 2026-08-16).
+    /// listener attached) and `handle_deep_link`'s own emitted preview -
+    /// both need `from_deep_link` so `ui/js/app.js`'s confirmation screen
+    /// can show its host warning (see `ProvisioningPreviewView`'s doc and
+    /// `commands::provisioning_apply`'s doc, round 2, for why that warning
+    /// is informed consent, not a check this crate enforces).
     pub fn peek_with_origin(&self) -> Option<(ProvisioningConfig, bool)> {
         self.lock().clone()
     }
@@ -919,9 +931,9 @@ mod tests {
     fn pending_set_then_peek_then_clear_leaves_it_empty() {
         let pending = ProvisioningPending::default();
         pending.set(valid_config());
-        assert_eq!(pending.peek_with_origin(), Some((valid_config(), false)));
+        assert_eq!(pending.peek(), Some(valid_config()));
         pending.clear();
-        assert_eq!(pending.peek_with_origin(), None);
+        assert_eq!(pending.peek(), None);
     }
 
     #[test]
@@ -929,7 +941,7 @@ mod tests {
         let pending = ProvisioningPending::default();
         pending.set(valid_config());
         pending.clear();
-        assert_eq!(pending.peek_with_origin(), None);
+        assert_eq!(pending.peek(), None);
     }
 
     #[test]
@@ -939,29 +951,31 @@ mod tests {
         let mut second = valid_config();
         second.ext = "2002".to_string();
         pending.set(second.clone());
-        assert_eq!(pending.peek_with_origin(), Some((second, false)));
+        assert_eq!(pending.peek(), Some(second));
     }
 
     #[test]
     fn pending_peek_does_not_consume() {
-        // R1/R3's whole point: peek_with_origin() must be side-effect-free
-        // so provisioning_apply can look before it leaps, and boot()'s
+        // R1/R3's whole point: peek() must be side-effect-free so
+        // provisioning_apply can look before it leaps, and boot()'s
         // provisioning_pending_preview can check without racing a real
         // apply/cancel.
         let pending = ProvisioningPending::default();
         pending.set(valid_config());
-        assert_eq!(pending.peek_with_origin(), Some((valid_config(), false)));
-        assert_eq!(pending.peek_with_origin(), Some((valid_config(), false))); // still there
+        assert_eq!(pending.peek(), Some(valid_config()));
+        assert_eq!(pending.peek(), Some(valid_config())); // still there
         pending.clear();
-        assert_eq!(pending.peek_with_origin(), None);
+        assert_eq!(pending.peek(), None);
     }
 
     #[test]
     fn set_from_deep_link_tags_the_origin_manual_paste_does_not() {
-        // The one bit `provisioning_apply`'s clean-install confirm_ext
-        // check (RISK 4R finding, 2026-08-16) actually branches on - a
-        // manual paste (`set`) must never require the extra confirmation a
-        // deep link (`set_from_deep_link`) does.
+        // The one bit the confirmation screen's host warning branches on
+        // (`ProvisioningPreviewView::from_deep_link` - see
+        // `commands::provisioning_apply`'s doc, round 2, for why this is
+        // informed consent and not an enforced check) - a manual paste
+        // (`set`) must never be tagged as needing that warning the way a
+        // deep link (`set_from_deep_link`) is.
         let pending = ProvisioningPending::default();
         pending.set(valid_config());
         assert_eq!(pending.peek_with_origin().map(|(_, from_deep_link)| from_deep_link), Some(false));
@@ -977,8 +991,8 @@ mod tests {
         // resolve must replace the origin, not just the config, or a
         // deep-link-sourced pending config could survive as
         // `from_deep_link` after being "overwritten" by a manual paste -
-        // silently downgrading the confirm_ext requirement for whichever
-        // config the operator actually sees on the confirmation screen.
+        // silently showing the host warning for a config the operator
+        // actually pasted themselves.
         let pending = ProvisioningPending::default();
         pending.set_from_deep_link(valid_config());
         pending.set(valid_config());

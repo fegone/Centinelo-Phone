@@ -1049,43 +1049,62 @@ pub fn provisioning_pending_preview(
 /// to a manual account edit - provisioning isn't a lesser-privileged way
 /// to change the account than typing it in by hand.
 ///
-/// `confirm_ext` (RISK 4R finding, 2026-08-16): the *unlocked* branch above
-/// - deliberately, for the clean-install case - was the whole gap. A
+/// **RISK 4R finding, 2026-08-16, round 2**: the *unlocked* branch above -
+/// deliberately, for the clean-install case - is a real gap. A
 /// `centinelo://provision` link is reachable from any email or webpage
 /// (`deeplink.rs`'s `handle_url` registers the OS scheme unconditionally),
-/// and its `config=` form carries `host`/`secret`/`tls_pin_sha256` inline
-/// with no fetch and nothing to verify their origin - so on a freshly
-/// installed, not-yet-configured machine, one click on a crafted link
-/// followed by one click on "Connect" repointed the phone at an attacker's
-/// PBX, no admin password involved because none exists yet. Signing the
-/// deep-link payload would close this properly, but that needs a signing
-/// key that doesn't exist yet (same offline-key-ceremony shape as the
-/// updater's own signing key - see that key's own doc) and is out of this
-/// fix's scope. Full admin-lock isn't an option either - it would strand
-/// the exact clean-install case this command carves out unlocked in the
-/// first place. What's shipped instead: for a config that arrived via a
-/// deep link on a not-yet-configured install, the caller must also pass
-/// the pending config's own `ext` back verbatim as `confirm_ext` -
-/// `ui/js/app.js`'s confirmation screen requires the operator to type it
-/// into a field that starts empty (never pre-filled from the preview), so
-/// a single click through a phishing link isn't enough; the operator has
-/// to already know (or be told out-of-band, e.g. an install worksheet)
-/// which extension they're expecting. Not cryptographic - a targeted
-/// attacker who already knows the victim's real extension isn't stopped -
-/// but it does close the "blind mass-phishing link" and "malicious
-/// webpage" shapes of this attack without any new key infrastructure and
-/// without breaking the legitimate first-run flow. A manual paste
-/// (`from_deep_link == false`) never hits this check: pasting a link
-/// requires the operator to already be looking at a trusted installer
-/// page and copy it themselves, a materially different trust posture than
-/// an app-external deep-link trigger.
+/// and its `config=` form carries `host`/`ext`/`secret`/`tls_pin_sha256`
+/// inline with no fetch and nothing to verify their origin - so on a
+/// freshly installed, not-yet-configured machine, one click on a crafted
+/// link followed by one click on "Connect" repoints the phone at an
+/// attacker's PBX, no admin password involved because none exists yet.
+///
+/// **This command does not close that gap, and doesn't pretend to.** The
+/// round-1 fix here required the caller to also pass the pending config's
+/// own `ext` back as a `confirm_ext` parameter, typed into a field the
+/// confirmation screen left empty - the idea being that a phishing link
+/// couldn't "know" the extension the operator was expecting. That idea was
+/// wrong: `ext` comes from the **same attacker-controlled config** as
+/// `host`/`secret`, so the attacker already knows exactly what the
+/// "correct" answer is (they wrote it into the link) and can simply say so
+/// in the phishing message itself ("your assigned extension is 4521,
+/// please confirm it below"). A check against a value the same party
+/// supplies both the config *and* (via whatever channel delivered the
+/// link) the confirmation for isn't a security boundary - it's a second
+/// click with extra steps. Caught in round-2 review before merge (the
+/// preview screen was independently also showing the very value the field
+/// asked the operator to retype, which would have made this even more
+/// obviously pointless, but removing that display wouldn't have fixed the
+/// underlying problem: the attacker doesn't need the app to show them
+/// their own chosen value back).
+///
+/// Signing the deep-link payload would close this properly - a signature
+/// the attacker can't produce is a boundary neither party's message can
+/// forge - but that needs a signing key that doesn't exist yet (same
+/// offline-key-ceremony shape as the updater's own signing key - see that
+/// key's own doc) and is out of this fix's scope. Full admin-lock isn't an
+/// option either - it would strand the exact clean-install case this
+/// command carves out unlocked in the first place.
+///
+/// What ships instead is **informed consent, not authentication**: the
+/// confirmation screen (`ui/js/app.js` `showProvisioningConfirm`) shows a
+/// prominent warning specifically for a deep-link-sourced pending config
+/// (`ProvisioningPreviewView::from_deep_link`, still tracked - see
+/// `provisioning::ProvisioningPending`) naming the host the phone is about
+/// to be pointed at and saying plainly that the link came from outside the
+/// app. That's real signal - a host string is comparatively hard to spoof
+/// convincingly inside a *specific* phishing narrative the way a bare
+/// extension number is - but it is friction against a blind click-through,
+/// not a technical control this command enforces. There is deliberately no
+/// second `commands.rs` check to bypass here: the honest state of this gap
+/// is "closable only by a signed payload that doesn't exist yet," and this
+/// doc says so instead of a check that only looked like one.
 #[tauri::command(rename_all = "snake_case")]
 pub fn provisioning_apply(
     settings: State<Arc<SettingsStore>>,
     admin: State<AdminSession>,
     sidecar: State<SidecarHandle>,
     provisioning: State<crate::provisioning::ProvisioningPending>,
-    confirm_ext: Option<String>,
 ) -> Result<(), String> {
     let already_configured = settings.snapshot().account.is_configured();
     if already_configured {
@@ -1101,99 +1120,21 @@ pub fn provisioning_apply(
     if sidecar.has_active_call() {
         return Err("You're on a call — finish or hang up before connecting to a new phone system.".to_string());
     }
-    // peek_with_origin(), not take() (2026-07-16 4R re-review, R1, extended
-    // 2026-08-16 to also carry origin): if update_account below fails (disk
-    // full, NAS-mounted app-data dir gone), the pending config must still
-    // be there for a retry - consuming it up front and only then
-    // discovering the persist failed left "Connect" looking like it had
-    // silently forgotten the link (a bewildering "Nothing pending" on
-    // retry) instead of surfacing the real, and often transient, disk-write
-    // error. Only cleared below once update_account has actually succeeded.
-    let (config, from_deep_link) = provisioning
-        .peek_with_origin()
+    // peek(), not take() (2026-07-16 4R re-review, R1): if update_account
+    // below fails (disk full, NAS-mounted app-data dir gone), the pending
+    // config must still be there for a retry - consuming it up front and
+    // only then discovering the persist failed left "Connect" looking
+    // like it had silently forgotten the link (a bewildering "Nothing
+    // pending" on retry) instead of surfacing the real, and often
+    // transient, disk-write error. Only cleared below once update_account
+    // has actually succeeded.
+    let config = provisioning
+        .peek()
         .ok_or_else(|| "Nothing pending - paste a provisioning link first.".to_string())?;
-    // See this command's own doc for the full threat model - this is the
-    // one branch that closes the clean-install deep-link gap. Pulled out
-    // as its own pure function (`check_deep_link_confirmation`) purely so
-    // it's unit-testable without standing up a mock Tauri `State<T>` for
-    // every argument this command takes - see that function's own tests.
-    check_deep_link_confirmation(already_configured, from_deep_link, &config.ext, confirm_ext.as_deref())?;
     settings.update_account(config.into()).map_err(|e| e.to_string())?;
     provisioning.clear();
     sidecar.restart_now();
     Ok(())
-}
-
-/// The actual enforcement `provisioning_apply`'s doc describes: on a
-/// not-yet-configured install, a deep-link-sourced pending config may only
-/// be applied if the caller also passes the config's own `expected_ext`
-/// back verbatim as `confirm_ext` (whitespace-trimmed, since it's meant to
-/// be hand-typed). Every other combination - already configured (admin-lock
-/// already covers it), or not from a deep link (a manual paste already
-/// implies the operator trusted the source enough to copy it) - passes
-/// through untouched, matching the narrow scope this fix targets.
-fn check_deep_link_confirmation(
-    already_configured: bool,
-    from_deep_link: bool,
-    expected_ext: &str,
-    confirm_ext: Option<&str>,
-) -> Result<(), String> {
-    if already_configured || !from_deep_link {
-        return Ok(());
-    }
-    if confirm_ext.unwrap_or_default().trim() == expected_ext {
-        return Ok(());
-    }
-    Err("Type the extension shown above to confirm you expected this link.".to_string())
-}
-
-#[cfg(test)]
-mod provisioning_apply_deep_link_confirmation_tests {
-    use super::check_deep_link_confirmation;
-
-    #[test]
-    fn manual_paste_never_needs_confirmation_even_on_a_clean_install() {
-        assert!(check_deep_link_confirmation(false, false, "210", None).is_ok());
-    }
-
-    #[test]
-    fn already_configured_never_needs_confirmation_even_from_a_deep_link() {
-        // Covered by `require_unlocked` upstream instead - see this
-        // function's doc.
-        assert!(check_deep_link_confirmation(true, true, "210", None).is_ok());
-    }
-
-    #[test]
-    fn clean_install_deep_link_with_no_confirm_ext_is_rejected() {
-        assert!(check_deep_link_confirmation(false, true, "210", None).is_err());
-    }
-
-    #[test]
-    fn clean_install_deep_link_with_wrong_confirm_ext_is_rejected() {
-        assert!(check_deep_link_confirmation(false, true, "210", Some("211")).is_err());
-    }
-
-    #[test]
-    fn clean_install_deep_link_with_matching_confirm_ext_is_accepted() {
-        assert!(check_deep_link_confirmation(false, true, "210", Some("210")).is_ok());
-    }
-
-    #[test]
-    fn confirm_ext_is_trimmed_before_comparing() {
-        // The operator is typing into a text field - stray leading/
-        // trailing whitespace shouldn't be a surprise rejection.
-        assert!(check_deep_link_confirmation(false, true, "210", Some("  210  ")).is_ok());
-    }
-
-    #[test]
-    fn confirm_ext_is_not_trimmed_on_the_expected_side() {
-        // Sanity check the trim only applies to the *typed* value - a
-        // config whose own ext somehow carries whitespace should never
-        // silently match an untrimmed typed value; this only matters if
-        // `resolve_input`'s own ext validation is ever loosened, but the
-        // asymmetry is deliberate enough to pin down.
-        assert!(check_deep_link_confirmation(false, true, "210 ", Some("210")).is_err());
-    }
 }
 
 /// Backs the confirmation screen's "Cancel" - discards a pending config
