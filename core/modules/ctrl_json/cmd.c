@@ -35,15 +35,75 @@ static bool require_str(const struct odict *od, const char *key,
 }
 
 
-/* Optional call_id, shared by most call-scoped commands. */
-static void optional_call_id(const struct odict *od, struct cent_cmd *out)
+/* Shared by optional_call_id()/optional_id(): both fields follow the same
+ * "absent is fine, present-but-wrong-type is a decode error" rule (see
+ * optional_call_id()'s own comment for why silently treating a wrong
+ * type as "absent" is actively dangerous for call_id specifically).
+ * Returns true with *out_v untouched when the key is genuinely absent
+ * (caller then leaves have_* false, unchanged v0/v1 behavior); true with
+ * *out_v set when it's a real string, empty or not (an empty string is
+ * still treated as "not supplied" by the two callers below - that part
+ * is unchanged); false (and *errmsg set) only when the key is present
+ * with a non-string JSON type - a caller bug (e.g. `"call_id":42` from a
+ * shell that serialized a number by mistake) that must never be
+ * silently swallowed. */
+static bool optional_str_field(const struct odict *od, const char *key,
+				const char *fieldname, const char **out_v,
+				const char **errmsg)
 {
-	const char *v = odict_string(od, "call_id");
+	const struct odict_entry *e = odict_lookup(od, key);
+	static char msg[160];
+
+	*out_v = NULL;
+
+	if (!e)
+		return true;
+
+	if (odict_entry_type(e) != ODICT_STRING) {
+		(void)re_snprintf(msg, sizeof(msg),
+				   "'%s' must be a JSON string, not %s",
+				   fieldname,
+				   odict_type_name(odict_entry_type(e)));
+		*errmsg = msg;
+		return false;
+	}
+
+	*out_v = odict_entry_str(e);
+	return true;
+}
+
+
+/* Optional call_id, shared by most call-scoped commands. Returns false
+ * (and sets *errmsg, decode fails with CENT_CMD_NONE) when call_id is
+ * present but not a JSON string - deliberately NOT treated the same as
+ * "absent". A caller that supplies a wrong-typed call_id almost always
+ * has more than one call in play (that's the whole reason to pass
+ * call_id instead of relying on "the current call") - silently falling
+ * back to resolve_call()'s "current call" default would then operate on
+ * a *different*, still-live call (see ctrl_json.c resolve_call()): e.g.
+ * two calls up, a buggy shell sends {"cmd":"hangup","call_id":42} (a
+ * number, not a string) meaning to hang up one specific call, and the
+ * engine silently hangs up the other one instead. That's a real,
+ * user-visible wrong-call action taken with no error reported anywhere
+ * - worse than doing nothing. Rejecting the whole command instead keeps
+ * the invariant PROTOCOL.md already documents for *required* fields
+ * ("a required field missing/wrong-typed ... produce an error event")
+ * and closes the gap that invariant left for this *optional* one - see
+ * PROTOCOL.md "Commands" call_id paragraph, updated alongside this fix. */
+static bool optional_call_id(const struct odict *od, struct cent_cmd *out,
+			      const char **errmsg)
+{
+	const char *v;
+
+	if (!optional_str_field(od, "call_id", "call_id", &v, errmsg))
+		return false;
 
 	if (v && v[0]) {
 		str_ncpy(out->call_id, v, sizeof(out->call_id));
 		out->have_call_id = true;
 	}
+
+	return true;
 }
 
 
@@ -51,15 +111,25 @@ static void optional_call_id(const struct odict *od, struct cent_cmd *out)
  * Unlike call_id (only meaningful on call-scoped commands), id applies to
  * every command, so this is called unconditionally, before 'cmd' itself
  * is even inspected - see cent_cmd_decode() below - not from inside each
- * per-command branch the way optional_call_id() is. */
-static void optional_id(const struct odict *od, struct cent_cmd *out)
+ * per-command branch the way optional_call_id() is. Same non-string-is-
+ * an-error rule as optional_call_id() above, for consistency - a
+ * wrong-typed id can never be used for correlation either way (have_id
+ * stays false), but the caller still gets an explicit error instead of
+ * a silently-dropped correlation token. */
+static bool optional_id(const struct odict *od, struct cent_cmd *out,
+			 const char **errmsg)
 {
-	const char *v = odict_string(od, "id");
+	const char *v;
+
+	if (!optional_str_field(od, "id", "id", &v, errmsg))
+		return false;
 
 	if (v && v[0]) {
 		str_ncpy(out->id, v, sizeof(out->id));
 		out->have_id = true;
 	}
+
+	return true;
 }
 
 
@@ -156,8 +226,13 @@ enum cent_cmd_type cent_cmd_decode(struct cent_cmd *out,
 
 	/* Unconditional, before 'cmd' is even looked at - see
 	 * optional_id()'s comment: every command MAY carry an id, including
-	 * ones that go on to decode as CENT_CMD_NONE/CENT_CMD_UNKNOWN. */
-	optional_id(od, out);
+	 * ones that go on to decode as CENT_CMD_NONE/CENT_CMD_UNKNOWN. A
+	 * wrong-typed id fails the whole decode (CENT_CMD_NONE) just like a
+	 * wrong-typed call_id below - there's no correlation token to carry
+	 * either way, but the caller gets a real error instead of a
+	 * silently-dropped id. */
+	if (!optional_id(od, out, errmsg))
+		return CENT_CMD_NONE;
 
 	cmd = odict_string(od, "cmd");
 	if (!cmd || !cmd[0]) {
@@ -177,11 +252,13 @@ enum cent_cmd_type cent_cmd_decode(struct cent_cmd *out,
 		 * now say exactly which one to answer; omitting it keeps
 		 * the v1/v1.1/v1.2 behavior of answering "the" incoming
 		 * call. */
-		optional_call_id(od, out);
+		if (!optional_call_id(od, out, errmsg))
+			return CENT_CMD_NONE;
 		out->type = CENT_CMD_ANSWER;
 	}
 	else if (!str_casecmp(cmd, "hangup")) {
-		optional_call_id(od, out);
+		if (!optional_call_id(od, out, errmsg))
+			return CENT_CMD_NONE;
 		out->type = CENT_CMD_HANGUP;
 	}
 	else if (!str_casecmp(cmd, "quit")) {
@@ -194,18 +271,21 @@ enum cent_cmd_type cent_cmd_decode(struct cent_cmd *out,
 		out->type = CENT_CMD_UNREGISTER;
 	}
 	else if (!str_casecmp(cmd, "hold")) {
-		optional_call_id(od, out);
+		if (!optional_call_id(od, out, errmsg))
+			return CENT_CMD_NONE;
 		out->type = CENT_CMD_HOLD;
 	}
 	else if (!str_casecmp(cmd, "resume")) {
-		optional_call_id(od, out);
+		if (!optional_call_id(od, out, errmsg))
+			return CENT_CMD_NONE;
 		out->type = CENT_CMD_RESUME;
 	}
 	else if (!str_casecmp(cmd, "dtmf")) {
 		if (!require_str(od, "digits", out->digits,
 				  sizeof(out->digits), "dtmf", errmsg))
 			return CENT_CMD_NONE;
-		optional_call_id(od, out);
+		if (!optional_call_id(od, out, errmsg))
+			return CENT_CMD_NONE;
 		out->type = CENT_CMD_DTMF;
 	}
 	else if (!str_casecmp(cmd, "mute")) {
@@ -217,32 +297,37 @@ enum cent_cmd_type cent_cmd_decode(struct cent_cmd *out,
 			return CENT_CMD_NONE;
 		}
 		out->mute_on = on;
-		optional_call_id(od, out);
+		if (!optional_call_id(od, out, errmsg))
+			return CENT_CMD_NONE;
 		out->type = CENT_CMD_MUTE;
 	}
 	else if (!str_casecmp(cmd, "blind_transfer")) {
 		if (!require_str(od, "uri", out->uri, sizeof(out->uri),
 				  "blind_transfer", errmsg))
 			return CENT_CMD_NONE;
-		optional_call_id(od, out);
+		if (!optional_call_id(od, out, errmsg))
+			return CENT_CMD_NONE;
 		out->type = CENT_CMD_BLIND_TRANSFER;
 	}
 	else if (!str_casecmp(cmd, "attended_transfer")) {
 		if (!require_str(od, "uri", out->uri, sizeof(out->uri),
 				  "attended_transfer", errmsg))
 			return CENT_CMD_NONE;
-		optional_call_id(od, out);
+		if (!optional_call_id(od, out, errmsg))
+			return CENT_CMD_NONE;
 		out->type = CENT_CMD_ATTENDED_TRANSFER;
 	}
 	else if (!str_casecmp(cmd, "complete_transfer")) {
-		optional_call_id(od, out);
+		if (!optional_call_id(od, out, errmsg))
+			return CENT_CMD_NONE;
 		out->type = CENT_CMD_COMPLETE_TRANSFER;
 	}
 	else if (!str_casecmp(cmd, "abort_transfer")) {
 		out->type = CENT_CMD_ABORT_TRANSFER;
 	}
 	else if (!str_casecmp(cmd, "quality_stats")) {
-		optional_call_id(od, out);
+		if (!optional_call_id(od, out, errmsg))
+			return CENT_CMD_NONE;
 		out->type = CENT_CMD_QUALITY_STATS;
 	}
 	else if (!str_casecmp(cmd, "blf_subscribe")) {
@@ -282,11 +367,13 @@ enum cent_cmd_type cent_cmd_decode(struct cent_cmd *out,
 		if (!require_str(od, "dir", out->dir, sizeof(out->dir),
 				  "tap_start", errmsg))
 			return CENT_CMD_NONE;
-		optional_call_id(od, out);
+		if (!optional_call_id(od, out, errmsg))
+			return CENT_CMD_NONE;
 		out->type = CENT_CMD_TAP_START;
 	}
 	else if (!str_casecmp(cmd, "tap_stop")) {
-		optional_call_id(od, out);
+		if (!optional_call_id(od, out, errmsg))
+			return CENT_CMD_NONE;
 		out->type = CENT_CMD_TAP_STOP;
 	}
 	else if (!str_casecmp(cmd, "park")) {
@@ -299,7 +386,8 @@ enum cent_cmd_type cent_cmd_decode(struct cent_cmd *out,
 		if (!require_str(od, "ext", out->ext, sizeof(out->ext),
 				  "park", errmsg))
 			return CENT_CMD_NONE;
-		optional_call_id(od, out);
+		if (!optional_call_id(od, out, errmsg))
+			return CENT_CMD_NONE;
 		out->type = CENT_CMD_PARK;
 	}
 	else if (!str_casecmp(cmd, "set_answer_mode")) {
