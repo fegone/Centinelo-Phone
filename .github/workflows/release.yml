@@ -164,7 +164,7 @@ jobs:
           echo "Resolved release version=$RAW tag=centinelo-v$RAW"
 
       - name: Checkout the exact tagged commit
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: refs/tags/${{ steps.resolve-version.outputs.tag }}
 
@@ -288,7 +288,7 @@ jobs:
           fi
           echo "OK: all Apple notarization secrets are configured (values never printed)."
 
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: refs/tags/${{ needs.preflight.outputs.tag }}
           submodules: recursive
@@ -801,7 +801,7 @@ jobs:
       # pipeline, not just convenience.
       VCPKG_REF: "2026.07.29"
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: refs/tags/${{ needs.preflight.outputs.tag }}
           submodules: recursive
@@ -1313,7 +1313,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: refs/tags/${{ needs.preflight.outputs.tag }}
 
