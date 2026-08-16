@@ -1038,6 +1038,7 @@ const ENTRIES = [
   // not interleaved above, per this workspace's protocol.
   ["settings.restartFailed", "Couldn't restart the engine: {error}", "Não foi possível reiniciar o motor: {error}", "No se pudo reiniciar el motor: {error}"],
   ["transcript.copyFailed", "Couldn't copy the transcript.", "Não foi possível copiar a transcrição.", "No se pudo copiar la transcripción."],
+  ["settings.copyFailed", "Couldn't copy. Select and copy it manually.", "Não foi possível copiar. Selecione e copie manualmente.", "No se pudo copiar. Selecciónalo y cópialo manualmente."],
 ];
 
 const DICTS = { en: {}, "pt-BR": {}, es: {} };

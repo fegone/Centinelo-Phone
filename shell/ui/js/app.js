@@ -65,6 +65,7 @@ import {
 import { logMilestone, reportFrontendIssue } from "./error-reporting.js";
 import { initConsolePanel, openConsolePanel, closeConsolePanel } from "./console-panel.js";
 import { SETTINGS_FIELD_GROUPS, summarizeSettledResults, runSettingsPaintSteps, describeError } from "./settings-load.js";
+import { resolveClipboardCopyOutcome } from "./clipboard-copy.js";
 
 // `Channel` (updater download progress) and `Resource` both live on
 // window.__TAURI__.core alongside `invoke` - withGlobalTauri bundles the
@@ -3219,21 +3220,47 @@ function wireStaticHandlers() {
   });
 
   // ---- click-to-call bridge settings ---------------------------------
+  // UI-silent-failures audit (2026-08-16, hallazgo #4): this used to
+  // always paint "Copied." after the try/catch, whether or not the copy
+  // actually happened - the async Clipboard API rejecting AND the
+  // execCommand fallback returning false (or throwing) both fell through
+  // to the same success text. This token gates the click-to-call bridge's
+  // own pairing; a user who believes it's on their clipboard and pastes
+  // something stale into the extension has nothing telling them
+  // otherwise. resolveClipboardCopyOutcome (clipboard-copy.js) is the
+  // testable decision; this handler only reports what actually happened
+  // to it.
   $("btn-copy-token").addEventListener("click", async () => {
     const token = $("bridge-token").value;
     const statusEl = $("copy-token-status");
+    let asyncOk = false;
+    let fallbackAttempted = false;
+    let fallbackOk = false;
     try {
       await navigator.clipboard.writeText(token);
+      asyncOk = true;
     } catch (e) {
       // Fallback if the webview didn't grant the async Clipboard API.
-      const input = $("bridge-token");
-      input.removeAttribute("readonly");
-      input.select();
-      document.execCommand("copy");
-      input.setAttribute("readonly", "");
+      fallbackAttempted = true;
+      try {
+        const input = $("bridge-token");
+        input.removeAttribute("readonly");
+        input.select();
+        fallbackOk = document.execCommand("copy");
+        input.setAttribute("readonly", "");
+      } catch (e2) {
+        fallbackOk = false;
+      }
     }
-    statusEl.textContent = t("settings.copied");
-    statusEl.className = "hint ok";
+    const outcome = resolveClipboardCopyOutcome({ asyncOk, fallbackAttempted, fallbackOk });
+    if (outcome.copied) {
+      statusEl.textContent = t("settings.copied");
+      statusEl.className = "hint ok";
+    } else {
+      statusEl.textContent = t("settings.copyFailed");
+      statusEl.className = "hint err";
+      reportFrontendIssue("bridge_token_copy_failed", { message: "clipboard write and execCommand fallback both failed" });
+    }
     setTimeout(() => {
       statusEl.textContent = "";
     }, 2500);
