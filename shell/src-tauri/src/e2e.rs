@@ -67,7 +67,32 @@
 //! back to the platform default, not a no-op - see
 //! `commands::merge_device_choice`'s doc for the exact three-way semantics,
 //! and `settings::validate_device_name` for the S1 rejection a `<name>`
-//! containing a raw newline would hit).
+//! containing a raw newline would hit),
+//! `ipc_acl_probe` (added 2026-08-15 - closes the gap every OTHER step in
+//! this file has: they all call the `#[tauri::command]` function directly
+//! via `AppHandle::state()`, which is the exact same `State<T>` extraction
+//! Tauri's IPC dispatch does, but never actually goes THROUGH
+//! `tauri::ipc::InvokeRequest` resolution - so none of them exercise ACL
+//! checking at all, see `acl_capabilities.rs`'s own doc comment for the
+//! full gap this closes. `ipc_acl_probe` instead uses
+//! `WebviewWindow::eval()` to make the real `main` webview itself call
+//! `window.__TAURI__.core.invoke(...)`, so the call genuinely crosses the
+//! IPC bridge and is subject to ACL resolution the same way a real
+//! frontend `invoke()` is. Two independent, zero-argument, zero-side-effect
+//! probes: `get_favorites` (granted to `main` in
+//! `capabilities/default.json` - must resolve) and `premium_diagnostic`
+//! (granted on NEITHER window - pinned by `acl_capabilities.rs`'s
+//! `unused_commands_are_granted_nowhere` test - must be rejected by the
+//! ACL, not by "command not found", since it IS wired into
+//! `generate_handler!`). `eval()` only injects a script (fire-and-forget
+//! from Rust's side, no return value - see `WebviewWindow::eval`'s own
+//! doc), so the probe reports its own outcome back over the SAME real IPC
+//! bridge via `log_frontend_error` - an already-`main`-granted production
+//! command (`frontend_log.rs`) - and this driver's caller is expected to
+//! `wait:` afterward and then read the resulting
+//! `e2e_ipc_acl_probe_positive`/`e2e_ipc_acl_probe_negative` frontend log
+//! lines, the same "fire it, then read the log" pattern `list_devices`/
+//! `list_codecs` already use above for their own fire-and-forget steps).
 //!
 //! Every step targets "the current call" (no `call_id`) - matching the
 //! frontend's own single-call-at-a-time UI; there's no scripted way here
@@ -282,6 +307,54 @@ pub fn maybe_run_e2e_script(app: &AppHandle) {
                 match commands::save_audio_settings(settings, sidecar, input) {
                     Ok(()) => log::info!("e2e: set_device({kind}, {name}) -> ok"),
                     Err(e) => log::error!("e2e: set_device({kind}, {name}) -> err: {e}"),
+                }
+            } else if step == "ipc_acl_probe" {
+                // See this module's top doc comment for the full "why" -
+                // short version: every other step in this file bypasses
+                // Tauri's IPC/ACL layer entirely by calling the command
+                // function directly via `AppHandle::state()`. This step is
+                // the one exception - it drives the real `main` webview to
+                // make the call itself, so it's the only thing in this
+                // driver that can actually prove the ACL denies what it's
+                // supposed to deny.
+                let Some(window) = app.get_webview_window("main") else {
+                    log::error!("e2e: ipc_acl_probe -> no main window to eval against");
+                    continue;
+                };
+                // `report()` reuses `log_frontend_error` (real, main-granted
+                // production command, see frontend_log.rs) as the return
+                // channel, since `WebviewWindow::eval` itself has no way to
+                // hand a result back to Rust. `get_favorites` is granted on
+                // `main` (capabilities/default.json) so it must resolve;
+                // `premium_diagnostic` is granted on NEITHER window
+                // (acl_capabilities.rs's `unused_commands_are_granted_nowhere`
+                // pins this) but IS wired into `generate_handler!`, so a
+                // rejection here can only be the ACL, never "command not
+                // found". Both are zero-argument, zero-side-effect getters -
+                // a bad-argument error can't masquerade as an ACL rejection.
+                let script = r#"(async function () {
+  const { invoke } = window.__TAURI__.core;
+  function report(kind, level, message) {
+    return invoke("log_frontend_error", { report: { kind: kind, level: level, message: message } }).catch(function () {});
+  }
+  try {
+    const value = await invoke("get_favorites");
+    await report("e2e_ipc_acl_probe_positive", "info", "ipc_ok:" + JSON.stringify(value));
+  } catch (e) {
+    await report("e2e_ipc_acl_probe_positive", "error", "ipc_unexpected_err:" + String(e));
+  }
+  try {
+    const value = await invoke("premium_diagnostic");
+    await report("e2e_ipc_acl_probe_negative", "error", "ipc_unexpected_ok:" + JSON.stringify(value));
+  } catch (e) {
+    await report("e2e_ipc_acl_probe_negative", "info", "ipc_denied:" + String(e));
+  }
+})();"#;
+                match window.eval(script) {
+                    Ok(()) => log::info!(
+                        "e2e: ipc_acl_probe -> injected (watch for e2e_ipc_acl_probe_positive/negative frontend log lines)"
+                    ),
+                    Err(e) => log::error!("e2e: ipc_acl_probe -> eval err: {e}"),
                 }
             } else {
                 log::warn!("e2e: unknown step '{step}'");

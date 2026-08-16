@@ -979,3 +979,109 @@ how it was closed). Re-verification after the fixes:
    app with a live sidecar connection, out of reach for this round's
    headless-only verification. Flagged for qa-e2e if a scripted repro is
    wanted.
+
+# `ipc_acl_probe` e2e step (2026-08-15) — the ACL is now proven to act at IPC time, not just on paper
+
+**Verdict: PASS.** Before this step existed, every claim that "the ACL
+protects command X" rested entirely on `acl_capabilities.rs`'s
+capability-file parse tests (see that module's own doc comment) - none of
+`e2e.rs`'s existing steps ever went through `tauri::ipc::InvokeRequest`
+resolution, since they all call the `#[tauri::command]` function directly
+via `AppHandle::state()`. This closes that gap with a real, IPC-crossing
+probe and no PBX/SIP involvement at all (ACL has nothing to do with SIP -
+no account was configured for this run).
+
+## Setup
+
+Real debug build (`cargo tauri dev`-equivalent binary,
+`shell/src-tauri/target/debug/centinelo-shell`), launched with a scratch
+`$HOME` (so `app_data_dir` resolves to an empty, unconfigured
+`settings.json` - no account, so `sidecar.start()` never runs and nothing
+ever touches the PBX) and `CENTINELO_E2E_SCRIPT="wait:3|ipc_acl_probe|wait:4"`.
+
+## Methodology
+
+`ipc_acl_probe` (`e2e.rs`) is the one step in this driver that does NOT
+call a command function directly. It uses `WebviewWindow::eval()` to make
+the real `main` webview itself run `window.__TAURI__.core.invoke(...)` -
+the exact same call path a human clicking a button reaches - so the
+request genuinely crosses Tauri's IPC bridge and is subject to
+`RuntimeAuthority::resolve_access`. Two zero-argument, zero-side-effect
+probes, chosen specifically so a rejection can only mean the ACL, never a
+bad-argument or missing-command error:
+
+- **Positive**: `get_favorites` - granted to `main` in
+  `capabilities/default.json` - must resolve.
+- **Negative**: `premium_diagnostic` - granted on NEITHER window
+  (`acl_capabilities.rs`'s `unused_commands_are_granted_nowhere` pins
+  this permanently), but IS wired into `generate_handler!`, so a
+  rejection can only be the ACL, not "command not found". Chosen over the
+  other 10 candidates in that same list because it's a pure getter with
+  no arguments and no side effects to worry about.
+
+`eval()` has no way to hand a return value back to Rust, so the probe
+reports its own outcome back over the SAME real IPC bridge via
+`log_frontend_error` (an already-`main`-granted production command).
+
+## Evidence: clean baseline run (verbatim log)
+
+```
+[app_lib::e2e][INFO] e2e: ipc_acl_probe -> injected (watch for e2e_ipc_acl_probe_positive/negative frontend log lines)
+[app_lib::frontend][INFO] frontend e2e_ipc_acl_probe_positive: ipc_ok:[{"ext":"","label":"Favorite 1"},{"ext":"","label":"Favorite 2"},{"ext":"","label":"Favorite 3"},{"ext":"","label":"Favorite 4"}]
+[app_lib::frontend][INFO] frontend e2e_ipc_acl_probe_negative: ipc_denied:premium_diagnostic not allowed. Permissions associated with this command: allow-premium-diagnostic
+```
+
+`get_favorites` resolved with a real value over real IPC; `premium_diagnostic`
+was rejected by name, with the ACL's own "not allowed" wording - not a
+"command not found" error, confirming the rejection is the ACL doing its
+job, not the command being absent.
+
+Note on message wording: `tauri`'s release build rejects with the fixed
+string `"Command {cmd} not allowed by ACL"`
+(`tauri-2.11.5/src/webview/mod.rs:1850`); this driver only ever runs in a
+`#[cfg(debug_assertions)]` build, which instead uses the more verbose
+developer-facing message from `RuntimeAuthority::resolve_access_message`
+(seen above) - still deterministically containing both the command name
+and "not allowed", just not the literal release-only phrase.
+
+## Evidence: mutation testing (both directions, four runs)
+
+**Mutation 1 - grant the forbidden command** (`allow-premium-diagnostic`
+added to `capabilities/default.json`, rebuilt, rerun): the negative half
+now fails, exactly as it must if the probe is actually sensitive to the
+ACL:
+
+```
+[app_lib::frontend][INFO]  frontend e2e_ipc_acl_probe_positive: ipc_ok:[...]
+[app_lib::frontend][ERROR] frontend e2e_ipc_acl_probe_negative: ipc_unexpected_ok:"loaded"
+```
+
+Reverted (`git checkout -- capabilities/default.json`).
+
+**Mutation 2 - revoke the granted command** (`allow-get-favorites` removed
+from `capabilities/default.json`, rebuilt, rerun): the positive half now
+fails:
+
+```
+[app_lib::frontend][ERROR] frontend e2e_ipc_acl_probe_positive: ipc_unexpected_err:get_favorites not allowed on window "main", webview "main", URL: local
+[app_lib::frontend][INFO]  frontend e2e_ipc_acl_probe_negative: ipc_denied:premium_diagnostic not allowed. ...
+```
+
+Reverted (`git checkout -- capabilities/default.json`); `cargo build`
+after both reverts confirmed a clean, unmodified `capabilities/default.json`
+(`git diff --stat` showed only `e2e.rs` changed).
+
+## Known limitations
+
+- This is observational (log-line evidence), not a hard-failing automated
+  assertion - `e2e.rs` is a `#[cfg(debug_assertions)]` manual driver, not
+  a `#[test]` harness, matching every other step in this file (see e.g.
+  `list_devices`/`list_codecs`'s own "watch for event on sidecar-event"
+  convention). A CI-enforced version of this would need a `tauri::test`
+  mock app wired to both windows' real capability files, which
+  `acl_capabilities.rs`'s own doc comment already notes `tauri-build`'s
+  `OUT_DIR` manifest makes awkward to reach in this crate version.
+- Windows/Linux: this run is macOS-only (WKWebView). The IPC/ACL
+  resolution code path itself is platform-independent
+  (`tauri::ipc::RuntimeAuthority`, not per-OS), but the `eval()` injection
+  mechanics were only exercised on macOS this round.
