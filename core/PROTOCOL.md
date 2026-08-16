@@ -1,4 +1,4 @@
-# core/ — ctrl_json wire protocol (v1.7)
+# core/ — ctrl_json wire protocol (v1.8)
 
 `ctrl_json` (`core/modules/ctrl_json/`) is a baresip "application" module
 that turns the running engine into a sidecar controllable over stdio:
@@ -281,6 +281,50 @@ own decode logic is — `resume_and_notify()` and its three call sites are
 mutation counterpart above is this fix's only verification, not a gap
 left uncovered by choice.
 
+**v1.8 status: one new event, `transfer_failed` — a call_id-correlated
+companion to the existing plain `error` event, alongside it, not
+replacing it.** Closes a real gap: `BEVENT_CALL_TRANSFER_FAILED` only
+ever produced the plain `error` event (see "Events" below), which has no
+`call_id` at all — with more than one `blind_transfer`/
+`attended_transfer` in flight at once, each an independent async
+operation able to fail on its own schedule on its own call, a consumer
+had no reliable way to tell which transfer's failure a given `error`
+event was actually reporting. Mirrors the v1.4 `audio_error` precedent
+exactly (same "dedicated call_id-bearing event alongside the unchanged
+plain one, for back-compat" shape — see `audio_error`'s own "Events"
+row). No new baresip/`re` behavior needed: `ua.c` already calls
+`bevent_call_emit(BEVENT_CALL_TRANSFER_FAILED, call, ...)` with the
+transferring call still valid; `event_handler()` already resolves it via
+`bevent_get_call(event)` — the gap was purely the missing call_id-bearing
+*event* on this side. **Fully backward compatible with v1.7**: an
+*additional* event now fires alongside the pre-existing plain `error`
+one, which is completely unchanged in shape and still fires every time
+it always did — no v1.7 consumer's existing behavior changes. Not
+unit-testable the way `cmd.c`'s own decode logic is (`emit_transfer_
+failed()`/`event_handler()` are `ctrl_json.c` code, baresip-dependent
+throughout, same category as `resume_and_notify()` above and
+`audiotap.c`) — verified by compiling the full engine clean and by
+reading `ua.c` to confirm `call` is always the transferring call (never
+a nonexistent target) at the point this bevent fires; no real-PBX e2e
+run for this specific event (host/credentials for the test PBX were not
+available in the context this was developed under) — see "Changes from
+v1.7" below.
+
+**Also in this version, unrelated to `transfer_failed`** (three
+independent findings from the same 2026-08 core-engine audit that
+produced v1.7 above, picked up in a follow-on pass): `emit_error()` no
+longer advances its internal `g_error_seq` correlation counter on a
+failed allocation with nothing actually emitted (see `emit_error()`'s
+own comment in `ctrl_json.c`); `dtmf` now validates its entire `digits`
+string before sending anything, rather than risking a mid-string invalid
+digit leaving the previous valid one's RFC2833 release never sent (see
+"Commands" `dtmf` row); and a stdin line longer than `INBUF_SIZE` with
+no `\n` in range is now discarded identically on POSIX and Windows,
+rather than Windows silently slicing it into several bogus fragment
+messages (see "Framing"/"stdin" below). None of these three change any
+event/command *shape* — see "Changes from v1.7" for the full writeup of
+each.
+
 ## Framing
 
 One JSON object per line (`\n`-terminated; a trailing `\r` is tolerated).
@@ -346,6 +390,26 @@ without `ctrl_json` in the loop at all).
   by MSVC or run on real Windows hardware — see core/BUILD.md "Windows
   CI" for the exact CI error and why fixing it is out of this version's
   scope.
+- **A single stdin line longer than `INBUF_SIZE` (8 KiB, `ctrl_json.c`)
+  with no `\n` in range is discarded whole, on both platforms, as of
+  v1.7** — one `{"event":"error","message":"input line too long, buffer
+  reset"}`, then normal processing resumes at the next real line
+  boundary. Before v1.7 this was two visibly different behaviors: POSIX
+  already discarded the whole thing (`process_inbuf()`'s
+  `inlen>=INBUF_SIZE` reset check), but Windows' `fgets()`-based reader
+  silently sliced an overlong line into several ~8 KiB fragments and fed
+  each to `process_line()` as if it were its own complete message — see
+  "Changes from v1.6" for the full story. This 8 KiB engine-side cap is
+  independent of, and much smaller than, the shell's own 1 MiB
+  `MAX_LINE_BYTES` per-line cap on the *output* side (`shell/src-tauri/
+  src/sidecar.rs`, reading this engine's stdout) — the shell's cap
+  exists for a different reason (tolerate a corrupt/misconfigured engine
+  binary writing unbounded garbage with no newline) and was deliberately
+  left alone here rather than picking a third, unrelated number: an
+  8 KiB *command* from a well-behaved shell was never realistic to begin
+  with (the largest legitimate command, `set_codecs`, is nowhere close),
+  so the fix was to make the *existing* 8 KiB behave the same on both
+  platforms, not to change what it's set to.
 
 ## Commands (stdin)
 
@@ -380,7 +444,7 @@ either, both, or neither.
 | `{"cmd":"unregister"}` | Unregister at runtime (`ua_unregister()`). |
 | `{"cmd":"hold","call_id":"..."}` | Put a call on hold (`call_hold(call, true)` — a re-INVITE, `a=sendonly`/similar). Emits `call_state` `"hold"` on success (see "Events"). |
 | `{"cmd":"resume","call_id":"..."}` | Take a call off hold (`uag_hold_resume()` — also holds whatever *other* call is currently active first, so two calls are never both off-hold at once; matters the moment there's a second call, i.e. attended transfer). Emits `call_state` `"resumed"` on success. |
-| `{"cmd":"dtmf","digits":"123#","call_id":"..."}` | Send RFC2833 DTMF. `digits` is any sequence of `0-9 * # A-D`; invalid characters produce an `error`. |
+| `{"cmd":"dtmf","digits":"123#","call_id":"..."}` | Send RFC2833 DTMF. `digits` is any sequence of `0-9 * # A-D`; invalid characters produce an `error`. **As of v1.7**, the whole string is validated *before* anything is sent — a bad character anywhere in `digits` rejects the command wholesale (no digits sent at all), rather than v1.6 and earlier's behavior of sending every digit up to the bad one and then silently leaving the last valid one "pressed" (no RFC2833 end event ever sent for it — see PROTOCOL.md "Changes from v1.6"). |
 | `{"cmd":"mute","on":true,"call_id":"..."}` | Mute (`on:true`) or un-mute (`on:false`) the call's outgoing audio. `on` is a required, real JSON boolean (not the string `"true"`). Emits `call_state` `"muted"`/`"unmuted"` on success. |
 | `{"cmd":"blind_transfer","uri":"sip:target@host","call_id":"..."}` | REFER the call to `uri` (`call_transfer()`). Does **not** implicitly hold the call first (unlike the interactive `menu` module's own transfer key) — hold is a separate, composable command; send `hold` first if that's the desired UX. Outcome is asynchronous — see "Events". |
 | `{"cmd":"attended_transfer","uri":"sip:target@host","call_id":"..."}` | Start an attended transfer: holds the named/current call (the "source"), then dials `uri` as a new "consultation" call on the same UA. Fails with an `error` if another attended transfer is already pending (F1 supports one at a time, matching `modules/menu/dynamic_menu.c`'s own single-slot design) or if the source's peer doesn't support the `Replaces` extension. Emits `call_state` `"hold"` for the source, then `attended_transfer_started` (see "Events"), then the consultation call's normal `call_state` lifecycle (`ringing`/`established`/...). If the consultation dial itself fails after the source was already put on hold, the source is resumed as a best-effort cleanup (so it's never left stranded on hold for a consultation call that never started) — **v1.7:** that cleanup resume now also emits `call_state` `"resumed"` for the source, same as every other resume path (see this file's own top-of-file v1.7 status paragraph). |
@@ -427,8 +491,9 @@ exactly what `ok:true`/`ok:false` do and don't promise about a command's
 | `{"event":"ready"}` | Once, right after `ctrl_json` finishes initializing — the earliest point commands can safely be sent. Unchanged from v0. |
 | `{"event":"reg_state","account":"...","state":"registering\|registered\|failed\|unregistered","transport":"udp\|tcp\|tls\|ws\|wss","reason":"..."}` | On every registration transition — now including transitions caused by the runtime `register`/`unregister` commands, not just process-start registration. `reason` present only on `failed`. Unchanged shape from v0. |
 | `{"event":"call_state","state":"...","peer":"...","id":"...","call_id":"...","}` | **`call_id` is new in v1** (added alongside the original `id` field, same value — kept both so a v0 consumer reading `id` doesn't break; a future v2 may drop `id`). `state` values beyond v0's `incoming\|ringing\|established\|closed`: **`hold`/`resumed`** (fired both for this engine's own local hold/resume commands — synthetically, right at the command's own success path, since baresip has no bevent for *locally*-initiated hold/resume, only peer-initiated — and relayed from `BEVENT_CALL_HOLD`/`BEVENT_CALL_RESUME` for a *peer*-initiated hold/resume) and **`muted`/`unmuted`** (from `mute`). None of these correspond to baresip's own `CALL_STATE_*` lifecycle machine changing — hold/mute are attributes of an otherwise-established call, not lifecycle transitions — they're folded into `call_state` anyway rather than inventing a new event per attribute, since from a consumer's perspective they're all "something about this call just changed, here's its id". **v1.7:** the "synthetic, at the command's own success path" half of that rule now genuinely covers *every* engine-initiated resume, not just the direct `resume` command — `abort_transfer`, `attended_transfer`'s own dial-failure cleanup, and the consultation-call-closes-before-`complete_transfer`/`abort_transfer` cleanup (`BEVENT_CALL_CLOSED` handling) all emit `"resumed"` for the source call now too; see this file's own top-of-file v1.7 status paragraph for the gap this closes. |
-| `{"event":"error","message":"..."}` | Malformed/unparseable input line, unknown `cmd`, a required field missing/wrong-typed, a baresip command that returned an error, `BEVENT_AUDIO_ERROR` (also emits the dedicated `audio_error` event below, **new in v1.4** — this plain `error` still fires too, unchanged, for back-compat), or `BEVENT_CALL_TRANSFER_FAILED` (an async transfer failure reported by the far end after `blind_transfer`/`complete_transfer` already returned success synchronously — reuses this existing event/shape rather than inventing a transfer-specific one; **as of v1.4** also fires for a `park`/`blind_transfer` subscription-*establishment* failure, e.g. the wss-specific `EDESTADDRREQ` finding under `park` below — previously silently swallowed, see "Changes from v1.3" and `core/patches/0005-*`). |
+| `{"event":"error","message":"..."}` | Malformed/unparseable input line, unknown `cmd`, a required field missing/wrong-typed, a baresip command that returned an error, `BEVENT_AUDIO_ERROR` (also emits the dedicated `audio_error` event below, **new in v1.4** — this plain `error` still fires too, unchanged, for back-compat), or `BEVENT_CALL_TRANSFER_FAILED` (an async transfer failure reported by the far end after `blind_transfer`/`complete_transfer` already returned success synchronously — reuses this existing event/shape rather than inventing a transfer-specific one; **as of v1.4** also fires for a `park`/`blind_transfer` subscription-*establishment* failure, e.g. the wss-specific `EDESTADDRREQ` finding under `park` below — previously silently swallowed, see "Changes from v1.3" and `core/patches/0005-*`; **as of v1.8** `BEVENT_CALL_TRANSFER_FAILED` additionally emits the dedicated, call_id-bearing `transfer_failed` event below — this plain `error` event still fires too, unchanged, for back-compat). |
 | `{"event":"audio_error","call_id":"...","message":"..."}` | **New in v1.4**, from `BEVENT_AUDIO_ERROR`, alongside the plain `error` event above (both fire, same underlying bevent). `call_id` is the failing call's real id (same convention as `call_state`/`tap_state`/`park`) — the plain `error` event has no `call_id` at all, so this is the only way to know *which* call's audio failed when more than one is in play. `message` is the identical text the plain `error` event's own `message` carries (baresip's own `"%d,%s", err, str` format from `call.c`'s `audio_error_handler()` — not re-parsed/restructured here). e2e-verified via fault injection (see this file's own top-of-file v1.4 status paragraph) — **only reachable for `ausrc`/microphone-side failures today**, see that same paragraph for the separate, unfixed `auplay`/speaker-side gap. |
+| `{"event":"transfer_failed","call_id":"...","message":"..."}` | **New in v1.8**, from `BEVENT_CALL_TRANSFER_FAILED`, alongside the plain `error` event above (both fire, same underlying bevent — same "dedicated call_id-bearing event alongside the unchanged plain one" shape v1.4's `audio_error` established). `call_id` is the *transferring* call's real id (the call `blind_transfer`/`attended_transfer`/`complete_transfer` was originally issued against — confirmed by reading `ua.c`'s `bevent_call_emit(BEVENT_CALL_TRANSFER_FAILED, call, ...)`, always the original call, never a nonexistent target). `message` is the identical text the plain `error` event's own `message` carries. Closes a real gap: with more than one transfer in flight at once (independent async operations, each on its own call, each able to fail minutes after its own `blind_transfer`/`complete_transfer` already returned success), the plain `error` event alone gave a consumer no way to tell *which* transfer a given failure belonged to. |
 | `{"event":"stats","call_id":"...","rtt_us":N,"tx_packets":N,"tx_lost":N,"tx_jitter_us":N,"rx_packets":N,"rx_lost":N,"rx_jitter_us":N,"codec":"...","transport":"udp\|tcp\|tls\|ws\|wss"}` | New in v1, from `quality_stats`. Sourced from `stream_rtcp_stats()` (`src/stream.c`) — **this reflects the most recently *received* RTCP Sender/Receiver Report, not a live per-packet counter.** Querying more often than the RTCP interval (empirically ~10-20s against the test PBX, see `core/E2E-F1.md`) returns identical numbers between reports; that's correct RTCP behavior, not a bug or a stale/broken reading. Query again after waiting a few RTCP intervals if you need fresher numbers. `rtt_us` is frequently `0` against a real PBX even while every other field is healthy/non-zero — RTCP round-trip-time needs a full SR/RR/DLSR round trip to populate, which this repo's test PBX has never been observed to complete (see `core/E2E-F1.md` scenario (d)); don't read a `0` there as "stats are broken". **`codec`/`transport` are new in v1.1**: `codec` is the call's negotiated TX/encoder codec name (`audio_codec()`, `src/audio.c`) — omitted entirely (not an empty string) if not yet negotiated; `transport` is the *call's own* actual SIP transport (`call_transp()`, not the account's static config) using the same vocabulary as `reg_state`'s `transport`. |
 | `{"event":"blf","ext":"...","state":"idle\|ringing\|busy\|held\|dnd\|offline"}` | New in v1, from `blf_subscribe`. `idle`: no active dialog for that extension (either no `<dialog>` element in the NOTIFY body, *or* one present with `<state>terminated</state>` — both occur in practice, see `core/E2E-F1.md` for the real captured body, which uses the second shape). `ringing`: `<state>` is `early`/`proceeding`/`trying`. `busy`: `<state>confirmed</state>`, no hold signal (see `held` below). `held` (**new in v1.3, "presence_override"**): `<state>confirmed</state>` *and* the dialog's NOTIFY body also carries the RFC 4235/RFC 3840 standard hold indication (a `<target>` `+sip.rendering` param, `pvalue="no"`) — see `core/modules/ctrl_json/dialog_info.h`'s own header comment on `CENT_BLF_HELD` for the full parsing rule. **Real-PBX finding**: this engine's test PBX (FreePBX 17.0.30 / Asterisk 22.8.2, chan_pjsip) does **not** actually emit this signal for a locally-held call — confirmed via a real NOTIFY captured mid-hold (3 separate NOTIFYs across the hold window, `version=` incrementing each time, all byte-identical to the plain `busy` shape) — so a held call on *this* PBX currently still reports `busy`, not `held`; the parser rule itself is implemented correctly to the RFC-documented shape and unit tested against synthetic RFC-compliant fixtures, and will report `held` the moment a NOTIFY body actually carries the param (a different/future PBX config, or a different vendor). See `core/E2E-F1.md` "F5 presence_override" for the full real-capture evidence. `dnd` (**new in v1.3, "presence_override", best-effort**): a non-standard `<dnd>true</dnd>` element or `dnd=` attribute anywhere in the NOTIFY body — see `dialog_info.h`'s `CENT_BLF_DND` comment. **Not verified against a real Asterisk capture** — standard Asterisk chan_pjsip `Event: dialog` hints have no dedicated element for "this extension is in DND" (dialog-info is a *dialog* package; DND is a device-config state, not a dialog — an idle-but-DND'd extension has zero active dialogs either way, indistinguishable from plain idle at this layer without something extra in the XML, which this repo has not observed Asterisk actually send). `offline`: the subscription itself failed/was rejected/expired before a NOTIFY could be parsed, *or* a `<dialog>` element was present with no parseable `<state>` — the "can't currently tell" bucket. Parsing is pure, tiny, and unit-tested against both synthetic bodies and real captures (idle *and*, new in v1.3, the mid-hold "still busy" real capture) — see `core/modules/ctrl_json/dialog_info.c` and `test/test_main.c`. |
 | `{"event":"attended_transfer_started","source_call_id":"...","target_call_id":"..."}` | New in v1, from `attended_transfer`, right after the consultation call's dial succeeds. Lets a consumer correlate exactly which two `call_id`s a pending `complete_transfer`/`abort_transfer` will act on — there's no other way to learn `target_call_id` (it's a brand new call, not something the caller supplied). |
@@ -855,7 +920,69 @@ for the full rationale; summary:
   call genuinely comes off hold, but no `"resumed"` event is emitted -
   the exact silent-desync this fix closes).
 
-## Planned (still not in v1.7)
+## Changes from v1.7
+
+v1.8 is additive and fully backward compatible — nothing a v1.7 consumer
+already relies on changed shape or behavior:
+
+- **`transfer_failed`** (see "Events" above) — a dedicated,
+  call_id-bearing event for `BEVENT_CALL_TRANSFER_FAILED`, alongside the
+  pre-existing plain `error` event (unchanged, still fires too). Mirrors
+  exactly what v1.4's `audio_error` did for `BEVENT_AUDIO_ERROR`: the
+  plain `error` event has no `call_id` field at all, so a consumer with
+  more than one `blind_transfer`/`attended_transfer` in flight at once —
+  each an independent async operation, each able to fail on its own
+  schedule, on its own call — had no reliable way to tell which
+  transfer a given failure event was actually reporting. No new baresip/
+  `re` behavior needed: `ua.c` already calls
+  `bevent_call_emit(BEVENT_CALL_TRANSFER_FAILED, call, ...)` with the
+  transferring call still valid, `event_handler()` already resolves it
+  via `bevent_get_call(event)` — the gap was purely the missing
+  call_id-bearing *event* on this side.
+- **`dtmf` now validates its whole `digits` string before sending
+  anything** (see "Commands" `dtmf` row above) — a real, observable
+  behavior change for a consumer that was relying on (or simply never
+  hit) the old partial-send behavior: a `digits` string with a bad
+  character anywhere in it used to send every valid digit up to that
+  point and then silently drop the trailing `KEYCODE_REL` release for
+  the last one sent (`call_send_digit()`'s error short-circuited the
+  loop in `cmd_dtmf()`, `ctrl_json.c`, skipping the release call right
+  after it) — the peer would see that digit stuck "pressed" with no
+  RFC2833 end event, ever. v1.7 rejects the entire command up front
+  instead (nothing sent, one `error`/`result` as usual) — simpler to
+  reason about than guaranteeing the release fires on every error path
+  through the loop, and consistent with how every other structurally-
+  invalid command in this protocol already behaves (reject cleanly,
+  never act on a partially-valid input).
+- **An overlong stdin line (> `INBUF_SIZE`, 8 KiB, no `\n` in range) now
+  behaves identically on POSIX and Windows** (see "Framing"/"stdin"
+  above for the full before/after). Windows' `fgets()`-based reader
+  thread (`stdin_thread_main()`, `ctrl_json.c`) used to silently hand
+  `process_line()` a *fragment* of such a line — whatever fit in one
+  `fgets()` call — as if it were a complete, independent message, one
+  bogus "malformed JSON" `error` per fragment; POSIX already discarded
+  the whole overlong line as a unit. v1.7 makes Windows do the same:
+  discard the whole thing, one `error` (`"input line too long, buffer
+  reset"`, byte-identical text to the pre-existing POSIX message),
+  resume cleanly at the next real `\n`.
+- **`blf`'s HELD/BUSY/RINGING detection is now scoped per `<dialog>`
+  element, not to the whole NOTIFY body** (`dialog_info.c`). RFC 4235
+  allows more than one `<dialog>` child per dialog-info document (a
+  monitored extension mid-attended-transfer, one call held while a
+  second rings/talks, is the realistic shape) — the old parser matched
+  only the *first* `<state>` in the whole body, while separately
+  scanning the *entire* body for HELD markers regardless of which
+  `<dialog>` they actually belonged to, so a marker on a second dialog
+  could get attributed to the first (unrelated) one, and a second
+  dialog's own state (e.g. a *ringing* second line) could be silently
+  invisible entirely. No wire-format change — `blf`'s event shape is
+  unchanged — this is purely a correctness fix to what state gets
+  chosen when a monitored extension has more than one concurrent
+  dialog; see `core/modules/ctrl_json/test/test_main.c`'s
+  `test_dialog_info_multi_dialog_scoping()` for the exact
+  before/after fixtures.
+
+## Planned (still not in v1.8)
 
 - **G.722 is not in this build, on any platform, and not planned for
   the near term** — see `core/BUILD.md` "Codecs (G.722 — not in this

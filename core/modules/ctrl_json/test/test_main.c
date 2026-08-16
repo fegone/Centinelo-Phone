@@ -1570,6 +1570,100 @@ static void test_dialog_info_dnd(void)
 }
 
 
+/*
+ * v1.7 fix regression guard: RFC 4235 allows more than one <dialog>
+ * child per dialog-info document (a monitored extension with two
+ * concurrent dialogs - e.g. mid-attended-transfer, one call held while
+ * a second is ringing/talking). Before v1.7, the HELD markers
+ * (+sip.rendering / pvalue="no") were searched across the *entire* body
+ * rather than scoped to the specific <dialog> element whose <state> was
+ * matched - see dialog_info.c's own top-of-function comment on
+ * dialog_info_parse() for the full story. These fixtures pin down that
+ * a held marker belonging to one dialog is never attributed to another,
+ * and that the priority-combination rule (ringing > busy > held > idle)
+ * behaves as documented.
+ */
+static void test_dialog_info_multi_dialog_scoping(void)
+{
+	/*
+	 * Two dialogs: the FIRST is a plain busy (confirmed, no hold
+	 * marker), the SECOND is held (confirmed + rendering=no). This is
+	 * the exact scenario the pre-v1.7 bug got wrong: the old code's
+	 * single whole-body state regex matched the *first* <state...>
+	 * occurrence (dialog 1's "confirmed"), but its held-marker check
+	 * ran across the *entire* body regardless, found dialog 2's
+	 * "pvalue=\"no\"", and reported the whole extension HELD - purely
+	 * because of what a *different*, later dialog happened to
+	 * contain, nothing to do with the dialog whose state was actually
+	 * matched. v1.7's per-dialog scoping correctly resolves dialog 1
+	 * as BUSY (own scope has no held marker) and dialog 2 as HELD
+	 * (own scope does) independently, and the combination priority
+	 * (ringing > busy > held > idle, see dialog_info_parse()'s own
+	 * comment) surfaces BUSY here - this fixture's actual, intended
+	 * regression signal is the value changing from the old code's
+	 * (wrong) HELD to the new code's BUSY, not that BUSY is
+	 * inherently "more correct" than HELD in the abstract.
+	 */
+	static const char busy_then_held[] =
+		"<dialog-info state=\"full\">"
+		"<dialog id=\"1\"><state>confirmed</state></dialog>"
+		"<dialog id=\"2\"><state>confirmed</state>"
+		"<local><target uri=\"sip:x@host\">"
+		"<param pname=\"+sip.rendering\" pvalue=\"no\"/>"
+		"</target></local></dialog>"
+		"</dialog-info>";
+
+	/* The scoping regression itself: a *single* busy dialog (no held
+	 * marker anywhere in the body at all) must never read as HELD.
+	 * This alone was already covered by test_dialog_info_busy() with
+	 * one dialog - repeated here with a *second*, unrelated ringing
+	 * dialog alongside it, to prove a held-looking marker in a
+	 * *different* dialog can't leak in from cross-document scanning
+	 * either (there is none here, so this also guards against a
+	 * regression that starts treating any second <dialog> as
+	 * "evidence of hold" just by existing). */
+	static const char busy_plus_ringing_no_held_marker_anywhere[] =
+		"<dialog-info state=\"full\">"
+		"<dialog id=\"1\"><state>confirmed</state></dialog>"
+		"<dialog id=\"2\"><state>early</state></dialog>"
+		"</dialog-info>";
+
+	/* Ringing always wins, even against a held dialog on the same
+	 * extension - an incoming call must never be hidden behind an
+	 * existing held line. */
+	static const char held_then_ringing[] =
+		"<dialog-info state=\"full\">"
+		"<dialog id=\"1\"><state>confirmed</state>"
+		"<local><target uri=\"sip:x@host\">"
+		"<param pname=\"+sip.rendering\" pvalue=\"no\"/>"
+		"</target></local></dialog>"
+		"<dialog id=\"2\"><state>early</state></dialog>"
+		"</dialog-info>";
+
+	CHECK(CENT_BLF_BUSY ==
+	      dialog_info_parse(busy_then_held, str_len(busy_then_held)),
+	      "dialog_info: busy dialog (1st) + a held dialog (2nd) -> busy,"
+	      " NOT held - the pre-v1.7 bug misattributed the 2nd dialog's"
+	      " held marker to the 1st (matched) dialog's state");
+
+	CHECK(CENT_BLF_RINGING ==
+	      dialog_info_parse(busy_plus_ringing_no_held_marker_anywhere,
+				 str_len(busy_plus_ringing_no_held_marker_anywhere)),
+	      "dialog_info: busy dialog (1st) + ringing dialog (2nd) ->"
+	      " ringing - pre-v1.7's single whole-body <state> match would"
+	      " only ever see the 1st dialog and report busy, completely"
+	      " masking the incoming call on the 2nd");
+
+	CHECK(CENT_BLF_RINGING ==
+	      dialog_info_parse(held_then_ringing,
+				 str_len(held_then_ringing)),
+	      "dialog_info: held dialog (1st) + ringing dialog (2nd) ->"
+	      " ringing wins - an incoming call must never be hidden behind"
+	      " an existing held line (pre-v1.7 would report held, again"
+	      " masking the incoming call entirely)");
+}
+
+
 static void test_blf_state_name(void)
 {
 	CHECK_STREQ(cent_blf_state_name(CENT_BLF_IDLE), "idle", "name: idle");
@@ -1628,6 +1722,7 @@ int main(void)
 	test_dialog_info_held();
 	test_dialog_info_real_capture_ext1000_confirmed_no_hold_signal();
 	test_dialog_info_dnd();
+	test_dialog_info_multi_dialog_scoping();
 	test_blf_state_name();
 
 	libre_close();

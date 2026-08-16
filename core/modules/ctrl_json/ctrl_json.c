@@ -225,10 +225,25 @@ static void emit_error(const char *message)
 	struct odict *od = NULL;
 
 	str_ncpy(g_last_error, message ? message : "", sizeof(g_last_error));
-	++g_error_seq;
 
+	/* v1.7 fix: odict_alloc() (ENOMEM only, but real under memory
+	 * pressure) used to be checked *after* ++g_error_seq below, so a
+	 * failed alloc here still bumped the sequence with nothing actually
+	 * emitted - process_line()'s "did g_error_seq move during this
+	 * command's dispatch" check (see its own top-of-file comment) would
+	 * then see a moved counter and correctly report the command as
+	 * failed via `result`, but a consumer also watching for a matching
+	 * plain "error" event on stdout would wait forever for one that was
+	 * never sent - a silent gap in the numbering with no event to
+	 * explain it. Bumping only once the event is actually about to be
+	 * built (the `return` below is now hit before either side effect)
+	 * keeps the two in lockstep: g_error_seq moves if and only if an
+	 * "error" event was actually emitted (or would have been, had this
+	 * message not been the fallback empty string). */
 	if (odict_alloc(&od, 4))
 		return;
+
+	++g_error_seq;
 
 	(void)odict_entry_add(od, "event", ODICT_STRING, "error");
 	(void)odict_entry_add(od, "message", ODICT_STRING,
@@ -580,6 +595,40 @@ static void emit_audio_error(struct call *call, const char *message)
 		return;
 
 	(void)odict_entry_add(od, "event", ODICT_STRING, "audio_error");
+	(void)odict_entry_add(od, "call_id", ODICT_STRING, id);
+	(void)odict_entry_add(od, "message", ODICT_STRING,
+			       message ? message : "");
+
+	emit(od);
+	mem_deref(od);
+}
+
+
+/*
+ * v1.8 (see PROTOCOL.md "transfer_failed"): same gap emit_audio_error()
+ * closed for BEVENT_AUDIO_ERROR in v1.4, now closed for
+ * BEVENT_CALL_TRANSFER_FAILED - the plain "error" event event_handler()
+ * already emits for it (unchanged, still fires too, for back-compat) has
+ * no call_id at all (see emit_error()), so a consumer with more than one
+ * blind_transfer/attended_transfer in flight at once - each an
+ * independent async operation that can fail minutes apart, on unrelated
+ * calls - had no reliable way to tell which transfer's failure a given
+ * "error" event was reporting. `call` here is the transferring call
+ * itself (confirmed by reading ua.c: bevent_call_emit(
+ * BEVENT_CALL_TRANSFER_FAILED, call, ...) is always called with the
+ * original call, not the (nonexistent, since the transfer never
+ * completed) target), so event_handler()'s already-resolved `call` local
+ * is exactly the right id to attach - no new lookup needed.
+ */
+static void emit_transfer_failed(struct call *call, const char *message)
+{
+	struct odict *od = NULL;
+	const char *id = call ? call_id(call) : "";
+
+	if (odict_alloc(&od, 8))
+		return;
+
+	(void)odict_entry_add(od, "event", ODICT_STRING, "transfer_failed");
 	(void)odict_entry_add(od, "call_id", ODICT_STRING, id);
 	(void)odict_entry_add(od, "message", ODICT_STRING,
 			       message ? message : "");
@@ -1559,6 +1608,24 @@ static void cmd_resume(const struct cent_cmd *cmd)
 }
 
 
+/* Every character in `digits` is a digit audio_send_digit() (src/audio.c)
+ * will actually accept - reuses telev_digit2code() (re_telev.h), the same
+ * function that call decides "valid DTMF digit" with, rather than
+ * duplicating its table here and risking drift. Pure lookup, no I/O - see
+ * cmd_dtmf()'s own comment for why this runs *before* anything is sent. */
+static bool dtmf_digits_valid(const char *digits)
+{
+	size_t i;
+
+	for (i = 0; digits[i]; i++) {
+		if (telev_digit2code(digits[i]) == -1)
+			return false;
+	}
+
+	return true;
+}
+
+
 static void cmd_dtmf(const struct cent_cmd *cmd)
 {
 	struct call *call = resolve_call(cmd->have_call_id, cmd->call_id);
@@ -1570,13 +1637,40 @@ static void cmd_dtmf(const struct cent_cmd *cmd)
 		return;
 	}
 
+	/*
+	 * v1.7 fix: validate the *entire* digit string up front, before
+	 * sending a single one, rather than discovering an invalid digit
+	 * mid-loop below. The old behavior stopped the send loop the
+	 * moment call_send_digit() returned EINVAL for a bad character
+	 * (e.g. a stray non-DTMF byte at position N of a longer string) -
+	 * but the "if (!err) err = call_send_digit(call, KEYCODE_REL)"
+	 * line right after it then *also* got skipped, since err was
+	 * already non-zero. Net effect: every valid digit already sent
+	 * before the bad one (audio_send_digit()'s a->tx.cur_key, src/
+	 * audio.c) was left "pressed" on the wire forever - no RFC2833
+	 * end event ever went out for it. Rejecting the whole command
+	 * up front (nothing sent at all on a bad string) is simpler to
+	 * reason about than trying to guarantee KEYCODE_REL fires on
+	 * every error path through the loop, and matches this file's own
+	 * convention elsewhere (cmd.c's require_str()/decode_codecs():
+	 * reject cleanly, never act on a partially-valid input).
+	 */
+	if (!dtmf_digits_valid(cmd->digits)) {
+		emit_errorf("dtmf: invalid digit in '%s'", cmd->digits);
+		return;
+	}
+
 	/* One call_send_digit() per digit, then a KEYCODE_REL to mark the
 	 * last one released - matches modules/menu/dynamic_menu.c's
 	 * send_code(), which audio_send_digit() (src/audio.c) depends on
 	 * for its start/end RFC2833 event pairing (it tracks "the
 	 * previous key" and emits that one's *end* event on the next
 	 * call, so a trailing release call is required to end the final
-	 * digit). */
+	 * digit). Every character is already known-valid at this point,
+	 * so the only way this loop's call_send_digit() can still fail is
+	 * a lower-level tx error, not a bad digit - KEYCODE_REL is then
+	 * still correctly withheld below (nothing valid to "release" if
+	 * the digit itself never actually went out). */
 	for (i = 0; cmd->digits[i] && !err; i++)
 		err = call_send_digit(call, cmd->digits[i]);
 
@@ -2104,6 +2198,13 @@ static void process_line(const char *line, size_t len)
  *     call_id at all. Only ausrc (microphone/input) failures actually
  *     reach this bevent in practice - see PROTOCOL.md's v1.4 changelog
  *     for the known, unfixed gap on the auplay (speaker/output) side.
+ * v1.8 adds:
+ *   - BEVENT_CALL_TRANSFER_FAILED now *also* emits a dedicated,
+ *     call_id-bearing "transfer_failed" event (see
+ *     emit_transfer_failed()'s own comment), for the same reason v1.4
+ *     added "audio_error" - the plain "error" event above has no
+ *     call_id, so more than one transfer in flight at once (independent
+ *     async operations, on independent calls) couldn't be told apart.
  * Still not mapped (see PROTOCOL.md "Planned"): BEVENT_CALL_TRANSFER/
  * _REDIRECT (the transfer-*target*-side perspective - this account never
  * plays that role in any tested flow), DTMF-received, RTCP/VU-meter,
@@ -2192,6 +2293,13 @@ static void event_handler(enum bevent_ev ev, struct bevent *event, void *arg)
 		break;
 
 	case BEVENT_CALL_TRANSFER_FAILED:
+		/* v1.8: emit_transfer_failed() first (see its own comment) -
+		 * call_id-correlated, so a consumer with more than one
+		 * transfer in flight can tell them apart - then the
+		 * unchanged plain "error" for back-compat, same
+		 * before/after ordering emit_audio_error() established for
+		 * BEVENT_AUDIO_ERROR below. */
+		emit_transfer_failed(call, bevent_get_text(event));
 		emit_errorf("transfer failed: %s", bevent_get_text(event));
 		break;
 
@@ -2362,22 +2470,73 @@ static void stdin_stop(struct ctrl_st *st)
  * push is never actually delivered to mqueue_handler() below regardless.
  */
 
-enum { MQ_LINE = 1, MQ_EOF = 2 };
+enum { MQ_LINE = 1, MQ_EOF = 2, MQ_OVERLONG = 3 };
 
 struct win_line {
 	char  *buf;
 	size_t len;
 };
 
+/*
+ * v1.7 fix: unify the "line longer than INBUF_SIZE with no '\n' in range"
+ * behavior with the POSIX path's process_inbuf()/stdin_handler() above,
+ * which discards the whole overlong line (and emits one "input line too
+ * long, buffer reset" error) rather than ever handing process_line() a
+ * fragment. Before this fix, fgets(line, sizeof(line), stdin) simply
+ * returned whatever fit once its buffer filled - a real line longer than
+ * INBUF_SIZE got silently sliced into several INBUF_SIZE-ish chunks, each
+ * pushed as its own MQ_LINE and independently fed to process_line() as if
+ * it were a complete, standalone message. Every chunk but (maybe) the last
+ * is not valid JSON on its own, so in practice this meant one bogus
+ * "malformed JSON" `error` per chunk instead of the POSIX side's single,
+ * clear "line too long" `error` - two platforms visibly disagreeing about
+ * what a hostile/misbehaving client on the other end of the pipe caused,
+ * exactly the "different behavior on Windows" shape this repo has already
+ * paid for once (see CLAUDE.md's 2026-08-13/14 entry). `skipping` tracks
+ * "still discarding the tail of an overlong line, waiting for its real
+ * '\n'" across fgets() calls, mirroring process_inbuf()'s inlen>=INBUF_SIZE
+ * reset check on the POSIX side.
+ */
 static int stdin_thread_main(void *arg)
 {
 	struct mqueue *mq = arg;
 	char line[INBUF_SIZE];
+	bool skipping = false;
 
 	while (fgets(line, sizeof(line), stdin)) {
 
 		size_t len = strlen(line);
+		bool got_newline = len > 0 && line[len - 1] == '\n';
 		struct win_line *wl;
+
+		if (skipping) {
+			/* Still discarding the remainder of an overlong
+			 * line - once this chunk actually ends in '\n', the
+			 * real line boundary has finally arrived and normal
+			 * processing can resume with the next fgets(). */
+			if (got_newline)
+				skipping = false;
+			continue;
+		}
+
+		/*
+		 * fgets() only stops without a '\n' for one of two
+		 * reasons: EOF, or its buffer filled up first. The two are
+		 * told apart by `len`: a genuine final line before EOF is
+		 * whatever length it happens to be (usually well under
+		 * sizeof(line)); a buffer-filled truncation always reads
+		 * exactly sizeof(line)-1 bytes (fgets() reserves one byte
+		 * for the NUL terminator). A short, no-trailing-newline
+		 * final line is legitimate and still gets processed below
+		 * (unchanged from before this fix) - only the
+		 * buffer-exactly-full case is the overlong-line problem
+		 * this closes.
+		 */
+		if (!got_newline && len == sizeof(line) - 1) {
+			skipping = true;
+			(void)mqueue_push(mq, MQ_OVERLONG, NULL);
+			continue;
+		}
 
 		/* tolerate CRLF/LF, matching process_inbuf()'s POSIX-path
 		 * behaviour */
@@ -2434,6 +2593,17 @@ static void mqueue_handler(int id, void *data, void *arg)
 		free(wl);
 		break;
 	}
+
+	case MQ_OVERLONG:
+		/* emit_error() touches re's own allocator (odict_alloc())
+		 * and stdout - both only ever safe from the main/re
+		 * thread, which is exactly where mqueue_handler() runs
+		 * (see stdin_thread_main()'s own comment for why it never
+		 * calls emit_error() itself) - same message text as the
+		 * POSIX side's equivalent reset, so a consumer sees one
+		 * consistent string regardless of platform. */
+		emit_error("input line too long, buffer reset");
+		break;
 
 	case MQ_EOF:
 		info("ctrl_json: stdin closed, shutting down\n");
