@@ -807,7 +807,12 @@ function renderTranscriptScreenBody() {
           await navigator.clipboard.writeText(text);
           showBanner(t("transcript.copiedToClipboard"), "info");
         } catch (e) {
-          console.error("clipboard write failed", e);
+          // UI-silent-failures audit (2026-08-16, hallazgo #3): this used
+          // to only console.error - no banner, no on-disk log line, so a
+          // "Copy" click that silently did nothing left no trace anywhere
+          // an operator (or later diagnosis) could see.
+          showBanner(t("transcript.copyFailed"), "err");
+          reportFrontendIssue("transcript_copy_failed", { message: describeError(e) });
         }
       },
       onShowFolder: revealInFileManager,

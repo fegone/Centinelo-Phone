@@ -1037,6 +1037,7 @@ const ENTRIES = [
   // --- UI-silent-failures audit (2026-08-16) - new keys appended here,
   // not interleaved above, per this workspace's protocol.
   ["settings.restartFailed", "Couldn't restart the engine: {error}", "Não foi possível reiniciar o motor: {error}", "No se pudo reiniciar el motor: {error}"],
+  ["transcript.copyFailed", "Couldn't copy the transcript.", "Não foi possível copiar a transcrição.", "No se pudo copiar la transcripción."],
 ];
 
 const DICTS = { en: {}, "pt-BR": {}, es: {} };
