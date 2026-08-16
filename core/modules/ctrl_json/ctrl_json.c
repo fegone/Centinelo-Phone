@@ -589,6 +589,40 @@ static void emit_audio_error(struct call *call, const char *message)
 }
 
 
+/*
+ * v1.8 (see PROTOCOL.md "transfer_failed"): same gap emit_audio_error()
+ * closed for BEVENT_AUDIO_ERROR in v1.4, now closed for
+ * BEVENT_CALL_TRANSFER_FAILED - the plain "error" event event_handler()
+ * already emits for it (unchanged, still fires too, for back-compat) has
+ * no call_id at all (see emit_error()), so a consumer with more than one
+ * blind_transfer/attended_transfer in flight at once - each an
+ * independent async operation that can fail minutes apart, on unrelated
+ * calls - had no reliable way to tell which transfer's failure a given
+ * "error" event was reporting. `call` here is the transferring call
+ * itself (confirmed by reading ua.c: bevent_call_emit(
+ * BEVENT_CALL_TRANSFER_FAILED, call, ...) is always called with the
+ * original call, not the (nonexistent, since the transfer never
+ * completed) target), so event_handler()'s already-resolved `call` local
+ * is exactly the right id to attach - no new lookup needed.
+ */
+static void emit_transfer_failed(struct call *call, const char *message)
+{
+	struct odict *od = NULL;
+	const char *id = call ? call_id(call) : "";
+
+	if (odict_alloc(&od, 8))
+		return;
+
+	(void)odict_entry_add(od, "event", ODICT_STRING, "transfer_failed");
+	(void)odict_entry_add(od, "call_id", ODICT_STRING, id);
+	(void)odict_entry_add(od, "message", ODICT_STRING,
+			       message ? message : "");
+
+	emit(od);
+	mem_deref(od);
+}
+
+
 /* ------------------------------------------------------------------- */
 /* Devices (v1.1 - see PROTOCOL.md "devices"/"set_device")             */
 
@@ -2104,6 +2138,13 @@ static void process_line(const char *line, size_t len)
  *     call_id at all. Only ausrc (microphone/input) failures actually
  *     reach this bevent in practice - see PROTOCOL.md's v1.4 changelog
  *     for the known, unfixed gap on the auplay (speaker/output) side.
+ * v1.8 adds:
+ *   - BEVENT_CALL_TRANSFER_FAILED now *also* emits a dedicated,
+ *     call_id-bearing "transfer_failed" event (see
+ *     emit_transfer_failed()'s own comment), for the same reason v1.4
+ *     added "audio_error" - the plain "error" event above has no
+ *     call_id, so more than one transfer in flight at once (independent
+ *     async operations, on independent calls) couldn't be told apart.
  * Still not mapped (see PROTOCOL.md "Planned"): BEVENT_CALL_TRANSFER/
  * _REDIRECT (the transfer-*target*-side perspective - this account never
  * plays that role in any tested flow), DTMF-received, RTCP/VU-meter,
@@ -2192,6 +2233,13 @@ static void event_handler(enum bevent_ev ev, struct bevent *event, void *arg)
 		break;
 
 	case BEVENT_CALL_TRANSFER_FAILED:
+		/* v1.8: emit_transfer_failed() first (see its own comment) -
+		 * call_id-correlated, so a consumer with more than one
+		 * transfer in flight can tell them apart - then the
+		 * unchanged plain "error" for back-compat, same
+		 * before/after ordering emit_audio_error() established for
+		 * BEVENT_AUDIO_ERROR below. */
+		emit_transfer_failed(call, bevent_get_text(event));
 		emit_errorf("transfer failed: %s", bevent_get_text(event));
 		break;
 
