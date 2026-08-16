@@ -950,6 +950,17 @@ const ENTRIES = [
     "O console da recepção não pôde ser exibido. Verifique o log para mais detalhes.",
     "La consola de recepción no pudo mostrarse. Consulta el registro para más detalles.",
   ],
+  // Non-blocking: the panel itself loaded and mounted fine (loadFailed
+  // above didn't fire) - only the initial status snapshot couldn't be
+  // fetched, so registration/watched-extension state shows whatever it
+  // was at mount (likely "Not registered" / 0 watched) until the next
+  // live event corrects it. See console-panel.js's hydrateConsoleSnapshot.
+  [
+    "console.hydrateFailed",
+    "Console opened, but couldn't fetch the current status yet — it will update as soon as the phone reports in.",
+    "O console abriu, mas ainda não foi possível obter o status atual — ele será atualizado assim que o telefone informar.",
+    "La consola se abrió, pero aún no se pudo obtener el estado actual — se actualizará en cuanto el teléfono informe.",
+  ],
   [
     "app.ipcUnreachable",
     "Could not reach the app's backend. Please restart Centinelo Phone; if this keeps happening, reinstall the latest version.",

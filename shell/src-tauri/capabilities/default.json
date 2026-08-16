@@ -31,6 +31,7 @@
     "allow-get-license-settings",
     "allow-get-locale",
     "allow-get-recents",
+    "allow-get-reg-state",
     "allow-get-theme",
     "allow-get-transcription-settings",
     "allow-get-updater-settings",

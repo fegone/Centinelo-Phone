@@ -391,12 +391,24 @@ async function mountConsole() {
   }
 
   const bridge = Centinelo.EngineBridge.create();
+  // `deps.listen(...)` (Tauri's own `listen`) returns a Promise that
+  // resolves once the event is actually wired up on the OS side - NOT
+  // when this synchronous call returns. Capturing it here and awaiting it
+  // below, before anything else in this function runs, closes the window
+  // where a live `sidecar-event` (a `reg_state` from the engine's own
+  // periodic re-REGISTER, a `blf` NOTIFY) could fire while nothing is
+  // listening yet: EngineBridge.dispatch() only fans events out to
+  // whatever's subscribed *right now* (bridge.js's own doc on `dispatch`)
+  // - it buffers nothing, so an event that arrives before the listener is
+  // live is simply gone, not delayed.
+  let listenerReady = Promise.resolve();
   bridge.init(
     makeConsoleDispatcher(deps.invoke),
     (handler) => {
-      deps.listen("sidecar-event", (e) => handler(e.payload));
+      listenerReady = deps.listen("sidecar-event", (e) => handler(e.payload));
     }
   );
+  await listenerReady;
 
   let favorites = [];
   try {
@@ -411,4 +423,93 @@ async function mountConsole() {
     selfExt: null,
     bridge,
   });
+
+  // Catch the panel up on what already happened before it existed to hear
+  // it - see hydrateConsoleSnapshot's own doc for why this is needed at
+  // all (this package's `ConsoleStore` starts from a hardcoded
+  // "unregistered"/empty-BLF default and only learns otherwise from a LIVE
+  // `sidecar-event`; the main window never notices because it's already
+  // listening before the engine's first `reg_state` of the session ever
+  // fires - this panel opens well after that, on demand).
+  await hydrateConsoleSnapshot();
+}
+
+/// Feeds the just-mounted `ConsoleStore` a snapshot of registration + BLF
+/// state the engine already reported to Rust (`sidecar_status`'s sibling
+/// commands `get_reg_state`/`get_blf_states` - see sidecar.rs's
+/// `RegStateSnapshot`/`blf_states` doc for why Rust caches these at all).
+/// Goes through `store.ingest(event)` directly - the SAME public entry
+/// point `ConsoleStore.js` documents as "also used directly by tests/mock
+/// without a real bridge in the loop" - rather than round-tripping through
+/// a synthetic bridge command, since there is no bridge verb for "give me
+/// a snapshot" (EngineBridge only shapes real PROTOCOL.md commands/events,
+/// see its own header doc) and inventing one here would be a second,
+/// competing way to feed the same store `mountConsole`'s real bridge
+/// subscription already uses for live events.
+///
+/// Ordering: called AFTER `ConsoleApp.mount()` (the store must exist to
+/// ingest into) and after `listenerReady` resolved (mountConsole's own
+/// await) - so the two snapshot fetches below race against LIVE events
+/// the exact same way the main window's own boot() does (`app.js`:
+/// snapshot fetched, then live listener wired), not worse. A live event
+/// landing concurrently with either fetch is never lost to a stale
+/// overwrite either way: `ConsoleStore.ingest`'s `reg_state`/`blf`
+/// handling is a plain last-write-wins field assignment, so whichever of
+/// (live event, snapshot response) actually arrives last simply wins -
+/// same outcome as if this snapshot had never been fetched at all, never
+/// a regression to older data.
+///
+/// Best-effort, like every other boot-time fetch in this codebase
+/// (app.js's own `boot()` treats `sidecar_status`/`get_blf_states`
+/// failures the same way): a failed fetch leaves the panel exactly as it
+/// already renders post-mount (the same "Not registered" / 0 watched a
+/// slow live event would also show, briefly) rather than blocking the
+/// open or tearing the panel down - the engine's own `regint=120`
+/// periodic re-REGISTER (or the next BLF NOTIFY) still corrects it from
+/// here regardless. Never silent, though - both `console.error` (log) and
+/// `reportFrontendIssue` (disk, `%LOCALAPPDATA%\...\logs` /
+/// `~/Library/.../logs`) fire, plus one non-blocking banner so the
+/// operator has a visible signal too - this project's own hard-learned
+/// rule (`docs/HANDOFF.md`: "el banner + log ... nunca escribio nada al
+/// disco" - the December 2.0.9 fix for exactly that class of silent
+/// failure) is "no failure path may be silent," and a status snapshot
+/// silently not loading is exactly that class of bug if left unlogged.
+async function hydrateConsoleSnapshot() {
+  if (!mounted || !mounted.store || typeof mounted.store.ingest !== "function") return;
+  const store = mounted.store;
+  let hadFailure = false;
+
+  try {
+    const regState = await deps.invoke("get_reg_state");
+    if (regState) store.ingest({ event: "reg_state", ...regState });
+  } catch (e) {
+    hadFailure = true;
+    console.error("console: get_reg_state failed", e);
+    if (deps.reportFrontendIssue) {
+      deps.reportFrontendIssue("console_panel_hydrate_failed", {
+        source: "get_reg_state",
+        message: String((e && e.message) || e),
+      });
+    }
+  }
+
+  try {
+    const blfStates = await deps.invoke("get_blf_states");
+    for (const [ext, blfState] of Object.entries(blfStates || {})) {
+      store.ingest({ event: "blf", ext, state: blfState });
+    }
+  } catch (e) {
+    hadFailure = true;
+    console.error("console: get_blf_states failed", e);
+    if (deps.reportFrontendIssue) {
+      deps.reportFrontendIssue("console_panel_hydrate_failed", {
+        source: "get_blf_states",
+        message: String((e && e.message) || e),
+      });
+    }
+  }
+
+  if (hadFailure && deps.showBanner) {
+    deps.showBanner(t("console.hydrateFailed"), "info");
+  }
 }
