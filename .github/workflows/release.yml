@@ -419,6 +419,16 @@ jobs:
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # This is the Community edition (no premium module at all - see
+          # this workflow's header comment) - it ships in release profile
+          # with the documented dev/test placeholder Ed25519 keys FOREVER,
+          # by design, since Community never bundles a premium dylib for
+          # them to gate. build.rs's release key-gate check (RISK finding,
+          # licensing agent, 2026-08-16) would otherwise block this build;
+          # see that check's own doc comment in shell/src-tauri/build.rs
+          # for the full rule and why Community is a named-legitimate
+          # exception, not an oversight.
+          CENTINELO_ALLOW_DEV_SIGNING_KEYS: "1"
         run: npx tauri build --bundles app
 
       - name: Stage core engine binary into the built .app (Community edition)
@@ -1023,6 +1033,9 @@ jobs:
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Same Community-edition rationale as the macOS job's identical
+          # env var above - see that comment.
+          CENTINELO_ALLOW_DEV_SIGNING_KEYS: "1"
         run: |
           set -euo pipefail
           # $OPENSSL_ROOT_DIR is a WINDOWS path (e.g. "C:\Program Files\OpenSSL"),

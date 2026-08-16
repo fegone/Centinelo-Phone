@@ -285,6 +285,17 @@ jobs:
 
       - name: Run scripts/package-official.sh --target windows (${{ matrix.combo }})
         shell: bash
+        env:
+          # This job packages purely synthetic fixtures (see the "Stage
+          # synthetic core build..." step above - the "premium dylib" is a
+          # text file, not a real signed binary) to smoke-test
+          # package-official.sh's own resources mechanism, not to produce
+          # anything that ships. build.rs's release key-gate check (RISK
+          # finding, licensing agent, 2026-08-16) would otherwise block
+          # this --release compile for still holding the dev/test
+          # placeholder Ed25519 keys; see that check's own doc comment in
+          # shell/src-tauri/build.rs for the full rule.
+          CENTINELO_ALLOW_DEV_SIGNING_KEYS: "1"
         run: |
           set -euo pipefail
           # --no-updater-artifacts: see the CI-ONLY SIGNING NOTE at the top

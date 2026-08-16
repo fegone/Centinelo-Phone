@@ -89,6 +89,17 @@ jobs:
         # unnecessary flakiness for a routine build-verification job - a
         # release workflow can build the full DMG separately.
         # --config disables updater-artifact signing for CI (see header).
+        # CENTINELO_ALLOW_DEV_SIGNING_KEYS: this is a --release compile
+        # (tauri build always builds release) that never ships anywhere -
+        # build.rs's release key-gate check (RISK finding, licensing
+        # agent, 2026-08-16) would otherwise fail this build for still
+        # holding the documented dev/test placeholder Ed25519 keys in
+        # src/premium.rs / src/activation.rs, which is correct for a REAL
+        # release build but not for this PR-verification job. See that
+        # check's own doc comment in shell/src-tauri/build.rs for the full
+        # rule and why this is one of the named-legitimate exceptions.
+        env:
+          CENTINELO_ALLOW_DEV_SIGNING_KEYS: "1"
         run: npx tauri build --bundles app --config src-tauri/tauri.ci.conf.json
 
   windows:
@@ -124,4 +135,9 @@ jobs:
         # --config disables updater-artifact signing for CI (see header):
         # without it the same "public key found, no private key" error
         # that broke macOS would break Windows too.
+        # CENTINELO_ALLOW_DEV_SIGNING_KEYS: same reason as the macOS job
+        # above - this is a --release compile that never ships, see that
+        # job's comment.
+        env:
+          CENTINELO_ALLOW_DEV_SIGNING_KEYS: "1"
         run: npx tauri build --bundles nsis --config src-tauri/tauri.ci.conf.json
