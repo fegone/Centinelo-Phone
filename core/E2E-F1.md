@@ -1078,7 +1078,7 @@ dial `*43`:
   751 → 1502 / `rx_packets` 729 → 1478 across a 30s window (real growth,
   not a stale read).
 - **Independent PBX-side confirmation, same call**: `asterisk -rx
-  "pjsip show channelstats"` on `100.119.230.80` showed `Codec opus`
+  "pjsip show channelstats"` on `<pbx host>` showed `Codec opus`
   for the live channel, counters growing **1069 → 1713 rx / 1047 → 1691
   tx** over the same ~13s window, from the PBX's own independently-kept
   counters — not a mirror of the engine's own numbers.
@@ -1152,7 +1152,7 @@ finding, not a `set_codecs` bug:
 - The first attempt used `set_codecs(["pcma"])` (G.711 A-law only).
   Call B's dial got **no `established` event at all** — straight to
   `call_state":"closed"`. Engine stderr showed why:
-  `sip:*43@100.119.230.80;transport=wss: session closed: 488 Not
+  `sip:*43@<pbx host>;transport=wss: session closed: 488 Not
   Acceptable Here`. This is the **PBX endpoint correctly rejecting the
   offer**, not an engine defect: `core/BUILD.md` already documents this
   test endpoint's `allow=(opus|ulaw)` (confirmed for endpoint `1000`;

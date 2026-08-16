@@ -81,17 +81,18 @@ use std::time::Duration;
 
 /// # DEV/TEST PLACEHOLDER — replace before shipping a real Pro build
 ///
-/// `SigningKey::from_bytes(&[0x77; 32]).verifying_key().to_bytes()` - a
-/// fixed, publicly-documented dev/test seed, deliberately distinct from
-/// `premium.rs`'s own `LIB_PUBKEY_BYTES` dev seed (`[0x24; 32]`, a
-/// different key for a different job: that one authenticates the
+/// The verifying key derived from a fixed, well-known dev/test seed,
+/// deliberately distinct from `premium.rs`'s own `LIB_PUBKEY_BYTES` dev
+/// seed (a different key for a different job: that one authenticates the
 /// `centinelo_premium` dylib *binary*, this one authenticates a *license*
 /// issued by an activation server) and from `centinelo-premium`'s
-/// `DEV_TEST_LICENSE_SIGNING_SEED` (`[0x42; 32]`, private repo, gates the
-/// dev-only `CENTINELO_PREMIUM_LICENSE_PATH` override) - three separate
-/// keypairs, three separate jobs, per
+/// `DEV_TEST_LICENSE_SIGNING_SEED` (private repo, gates the dev-only
+/// `CENTINELO_PREMIUM_LICENSE_PATH` override) - three separate keypairs,
+/// three separate jobs, per
 /// `premium/docs/SPEC-2026-07-17-activation-server-design.md` §3's key
-/// model table.
+/// model table. The seed literals are intentionally not written here —
+/// they live in the private `centinelo-premium` repo for anyone with
+/// access who needs to reproduce a matching signature.
 ///
 /// **Before an official release build**: Felix generates a real Ed25519
 /// activation keypair offline (same ceremony `shell/README.md`'s "Dev
