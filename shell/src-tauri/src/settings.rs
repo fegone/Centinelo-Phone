@@ -692,6 +692,16 @@ pub struct AdminSettings {
     /// operator sets an admin password on first run.
     #[serde(default)]
     pub password_hash: Option<String>,
+    /// Consecutive failed `admin_unlock` attempts since the last success.
+    /// Persisted (not just in-memory) so the lockout below survives an app
+    /// restart - see `SettingsStore::admin_lockout_remaining_ms`'s doc for
+    /// why that matters.
+    #[serde(default)]
+    pub failed_attempts: u32,
+    /// Epoch milliseconds until which `admin_unlock` refuses every attempt
+    /// regardless of password correctness. `0` = no active lockout.
+    #[serde(default)]
+    pub locked_until_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -1074,6 +1084,162 @@ impl SettingsStore {
 
     pub fn admin_password_hash(&self) -> Option<String> {
         self.inner.lock_or_recover().admin.password_hash.clone()
+    }
+
+    /// `Some(remaining_ms)` while `admin_unlock` is locked out after
+    /// `ADMIN_LOCKOUT_THRESHOLD` consecutive failures, `None` once the
+    /// window has elapsed (or no lockout is active).
+    ///
+    /// This lives on disk (`settings.json`, mode 600 - same trust boundary
+    /// as `admin.password_hash` itself) rather than as an in-memory
+    /// counter next to `AdminSession`. An in-memory-only counter would be
+    /// reset by quitting and relaunching the app, which any local user (or
+    /// a script driving the app from outside the webview) can always do -
+    /// that would make the lockout enforce nothing against the sustained
+    /// offline-guessing scenario it exists for, only against a
+    /// same-process JS loop that never restarts the app. Persisting costs
+    /// nothing extra: this file is already the durable home for the thing
+    /// being brute-forced.
+    pub fn admin_lockout_remaining_ms(&self) -> Option<u64> {
+        let locked_until = self.inner.lock_or_recover().admin.locked_until_ms;
+        if locked_until == 0 {
+            return None;
+        }
+        let now = now_ms();
+        if now >= locked_until {
+            None
+        } else {
+            Some(locked_until - now)
+        }
+    }
+
+    /// Records one failed `admin_unlock` attempt; once the running count
+    /// reaches `ADMIN_LOCKOUT_THRESHOLD`, opens a `ADMIN_LOCKOUT_MS`
+    /// lockout window. Returns the attempt count reached, for the caller's
+    /// log line - deliberately never the password itself.
+    pub fn record_admin_unlock_failure(&self) -> std::io::Result<u32> {
+        let mut guard = self.inner.lock_or_recover();
+        guard.admin.failed_attempts = guard.admin.failed_attempts.saturating_add(1);
+        if guard.admin.failed_attempts >= ADMIN_LOCKOUT_THRESHOLD {
+            guard.admin.locked_until_ms = now_ms() + ADMIN_LOCKOUT_MS;
+        }
+        let count = guard.admin.failed_attempts;
+        self.persist(&guard)?;
+        Ok(count)
+    }
+
+    /// Clears the failed-attempt counter and any active lockout window -
+    /// called on a successful `admin_unlock` so a legitimate operator who
+    /// mistyped a few times isn't left ticking down a lockout they no
+    /// longer need.
+    pub fn reset_admin_lockout(&self) -> std::io::Result<()> {
+        let mut guard = self.inner.lock_or_recover();
+        if guard.admin.failed_attempts == 0 && guard.admin.locked_until_ms == 0 {
+            return Ok(()); // nothing to persist - the common case
+        }
+        guard.admin.failed_attempts = 0;
+        guard.admin.locked_until_ms = 0;
+        self.persist(&guard)
+    }
+}
+
+/// Consecutive failed `admin_unlock` attempts before the lockout window
+/// opens.
+const ADMIN_LOCKOUT_THRESHOLD: u32 = 5;
+/// Lockout window once `ADMIN_LOCKOUT_THRESHOLD` is reached. Long enough to
+/// make a dictionary attack against an 8+ char password impractical
+/// (Argon2id already costs tens of ms/attempt; this adds a hard floor on
+/// top independent of that cost), short enough that a legitimate operator
+/// who fumbled the password a few times isn't locked out for long.
+const ADMIN_LOCKOUT_MS: u64 = 30_000;
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod admin_lockout_tests {
+    use super::*;
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("centinelo-admin-lockout-test.{name}.{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn no_password_configured_never_locks_out() {
+        // Nothing to brute-force yet - record_admin_unlock_failure should
+        // never even run, so the counter stays untouched.
+        let dir = scratch_dir("no-password");
+        let store = SettingsStore::load(&dir).unwrap();
+        assert!(store.admin_password_hash().is_none());
+        assert_eq!(store.admin_lockout_remaining_ms(), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn opens_after_threshold_failures_and_persists_across_reload() {
+        // This is the guarantee the finding was about: the lockout must
+        // survive `SettingsStore::load` being called fresh (== the app
+        // restarting), not just live in the current process's memory.
+        let dir = scratch_dir("persists");
+        let store = SettingsStore::load(&dir).unwrap();
+        store.set_admin_password_hash(hash_password("correct horse battery").unwrap()).unwrap();
+
+        for n in 1..ADMIN_LOCKOUT_THRESHOLD {
+            let count = store.record_admin_unlock_failure().unwrap();
+            assert_eq!(count, n);
+            assert_eq!(
+                store.admin_lockout_remaining_ms(),
+                None,
+                "must not lock out before the threshold ({n} < {ADMIN_LOCKOUT_THRESHOLD})"
+            );
+        }
+        // The threshold-th failure trips the lockout.
+        let count = store.record_admin_unlock_failure().unwrap();
+        assert_eq!(count, ADMIN_LOCKOUT_THRESHOLD);
+        let remaining = store.admin_lockout_remaining_ms();
+        assert!(remaining.is_some() && remaining.unwrap() > 0, "must be locked out at the threshold");
+
+        // Simulates restarting the app: a brand-new SettingsStore reading
+        // the same file must still see the lockout - this is the whole
+        // point of persisting instead of keeping the counter in memory.
+        let reloaded = SettingsStore::load(&dir).unwrap();
+        let remaining_after_reload = reloaded.admin_lockout_remaining_ms();
+        assert!(
+            remaining_after_reload.is_some() && remaining_after_reload.unwrap() > 0,
+            "lockout must survive a restart, not just live in AdminSession's in-memory flag"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn success_resets_the_counter_and_any_lockout() {
+        let dir = scratch_dir("reset-on-success");
+        let store = SettingsStore::load(&dir).unwrap();
+        store.set_admin_password_hash(hash_password("correct horse battery").unwrap()).unwrap();
+
+        for _ in 0..ADMIN_LOCKOUT_THRESHOLD {
+            store.record_admin_unlock_failure().unwrap();
+        }
+        assert!(store.admin_lockout_remaining_ms().is_some());
+
+        // A caller only reaches reset_admin_lockout() after verifying the
+        // password out-of-band (commands::admin_unlock's job, not this
+        // store's) - simulate that here directly.
+        store.reset_admin_lockout().unwrap();
+        assert_eq!(store.admin_lockout_remaining_ms(), None);
+        assert_eq!(store.inner.lock_or_recover().admin.failed_attempts, 0);
+
+        // And the reset itself must be durable too.
+        let reloaded = SettingsStore::load(&dir).unwrap();
+        assert_eq!(reloaded.admin_lockout_remaining_ms(), None);
+        let _ = fs::remove_dir_all(&dir);
     }
 }
 
