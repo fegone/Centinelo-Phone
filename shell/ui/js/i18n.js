@@ -1034,6 +1034,9 @@ const ENTRIES = [
     "Não foi possível salvar — está seguro neste computador.",
     "No se pudo guardar — está a salvo en este equipo.",
   ],
+  // --- UI-silent-failures audit (2026-08-16) - new keys appended here,
+  // not interleaved above, per this workspace's protocol.
+  ["settings.restartFailed", "Couldn't restart the engine: {error}", "Não foi possível reiniciar o motor: {error}", "No se pudo reiniciar el motor: {error}"],
 ];
 
 const DICTS = { en: {}, "pt-BR": {}, es: {} };

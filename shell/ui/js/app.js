@@ -3043,9 +3043,21 @@ function wireStaticHandlers() {
   });
 
   $("btn-save-settings").addEventListener("click", saveAccountSettings);
-  $("btn-restart-engine").addEventListener("click", () => {
-    invoke("sidecar_restart");
+  // UI-silent-failures audit (2026-08-16, hallazgo #1): this used to be a
+  // bare `invoke(...)` with no `.catch` at all, immediately followed by an
+  // unconditional "Restarting…" banner - a rejected restart (engine binary
+  // missing, sidecar already mid-restart, ...) left the operator reading a
+  // success message forever, with nothing in the log either. Same
+  // "reportFrontendIssue + honest banner" shape this session's other
+  // fixes use.
+  $("btn-restart-engine").addEventListener("click", async () => {
     showBanner(t("settings.restarting"), "info");
+    try {
+      await invoke("sidecar_restart");
+    } catch (e) {
+      showBanner(t("settings.restartFailed", { error: describeError(e) }), "err");
+      reportFrontendIssue("sidecar_restart_failed", { message: describeError(e) });
+    }
   });
 
   $("btn-activate-license").addEventListener("click", async () => {
