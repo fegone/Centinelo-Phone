@@ -56,6 +56,21 @@
 # (or artifact download locations) — the actual signing key stays offline
 # with Felix per CLAUDE.md's release rules; this script only ever touches
 # its *output* (the already-signed dylib + .sig).
+#
+# 🚨 Release key-gate (RISK finding, licensing agent, 2026-08-16): the
+# `tauri build` this script runs internally compiles shell/src-tauri in
+# release profile, and that crate's build.rs now REFUSES to compile in
+# release profile while src/premium.rs's LIB_PUBKEY_BYTES or
+# src/activation.rs's ACTIVATION_PUBKEY_BYTES still hold the documented
+# dev/test placeholder Ed25519 keys — unless CENTINELO_ALLOW_DEV_SIGNING_KEYS=1
+# is set in the environment. For a devsigned/fixture/CI run (the ONLY kind
+# this script has ever been exercised against so far — see "Status" above)
+# export that variable before invoking this script. For an actual official
+# Pro release built with Felix's REAL keys, do NOT set it — swap the two
+# placeholder constants first (premium/docs/PACKAGING-SIGNATURES.md,
+# "Where the real public key goes") and let the gate pass on its own; if it
+# still fails, the swap did not actually take, and finding that out here is
+# the whole point.
 set -euo pipefail
 
 # Captured before this script ever `cd`s anywhere (see "Resolve repo root"

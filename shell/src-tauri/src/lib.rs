@@ -11,6 +11,8 @@ mod frontend_log;
 #[cfg(test)]
 mod generate_handler_parser_tests;
 mod hid;
+#[cfg(test)]
+mod key_gate_tests;
 mod premium;
 mod profile_cleanup;
 mod provisioning;
