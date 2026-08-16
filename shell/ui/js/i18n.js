@@ -890,6 +890,18 @@ const ENTRIES = [
     "Conectado — registrando con tu sistema telefónico…",
   ],
   ["provisioning.linkError", "Provisioning link: {message}", "Link de provisionamento: {message}", "Enlace de aprovisionamiento: {message}"],
+  [
+    // Informed-consent warning, not a security check (RISK 4R finding,
+    // 2026-08-16, round 2 - see commands::provisioning_apply's doc): the
+    // one thing this asks the operator to actually look at is the host
+    // above (highlighted separately, see app.css .deep-link-warn), since
+    // that's the fact a phishing narrative has the hardest time explaining
+    // away.
+    "provisioning.deepLinkWarning",
+    "This link came from outside the app — if you weren't told to expect it, don't continue. Check the address above.",
+    "Este link veio de fora do aplicativo — se você não esperava por ele, não continue. Confira o endereço acima.",
+    "Este enlace llegó desde fuera de la aplicación — si no esperabas recibirlo, no continúes. Verifica la dirección de arriba.",
+  ],
 
   // -- dial confirmation ------------------------------------------------
   ["dialConfirm.question", "Call this number?", "Ligar para este número?", "¿Llamar a este número?"],

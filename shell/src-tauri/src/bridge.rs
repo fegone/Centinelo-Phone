@@ -152,6 +152,22 @@ pub(crate) fn redacted_log_number(number: &str) -> String {
     format!("{} digits#{}", number.chars().count(), number_fingerprint(number))
 }
 
+/// `redacted_log_number`'s sibling for a string that isn't a dialed number
+/// but is still a real-person/real-deployment identifier that shouldn't sit
+/// in plaintext in the persistent on-disk log - a monitored BLF extension
+/// (this app's own `commands.rs:229-234` doc already treats a favorited
+/// extension as identifying a real person, admin-locking it for exactly
+/// that reason) or a provisioning config's `host`/PBX address (identifies
+/// *which deployment*, and - unlike a dialed number - a value an attacker
+/// controls end-to-end on the `centinelo://provision` deep-link path; see
+/// `provisioning.rs`'s module doc). `"N digits"` would be a misleading label
+/// for a hostname, so this uses the generic `"N chars"` instead; same
+/// fingerprint scheme, same non-cryptographic "same value logs the same way
+/// twice" goal as `redacted_log_number`'s own doc.
+pub(crate) fn redacted_log_value(value: &str) -> String {
+    format!("{} chars#{}", value.chars().count(), number_fingerprint(value))
+}
+
 fn handle_request(
     mut request: tiny_http::Request,
     app: &AppHandle,

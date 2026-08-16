@@ -144,6 +144,16 @@ impl From<ProvisioningConfig> for AccountSettings {
 /// "the secret never round-trips to the frontend"). `has_tls_pin` is
 /// enough for the confirmation copy ("TLS pin included") without handing
 /// back a value that's only useful for impersonating the pin itself.
+///
+/// `from_deep_link` (RISK 4R finding, 2026-08-16): whether this preview
+/// came from a `centinelo://provision` link (`handle_deep_link`, reachable
+/// from any email/webpage on the machine - see this module's doc) rather
+/// than the operator pasting a link into Settings themselves
+/// (`commands::provisioning_resolve`). The frontend uses it to show the
+/// "this came from outside the app" confirmation copy and require a typed
+/// extension before enabling Connect; `commands::provisioning_apply` is
+/// the actual enforcement boundary (a compromised/patched frontend can't
+/// skip it by lying about this field) - see that command's doc.
 #[derive(Debug, Clone, Serialize)]
 pub struct ProvisioningPreviewView {
     pub host: String,
@@ -151,16 +161,18 @@ pub struct ProvisioningPreviewView {
     pub display_name: String,
     pub transport_priority: TransportPriority,
     pub has_tls_pin: bool,
+    pub from_deep_link: bool,
 }
 
-impl From<&ProvisioningConfig> for ProvisioningPreviewView {
-    fn from(c: &ProvisioningConfig) -> Self {
+impl ProvisioningPreviewView {
+    pub fn from_config(c: &ProvisioningConfig, from_deep_link: bool) -> Self {
         Self {
             host: c.host.clone(),
             ext: c.ext.clone(),
             display_name: c.display_name.clone(),
             transport_priority: c.transport_priority,
             has_tls_pin: c.tls_pin_sha256.as_deref().is_some_and(|p| !p.is_empty()),
+            from_deep_link,
         }
     }
 }
@@ -177,7 +189,14 @@ impl From<&ProvisioningConfig> for ProvisioningPreviewView {
 /// confirmation screen visible at a time in this UI.
 #[derive(Default)]
 pub struct ProvisioningPending {
-    inner: Mutex<Option<ProvisioningConfig>>,
+    // `bool` = "arrived via a centinelo://provision deep link" (see
+    // `ProvisioningPreviewView::from_deep_link`'s doc) - `set()` (manual
+    // paste) always tags `false`; `set_from_deep_link()` (the OS-launch/
+    // second-instance path) tags `true`. Kept alongside the config rather
+    // than as a separate field so the two can never drift out of sync
+    // under a second resolve overwriting the first (see
+    // `pending_second_resolve_overwrites_first`'s test doc).
+    inner: Mutex<Option<(ProvisioningConfig, bool)>>,
 }
 
 impl ProvisioningPending {
@@ -191,21 +210,46 @@ impl ProvisioningPending {
     /// unrelated panic into losing (or crashing on) a pending provisioning
     /// confirmation (2026-07-16 4R re-review, B2 - was `.expect(...)` on
     /// all three methods).
-    fn lock(&self) -> std::sync::MutexGuard<'_, Option<ProvisioningConfig>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<(ProvisioningConfig, bool)>> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     pub fn set(&self, config: ProvisioningConfig) {
-        *self.lock() = Some(config);
+        *self.lock() = Some((config, false));
     }
 
-    /// Non-consuming read - see `commands::provisioning_pending_preview`
-    /// (R3: lets the frontend catch a preview whose event fired before
-    /// any listener attached) and `commands::provisioning_apply` (R1:
-    /// peek, only `clear()` once the apply has actually succeeded, so a
-    /// failed apply leaves the config available to retry instead of
-    /// forcing a re-paste).
+    /// Same as `set`, but tags the pending config as having arrived via a
+    /// `centinelo://provision` deep link - see `handle_deep_link` (the
+    /// only caller) and `ProvisioningPreviewView::from_deep_link`'s doc for
+    /// why the distinction matters (RISK 4R finding, 2026-08-16).
+    pub fn set_from_deep_link(&self, config: ProvisioningConfig) {
+        *self.lock() = Some((config, true));
+    }
+
+    /// Non-consuming read - see `commands::provisioning_apply` (R1: peek,
+    /// only `clear()` once the apply has actually succeeded, so a failed
+    /// apply leaves the config available to retry instead of forcing a
+    /// re-paste). `provisioning_apply` no longer needs the origin tag (see
+    /// that command's doc, round 2, 2026-08-16 - the confirm_ext check that
+    /// used to need it here turned out to check nothing an attacker didn't
+    /// already control), so this stays the plain accessor;
+    /// `peek_with_origin` below is `provisioning_pending_preview`'s.
     pub fn peek(&self) -> Option<ProvisioningConfig> {
+        self.lock().clone().map(|(config, _)| config)
+    }
+
+    /// Non-consuming read of the pending config plus whether it arrived via
+    /// a `centinelo://provision` deep link, taken under a single lock
+    /// acquisition so a caller that needs both never risks reading them
+    /// from two different pending configs if a second resolve overwrites
+    /// the first in between. Used by `commands::provisioning_pending_preview`
+    /// (R3: lets the frontend catch a preview whose event fired before any
+    /// listener attached) and `handle_deep_link`'s own emitted preview -
+    /// both need `from_deep_link` so `ui/js/app.js`'s confirmation screen
+    /// can show its host warning (see `ProvisioningPreviewView`'s doc and
+    /// `commands::provisioning_apply`'s doc, round 2, for why that warning
+    /// is informed consent, not a check this crate enforces).
+    pub fn peek_with_origin(&self) -> Option<(ProvisioningConfig, bool)> {
         self.lock().clone()
     }
 
@@ -492,22 +536,48 @@ fn validate(config: &ProvisioningConfig) -> Result<(), String> {
 // Deep link entry point (wired from deeplink.rs)
 // ---------------------------------------------------------------------------
 
+/// The line logged once a `centinelo://provision` deep link resolves -
+/// redacted (RISK 4R finding, 2026-08-16, found in the same sweep as
+/// `commands.rs`'s `blf_ipc_log_line`/`blf_teardown_unsubscribe_failed_log_line`
+/// and `sidecar.rs`'s `auto_subscribe_failed_log_line`): `host` identifies
+/// which PBX deployment this machine is being pointed at and `ext`
+/// identifies which real extension, and on this specific path both come
+/// from a `centinelo://provision` link whose config is attacker-controlled
+/// end-to-end (see this module's doc and `commands::provisioning_apply`'s
+/// doc for the full threat model), so the log line is exactly the audit
+/// trail an attacker would want scrubbed - same class of fix as
+/// `bridge.rs`'s click-to-call handler and `deeplink.rs`'s tel:/centinelo:
+/// handler (`bridge::redacted_log_number`'s doc). `ext` is a short numeric
+/// extension like a BLF-monitored one, so `redacted_log_number` fits;
+/// `host` isn't digits, so it uses the generic `redacted_log_value`
+/// sibling instead. Pulled into its own function (matching `deeplink.rs`'s
+/// `dial_target_log_line` precedent) so the redaction is unit-testable
+/// without spawning the real deep-link thread.
+fn deep_link_resolved_log_line(host: &str, ext: &str) -> String {
+    format!(
+        "provisioning: deep link resolved for host={} ext={}",
+        crate::bridge::redacted_log_value(host),
+        crate::bridge::redacted_log_number(ext)
+    )
+}
+
 /// Called from `deeplink.rs`'s `handle_url` for a `centinelo://provision`
 /// link - the OS-launch/second-instance path, not the paste-a-link
 /// onboarding field. Runs the resolve (which may block on a network fetch)
 /// on its own thread so it never stalls the deep-link callback itself,
-/// then emits the same secret-free preview the paste flow's
-/// `commands::provisioning_resolve` returns directly, so
-/// `ui/js/app.js`'s confirmation screen doesn't need to know which path a
-/// given confirmation came from - see that file's
-/// `showProvisioningConfirm`.
+/// then emits the same secret-free preview shape the paste flow's
+/// `commands::provisioning_resolve` returns directly (`from_deep_link` is
+/// the one field that actually differs - see `ProvisioningPreviewView`'s
+/// doc), so `ui/js/app.js`'s confirmation screen only branches on that one
+/// flag, not on which path a given confirmation came from - see that
+/// file's `showProvisioningConfirm`.
 pub fn handle_deep_link(app: AppHandle, url: url::Url) {
     std::thread::spawn(move || {
         match resolve_input(url.as_str()) {
             Ok(config) => {
-                let preview = ProvisioningPreviewView::from(&config);
+                let preview = ProvisioningPreviewView::from_config(&config, true);
                 if let Some(pending) = app.try_state::<ProvisioningPending>() {
-                    pending.set(config);
+                    pending.set_from_deep_link(config);
                 } else {
                     // Shouldn't happen (lib.rs manages this before
                     // deeplink::setup runs) - fails safe by not emitting a
@@ -519,7 +589,7 @@ pub fn handle_deep_link(app: AppHandle, url: url::Url) {
                     );
                     return;
                 }
-                log::info!("provisioning: deep link resolved for host={} ext={}", preview.host, preview.ext);
+                log::info!("{}", deep_link_resolved_log_line(&preview.host, &preview.ext));
                 let _ = app.emit(EVENT_PREVIEW, &preview);
                 crate::tray::show_and_focus(&app);
             }
@@ -810,7 +880,7 @@ mod tests {
     fn preview_never_carries_secret_or_pin_value() {
         let mut cfg = valid_config();
         cfg.tls_pin_sha256 = Some("AA".repeat(32));
-        let preview = ProvisioningPreviewView::from(&cfg);
+        let preview = ProvisioningPreviewView::from_config(&cfg, false);
         // Compile-time guarantee too (ProvisioningPreviewView has no
         // `secret`/`tls_pin_sha256` field at all) - this assertion is
         // just the runtime half: the flag is set, no value leaks with it.
@@ -818,6 +888,41 @@ mod tests {
         let json = serde_json::to_string(&preview).unwrap();
         assert!(!json.contains("s3cret"));
         assert!(!json.contains(&"AA".repeat(32)));
+    }
+
+    // ---- deep_link_resolved_log_line (RISK 4R finding, 2026-08-16) -------
+    //
+    // Exercises the real function `handle_deep_link` calls to build its log
+    // line - not a parallel reimplementation - so reverting that call site
+    // back to raw `preview.host`/`preview.ext` interpolation breaks these
+    // tests directly.
+
+    #[test]
+    fn deep_link_resolved_log_line_never_contains_the_raw_host_or_ext() {
+        let line = deep_link_resolved_log_line("pbx.example.test", "1100");
+        assert!(!line.contains("pbx.example.test"), "log line leaked the raw host: {line}");
+        assert!(!line.contains("1100"), "log line leaked the raw extension: {line}");
+        assert!(line.contains("provisioning: deep link resolved"));
+    }
+
+    #[test]
+    fn deep_link_resolved_log_line_is_stable_for_the_same_host_and_ext() {
+        // Matches `redacted_log_number`'s own "same input -> same
+        // fingerprint" guarantee - a support engineer reading two log
+        // lines with matching fingerprints can tell it's the same deep
+        // link retried, without either ever touching disk in the clear.
+        assert_eq!(
+            deep_link_resolved_log_line("pbx.example.test", "1100"),
+            deep_link_resolved_log_line("pbx.example.test", "1100")
+        );
+    }
+
+    #[test]
+    fn deep_link_resolved_log_line_differs_for_a_different_host() {
+        assert_ne!(
+            deep_link_resolved_log_line("pbx.example.test", "1100"),
+            deep_link_resolved_log_line("attacker.example.invalid", "1100")
+        );
     }
 
     // ---- ProvisioningPending ---------------------------------------------
@@ -861,6 +966,37 @@ mod tests {
         assert_eq!(pending.peek(), Some(valid_config())); // still there
         pending.clear();
         assert_eq!(pending.peek(), None);
+    }
+
+    #[test]
+    fn set_from_deep_link_tags_the_origin_manual_paste_does_not() {
+        // The one bit the confirmation screen's host warning branches on
+        // (`ProvisioningPreviewView::from_deep_link` - see
+        // `commands::provisioning_apply`'s doc, round 2, for why this is
+        // informed consent and not an enforced check) - a manual paste
+        // (`set`) must never be tagged as needing that warning the way a
+        // deep link (`set_from_deep_link`) is.
+        let pending = ProvisioningPending::default();
+        pending.set(valid_config());
+        assert_eq!(pending.peek_with_origin().map(|(_, from_deep_link)| from_deep_link), Some(false));
+
+        pending.set_from_deep_link(valid_config());
+        assert_eq!(pending.peek_with_origin().map(|(_, from_deep_link)| from_deep_link), Some(true));
+    }
+
+    #[test]
+    fn a_manual_paste_after_a_deep_link_clears_the_deep_link_tag() {
+        // Same overwrite behavior `pending_second_resolve_overwrites_first`
+        // covers for the config itself, but for the origin tag: a second
+        // resolve must replace the origin, not just the config, or a
+        // deep-link-sourced pending config could survive as
+        // `from_deep_link` after being "overwritten" by a manual paste -
+        // silently showing the host warning for a config the operator
+        // actually pasted themselves.
+        let pending = ProvisioningPending::default();
+        pending.set_from_deep_link(valid_config());
+        pending.set(valid_config());
+        assert_eq!(pending.peek_with_origin().map(|(_, from_deep_link)| from_deep_link), Some(false));
     }
 
     // ---- is_provision_link -------------------------------------------

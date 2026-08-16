@@ -27,10 +27,18 @@
 //! out-of-scope path exactly like it would from the real UI, not that it
 //! succeeds without a real transcript on disk),
 //! `provisioning_resolve:<link>` (auto-provisioning, spec §5 - see
-//! provisioning.rs; `<link>` is passed through unencoded, so a
-//! `centinelo://provision?config=...` link's base64url payload is fine
-//! as-is, but avoid a link containing a literal `|` - this driver's own
-//! step separator), `provisioning_apply`, `provisioning_cancel`,
+//! provisioning.rs - the *manual paste* command; always tags the pending
+//! config `from_deep_link=false`) / `deep_link:<link>` (same resolve, but
+//! via `provisioning::handle_deep_link` - the OS-scheme-handler path,
+//! tags the pending config `from_deep_link=true` so a script can confirm
+//! `provisioning_pending_preview`'s `from_deep_link` flag comes back set -
+//! `commands::provisioning_apply`'s doc, round 2, has the full reasoning
+//! for why that flag drives an informed-consent UI warning and not an
+//! enforced check; needs a `wait:` after it before the next step, see
+//! that step's own comment below) - `<link>` is passed through unencoded,
+//! so a `centinelo://provision?config=...` link's base64url payload is
+//! fine as-is, but avoid a link containing a literal `|` - this driver's
+//! own step separator), `provisioning_apply`, `provisioning_cancel`,
 //! `admin_set_password:<password>` (sets/changes the admin password and
 //! leaves the session unlocked on success, same as the real
 //! `admin_set_password` command - lets a script reach an admin-gated step
@@ -249,6 +257,32 @@ pub fn maybe_run_e2e_script(app: &AppHandle) {
                 match commands::provisioning_resolve(provisioning, link.to_string()) {
                     Ok(preview) => log::info!("e2e: provisioning_resolve -> ok, preview={preview:?}"),
                     Err(e) => log::info!("e2e: provisioning_resolve -> err: {e}"),
+                }
+            } else if let Some(link) = step.strip_prefix("deep_link:") {
+                // Drives `provisioning::handle_deep_link` directly - the
+                // OS-scheme-handler path `provisioning_resolve` above never
+                // exercises (that's the manual-paste command, which always
+                // tags a pending config `from_deep_link=false` -
+                // `ProvisioningPending::set` vs `set_from_deep_link`). Added
+                // 2026-08-16 so a script can confirm
+                // `provisioning_pending_preview`'s `from_deep_link` comes
+                // back `true` for a deep-link-sourced config (drives
+                // `ui/js/app.js`'s host warning - see
+                // `commands::provisioning_apply`'s doc, round 2, for why
+                // that's informed consent, not something this crate
+                // enforces) without triggering a real OS deep link.
+                // `handle_deep_link` runs on its own spawned thread and
+                // returns immediately - a script needs its own `wait:`
+                // after this step before `provisioning_pending_preview` to
+                // give that thread time to finish resolving (matches this
+                // driver's existing fire-and-forget steps, e.g.
+                // `list_devices`).
+                match url::Url::parse(link) {
+                    Ok(url) => {
+                        crate::provisioning::handle_deep_link(app.clone(), url);
+                        log::info!("e2e: deep_link -> dispatched");
+                    }
+                    Err(e) => log::error!("e2e: deep_link -> bad url: {e}"),
                 }
             } else if step == "provisioning_apply" {
                 let settings: tauri::State<std::sync::Arc<crate::settings::SettingsStore>> = app.state();

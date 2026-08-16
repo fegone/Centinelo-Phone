@@ -1152,6 +1152,16 @@ fn favorites_to_auto_subscribe(settings: &AppSettings) -> Vec<String> {
         .collect()
 }
 
+/// The line logged when the favorites auto-subscribe (just above) fails to
+/// subscribe one extension on a fresh "registered" transition - redacted
+/// (RISK 4R finding, 2026-08-16), same reasoning and same fix shape as
+/// `commands.rs`'s `blf_teardown_unsubscribe_failed_log_line`/
+/// `blf_ipc_log_line`: a monitored BLF extension is a real person's
+/// identifier, not safe in plaintext in the persistent on-disk log.
+fn auto_subscribe_failed_log_line(ext: &str, err: &str) -> String {
+    format!("sidecar: blf_subscribe({}) failed: {err}", crate::bridge::redacted_log_number(ext))
+}
+
 /// Shared implementation of [`SidecarHandle::emit_notice`] - a free
 /// function (same reason as `send_cmd_raw`/`blf_subscribe_raw` below) so
 /// `supervisor_loop` (which only ever holds the inner `Arc<Shared>`, spawned
@@ -1508,7 +1518,7 @@ fn spawn_stdout_reader(
                     // SIP SUBSCRIBE (RFC 4235). See favorites_to_auto_subscribe.
                     for ext in favorites_to_auto_subscribe(&shared.settings.snapshot()) {
                         if let Err(e) = blf_subscribe_raw(&shared, &ext) {
-                            log::warn!("sidecar: blf_subscribe({ext}) failed: {e}");
+                            log::warn!("{}", auto_subscribe_failed_log_line(&ext, &e));
                         }
                     }
                     // Availability/auto-answer (shell task, 2b): a fresh
@@ -2907,5 +2917,22 @@ mod blf_gating_tests {
     #[test]
     fn default_on_with_empty_slots_subscribes_nothing() {
         assert!(favorites_to_auto_subscribe(&AppSettings::default()).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod auto_subscribe_failed_log_line_tests {
+    // RISK 4R finding (2026-08-16) - see `auto_subscribe_failed_log_line`'s
+    // own doc and `commands.rs`'s `blf_log_redaction_tests` module doc for
+    // why this exercises the real call site's log-line function rather
+    // than just `bridge::redacted_log_number` in isolation.
+    use super::auto_subscribe_failed_log_line;
+
+    #[test]
+    fn never_contains_the_raw_extension() {
+        let line = auto_subscribe_failed_log_line("1100", "engine unreachable");
+        assert!(!line.contains("1100"), "log line leaked the raw extension: {line}");
+        assert!(line.contains("sidecar: blf_subscribe"));
+        assert!(line.contains("engine unreachable"));
     }
 }

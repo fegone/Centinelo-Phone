@@ -40,6 +40,7 @@ import {
   renderUpdaterAboutStatus,
 } from "./updater.js";
 import { computeBlfUiHidden, BLF_UI_TARGETS } from "./blf-ui.js";
+import { computeDeepLinkWarning } from "./provisioning-confirm.js";
 import {
   describeCodec,
   buildCodecState,
@@ -507,6 +508,15 @@ function showProvisioningConfirm(preview) {
   $("prov-confirm-ext").textContent = extLabel;
   const transportLabel = PROV_TRANSPORT_LABEL_KEY[preview.transport_priority] ? t(PROV_TRANSPORT_LABEL_KEY[preview.transport_priority]) : preview.transport_priority;
   $("prov-confirm-transport").textContent = preview.has_tls_pin ? t("provisioning.tlsPinIncluded", { transport: transportLabel }) : transportLabel;
+  // Deep-link informed-consent warning - see provisioning-confirm.js's
+  // module doc (RISK 4R finding, 2026-08-16, round 2) for the full
+  // reasoning, including why round 1's typed "confirm the extension"
+  // field was removed (it validated nothing an attacker didn't already
+  // control). computeDeepLinkWarning is pure/unit-tested
+  // (provisioning-confirm.test.js); this is just the DOM applier over it.
+  const dlw = computeDeepLinkWarning(preview);
+  $("prov-confirm-host").classList.toggle("deep-link-warn", dlw.hostWarnClass);
+  $("prov-confirm-deep-link-warning").hidden = dlw.warningHidden;
   $("prov-confirm-error").hidden = true;
   $("provision-confirm-overlay").hidden = false;
 }

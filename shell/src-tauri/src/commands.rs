@@ -293,11 +293,25 @@ pub fn set_blf_enabled(
     if !enabled {
         for ext in crate::sidecar::blf_teardown_targets(&sidecar.subscribed_exts()) {
             if let Err(e) = sidecar.blf_unsubscribe(&ext) {
-                log::warn!("set_blf_enabled: blf_unsubscribe({ext}) failed: {e}");
+                log::warn!("{}", blf_teardown_unsubscribe_failed_log_line(&ext, &e));
             }
         }
     }
     settings.update_blf_enabled(enabled).map_err(|e| e.to_string())
+}
+
+/// The line logged when `set_blf_enabled(false)`'s best-effort teardown
+/// fails to unsubscribe one extension - redacted (RISK 4R finding,
+/// 2026-08-16): a monitored BLF extension identifies a real person (see
+/// this file's own doc on `favorites`, admin-locked for exactly that
+/// reason), so it doesn't belong in plaintext in the persistent on-disk
+/// log any more than a dialed number does - same fix shape as
+/// `bridge::redacted_log_number`'s two original call sites. Pulled into
+/// its own function (matching `deeplink.rs`'s `dial_target_log_line`
+/// precedent) so the redaction is unit-testable without a mock
+/// `SidecarHandle`.
+fn blf_teardown_unsubscribe_failed_log_line(ext: &str, err: &str) -> String {
+    format!("set_blf_enabled: blf_unsubscribe({}) failed: {err}", crate::bridge::redacted_log_number(ext))
 }
 
 // ---- audio devices (real-audio-devices fix; NOT admin-gated as of the
@@ -993,7 +1007,7 @@ pub fn provisioning_resolve(
     input: String,
 ) -> Result<crate::provisioning::ProvisioningPreviewView, String> {
     let config = crate::provisioning::resolve_input(&input)?;
-    let preview = crate::provisioning::ProvisioningPreviewView::from(&config);
+    let preview = crate::provisioning::ProvisioningPreviewView::from_config(&config, false);
     provisioning.set(config);
     Ok(preview)
 }
@@ -1017,7 +1031,9 @@ pub fn provisioning_resolve(
 pub fn provisioning_pending_preview(
     provisioning: State<crate::provisioning::ProvisioningPending>,
 ) -> Option<crate::provisioning::ProvisioningPreviewView> {
-    provisioning.peek().as_ref().map(crate::provisioning::ProvisioningPreviewView::from)
+    provisioning
+        .peek_with_origin()
+        .map(|(c, from_deep_link)| crate::provisioning::ProvisioningPreviewView::from_config(&c, from_deep_link))
 }
 
 /// Admin-gated *unless* this is the very first provisioning on a clean
@@ -1032,6 +1048,57 @@ pub fn provisioning_pending_preview(
 /// same `require_unlocked` check `save_account_settings` already applies
 /// to a manual account edit - provisioning isn't a lesser-privileged way
 /// to change the account than typing it in by hand.
+///
+/// **RISK 4R finding, 2026-08-16, round 2**: the *unlocked* branch above -
+/// deliberately, for the clean-install case - is a real gap. A
+/// `centinelo://provision` link is reachable from any email or webpage
+/// (`deeplink.rs`'s `handle_url` registers the OS scheme unconditionally),
+/// and its `config=` form carries `host`/`ext`/`secret`/`tls_pin_sha256`
+/// inline with no fetch and nothing to verify their origin - so on a
+/// freshly installed, not-yet-configured machine, one click on a crafted
+/// link followed by one click on "Connect" repoints the phone at an
+/// attacker's PBX, no admin password involved because none exists yet.
+///
+/// **This command does not close that gap, and doesn't pretend to.** The
+/// round-1 fix here required the caller to also pass the pending config's
+/// own `ext` back as a `confirm_ext` parameter, typed into a field the
+/// confirmation screen left empty - the idea being that a phishing link
+/// couldn't "know" the extension the operator was expecting. That idea was
+/// wrong: `ext` comes from the **same attacker-controlled config** as
+/// `host`/`secret`, so the attacker already knows exactly what the
+/// "correct" answer is (they wrote it into the link) and can simply say so
+/// in the phishing message itself ("your assigned extension is 4521,
+/// please confirm it below"). A check against a value the same party
+/// supplies both the config *and* (via whatever channel delivered the
+/// link) the confirmation for isn't a security boundary - it's a second
+/// click with extra steps. Caught in round-2 review before merge (the
+/// preview screen was independently also showing the very value the field
+/// asked the operator to retype, which would have made this even more
+/// obviously pointless, but removing that display wouldn't have fixed the
+/// underlying problem: the attacker doesn't need the app to show them
+/// their own chosen value back).
+///
+/// Signing the deep-link payload would close this properly - a signature
+/// the attacker can't produce is a boundary neither party's message can
+/// forge - but that needs a signing key that doesn't exist yet (same
+/// offline-key-ceremony shape as the updater's own signing key - see that
+/// key's own doc) and is out of this fix's scope. Full admin-lock isn't an
+/// option either - it would strand the exact clean-install case this
+/// command carves out unlocked in the first place.
+///
+/// What ships instead is **informed consent, not authentication**: the
+/// confirmation screen (`ui/js/app.js` `showProvisioningConfirm`) shows a
+/// prominent warning specifically for a deep-link-sourced pending config
+/// (`ProvisioningPreviewView::from_deep_link`, still tracked - see
+/// `provisioning::ProvisioningPending`) naming the host the phone is about
+/// to be pointed at and saying plainly that the link came from outside the
+/// app. That's real signal - a host string is comparatively hard to spoof
+/// convincingly inside a *specific* phishing narrative the way a bare
+/// extension number is - but it is friction against a blind click-through,
+/// not a technical control this command enforces. There is deliberately no
+/// second `commands.rs` check to bypass here: the honest state of this gap
+/// is "closable only by a signed payload that doesn't exist yet," and this
+/// doc says so instead of a check that only looked like one.
 #[tauri::command(rename_all = "snake_case")]
 pub fn provisioning_apply(
     settings: State<Arc<SettingsStore>>,
@@ -1335,14 +1402,24 @@ pub fn sidecar_blf_subscribe(sidecar: State<SidecarHandle>, ext: String) -> Resu
     // distinct from sidecar.rs's favorites auto-subscribe, which never
     // goes through this `#[tauri::command]` at all (it calls
     // `blf_subscribe_raw` directly from the stdout-reader thread).
-    log::info!("commands: sidecar_blf_subscribe({ext}) invoked over IPC");
+    log::info!("{}", blf_ipc_log_line("sidecar_blf_subscribe", &ext));
     sidecar.blf_subscribe(&ext)
 }
 
 #[tauri::command(rename_all = "snake_case")]
 pub fn sidecar_blf_unsubscribe(sidecar: State<SidecarHandle>, ext: String) -> Result<(), String> {
-    log::info!("commands: sidecar_blf_unsubscribe({ext}) invoked over IPC");
+    log::info!("{}", blf_ipc_log_line("sidecar_blf_unsubscribe", &ext));
     sidecar.blf_unsubscribe(&ext)
+}
+
+/// The e2e-evidence-trail line `sidecar_blf_subscribe`/
+/// `sidecar_blf_unsubscribe` log on every IPC invocation - redacted (RISK
+/// 4R finding, 2026-08-16), see `blf_teardown_unsubscribe_failed_log_line`'s
+/// doc for the "why" (same reasoning, same fix shape). `command_name` is a
+/// static string literal at both call sites, never operator input - no
+/// redaction concern there.
+fn blf_ipc_log_line(command_name: &str, ext: &str) -> String {
+    format!("commands: {command_name}({}) invoked over IPC", crate::bridge::redacted_log_number(ext))
 }
 
 // ---- transcription (F4) -----------------------------------------------
@@ -2131,5 +2208,45 @@ mod remote_stt_probe_tests {
         let result = probe_remote_stt("http://127.0.0.1:1", RemoteBackend::Centinelo, None);
         assert!(!result.ok);
         assert_eq!(result.code, "network");
+    }
+}
+
+#[cfg(test)]
+mod blf_log_redaction_tests {
+    // RISK 4R finding (2026-08-16): a monitored BLF extension is a real
+    // person's identifier (see `set_blf_enabled`'s own doc on `favorites`),
+    // and four call sites across commands.rs/sidecar.rs were writing it in
+    // plaintext to the persistent on-disk log. Fixed by routing every one
+    // of them through `bridge::redacted_log_number` - these tests exercise
+    // the *actual* log-line-building functions each fixed call site now
+    // calls (not a parallel reimplementation), so reverting any one call
+    // site back to raw interpolation breaks the matching test here, not
+    // just `bridge::tests::redacted_log_number_never_contains_the_digits`
+    // (which only proves the primitive itself is safe, not that any given
+    // call site actually uses it).
+    use super::{blf_ipc_log_line, blf_teardown_unsubscribe_failed_log_line};
+
+    const REAL_EXT: &str = "1100";
+
+    #[test]
+    fn blf_teardown_unsubscribe_failed_line_never_contains_the_extension() {
+        let line = blf_teardown_unsubscribe_failed_log_line(REAL_EXT, "timeout");
+        assert!(!line.contains(REAL_EXT), "log line leaked the raw extension: {line}");
+        assert!(line.contains("set_blf_enabled"));
+        assert!(line.contains("timeout"));
+    }
+
+    #[test]
+    fn blf_ipc_subscribe_line_never_contains_the_extension() {
+        let line = blf_ipc_log_line("sidecar_blf_subscribe", REAL_EXT);
+        assert!(!line.contains(REAL_EXT), "log line leaked the raw extension: {line}");
+        assert!(line.contains("sidecar_blf_subscribe"));
+    }
+
+    #[test]
+    fn blf_ipc_unsubscribe_line_never_contains_the_extension() {
+        let line = blf_ipc_log_line("sidecar_blf_unsubscribe", REAL_EXT);
+        assert!(!line.contains(REAL_EXT), "log line leaked the raw extension: {line}");
+        assert!(line.contains("sidecar_blf_unsubscribe"));
     }
 }
