@@ -66,6 +66,8 @@ import {
 import { logMilestone, reportFrontendIssue } from "./error-reporting.js";
 import { initConsolePanel, openConsolePanel, closeConsolePanel } from "./console-panel.js";
 import { SETTINGS_FIELD_GROUPS, summarizeSettledResults, runSettingsPaintSteps, describeError } from "./settings-load.js";
+import { resolveClipboardCopyOutcome } from "./clipboard-copy.js";
+import { shouldFinalizeClosedCall } from "./call-lifecycle.js";
 
 // `Channel` (updater download progress) and `Resource` both live on
 // window.__TAURI__.core alongside `invoke` - withGlobalTauri bundles the
@@ -817,7 +819,12 @@ function renderTranscriptScreenBody() {
           await navigator.clipboard.writeText(text);
           showBanner(t("transcript.copiedToClipboard"), "info");
         } catch (e) {
-          console.error("clipboard write failed", e);
+          // UI-silent-failures audit (2026-08-16, hallazgo #3): this used
+          // to only console.error - no banner, no on-disk log line, so a
+          // "Copy" click that silently did nothing left no trace anywhere
+          // an operator (or later diagnosis) could see.
+          showBanner(t("transcript.copyFailed"), "err");
+          reportFrontendIssue("transcript_copy_failed", { message: describeError(e) });
         }
       },
       onShowFolder: revealInFileManager,
@@ -1076,9 +1083,23 @@ function handleCallState(evt) {
       maybeAutoStartTranscript(state.call.callId, state.call.peer, state.call.direction);
       break;
     case "closed":
-      maybeTranscriptCallEnded(callId);
-      finalizeClosedCall();
-      renderAll();
+      // UI-silent-failures audit (2026-08-16, hallazgo #5): this used to
+      // call finalizeClosedCall() unconditionally - it tears down
+      // whatever is CURRENTLY in state.call, without ever comparing this
+      // event's own call_id against it. state.call is a single-slot
+      // mirror, but the engine is not single-call by design (see
+      // call-lifecycle.js's header comment for the full reasoning:
+      // attended_transfer's held source + consultation call, and plain
+      // call waiting via a second inbound INVITE, both legitimately put a
+      // SECOND call_id in play on this UA - and the "incoming" case just
+      // above already unconditionally overwrites state.call with it). A
+      // closed event for a call that ISN'T the one on screen must not
+      // wipe the one that is.
+      maybeTranscriptCallEnded(callId); // safe unconditionally - already compares against state.transcript's own callId
+      if (shouldFinalizeClosedCall(state.call, callId)) {
+        finalizeClosedCall();
+        renderAll();
+      }
       return;
     default:
       break;
@@ -3053,9 +3074,21 @@ function wireStaticHandlers() {
   });
 
   $("btn-save-settings").addEventListener("click", saveAccountSettings);
-  $("btn-restart-engine").addEventListener("click", () => {
-    invoke("sidecar_restart");
+  // UI-silent-failures audit (2026-08-16, hallazgo #1): this used to be a
+  // bare `invoke(...)` with no `.catch` at all, immediately followed by an
+  // unconditional "Restarting…" banner - a rejected restart (engine binary
+  // missing, sidecar already mid-restart, ...) left the operator reading a
+  // success message forever, with nothing in the log either. Same
+  // "reportFrontendIssue + honest banner" shape this session's other
+  // fixes use.
+  $("btn-restart-engine").addEventListener("click", async () => {
     showBanner(t("settings.restarting"), "info");
+    try {
+      await invoke("sidecar_restart");
+    } catch (e) {
+      showBanner(t("settings.restartFailed", { error: describeError(e) }), "err");
+      reportFrontendIssue("sidecar_restart_failed", { message: describeError(e) });
+    }
   });
 
   $("btn-activate-license").addEventListener("click", async () => {
@@ -3212,25 +3245,65 @@ function wireStaticHandlers() {
   });
 
   // ---- click-to-call bridge settings ---------------------------------
+  // UI-silent-failures audit (2026-08-16, hallazgo #4): this used to
+  // always paint "Copied." after the try/catch, whether or not the copy
+  // actually happened - the async Clipboard API rejecting AND the
+  // execCommand fallback returning false (or throwing) both fell through
+  // to the same success text. This token gates the click-to-call bridge's
+  // own pairing; a user who believes it's on their clipboard and pastes
+  // something stale into the extension has nothing telling them
+  // otherwise. resolveClipboardCopyOutcome (clipboard-copy.js) is the
+  // testable decision; this handler only reports what actually happened
+  // to it.
   $("btn-copy-token").addEventListener("click", async () => {
     const token = $("bridge-token").value;
     const statusEl = $("copy-token-status");
+    let asyncOk = false;
+    let fallbackAttempted = false;
+    let fallbackOk = false;
     try {
       await navigator.clipboard.writeText(token);
+      asyncOk = true;
     } catch (e) {
       // Fallback if the webview didn't grant the async Clipboard API.
-      const input = $("bridge-token");
-      input.removeAttribute("readonly");
-      input.select();
-      document.execCommand("copy");
-      input.setAttribute("readonly", "");
+      fallbackAttempted = true;
+      try {
+        const input = $("bridge-token");
+        input.removeAttribute("readonly");
+        input.select();
+        fallbackOk = document.execCommand("copy");
+        input.setAttribute("readonly", "");
+      } catch (e2) {
+        fallbackOk = false;
+      }
     }
-    statusEl.textContent = t("settings.copied");
-    statusEl.className = "hint ok";
+    const outcome = resolveClipboardCopyOutcome({ asyncOk, fallbackAttempted, fallbackOk });
+    if (outcome.copied) {
+      statusEl.textContent = t("settings.copied");
+      statusEl.className = "hint ok";
+    } else {
+      statusEl.textContent = t("settings.copyFailed");
+      statusEl.className = "hint err";
+      reportFrontendIssue("bridge_token_copy_failed", { message: "clipboard write and execCommand fallback both failed" });
+    }
     setTimeout(() => {
       statusEl.textContent = "";
     }, 2500);
   });
+  // UI-silent-failures audit (2026-08-16, hallazgo #2): these two rows -
+  // and updater-check-on-startup-row below - paint the CLICKED value
+  // optimistically same as available-row/auto-answer-row do, but unlike
+  // those two (fixed 2026-07-18, see that fix's own comment a bit further
+  // down) never reverted the row on a rejected save: `state.bridge.*`
+  // (the real source of truth this file mirrors) stays on the OLD value
+  // when the invoke() fails, but the row itself stayed painted on the
+  // failed NEW value - a switch showing a position that doesn't match
+  // what Rust actually has saved, exactly the "state duplicated and
+  // diverging from the source of truth" class this workspace's own rule
+  // exists to prevent. Reverting via renderBridgeFields(state.bridge) on
+  // failure repaints both rows from the last known-good state.bridge
+  // (never touched on the failure path - the `if (state.bridge) ...`
+  // mutation above only runs on success).
   document.querySelectorAll("#auto-dial-row button").forEach((b) => {
     b.addEventListener("click", async () => {
       const value = b.dataset.boolChoice === "true";
@@ -3240,6 +3313,7 @@ function wireStaticHandlers() {
         if (state.bridge) state.bridge.auto_dial = value;
       } catch (e) {
         showBanner(String(e), "err");
+        if (state.bridge) renderBridgeFields(state.bridge); // revert auto-dial-row (and tel-handler-row's own paint, harmlessly re-run) to the real, unchanged state.bridge
       }
     });
   });
@@ -3252,6 +3326,7 @@ function wireStaticHandlers() {
         if (state.bridge) state.bridge.register_tel_handler = value;
       } catch (e) {
         showBanner(String(e), "err");
+        if (state.bridge) renderBridgeFields(state.bridge); // revert tel-handler-row to the real, unchanged state.bridge
       }
     });
   });
@@ -3319,6 +3394,11 @@ function wireStaticHandlers() {
         state.updaterCheckOnStartup = value;
       } catch (e) {
         showBanner(String(e), "err");
+        // UI-silent-failures audit (2026-08-16, hallazgo #2): revert to
+        // the real, unchanged state.updaterCheckOnStartup (never touched
+        // on this failure path) instead of leaving the row painted on the
+        // rejected value.
+        setBoolRowUI("updater-check-on-startup-row", state.updaterCheckOnStartup);
       }
     });
   });
