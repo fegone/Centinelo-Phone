@@ -111,10 +111,9 @@ impl PremiumHandle {
             }
         };
         // Needed for `stage_verified_copy` (see `load_premium`'s TOCTOU
-        // note) - the verified library bytes get staged here, never
-        // reloaded from `exe_dir`, which this app cannot assume is a
-        // trusted, single-writer location (on macOS it's commonly
-        // `/Applications/...`, writable by any local admin account).
+        // note for the full reasoning, including why this only narrows
+        // the exposure on macOS and is a no-op on Windows) - the verified
+        // library bytes get staged here, never reloaded from `exe_dir`.
         let app_data_dir = match app.path().app_data_dir() {
             Ok(dir) => dir,
             Err(_) => {
@@ -302,36 +301,60 @@ fn load_premium(
         return Err("signature does not verify");
     }
 
-    // TOCTOU (2026-08-16 security review, RISK: high): `Library::new`
-    // below must load *exactly* the bytes just verified - it must NOT
-    // reopen `lib_path` by path. `exe_dir` is not a single-writer trusted
-    // location: on macOS it's commonly `/Applications/...`, writable by
-    // any local admin account, not just this app's own user, and the
-    // race doesn't need microsecond timing - every app *launch* is
-    // another attempt, so a background loop alternating a legitimate and
-    // a malicious dylib on disk eventually wins regardless of how narrow
-    // the window is. A `Library::new(&lib_path)` here would re-read
-    // `lib_path` from disk a second time, after the signature check
-    // above, which means the bytes that actually get executed are never
-    // guaranteed to be the bytes that were verified.
+    // TOCTOU (2026-08-16 security review, RISK: high; narrowed-not-closed
+    // wording fixed 2026-08-16 round 2 - see the shell-tauri report for
+    // both rounds). `Library::new` below must load *exactly* the bytes
+    // just verified, not reopen `lib_path` by path - a
+    // `Library::new(&lib_path)` here would re-read `lib_path` from disk a
+    // second time, after the signature check above, so the bytes that
+    // actually get executed would never be guaranteed to be the bytes
+    // that were verified. The race doesn't need microsecond timing either:
+    // every app *launch* is another attempt, so a background loop
+    // alternating a legitimate and a malicious dylib on disk eventually
+    // wins regardless of how narrow the window is.
     //
-    // Fix: copy the already-verified `lib_bytes` - the in-memory buffer
-    // above, not a fresh read of `lib_path` - into a private file this
-    // process just created inside `app_data_dir` (never `exe_dir`), then
-    // load *that* file. `app_data_dir` is the same directory
-    // `settings.rs` already trusts to hold the plaintext SIP account
-    // secret (unix mode 0600 via `write_private_file`; ACL-protected the
-    // same way on Windows), so an attacker able to write there could
-    // already do far worse than swap this dylib - staging into it
-    // doesn't introduce a new trust boundary, it reuses the one this app
-    // already depends on.
+    // What staging into `app_data_dir` actually buys - be precise here,
+    // it's easy to overclaim: this does NOT eliminate check-then-use.
+    // `Library::new` below still loads `staged.path` *by path*, a second
+    // filesystem operation after the write, so in the abstract, whoever
+    // can write to `app_data_dir` between that write and this load still
+    // has a race window (the staged filename isn't secret either - the
+    // pid is visible via `ps`, and `next_stage_nonce` starts from 0). What
+    // this change actually does is swap *who* that "whoever" can be:
+    //   - `exe_dir` (the old, buggy target) is not a single-writer
+    //     location on macOS - it's commonly `/Applications/...`, writable
+    //     by any local admin account, not just this app's own user. That
+    //     was the exploitable case: an attacker without this user's
+    //     session, via another admin account, tampering with a dylib this
+    //     user's app would then load and run.
+    //   - `app_data_dir` is writable only by the user running this app -
+    //     the same trust boundary `settings.rs` already depends on for
+    //     the plaintext SIP secret. An attacker who can already write
+    //     there as that user has strictly cheaper, race-free ways in
+    //     (`DYLD_INSERT_LIBRARIES`, reading `settings.json`'s secret
+    //     directly, straight memory injection into this process) - none
+    //     of which need to win a race against `stage_verified_copy`.
+    // So: this narrows the window from "any local admin, no race skill
+    // needed in practice" to "the same user this process already runs
+    // as, who has no reason to bother racing it." That's what closes the
+    // *practically exploitable* case, not TOCTOU as an abstract pattern.
+    //
+    // Windows: `tauri.conf.json`'s `bundle.windows.nsis.installMode` is
+    // `"currentUser"` (see that file, line ~55) - the installer places
+    // this app under `%LOCALAPPDATA%\Programs\...`, already writable by
+    // the same user without admin rights. So on Windows `exe_dir` and
+    // `app_data_dir` sit in the *same* trust boundary already - moving
+    // the load off `exe_dir` buys nothing there. This block is done on
+    // Windows too only for one code path across both OSes, not because
+    // it changes Windows's exposure.
     let staged = stage_verified_copy(app_data_dir, &lib_bytes)?;
 
     // SAFETY: runs the dylib's load-time init code - only reached after
-    // the signature check above succeeded, and loading `staged.path`
-    // (not `lib_path`) closes the TOCTOU window documented above:
-    // `staged.path` holds exactly the bytes that were verified, and
-    // nothing after the verify step ever reads `lib_path` again.
+    // the signature check above succeeded. Loading `staged.path` (not
+    // `lib_path`) is what narrows the TOCTOU window documented above from
+    // "any local admin on the machine" down to "the same user this
+    // process already runs as" (macOS; a no-op on Windows - see that same
+    // comment) - it does not remove the check-then-use shape itself.
     let lib = unsafe { Library::new(&staged.path) }.map_err(|_| "failed to load library")?;
 
     // Best-effort cleanup, not required for correctness: on unix,
