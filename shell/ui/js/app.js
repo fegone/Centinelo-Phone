@@ -3233,6 +3233,20 @@ function wireStaticHandlers() {
       statusEl.textContent = "";
     }, 2500);
   });
+  // UI-silent-failures audit (2026-08-16, hallazgo #2): these two rows -
+  // and updater-check-on-startup-row below - paint the CLICKED value
+  // optimistically same as available-row/auto-answer-row do, but unlike
+  // those two (fixed 2026-07-18, see that fix's own comment a bit further
+  // down) never reverted the row on a rejected save: `state.bridge.*`
+  // (the real source of truth this file mirrors) stays on the OLD value
+  // when the invoke() fails, but the row itself stayed painted on the
+  // failed NEW value - a switch showing a position that doesn't match
+  // what Rust actually has saved, exactly the "state duplicated and
+  // diverging from the source of truth" class this workspace's own rule
+  // exists to prevent. Reverting via renderBridgeFields(state.bridge) on
+  // failure repaints both rows from the last known-good state.bridge
+  // (never touched on the failure path - the `if (state.bridge) ...`
+  // mutation above only runs on success).
   document.querySelectorAll("#auto-dial-row button").forEach((b) => {
     b.addEventListener("click", async () => {
       const value = b.dataset.boolChoice === "true";
@@ -3242,6 +3256,7 @@ function wireStaticHandlers() {
         if (state.bridge) state.bridge.auto_dial = value;
       } catch (e) {
         showBanner(String(e), "err");
+        if (state.bridge) renderBridgeFields(state.bridge); // revert auto-dial-row (and tel-handler-row's own paint, harmlessly re-run) to the real, unchanged state.bridge
       }
     });
   });
@@ -3254,6 +3269,7 @@ function wireStaticHandlers() {
         if (state.bridge) state.bridge.register_tel_handler = value;
       } catch (e) {
         showBanner(String(e), "err");
+        if (state.bridge) renderBridgeFields(state.bridge); // revert tel-handler-row to the real, unchanged state.bridge
       }
     });
   });
@@ -3321,6 +3337,11 @@ function wireStaticHandlers() {
         state.updaterCheckOnStartup = value;
       } catch (e) {
         showBanner(String(e), "err");
+        // UI-silent-failures audit (2026-08-16, hallazgo #2): revert to
+        // the real, unchanged state.updaterCheckOnStartup (never touched
+        // on this failure path) instead of leaving the row painted on the
+        // rejected value.
+        setBoolRowUI("updater-check-on-startup-row", state.updaterCheckOnStartup);
       }
     });
   });
