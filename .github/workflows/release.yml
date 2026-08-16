@@ -164,7 +164,7 @@ jobs:
           echo "Resolved release version=$RAW tag=centinelo-v$RAW"
 
       - name: Checkout the exact tagged commit
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: refs/tags/${{ steps.resolve-version.outputs.tag }}
 
@@ -288,7 +288,7 @@ jobs:
           fi
           echo "OK: all Apple notarization secrets are configured (values never printed)."
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: refs/tags/${{ needs.preflight.outputs.tag }}
           submodules: recursive
@@ -381,7 +381,7 @@ jobs:
 
       # --- shell/: version stamp + Tauri build + core-engine injection ---
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           # Matches shell-build.yml's own node-version - kept in lockstep
           # with that workflow rather than "whatever's current" so a Node
@@ -728,7 +728,7 @@ jobs:
           echo "OK: dmg + app.tar.gz + app.tar.gz.sig all present and non-empty"
 
       - name: Upload macOS release assets
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-assets-macos
           path: |
@@ -801,7 +801,7 @@ jobs:
       # pipeline, not just convenience.
       VCPKG_REF: "2026.07.29"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: refs/tags/${{ needs.preflight.outputs.tag }}
           submodules: recursive
@@ -821,7 +821,7 @@ jobs:
         # if this job's opus triplet/build flags ever change without the
         # VCPKG_REF pin also changing.
         id: vcpkg-cache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: vcpkg
           key: vcpkg-opus-x64-windows-static-md-${{ env.VCPKG_REF }}-opus-port-v1
@@ -965,7 +965,7 @@ jobs:
           done
           echo "OK: re + baresip(+ctrl_json, +ausine, +aufile, +ice, +dtls_srtp, +wasapi, +opus) built on Windows"
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           # Kept identical to the macOS job's own node-version above and to
           # shell-build.yml's - see that step's comment.
@@ -1285,7 +1285,7 @@ jobs:
           find dist/windows-assets -type f
 
       - name: Upload Windows release assets
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-assets-windows
           path: dist/windows-assets/*
@@ -1313,20 +1313,20 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: refs/tags/${{ needs.preflight.outputs.tag }}
 
       - name: Download macOS release assets
         if: ${{ needs.build-macos.result == 'success' }}
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: release-assets-macos
           path: dist/macos
 
       - name: Download Windows release assets
         if: ${{ needs.build-windows.result == 'success' }}
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: release-assets-windows
           path: dist/windows
