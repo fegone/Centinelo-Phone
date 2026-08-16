@@ -16,6 +16,7 @@ mod key_gate_tests;
 mod premium;
 mod profile_cleanup;
 mod provisioning;
+mod secret_store;
 mod settings;
 mod sidecar;
 mod sync_ext;

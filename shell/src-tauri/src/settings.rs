@@ -1,10 +1,16 @@
 //! Settings persistence for Centinelo Phone.
 //!
 //! Everything lives in one JSON file in the Tauri app-data directory
-//! (`settings.json`). The SIP `secret` field is the only sensitive value we
-//! ever hold, and it is stored the same way the v1 Electron app stored it
-//! (plaintext, in a settings file that lives under the OS's per-user
-//! application-data directory, never in the repo, never logged). It is
+//! (`settings.json`), EXCEPT the SIP `secret`. That field used to live in
+//! this same file, in cleartext, the same way the v1 Electron app stored
+//! it - fine against other users of the machine (the file is 0600), not
+//! fine against anything that reads this user's own profile wholesale (a
+//! backup tool, a sync client). It now lives in the OS's own per-user
+//! credential store instead (macOS Keychain / Windows Credential Manager -
+//! see `secret_store.rs`), with `settings.json` demoted to a fallback that
+//! only ever holds the secret when the credential store couldn't be
+//! reached (see `SettingsStore::persist`'s `secret_synced` check, and
+//! `SettingsStore::load`'s migration of any legacy plaintext copy). It is
 //! *never* written anywhere else: not to logs, not to a second file, not
 //! into the child process's environment (see sidecar.rs for why the scratch
 //! `accounts` file baresip itself reads is the one documented exception,
@@ -13,12 +19,14 @@
 //! The admin password is never stored in any recoverable form: only its
 //! Argon2 hash (see `hash_password`/`verify_password`).
 
+use crate::secret_store::{default_secret_store, verified_set, SecretStore};
 use crate::sync_ext::PoisonRecover;
 use argon2::password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 pub const SETTINGS_FILE: &str = "settings.json";
@@ -843,10 +851,41 @@ pub struct SettingsStore {
     path: PathBuf,
     recents_path: PathBuf,
     inner: Mutex<AppSettings>,
+    /// Where the SIP secret actually lives - see `secret_store.rs`'s
+    /// module doc. Picked once at `load()` time (real OS store, unless
+    /// `CENTINELO_E2E_SECRET_STORE=memory` overrides it).
+    secret_store: Box<dyn SecretStore>,
+    /// `true` once the in-memory `account.secret` is known to also be
+    /// safely held by `secret_store` - meaning `persist()` can scrub the
+    /// on-disk copy. Starts `true` (the common case: either there was
+    /// nothing to migrate, or the migration/lookup at `load()` time
+    /// succeeded) and only ever flips to `false` when a `secret_store`
+    /// write fails while a non-empty secret is sitting in memory - see
+    /// `persist()` and `update_account()` for the two places this
+    /// matters. Deliberately NOT reset to `true` by a failed *read* (see
+    /// `load()`'s `Err` branch on `secret_store.get()`): a read failure
+    /// with an already-empty in-memory secret has nothing that would be
+    /// unsafe to scrub, so the flag's default of `true` is already
+    /// correct there.
+    secret_synced: AtomicBool,
 }
 
 impl SettingsStore {
     pub fn load(app_data_dir: &Path) -> std::io::Result<Self> {
+        Self::load_with_store(app_data_dir, default_secret_store())
+    }
+
+    /// The actual body of `load()`, parameterized over which `SecretStore`
+    /// to migrate into / read from. `load()` above always passes
+    /// `default_secret_store()` (the real OS store, unless
+    /// `CENTINELO_E2E_SECRET_STORE=memory` overrides it) - this split
+    /// exists purely so this module's own tests can inject a
+    /// `FailingSecretStore` double and exercise the "the credential store
+    /// itself is unreachable" branch deterministically, without either
+    /// touching a real OS keychain or depending on the `memory` env-var
+    /// escape hatch (which, by construction, never fails - see
+    /// `secret_store.rs`'s `MemorySecretStore`).
+    fn load_with_store(app_data_dir: &Path, secret_store: Box<dyn SecretStore>) -> std::io::Result<Self> {
         fs::create_dir_all(app_data_dir)?;
         let path = app_data_dir.join(SETTINGS_FILE);
         let recents_path = app_data_dir.join(RECENTS_FILE);
@@ -870,10 +909,103 @@ impl SettingsStore {
             dirty = true;
         }
 
+        // ---- SIP secret: move it into the OS credential store ---------
+        //
+        // Three cases land here, and this block's whole job is to leave
+        // `settings.account.secret` holding the right in-memory value
+        // for the rest of the app (sidecar.rs reads it unchanged via
+        // `snapshot().account.secret`) while deciding whether the
+        // on-disk copy is safe to scrub (`secret_synced`, checked by
+        // `persist()` below):
+        //
+        // 1. **Legacy plaintext found** (`file_secret` non-empty) - either
+        //    an existing install from before this fix, or a settings.json
+        //    written by `update_account`'s own on-disk fallback path
+        //    (see that method's doc) after a previous keystore failure.
+        //    Try to move it into the store now, via `verified_set` - NOT
+        //    a bare `set()` (2026-08-16 round 2 of review, S1): `set()`
+        //    returning `Ok(())` is not proof the value is actually
+        //    retrievable on this machine (a Windows Credential Manager
+        //    profile that misbehaves, a credential scoped to the login
+        //    session, a policy that silently no-ops the write, ...) -
+        //    see `secret_store.rs`'s `verified_set` doc for the full
+        //    reasoning and why that gap matters specifically here: this
+        //    is the one call in the whole module that's immediately
+        //    followed by scrubbing the only other copy of the secret.
+        //    Success (write AND read-back both confirmed): `dirty = true`
+        //    forces this run's first `persist()` to write the scrubbed
+        //    file immediately, closing the exposure window rather than
+        //    waiting for the next unrelated settings change. Failure
+        //    (either the write itself failed, or it "succeeded" but
+        //    reading it straight back didn't return the same value):
+        //    `secret_synced = false` - the account keeps working (the
+        //    secret is still right here in memory) and the plaintext
+        //    copy on disk is left exactly as it was; nothing is lost,
+        //    and the next launch retries the same migration.
+        // 2. **Nothing on disk, store has it** (fresh launch after a
+        //    prior successful migration, or an account provisioned
+        //    straight into the store by a previous `update_account`
+        //    call) - read it back into memory. This is the steady state
+        //    for every launch after the first.
+        // 3. **Nothing on disk, store unreachable** (locked keychain, no
+        //    desktop session, ...) - this is the case the task's own
+        //    "what happens when the store fails" question is really
+        //    about. There is no secret to fall back to (by definition,
+        //    it isn't in the file) - so `account.secret` stays empty,
+        //    `AccountSettings::is_configured()` reads as "not
+        //    configured," and the sidecar simply never attempts
+        //    registration this session (see sidecar.rs's own gate on
+        //    `is_configured()` before it spawns) rather than trying with
+        //    a blank credential and risking a lockout on the PBX side.
+        //    That's a real "no phone this session" outcome for a real
+        //    account - but the alternative (refusing to start the app,
+        //    or silently reusing some other secret) is worse, and the
+        //    log line below at least makes the cause diagnosable instead
+        //    of looking like a settings wipe. Recovers on its own the
+        //    next time the store is reachable - nothing here deletes or
+        //    overwrites the stored entry on a read failure.
+        let file_secret = std::mem::take(&mut settings.account.secret);
+        let mut secret_synced = true;
+        if !file_secret.is_empty() {
+            match verified_set(secret_store.as_ref(), &file_secret) {
+                Ok(()) => {
+                    dirty = true;
+                    log::info!(
+                        "settings: moved the SIP secret out of settings.json and into the OS credential \
+                         store (write verified by reading it back)"
+                    );
+                }
+                Err(e) => {
+                    secret_synced = false;
+                    log::warn!(
+                        "settings: could not move the SIP secret into the OS credential store ({e}); \
+                         leaving it in settings.json for now, will retry next launch"
+                    );
+                }
+            }
+            settings.account.secret = file_secret;
+        } else {
+            match secret_store.get() {
+                Ok(Some(s)) => settings.account.secret = s,
+                Ok(None) => {} // never configured, or nothing to migrate - stays empty
+                Err(e) => {
+                    log::warn!(
+                        "settings: SIP secret could not be read from the OS credential store this \
+                         session ({e}); the account will not register until a later launch can \
+                         reach it (host={}, ext={})",
+                        settings.account.host,
+                        settings.account.ext
+                    );
+                }
+            }
+        }
+
         let store = Self {
             path,
             recents_path,
             inner: Mutex::new(settings),
+            secret_store,
+            secret_synced: AtomicBool::new(secret_synced),
         };
         if dirty {
             let snapshot = store.snapshot();
@@ -898,8 +1030,25 @@ impl SettingsStore {
     }
 
     fn persist(&self, settings: &AppSettings) -> std::io::Result<()> {
-        let json = serde_json::to_string_pretty(settings)?;
-        // Settings file contains the SIP secret - keep it user-readable only.
+        // Scrub the SIP secret from the on-disk copy whenever the OS
+        // credential store is known to hold it (`secret_synced`, set by
+        // `load()`'s migration and kept current by `update_account()`) -
+        // see secret_store.rs's module doc for why the store is the
+        // primary copy now. When it's `false` (store unreachable, or a
+        // write to it just failed) the secret is left in the JSON below
+        // exactly as `settings.account.secret` has it in memory - the
+        // same plaintext-in-a-0600-file behavior this file always had,
+        // used here only as the documented fallback so a settings save
+        // (e.g. flipping the theme) can never silently drop a working
+        // SIP credential just because the keychain happened to be
+        // unreachable at that moment.
+        let mut on_disk = settings.clone();
+        if self.secret_synced.load(Ordering::Relaxed) {
+            on_disk.account.secret = String::new();
+        }
+        let json = serde_json::to_string_pretty(&on_disk)?;
+        // Settings file contains the SIP secret only in the fallback case
+        // above - keep it user-readable only either way.
         write_private_file(&self.path, json.as_bytes())
     }
 
@@ -919,6 +1068,40 @@ impl SettingsStore {
     pub fn update_account(&self, account: AccountSettings) -> std::io::Result<()> {
         let mut guard = self.inner.lock_or_recover();
         let previous = guard.account.clone();
+        // Push the new secret to the OS credential store BEFORE touching
+        // `guard`/disk - same "sync the store, then let `persist()`
+        // decide what disk gets to see" shape `load()`'s migration
+        // established. Only when the secret actually changed: every
+        // other field on `AccountSettings` (host, transport, the TLS pin,
+        // ...) can change without this ever touching the keychain -
+        // matters in practice, since an unconditional touch here would
+        // mean even a display-name edit could trigger a macOS "allow
+        // Centinelo Phone to access this keychain item?" prompt.
+        if account.secret != previous.secret {
+            // `verified_set`, not a bare `set()` - same "don't trust
+            // `Ok(())` alone" reasoning as `load_with_store`'s migration
+            // above (see that call site's comment, and
+            // `secret_store.rs`'s `verified_set` doc): a save here is
+            // immediately followed by `persist()` scrubbing the on-disk
+            // fallback, exactly the moment a write that "succeeded" but
+            // can't be read back would otherwise turn into a silently
+            // unrecoverable credential.
+            let sync_result = if account.secret.is_empty() {
+                self.secret_store.delete()
+            } else {
+                verified_set(self.secret_store.as_ref(), &account.secret)
+            };
+            match sync_result {
+                Ok(()) => self.secret_synced.store(true, Ordering::Relaxed),
+                Err(e) => {
+                    self.secret_synced.store(false, Ordering::Relaxed);
+                    log::warn!(
+                        "settings: could not update the SIP secret in the OS credential store ({e}); \
+                         keeping it in settings.json instead this run"
+                    );
+                }
+            }
+        }
         guard.account = account;
         if let Err(e) = self.persist(&guard) {
             guard.account = previous;
@@ -2165,6 +2348,267 @@ mod codec_settings_tests {
         );
 
         let _ = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600));
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+// ---- SIP secret -> OS credential store migration (security finding fix) --
+//
+// All of these use `SettingsStore::load_with_store` with an explicit
+// `MemorySecretStore`/`FailingSecretStore` rather than `SettingsStore::load`
+// (which would reach for the real OS keychain/Credential Manager) - see
+// `secret_store.rs`'s module doc, "why a trait", point 1: these must run
+// unattended on CI, on both macOS and Windows runners, with no keychain
+// session to rely on.
+#[cfg(test)]
+mod secret_migration_tests {
+    use super::*;
+    use crate::secret_store::{FailingSecretStore, MemorySecretStore, SucceedsWriteButCannotReadBackStore};
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("centinelo-secret-migration-test.{name}.{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Mutation check (a)+(b): a `settings.json` written the OLD way - SIP
+    /// secret in cleartext, exactly the shape a real pre-this-fix install
+    /// has on disk - gets its secret moved into the store and scrubbed
+    /// from the file on the very first launch that reads it.
+    #[test]
+    fn legacy_plaintext_secret_migrates_into_the_store_and_is_scrubbed_from_disk() {
+        let dir = scratch_dir("legacy-migrates");
+        let settings_path = dir.join(SETTINGS_FILE);
+        fs::write(
+            &settings_path,
+            br#"{"account":{"host":"pbx.example.test","ext":"9999","secret":"legacy-plaintext-secret"}}"#,
+        )
+        .unwrap();
+
+        let secret_store: Box<dyn SecretStore> = Box::new(MemorySecretStore::default());
+        let store = SettingsStore::load_with_store(&dir, secret_store).unwrap();
+
+        // (a) ends up in the store, (b) scrubbed from the file: only
+        // possible if the migration's `set()` succeeded (`secret_synced`
+        // came back `true`), since that's the only thing that makes
+        // `persist()` write an empty field here.
+        let raw = fs::read_to_string(&settings_path).unwrap();
+        assert!(
+            !raw.contains("legacy-plaintext-secret"),
+            "the plaintext secret must be gone from settings.json after migration, got: {raw}"
+        );
+        assert!(
+            raw.contains("\"secret\": \"\""),
+            "the on-disk secret field must be scrubbed to empty, not merely different, got: {raw}"
+        );
+
+        // (c) the phone still works: the in-memory account is unaffected,
+        // is_configured() still reads true, exactly as if nothing had
+        // moved.
+        let account = store.snapshot().account;
+        assert_eq!(account.secret, "legacy-plaintext-secret");
+        assert!(account.is_configured());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The gap round 2 of review named directly: a store whose `set()`
+    /// reports success but whose `get()` never returns what was written
+    /// (a misbehaving Windows Credential Manager profile, a credential
+    /// scoped to expire with the session, a policy-blocked write that
+    /// still returns `Ok`, ...). Without the read-back check inside
+    /// `verified_set`, this is indistinguishable from a real success -
+    /// the file would get scrubbed and the secret would only ever have
+    /// existed in this one process's memory, unrecoverable on the very
+    /// next launch. Must be treated exactly like a `set()` failure: the
+    /// file keeps the secret, `is_configured()` still holds this session.
+    #[test]
+    fn legacy_plaintext_secret_stays_on_disk_when_the_store_accepts_the_write_but_cannot_read_it_back() {
+        let dir = scratch_dir("legacy-lying-store");
+        let settings_path = dir.join(SETTINGS_FILE);
+        fs::write(
+            &settings_path,
+            br#"{"account":{"host":"pbx.example.test","ext":"9999","secret":"legacy-plaintext-secret"}}"#,
+        )
+        .unwrap();
+
+        let secret_store: Box<dyn SecretStore> = Box::new(SucceedsWriteButCannotReadBackStore);
+        let store = SettingsStore::load_with_store(&dir, secret_store).unwrap();
+
+        // The phone still works this session either way - the in-memory
+        // secret came straight from the file, not from the (lying)
+        // store.
+        let account = store.snapshot().account;
+        assert_eq!(account.secret, "legacy-plaintext-secret");
+        assert!(account.is_configured());
+
+        // The load-time migration attempt itself may or may not have
+        // triggered a persist (`dirty` can be set by other fields, e.g.
+        // a freshly minted bridge token) - force one the same way a
+        // normal settings change would, and confirm the fallback holds:
+        // the secret must NOT have been scrubbed, under any path.
+        store.update_theme(ThemePref::Dark).unwrap();
+        let raw = fs::read_to_string(&settings_path).unwrap();
+        assert!(
+            raw.contains("legacy-plaintext-secret"),
+            "a set() that can't be read back must not be trusted enough to scrub the fallback copy \
+             - got: {raw}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Same gap, but on the `update_account` (manual save / provisioning)
+    /// path rather than load-time migration - a save must not trust a
+    /// lying `set()` either.
+    #[test]
+    fn update_account_falls_back_to_disk_when_the_store_accepts_the_write_but_cannot_read_it_back() {
+        let dir = scratch_dir("update-lying-store");
+        let secret_store: Box<dyn SecretStore> = Box::new(SucceedsWriteButCannotReadBackStore);
+        let store = SettingsStore::load_with_store(&dir, secret_store).unwrap();
+
+        store
+            .update_account(AccountSettings {
+                host: "pbx.example.test".to_string(),
+                ext: "9999".to_string(),
+                secret: "brand-new-secret".to_string(),
+                display_name: String::new(),
+                transport_priority: TransportPriority::default(),
+                tls_pin_sha256: None,
+            })
+            .unwrap();
+
+        assert_eq!(store.snapshot().account.secret, "brand-new-secret", "the app keeps working");
+        let raw = fs::read_to_string(dir.join(SETTINGS_FILE)).unwrap();
+        assert!(
+            raw.contains("brand-new-secret"),
+            "a set() that can't be read back must not be trusted enough to scrub settings.json - \
+             got: {raw}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Same legacy file, but the store itself is unreachable. Must NOT
+    /// lose the credential: the plaintext stays on disk (the documented
+    /// fallback - see `SettingsStore::persist`'s doc) and the account
+    /// keeps working this session, exactly as it did before this fix
+    /// existed. This is the "what happens when the store fails" case the
+    /// task asked to demonstrate.
+    #[test]
+    fn legacy_plaintext_secret_stays_on_disk_when_the_store_is_unreachable() {
+        let dir = scratch_dir("legacy-store-down");
+        let settings_path = dir.join(SETTINGS_FILE);
+        fs::write(
+            &settings_path,
+            br#"{"account":{"host":"pbx.example.test","ext":"9999","secret":"legacy-plaintext-secret"}}"#,
+        )
+        .unwrap();
+
+        let secret_store: Box<dyn SecretStore> = Box::new(FailingSecretStore);
+        let store = SettingsStore::load_with_store(&dir, secret_store).unwrap();
+
+        assert_eq!(store.snapshot().account.secret, "legacy-plaintext-secret");
+        assert!(store.snapshot().account.is_configured(), "must still register this session");
+
+        // load_with_store only persists when `dirty` (e.g. a freshly
+        // minted bridge token) - trigger one explicit persist the same
+        // way a normal settings change would, and confirm the fallback
+        // holds under that path too, not just at load time.
+        store.update_theme(ThemePref::Dark).unwrap();
+        let raw = fs::read_to_string(&settings_path).unwrap();
+        assert!(
+            raw.contains("legacy-plaintext-secret"),
+            "with the store unreachable, the secret must stay in settings.json rather than being \
+             dropped - got: {raw}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Steady state: nothing in the file, store already has it (the
+    /// normal case for every launch after the first successful
+    /// migration, or a freshly provisioned account) - it must be read
+    /// back into memory so the account still registers.
+    #[test]
+    fn secret_already_in_the_store_is_read_back_into_memory() {
+        let dir = scratch_dir("read-back");
+        let settings_path = dir.join(SETTINGS_FILE);
+        fs::write(&settings_path, br#"{"account":{"host":"pbx.example.test","ext":"9999"}}"#).unwrap();
+
+        let memory_store = MemorySecretStore::default();
+        memory_store.set("stored-secret").unwrap();
+        let secret_store: Box<dyn SecretStore> = Box::new(memory_store);
+        let store = SettingsStore::load_with_store(&dir, secret_store).unwrap();
+
+        let account = store.snapshot().account;
+        assert_eq!(account.secret, "stored-secret");
+        assert!(account.is_configured());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Mutation check (the other "what happens when the store fails"
+    /// case): nothing in the file (already migrated on some earlier,
+    /// successful launch), and THIS launch can't reach the store at all
+    /// (locked keychain, no desktop session, ...). Must degrade to "not
+    /// configured this session" rather than attempting registration with
+    /// a blank credential - see `load_with_store`'s doc, case 3 - and
+    /// must NOT touch (delete/overwrite) whatever the store actually
+    /// holds, so the very next successful launch recovers on its own.
+    #[test]
+    fn store_unreachable_with_nothing_on_disk_degrades_to_unconfigured_this_session() {
+        let dir = scratch_dir("read-fails");
+        let settings_path = dir.join(SETTINGS_FILE);
+        fs::write(&settings_path, br#"{"account":{"host":"pbx.example.test","ext":"9999"}}"#).unwrap();
+
+        let secret_store: Box<dyn SecretStore> = Box::new(FailingSecretStore);
+        let store = SettingsStore::load_with_store(&dir, secret_store).unwrap();
+
+        let account = store.snapshot().account;
+        assert_eq!(account.secret, "", "no secret to fall back to - must stay empty, not fabricated");
+        assert!(
+            !account.is_configured(),
+            "a blank secret must read as unconfigured, so the sidecar never attempts to register \
+             with an empty credential"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `update_account` (the manual-Settings-save / provisioning-apply
+    /// choke point, see its own doc) must push a changed secret to the
+    /// store too, not just `load()`'s one-time migration - and must fall
+    /// back to keeping it in `settings.json` when that push fails,
+    /// exactly like the load-time case, so a save never silently drops a
+    /// working credential.
+    #[test]
+    fn update_account_falls_back_to_disk_when_the_store_rejects_the_write() {
+        let dir = scratch_dir("update-store-down");
+        let secret_store: Box<dyn SecretStore> = Box::new(FailingSecretStore);
+        let store = SettingsStore::load_with_store(&dir, secret_store).unwrap();
+
+        store
+            .update_account(AccountSettings {
+                host: "pbx.example.test".to_string(),
+                ext: "9999".to_string(),
+                secret: "brand-new-secret".to_string(),
+                display_name: String::new(),
+                transport_priority: TransportPriority::default(),
+                tls_pin_sha256: None,
+            })
+            .unwrap();
+
+        assert_eq!(store.snapshot().account.secret, "brand-new-secret", "the app keeps working");
+        let raw = fs::read_to_string(dir.join(SETTINGS_FILE)).unwrap();
+        assert!(
+            raw.contains("brand-new-secret"),
+            "with the store unreachable, update_account must fall back to writing the secret to \
+             settings.json rather than losing it - got: {raw}"
+        );
+
         let _ = fs::remove_dir_all(&dir);
     }
 }

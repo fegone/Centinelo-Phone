@@ -118,6 +118,18 @@ tauri-plugin-process = "2"
 # machine fingerprint with the exact same algorithm
 # centinelo-license::machine_fingerprint uses, for byte-identical output.
 sha2 = "0.10"
+# SIP secret storage (src/secret_store.rs - security finding fix: the SIP
+# secret used to sit in settings.json in cleartext, same as v1). Wraps the
+# per-platform OS credential store: macOS Keychain (`apple-native`) and
+# Windows Credential Manager, DPAPI-backed (`windows-native`) - both
+# feature-gated but harmless to enable together, since the crate's own
+# backend modules are internally `cfg(target_os = ...)`-gated regardless
+# of which features are turned on; this just makes sure the right backend
+# is compiled in on whichever OS actually builds this crate. No Linux
+# feature enabled - this app doesn't ship a Linux build yet (see
+# shell/README.md), and secret_store.rs's `OsKeystore` simply wouldn't
+# resolve a working backend there today.
+keyring = { version = "3", features = ["apple-native", "windows-native"] }
 
 [target.'cfg(windows)'.dependencies]
 # Windows half of activation.rs's machine-fingerprint duplication (reads
