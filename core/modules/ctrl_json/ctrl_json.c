@@ -2470,22 +2470,73 @@ static void stdin_stop(struct ctrl_st *st)
  * push is never actually delivered to mqueue_handler() below regardless.
  */
 
-enum { MQ_LINE = 1, MQ_EOF = 2 };
+enum { MQ_LINE = 1, MQ_EOF = 2, MQ_OVERLONG = 3 };
 
 struct win_line {
 	char  *buf;
 	size_t len;
 };
 
+/*
+ * v1.7 fix: unify the "line longer than INBUF_SIZE with no '\n' in range"
+ * behavior with the POSIX path's process_inbuf()/stdin_handler() above,
+ * which discards the whole overlong line (and emits one "input line too
+ * long, buffer reset" error) rather than ever handing process_line() a
+ * fragment. Before this fix, fgets(line, sizeof(line), stdin) simply
+ * returned whatever fit once its buffer filled - a real line longer than
+ * INBUF_SIZE got silently sliced into several INBUF_SIZE-ish chunks, each
+ * pushed as its own MQ_LINE and independently fed to process_line() as if
+ * it were a complete, standalone message. Every chunk but (maybe) the last
+ * is not valid JSON on its own, so in practice this meant one bogus
+ * "malformed JSON" `error` per chunk instead of the POSIX side's single,
+ * clear "line too long" `error` - two platforms visibly disagreeing about
+ * what a hostile/misbehaving client on the other end of the pipe caused,
+ * exactly the "different behavior on Windows" shape this repo has already
+ * paid for once (see CLAUDE.md's 2026-08-13/14 entry). `skipping` tracks
+ * "still discarding the tail of an overlong line, waiting for its real
+ * '\n'" across fgets() calls, mirroring process_inbuf()'s inlen>=INBUF_SIZE
+ * reset check on the POSIX side.
+ */
 static int stdin_thread_main(void *arg)
 {
 	struct mqueue *mq = arg;
 	char line[INBUF_SIZE];
+	bool skipping = false;
 
 	while (fgets(line, sizeof(line), stdin)) {
 
 		size_t len = strlen(line);
+		bool got_newline = len > 0 && line[len - 1] == '\n';
 		struct win_line *wl;
+
+		if (skipping) {
+			/* Still discarding the remainder of an overlong
+			 * line - once this chunk actually ends in '\n', the
+			 * real line boundary has finally arrived and normal
+			 * processing can resume with the next fgets(). */
+			if (got_newline)
+				skipping = false;
+			continue;
+		}
+
+		/*
+		 * fgets() only stops without a '\n' for one of two
+		 * reasons: EOF, or its buffer filled up first. The two are
+		 * told apart by `len`: a genuine final line before EOF is
+		 * whatever length it happens to be (usually well under
+		 * sizeof(line)); a buffer-filled truncation always reads
+		 * exactly sizeof(line)-1 bytes (fgets() reserves one byte
+		 * for the NUL terminator). A short, no-trailing-newline
+		 * final line is legitimate and still gets processed below
+		 * (unchanged from before this fix) - only the
+		 * buffer-exactly-full case is the overlong-line problem
+		 * this closes.
+		 */
+		if (!got_newline && len == sizeof(line) - 1) {
+			skipping = true;
+			(void)mqueue_push(mq, MQ_OVERLONG, NULL);
+			continue;
+		}
 
 		/* tolerate CRLF/LF, matching process_inbuf()'s POSIX-path
 		 * behaviour */
@@ -2542,6 +2593,17 @@ static void mqueue_handler(int id, void *data, void *arg)
 		free(wl);
 		break;
 	}
+
+	case MQ_OVERLONG:
+		/* emit_error() touches re's own allocator (odict_alloc())
+		 * and stdout - both only ever safe from the main/re
+		 * thread, which is exactly where mqueue_handler() runs
+		 * (see stdin_thread_main()'s own comment for why it never
+		 * calls emit_error() itself) - same message text as the
+		 * POSIX side's equivalent reset, so a consumer sees one
+		 * consistent string regardless of platform. */
+		emit_error("input line too long, buffer reset");
+		break;
 
 	case MQ_EOF:
 		info("ctrl_json: stdin closed, shutting down\n");

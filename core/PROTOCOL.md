@@ -390,6 +390,26 @@ without `ctrl_json` in the loop at all).
   by MSVC or run on real Windows hardware — see core/BUILD.md "Windows
   CI" for the exact CI error and why fixing it is out of this version's
   scope.
+- **A single stdin line longer than `INBUF_SIZE` (8 KiB, `ctrl_json.c`)
+  with no `\n` in range is discarded whole, on both platforms, as of
+  v1.7** — one `{"event":"error","message":"input line too long, buffer
+  reset"}`, then normal processing resumes at the next real line
+  boundary. Before v1.7 this was two visibly different behaviors: POSIX
+  already discarded the whole thing (`process_inbuf()`'s
+  `inlen>=INBUF_SIZE` reset check), but Windows' `fgets()`-based reader
+  silently sliced an overlong line into several ~8 KiB fragments and fed
+  each to `process_line()` as if it were its own complete message — see
+  "Changes from v1.6" for the full story. This 8 KiB engine-side cap is
+  independent of, and much smaller than, the shell's own 1 MiB
+  `MAX_LINE_BYTES` per-line cap on the *output* side (`shell/src-tauri/
+  src/sidecar.rs`, reading this engine's stdout) — the shell's cap
+  exists for a different reason (tolerate a corrupt/misconfigured engine
+  binary writing unbounded garbage with no newline) and was deliberately
+  left alone here rather than picking a third, unrelated number: an
+  8 KiB *command* from a well-behaved shell was never realistic to begin
+  with (the largest legitimate command, `set_codecs`, is nowhere close),
+  so the fix was to make the *existing* 8 KiB behave the same on both
+  platforms, not to change what it's set to.
 
 ## Commands (stdin)
 
@@ -934,6 +954,17 @@ already relies on changed shape or behavior:
   through the loop, and consistent with how every other structurally-
   invalid command in this protocol already behaves (reject cleanly,
   never act on a partially-valid input).
+- **An overlong stdin line (> `INBUF_SIZE`, 8 KiB, no `\n` in range) now
+  behaves identically on POSIX and Windows** (see "Framing"/"stdin"
+  above for the full before/after). Windows' `fgets()`-based reader
+  thread (`stdin_thread_main()`, `ctrl_json.c`) used to silently hand
+  `process_line()` a *fragment* of such a line — whatever fit in one
+  `fgets()` call — as if it were a complete, independent message, one
+  bogus "malformed JSON" `error` per fragment; POSIX already discarded
+  the whole overlong line as a unit. v1.7 makes Windows do the same:
+  discard the whole thing, one `error` (`"input line too long, buffer
+  reset"`, byte-identical text to the pre-existing POSIX message),
+  resume cleanly at the next real `\n`.
 
 ## Planned (still not in v1.8)
 
