@@ -673,10 +673,15 @@ the surviving channel).
   `127.0.0.1:38911`, same `X-Centinelo-Token` header, same `GET /ping` +
   `POST /dial` (JSON body `{"number":...}`) contract, same CORS headers
   including `Access-Control-Allow-Private-Network` — the v1 Chrome
-  extension in `extension/` works against it unchanged. `token`/`number`
-  are *also* accepted as query params purely for `curl`-based verification
-  convenience; the extension itself never uses that path. One deliberate
-  behavior change from v1: a dial request no longer dials silently — it
+  extension in `extension/` works against it unchanged. `number` is *also*
+  accepted as a query param purely for `curl`-based verification
+  convenience; the extension itself never uses that path. `token` is
+  **not** accepted as a query param (RISK 4R finding, 2026-08-16) — a
+  bearer secret in a query string lands in shell history and proxy/browser
+  logs, and with `bridge.auto_dial` on a leaked token dials with no
+  confirmation; header-only, same as the extension already sends. One
+  deliberate behavior change from v1: a dial request no longer dials
+  silently — it
   raises the same "Call this number?" confirmation as favorites, unless
   `settings.bridge.auto_dial` is on (default off).
 - **`centinelo://`/`tel:` deep links** (`deeplink.rs`, `tauri-plugin-deep-link`

@@ -11,10 +11,16 @@
 //! Two deliberate, additive differences from v1, both backward compatible
 //! with the unchanged extension:
 //!
-//! 1. `token`/`number` are also accepted as query-string parameters (in
-//!    addition to the header/JSON-body form the extension actually sends) -
-//!    pure convenience for manual `curl`-based verification; the extension
-//!    itself never uses this path and is unaffected either way.
+//! 1. `number` is also accepted as a query-string parameter (in addition to
+//!    the JSON-body form the extension actually sends) - pure convenience
+//!    for manual `curl`-based verification; the extension itself never uses
+//!    this path and is unaffected either way. `token` deliberately is
+//!    **not** accepted this way (RISK 4R finding, 2026-08-16): a bearer
+//!    secret in a query string ends up in shell history, proxy/browser
+//!    logs, and this server's own request line if it's ever logged - and
+//!    with `bridge.auto_dial` on, a leaked token dials numbers with no
+//!    confirmation. Header-only, matching what the extension already sends
+//!    and what `shell/E2E.md`'s actual curl transcripts already use.
 //! 2. A dial request no longer dials silently - it always goes through the
 //!    same "call this number?" confirmation the frontend also uses for
 //!    favorites and centinelo:// or tel: deep links (see deeplink.rs), unless
@@ -97,6 +103,20 @@ fn split_url(url: &str) -> (&str, &str) {
         Some((path, query)) => (path, query),
         None => (url, ""),
     }
+}
+
+/// Resolves the bearer token to authenticate a request with: the
+/// `X-Centinelo-Token` header, and *only* that header. `query_params` is
+/// still taken as a parameter (rather than dropped entirely) so the
+/// omission is visible at the call site and this exact behavior is
+/// unit-testable - see this module's doc comment ("Two deliberate,
+/// additive differences from v1", point 1) for why a `token` query
+/// parameter is deliberately never consulted here even though `number`
+/// still is: a bearer secret in a URL ends up in shell history and
+/// proxy/browser logs, and with `bridge.auto_dial` on, a leaked token
+/// dials with no confirmation. RISK 4R finding, 2026-08-16.
+fn extract_bridge_token(header_token: &str, _query_params: &HashMap<String, String>) -> String {
+    header_token.to_string()
 }
 
 /// Constant-time token compare - the token is a bearer secret shared only
@@ -184,11 +204,7 @@ fn handle_request(
     }
 
     let expected_token = settings.snapshot().bridge.token;
-    let provided_token = if !header_token.is_empty() {
-        header_token
-    } else {
-        query_params.get("token").cloned().unwrap_or_default()
-    };
+    let provided_token = extract_bridge_token(&header_token, &query_params);
     if !tokens_match(&provided_token, &expected_token) {
         let _ = request.respond(json_response(403, serde_json::json!({"error": "bad token"})));
         return;
@@ -288,6 +304,34 @@ mod tests {
         let q = parse_query("number=%2A43&token=abc%20def");
         assert_eq!(q.get("number").map(String::as_str), Some("*43"));
         assert_eq!(q.get("token").map(String::as_str), Some("abc def"));
+    }
+
+    // RISK 4R finding (2026-08-16): a bearer token in a query string ends
+    // up in shell history / proxy logs, unlike a header. These pin the
+    // actual guarantee - a query-string `token` must never authenticate a
+    // request, no matter what the header is - not just that the function
+    // returns *some* string.
+
+    #[test]
+    fn extract_bridge_token_ignores_a_token_in_the_query_string() {
+        let mut q = HashMap::new();
+        q.insert("token".to_string(), "leaked-in-the-url".to_string());
+        // No header sent at all - if the query string were still a
+        // fallback, this would resolve to "leaked-in-the-url".
+        assert_eq!(extract_bridge_token("", &q), "");
+    }
+
+    #[test]
+    fn extract_bridge_token_uses_the_header_when_present() {
+        let q = HashMap::new();
+        assert_eq!(extract_bridge_token("abc123", &q), "abc123");
+    }
+
+    #[test]
+    fn extract_bridge_token_prefers_the_header_even_if_query_also_has_one() {
+        let mut q = HashMap::new();
+        q.insert("token".to_string(), "wrong-leaked-token".to_string());
+        assert_eq!(extract_bridge_token("the-real-header-token", &q), "the-real-header-token");
     }
 
     // HIPAA remote-install hardening (2026-08-13) - `redacted_log_number`
