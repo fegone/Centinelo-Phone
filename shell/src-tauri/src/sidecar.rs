@@ -1413,10 +1413,177 @@ fn choose_transport(account: &AccountSettings, shared: &Arc<Shared>) -> &'static
     }
 }
 
+/// Per-line cap for both stdout/stderr readers below. `BufRead::lines()`
+/// (the obvious std API) accumulates into a `String` with no size limit -
+/// it stops at `\n`, not at any byte budget - so a corrupted core binary,
+/// or literally any binary someone points `core_binary_path` at (an
+/// admin-gated setting, but one that accepts any path, no validation that
+/// it's actually this project's engine), that writes gigabytes without a
+/// newline inflates this process's RAM without bound until the OS kills
+/// the shell. The "child died" failure mode is already covered by the
+/// supervisor's restart/backoff; this closes the "child talks garbage
+/// instead of dying" one. 1 MiB comfortably covers the largest legitimate
+/// line today (the `devices`/`codecs` enumeration events) with headroom.
+const MAX_LINE_BYTES: usize = 1024 * 1024;
+
+/// Reads one `\n`-delimited line from `reader`, never buffering more than
+/// `cap` bytes regardless of how much the writer produces before the next
+/// `\n` (or EOF) - unlike `BufRead::read_until`, which keeps appending
+/// forever if the delimiter never shows up. `Ok(None)` = clean EOF,
+/// nothing left to read. `Ok(Some((line, oversized)))` otherwise:
+/// `oversized == true` means the real line was longer than `cap` and was
+/// discarded (`line` is empty in that case, not truncated - a partial
+/// line is still garbage, no point keeping the prefix). This function
+/// itself only ever returns once per delimited line, however long that
+/// line's bytes were before the cap kicked in - the caller can safely log
+/// once per `Some((_, true))`, never once per byte.
+fn read_bounded_line<R: BufRead>(reader: &mut R, cap: usize) -> std::io::Result<Option<(Vec<u8>, bool)>> {
+    let mut buf = Vec::new();
+    let mut oversized = false;
+    let mut saw_any_byte = false;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            break; // EOF
+        }
+        saw_any_byte = true;
+        let newline_pos = available.iter().position(|&b| b == b'\n');
+        let take = newline_pos.unwrap_or(available.len());
+        if !oversized {
+            if buf.len() + take > cap {
+                oversized = true;
+                buf.clear(); // stop carrying a partial line we're going to throw away anyway
+            } else {
+                buf.extend_from_slice(&available[..take]);
+            }
+        }
+        match newline_pos {
+            Some(pos) => {
+                reader.consume(pos + 1);
+                return Ok(Some((buf, oversized)));
+            }
+            None => reader.consume(take),
+        }
+    }
+    if !saw_any_byte {
+        return Ok(None);
+    }
+    Ok(Some((buf, oversized))) // final line with no trailing newline before EOF
+}
+
+/// Bounded drop-in for `BufRead::lines().map_while(Result::ok)`: same
+/// "skip a line that isn't valid UTF-8" tolerance every existing call site
+/// already had, plus the `MAX_LINE_BYTES` cap from `read_bounded_line`.
+/// `log_label` names the stream in the one warning logged per discarded
+/// oversized line (never per byte - see `read_bounded_line`'s doc).
+fn bounded_lines<R: std::io::Read>(source: R, log_label: &'static str) -> impl Iterator<Item = String> {
+    let mut reader = BufReader::new(source);
+    std::iter::from_fn(move || loop {
+        match read_bounded_line(&mut reader, MAX_LINE_BYTES) {
+            Ok(None) => return None,
+            Ok(Some((_, true))) => {
+                log::warn!(
+                    "sidecar: discarded an oversized core {log_label} line (> {MAX_LINE_BYTES} bytes with no newline in range) - engine binary may be corrupt or misconfigured"
+                );
+            }
+            Ok(Some((bytes, false))) => {
+                // Not valid UTF-8 - same as .lines()'s Result::Err, skip and keep going.
+                if let Ok(s) = String::from_utf8(bytes) {
+                    return Some(s);
+                }
+            }
+            Err(_) => return None,
+        }
+    })
+}
+
+#[cfg(test)]
+mod bounded_line_reader_tests {
+    use super::*;
+
+    #[test]
+    fn reads_ordinary_lines_unchanged() {
+        let input = b"one\ntwo\nthree\n".as_slice();
+        let lines: Vec<String> = bounded_lines(input, "test").collect();
+        assert_eq!(lines, vec!["one", "two", "three"]);
+    }
+
+    #[test]
+    fn keeps_a_final_line_with_no_trailing_newline() {
+        let input = b"one\ntwo".as_slice();
+        let lines: Vec<String> = bounded_lines(input, "test").collect();
+        assert_eq!(lines, vec!["one", "two"]);
+    }
+
+    /// The actual finding: a line without ANY `\n` must never grow the
+    /// buffer past the cap, no matter how many bytes the source produces
+    /// before EOF. This is the "corrupt/hostile engine binary writes
+    /// gigabytes with no newline" scenario from the audit, at a scale a
+    /// unit test can actually run - `cap` stands in for `MAX_LINE_BYTES`.
+    #[test]
+    fn never_buffers_past_the_cap_even_with_no_newline_at_all() {
+        let cap = 64usize;
+        // Far bigger than the cap, all in one "line" (no \n anywhere).
+        let garbage = vec![b'x'; cap * 50];
+        let mut reader = std::io::Cursor::new(garbage);
+        let result = read_bounded_line(&mut reader, cap).unwrap();
+        let (bytes, oversized) = result.expect("EOF mid-garbage still yields the discarded line, not None");
+        assert!(oversized, "a line 50x the cap with no newline must be flagged oversized");
+        assert!(bytes.is_empty(), "an oversized line's discarded bytes must not be retained");
+        assert!(bytes.len() <= cap, "must never exceed the cap even transiently");
+    }
+
+    #[test]
+    fn an_oversized_line_is_discarded_but_the_stream_recovers_on_the_next_one() {
+        // Exercises read_bounded_line directly with a small custom cap (not
+        // bounded_lines's fixed MAX_LINE_BYTES=1MiB, which a hand-written
+        // test input can't realistically exceed) - two calls on the same
+        // reader is exactly what bounded_lines's loop does internally.
+        let cap = 16usize;
+        let mut input = vec![b'x'; cap * 10];
+        input.push(b'\n');
+        input.extend_from_slice(b"ok\n");
+        let mut reader = std::io::Cursor::new(input);
+
+        let (first, oversized) = read_bounded_line(&mut reader, cap).unwrap().unwrap();
+        assert!(oversized, "the first line was 10x the cap - must be flagged");
+        assert!(first.is_empty(), "an oversized line's bytes must not be retained");
+
+        let (second, oversized) = read_bounded_line(&mut reader, cap).unwrap().unwrap();
+        assert!(!oversized, "the reader must recover and read the next line normally");
+        assert_eq!(second, b"ok");
+    }
+
+    #[test]
+    fn a_line_exactly_at_the_cap_is_not_flagged_oversized() {
+        let cap = 8usize;
+        let mut input = vec![b'x'; cap];
+        input.push(b'\n');
+        let mut reader = std::io::Cursor::new(input);
+        let (bytes, oversized) = read_bounded_line(&mut reader, cap).unwrap().unwrap();
+        assert!(!oversized);
+        assert_eq!(bytes.len(), cap);
+    }
+
+    #[test]
+    fn empty_input_yields_no_lines() {
+        let lines: Vec<String> = bounded_lines(std::io::Cursor::new(Vec::<u8>::new()), "test").collect();
+        assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn invalid_utf8_line_is_skipped_like_the_old_lines_based_reader() {
+        let mut input = vec![0xFFu8, 0xFE, 0xFD];
+        input.push(b'\n');
+        input.extend_from_slice(b"valid\n");
+        let lines: Vec<String> = bounded_lines(std::io::Cursor::new(input), "test").collect();
+        assert_eq!(lines, vec!["valid"]);
+    }
+}
+
 fn spawn_stderr_drain(stderr: std::process::ChildStderr, sink: Arc<Mutex<Vec<String>>>) {
     std::thread::spawn(move || {
-        let reader = BufReader::new(stderr);
-        for line in reader.lines().map_while(Result::ok) {
+        for line in bounded_lines(stderr, "stderr") {
             log::debug!("core: {line}");
             if let Ok(mut buf) = sink.lock() {
                 buf.push(line);
@@ -1435,9 +1602,8 @@ fn spawn_stdout_reader(
     priority: TransportPriority,
 ) {
     std::thread::spawn(move || {
-        let reader = BufReader::new(stdout);
         let mut registered_once = false;
-        for line in reader.lines().map_while(Result::ok) {
+        for line in bounded_lines(stdout, "stdout") {
             let trimmed = line.trim_start();
             if !trimmed.starts_with('{') {
                 continue; // baresip's own human-readable log noise, see PROTOCOL.md "Framing"
