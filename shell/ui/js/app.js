@@ -66,6 +66,7 @@ import { logMilestone, reportFrontendIssue } from "./error-reporting.js";
 import { initConsolePanel, openConsolePanel, closeConsolePanel } from "./console-panel.js";
 import { SETTINGS_FIELD_GROUPS, summarizeSettledResults, runSettingsPaintSteps, describeError } from "./settings-load.js";
 import { resolveClipboardCopyOutcome } from "./clipboard-copy.js";
+import { shouldFinalizeClosedCall } from "./call-lifecycle.js";
 
 // `Channel` (updater download progress) and `Resource` both live on
 // window.__TAURI__.core alongside `invoke` - withGlobalTauri bundles the
@@ -1072,9 +1073,23 @@ function handleCallState(evt) {
       maybeAutoStartTranscript(state.call.callId, state.call.peer, state.call.direction);
       break;
     case "closed":
-      maybeTranscriptCallEnded(callId);
-      finalizeClosedCall();
-      renderAll();
+      // UI-silent-failures audit (2026-08-16, hallazgo #5): this used to
+      // call finalizeClosedCall() unconditionally - it tears down
+      // whatever is CURRENTLY in state.call, without ever comparing this
+      // event's own call_id against it. state.call is a single-slot
+      // mirror, but the engine is not single-call by design (see
+      // call-lifecycle.js's header comment for the full reasoning:
+      // attended_transfer's held source + consultation call, and plain
+      // call waiting via a second inbound INVITE, both legitimately put a
+      // SECOND call_id in play on this UA - and the "incoming" case just
+      // above already unconditionally overwrites state.call with it). A
+      // closed event for a call that ISN'T the one on screen must not
+      // wipe the one that is.
+      maybeTranscriptCallEnded(callId); // safe unconditionally - already compares against state.transcript's own callId
+      if (shouldFinalizeClosedCall(state.call, callId)) {
+        finalizeClosedCall();
+        renderAll();
+      }
       return;
     default:
       break;
