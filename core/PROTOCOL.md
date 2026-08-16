@@ -424,7 +424,7 @@ either, both, or neither.
 | `{"cmd":"unregister"}` | Unregister at runtime (`ua_unregister()`). |
 | `{"cmd":"hold","call_id":"..."}` | Put a call on hold (`call_hold(call, true)` — a re-INVITE, `a=sendonly`/similar). Emits `call_state` `"hold"` on success (see "Events"). |
 | `{"cmd":"resume","call_id":"..."}` | Take a call off hold (`uag_hold_resume()` — also holds whatever *other* call is currently active first, so two calls are never both off-hold at once; matters the moment there's a second call, i.e. attended transfer). Emits `call_state` `"resumed"` on success. |
-| `{"cmd":"dtmf","digits":"123#","call_id":"..."}` | Send RFC2833 DTMF. `digits` is any sequence of `0-9 * # A-D`; invalid characters produce an `error`. |
+| `{"cmd":"dtmf","digits":"123#","call_id":"..."}` | Send RFC2833 DTMF. `digits` is any sequence of `0-9 * # A-D`; invalid characters produce an `error`. **As of v1.7**, the whole string is validated *before* anything is sent — a bad character anywhere in `digits` rejects the command wholesale (no digits sent at all), rather than v1.6 and earlier's behavior of sending every digit up to the bad one and then silently leaving the last valid one "pressed" (no RFC2833 end event ever sent for it — see PROTOCOL.md "Changes from v1.6"). |
 | `{"cmd":"mute","on":true,"call_id":"..."}` | Mute (`on:true`) or un-mute (`on:false`) the call's outgoing audio. `on` is a required, real JSON boolean (not the string `"true"`). Emits `call_state` `"muted"`/`"unmuted"` on success. |
 | `{"cmd":"blind_transfer","uri":"sip:target@host","call_id":"..."}` | REFER the call to `uri` (`call_transfer()`). Does **not** implicitly hold the call first (unlike the interactive `menu` module's own transfer key) — hold is a separate, composable command; send `hold` first if that's the desired UX. Outcome is asynchronous — see "Events". |
 | `{"cmd":"attended_transfer","uri":"sip:target@host","call_id":"..."}` | Start an attended transfer: holds the named/current call (the "source"), then dials `uri` as a new "consultation" call on the same UA. Fails with an `error` if another attended transfer is already pending (F1 supports one at a time, matching `modules/menu/dynamic_menu.c`'s own single-slot design) or if the source's peer doesn't support the `Replaces` extension. Emits `call_state` `"hold"` for the source, then `attended_transfer_started` (see "Events"), then the consultation call's normal `call_state` lifecycle (`ringing`/`established`/...). If the consultation dial itself fails after the source was already put on hold, the source is resumed as a best-effort cleanup (so it's never left stranded on hold for a consultation call that never started) — **v1.7:** that cleanup resume now also emits `call_state` `"resumed"` for the source, same as every other resume path (see this file's own top-of-file v1.7 status paragraph). |
@@ -919,6 +919,21 @@ already relies on changed shape or behavior:
   transferring call still valid, `event_handler()` already resolves it
   via `bevent_get_call(event)` — the gap was purely the missing
   call_id-bearing *event* on this side.
+- **`dtmf` now validates its whole `digits` string before sending
+  anything** (see "Commands" `dtmf` row above) — a real, observable
+  behavior change for a consumer that was relying on (or simply never
+  hit) the old partial-send behavior: a `digits` string with a bad
+  character anywhere in it used to send every valid digit up to that
+  point and then silently drop the trailing `KEYCODE_REL` release for
+  the last one sent (`call_send_digit()`'s error short-circuited the
+  loop in `cmd_dtmf()`, `ctrl_json.c`, skipping the release call right
+  after it) — the peer would see that digit stuck "pressed" with no
+  RFC2833 end event, ever. v1.7 rejects the entire command up front
+  instead (nothing sent, one `error`/`result` as usual) — simpler to
+  reason about than guaranteeing the release fires on every error path
+  through the loop, and consistent with how every other structurally-
+  invalid command in this protocol already behaves (reject cleanly,
+  never act on a partially-valid input).
 
 ## Planned (still not in v1.8)
 

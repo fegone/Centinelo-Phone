@@ -1608,6 +1608,24 @@ static void cmd_resume(const struct cent_cmd *cmd)
 }
 
 
+/* Every character in `digits` is a digit audio_send_digit() (src/audio.c)
+ * will actually accept - reuses telev_digit2code() (re_telev.h), the same
+ * function that call decides "valid DTMF digit" with, rather than
+ * duplicating its table here and risking drift. Pure lookup, no I/O - see
+ * cmd_dtmf()'s own comment for why this runs *before* anything is sent. */
+static bool dtmf_digits_valid(const char *digits)
+{
+	size_t i;
+
+	for (i = 0; digits[i]; i++) {
+		if (telev_digit2code(digits[i]) == -1)
+			return false;
+	}
+
+	return true;
+}
+
+
 static void cmd_dtmf(const struct cent_cmd *cmd)
 {
 	struct call *call = resolve_call(cmd->have_call_id, cmd->call_id);
@@ -1619,13 +1637,40 @@ static void cmd_dtmf(const struct cent_cmd *cmd)
 		return;
 	}
 
+	/*
+	 * v1.7 fix: validate the *entire* digit string up front, before
+	 * sending a single one, rather than discovering an invalid digit
+	 * mid-loop below. The old behavior stopped the send loop the
+	 * moment call_send_digit() returned EINVAL for a bad character
+	 * (e.g. a stray non-DTMF byte at position N of a longer string) -
+	 * but the "if (!err) err = call_send_digit(call, KEYCODE_REL)"
+	 * line right after it then *also* got skipped, since err was
+	 * already non-zero. Net effect: every valid digit already sent
+	 * before the bad one (audio_send_digit()'s a->tx.cur_key, src/
+	 * audio.c) was left "pressed" on the wire forever - no RFC2833
+	 * end event ever went out for it. Rejecting the whole command
+	 * up front (nothing sent at all on a bad string) is simpler to
+	 * reason about than trying to guarantee KEYCODE_REL fires on
+	 * every error path through the loop, and matches this file's own
+	 * convention elsewhere (cmd.c's require_str()/decode_codecs():
+	 * reject cleanly, never act on a partially-valid input).
+	 */
+	if (!dtmf_digits_valid(cmd->digits)) {
+		emit_errorf("dtmf: invalid digit in '%s'", cmd->digits);
+		return;
+	}
+
 	/* One call_send_digit() per digit, then a KEYCODE_REL to mark the
 	 * last one released - matches modules/menu/dynamic_menu.c's
 	 * send_code(), which audio_send_digit() (src/audio.c) depends on
 	 * for its start/end RFC2833 event pairing (it tracks "the
 	 * previous key" and emits that one's *end* event on the next
 	 * call, so a trailing release call is required to end the final
-	 * digit). */
+	 * digit). Every character is already known-valid at this point,
+	 * so the only way this loop's call_send_digit() can still fail is
+	 * a lower-level tx error, not a bad digit - KEYCODE_REL is then
+	 * still correctly withheld below (nothing valid to "release" if
+	 * the digit itself never actually went out). */
 	for (i = 0; cmd->digits[i] && !err; i++)
 		err = call_send_digit(call, cmd->digits[i]);
 
