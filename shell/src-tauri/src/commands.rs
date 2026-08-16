@@ -226,6 +226,15 @@ pub fn get_blf_states(sidecar: State<SidecarHandle>) -> std::collections::HashMa
     sidecar.blf_states()
 }
 
+/// Last-known `reg_state` event, cached the same way `get_blf_states` is -
+/// for a UI surface that starts listening well after the engine already
+/// registered (the premium console panel, opened on demand rather than at
+/// boot like the main window). See `sidecar::RegStateSnapshot`'s doc.
+#[tauri::command(rename_all = "snake_case")]
+pub fn get_reg_state(sidecar: State<SidecarHandle>) -> crate::sidecar::RegStateSnapshot {
+    sidecar.reg_state()
+}
+
 /// Admin-gated, like account/transport/core-path - favorites in a real
 /// clinic dial real people's extensions (see shell task spec). Restarts the
 /// sidecar so the new list takes effect immediately: a fresh process

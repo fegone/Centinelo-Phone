@@ -59,6 +59,48 @@ pub enum StatusPayload {
 const EVENT_STATUS: &str = "sidecar-status";
 const EVENT_LINE: &str = "sidecar-event";
 
+/// Last-known `reg_state` event, cached the same way `Shared::blf_states`
+/// caches the last `blf` event per extension (see that field's doc):
+/// so a UI surface that starts subscribing to `sidecar-event` *after* the
+/// engine already registered - the premium console panel, opened well
+/// after boot - has something to paint immediately instead of showing
+/// "Not registered" until the next `regint=120` periodic re-REGISTER
+/// happens to fire. `commands::get_reg_state` exposes this; the main
+/// window doesn't need it (it's already listening before the first
+/// `reg_state` of the session ever fires) but reads it too now for the
+/// same "devtools reload doesn't lose it" reason `get_blf_states` exists.
+/// Field names/values mirror the wire event verbatim - see `core/
+/// PROTOCOL.md`'s `reg_state` row - so the frontend can feed this
+/// straight into `{event:"reg_state", ...}`-shaped ingestion with no
+/// translation.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct RegStateSnapshot {
+    /// "unregistered" until the first `reg_state` event of this session -
+    /// same default the frontend's own `state.regState`/`ConsoleStore`
+    /// already assume, so a snapshot fetched before the engine has ever
+    /// reported in looks identical to one that's genuinely never happened.
+    pub state: String,
+    pub transport: Option<String>,
+    pub account: Option<String>,
+    pub reason: Option<String>,
+}
+
+fn default_reg_state() -> String {
+    "unregistered".to_string()
+}
+
+impl RegStateSnapshot {
+    fn unregistered() -> Self {
+        Self {
+            state: default_reg_state(),
+            transport: None,
+            account: None,
+            reason: None,
+        }
+    }
+}
+
 enum ControlSignal {
     None,
     Stop,
@@ -698,6 +740,12 @@ struct Shared {
     /// `ping_state()` (bridge.rs `/ping`) and used to gate the one-time BLF
     /// auto-subscribe below.
     registered: AtomicBool,
+    /// Last-known full `reg_state` event (state/transport/account/reason) -
+    /// see [`RegStateSnapshot`]'s doc. Distinct from `registered` above:
+    /// that bool only gates the BLF auto-subscribe/`/ping` fast path, this
+    /// carries everything a UI status line needs to render without having
+    /// witnessed the live event itself.
+    last_reg_state: Mutex<RegStateSnapshot>,
     /// Per-`call_id` phase - see [`CallPhase`]'s doc for why this is a map
     /// keyed by `call_id` and not a single global flag. An entry exists
     /// only while its call_id is live; `"closed"` removes it rather than
@@ -801,6 +849,7 @@ impl SidecarHandle {
             pending_transport_override: Mutex::new(None),
             last_status: Mutex::new(StatusPayload::Idle),
             registered: AtomicBool::new(false),
+            last_reg_state: Mutex::new(RegStateSnapshot::unregistered()),
             call_phases: Mutex::new(HashMap::new()),
             blf_states: Mutex::new(HashMap::new()),
             subscribed_exts: Mutex::new(HashSet::new()),
@@ -825,6 +874,11 @@ impl SidecarHandle {
     /// Snapshot of every extension's last-known BLF state (see `Shared::blf_states`).
     pub fn blf_states(&self) -> HashMap<String, String> {
         self.0.blf_states.lock_or_recover().clone()
+    }
+
+    /// Snapshot of the last-known `reg_state` event (see `Shared::last_reg_state`).
+    pub fn reg_state(&self) -> RegStateSnapshot {
+        self.0.last_reg_state.lock_or_recover().clone()
     }
 
     /// Snapshot of every extension this process has already sent
@@ -1329,6 +1383,12 @@ fn supervisor_loop(shared: Arc<Shared>) {
         shared.registered.store(false, Ordering::SeqCst);
         shared.call_phases.lock_or_recover().clear();
         shared.blf_states.lock_or_recover().clear();
+        // A snapshot claiming "registered" (or any transport/account from
+        // the dead process) would be exactly the same lie the `registered`
+        // bool reset above exists to prevent - a UI opened right after this
+        // exit must see "unregistered", not the last thing the now-gone
+        // engine happened to say.
+        *shared.last_reg_state.lock_or_recover() = RegStateSnapshot::unregistered();
         // A fresh process starts with no subscriptions either - matches
         // blf_states being cleared above, and lets a respawned process's
         // favorites auto-subscribe (and any console still open across the
@@ -1668,6 +1728,16 @@ fn spawn_stdout_reader(
                 }
             } else if event_name == "reg_state" {
                 let state = value.get("state").and_then(Value::as_str).unwrap_or("");
+                // Cache the whole event verbatim (see RegStateSnapshot's doc)
+                // before any of the branch-specific side effects below - a
+                // late-opening UI (the premium console panel) needs this
+                // regardless of which branch this transition takes.
+                *shared.last_reg_state.lock_or_recover() = RegStateSnapshot {
+                    state: if state.is_empty() { default_reg_state() } else { state.to_string() },
+                    transport: value.get("transport").and_then(Value::as_str).map(str::to_string),
+                    account: value.get("account").and_then(Value::as_str).map(str::to_string),
+                    reason: value.get("reason").and_then(Value::as_str).map(str::to_string),
+                };
                 if state == "registered" {
                     registered_once = true;
                     shared.registered.store(true, Ordering::SeqCst);

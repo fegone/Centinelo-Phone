@@ -245,7 +245,9 @@ function installFakeConsoleUi() {
         },
         ConsoleApp: {
           mount(hostElement, opts) {
-            const handle = { hostElement, opts, destroyed: false, destroy() { this.destroyed = true; } };
+            const ingestCalls = [];
+            const store = { ingestCalls, ingest(event) { ingestCalls.push(event); } };
+            const handle = { hostElement, opts, store, destroyed: false, destroy() { this.destroyed = true; } };
             hostElement.children.push({ mountHandle: handle });
             ui.mounts.push({ hostElement, opts });
             ui.mounted.push(handle);
@@ -259,9 +261,17 @@ function installFakeConsoleUi() {
 }
 
 /// deps double: every Tauri binding initConsolePanel takes, as a spy.
-/// get_favorites resolves [] (the degraded-empty-roster path is not
-/// under test here).
-function installFakeDeps() {
+/// get_favorites resolves [] (the degraded-empty-roster path is not under
+/// test here) by default. `regState`/`blfStates`/`failCommands` (set of
+/// command names) let hydration tests configure the snapshot commands'
+/// responses without touching every other test's setup.
+/// `listenDelay: true` makes `listen()` return a Promise that resolves on
+/// a LATER microtask (instead of an already-resolved one) - the shape
+/// real Tauri `listen()` actually has (it awaits an IPC round-trip before
+/// the listener is truly live) - so a test can assert nothing else runs
+/// until it settles.
+function installFakeDeps({ regState = null, blfStates = null, failCommands = [] } = {}) {
+  const fail = new Set(failCommands);
   const d = {
     invokeCalls: [],
     listenCalls: [],
@@ -269,9 +279,16 @@ function installFakeDeps() {
     reportCalls: [],
     invoke(cmd, args) {
       d.invokeCalls.push([cmd, args]);
-      return Promise.resolve(cmd === "get_favorites" ? [] : null);
+      if (fail.has(cmd)) return Promise.reject(new Error(cmd + " failed"));
+      if (cmd === "get_favorites") return Promise.resolve([]);
+      if (cmd === "get_reg_state") return Promise.resolve(regState);
+      if (cmd === "get_blf_states") return Promise.resolve(blfStates);
+      return Promise.resolve(null);
     },
-    listen(event, handler) { d.listenCalls.push([event, handler]); },
+    listen(event, handler) {
+      d.listenCalls.push([event, handler]);
+      return Promise.resolve(() => {});
+    },
     showBanner(message, kind) { d.showBannerCalls.push([message, kind]); },
     reportFrontendIssue(kind, data) { d.reportCalls.push([kind, data]); },
     // Fixed to the macOS/Linux shape - the stateful tests below don't
@@ -293,14 +310,14 @@ const TEST_ORIGIN = MACOS_LINUX_ORIGIN;
 /// whatever was there), reset the module's singletons, silence the
 /// module's own console.error noise from the failure paths under test.
 /// Call teardown() in a finally.
-function setupStateful({ failUrls = [] } = {}) {
+function setupStateful({ failUrls = [], regState, blfStates, failCommands } = {}) {
   const prevDocument = globalThis.document;
   const prevWindow = globalThis.window;
   const prevError = console.error;
   console.error = () => {};
   const dom = installFakeDom({ failUrls });
   const ui = installFakeConsoleUi();
-  const deps = installFakeDeps();
+  const deps = installFakeDeps({ regState, blfStates, failCommands });
   globalThis.document = dom.document;
   globalThis.window = ui.window;
   resetConsolePanelStateForTests();
@@ -507,6 +524,132 @@ test("P5 superseded open events still update the session the eventual close acks
       .filter(([cmd]) => cmd === "console_panel_closed")
       .map(([, args]) => args);
     assert.deepEqual(acks, [{ session: 2 }, { session: 4 }], "each close acks the session Rust considers live at that moment, never a superseded one");
+  } finally {
+    s.teardown();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// hydration - the console must not start blind to what already happened
+// before it existed to hear it (2026-08-16, reg_state/blf snapshot fix)
+// ---------------------------------------------------------------------------
+
+test("H1 mount hydrates the store from get_reg_state + get_blf_states, after mounting", async () => {
+  const s = setupStateful({
+    regState: { state: "registered", transport: "wss", account: "sip:101@pbx.example", reason: null },
+    blfStates: { "101": "idle", "102": "busy" },
+  });
+  try {
+    await openConsolePanel();
+    const store = s.ui.mounted[0].store;
+    assert.deepEqual(store.ingestCalls, [
+      { event: "reg_state", state: "registered", transport: "wss", account: "sip:101@pbx.example", reason: null },
+      { event: "blf", ext: "101", state: "idle" },
+      { event: "blf", ext: "102", state: "busy" },
+    ]);
+    // No failure -> no visible banner, nothing reported.
+    assert.equal(s.deps.showBannerCalls.length, 0);
+    assert.equal(s.deps.reportCalls.length, 0);
+  } finally {
+    s.teardown();
+  }
+});
+
+test("H2 mount with nothing to hydrate (fresh engine, no favorites) ingests nothing and stays quiet", async () => {
+  const s = setupStateful({ regState: null, blfStates: {} });
+  try {
+    await openConsolePanel();
+    const store = s.ui.mounted[0].store;
+    assert.deepEqual(store.ingestCalls, [], "null reg_state and an empty BLF map ingest nothing, not a malformed event");
+    assert.equal(s.deps.showBannerCalls.length, 0);
+  } finally {
+    s.teardown();
+  }
+});
+
+test("H3 get_reg_state failure: reported + banner shown, but the panel stays open and BLF hydration still runs", async () => {
+  const s = setupStateful({
+    blfStates: { "101": "idle" },
+    failCommands: ["get_reg_state"],
+  });
+  try {
+    await openConsolePanel();
+    assert.equal(s.dom.screen.hidden, false, "a hydration failure must never take the panel down");
+    const store = s.ui.mounted[0].store;
+    assert.deepEqual(store.ingestCalls, [{ event: "blf", ext: "101", state: "idle" }], "the OTHER snapshot still hydrates independently");
+    assert.deepEqual(s.deps.reportCalls.map(([kind]) => kind), ["console_panel_hydrate_failed"]);
+    assert.equal(s.deps.reportCalls[0][1].source, "get_reg_state");
+    assert.equal(s.deps.showBannerCalls.length, 1);
+    assert.equal(s.deps.showBannerCalls[0][1], "info", "a hydration hiccup is informational, not an error banner - the panel still works");
+  } finally {
+    s.teardown();
+  }
+});
+
+test("H4 get_blf_states failure: reported + banner shown, reg_state hydration still applied", async () => {
+  const s = setupStateful({
+    regState: { state: "registered", transport: "udp", account: null, reason: null },
+    failCommands: ["get_blf_states"],
+  });
+  try {
+    await openConsolePanel();
+    const store = s.ui.mounted[0].store;
+    assert.deepEqual(store.ingestCalls, [{ event: "reg_state", state: "registered", transport: "udp", account: null, reason: null }]);
+    assert.deepEqual(s.deps.reportCalls.map(([, data]) => data.source), ["get_blf_states"]);
+    assert.equal(s.deps.showBannerCalls.length, 1);
+  } finally {
+    s.teardown();
+  }
+});
+
+test("H5 both snapshot commands fail: exactly one banner (not one per failure), panel still open", async () => {
+  const s = setupStateful({ failCommands: ["get_reg_state", "get_blf_states"] });
+  try {
+    await openConsolePanel();
+    assert.equal(s.dom.screen.hidden, false);
+    assert.deepEqual(s.deps.reportCalls.map(([, data]) => data.source), ["get_reg_state", "get_blf_states"], "both failures are individually logged/reported");
+    assert.equal(s.deps.showBannerCalls.length, 1, "one summarizing banner, not a banner storm");
+  } finally {
+    s.teardown();
+  }
+});
+
+test("H6 the live listener is confirmed registered before any snapshot/roster fetch runs", async () => {
+  // Regression net for the ordering fix: deps.listen()'s returned promise
+  // must be awaited BEFORE get_favorites/get_reg_state/get_blf_states -
+  // otherwise a live event racing the (real, async) Tauri listener
+  // registration could be lost with nothing subscribed yet to catch it.
+  // A deferred listen() lets this test observe the invariant directly:
+  // while it's pending, NOTHING past it may have been invoked yet.
+  const s = setupStateful();
+  try {
+    let resolveListen;
+    const originalListen = s.deps.listen;
+    s.deps.listen = (event, handler) => {
+      s.deps.listenCalls.push([event, handler]);
+      return new Promise((resolve) => {
+        resolveListen = () => resolve(() => {});
+      });
+    };
+    const opening = openConsolePanel();
+    // Poll (never a fixed tick count - asset loading takes a variable
+    // number of microtask turns) until bridge.init() itself has actually
+    // run and called deps.listen(); that call is synchronous with
+    // bridge.init, so its presence means we're exactly at the point right
+    // before `await listenerReady` - the earliest moment worth asserting.
+    for (let i = 0; i < 1000 && s.deps.listenCalls.length === 0; i++) {
+      await Promise.resolve();
+    }
+    assert.equal(s.deps.listenCalls.length, 1, "sanity: the listener registration itself did happen");
+    assert.deepEqual(
+      s.deps.invokeCalls,
+      [],
+      "get_favorites/get_reg_state/get_blf_states must not fire until the listener is confirmed live"
+    );
+    resolveListen();
+    await opening;
+    assert.ok(s.deps.invokeCalls.some(([cmd]) => cmd === "get_favorites"), "the fetches proceed once the listener is live");
+    s.deps.listen = originalListen;
   } finally {
     s.teardown();
   }
