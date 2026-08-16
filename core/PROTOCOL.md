@@ -965,6 +965,22 @@ already relies on changed shape or behavior:
   discard the whole thing, one `error` (`"input line too long, buffer
   reset"`, byte-identical text to the pre-existing POSIX message),
   resume cleanly at the next real `\n`.
+- **`blf`'s HELD/BUSY/RINGING detection is now scoped per `<dialog>`
+  element, not to the whole NOTIFY body** (`dialog_info.c`). RFC 4235
+  allows more than one `<dialog>` child per dialog-info document (a
+  monitored extension mid-attended-transfer, one call held while a
+  second rings/talks, is the realistic shape) — the old parser matched
+  only the *first* `<state>` in the whole body, while separately
+  scanning the *entire* body for HELD markers regardless of which
+  `<dialog>` they actually belonged to, so a marker on a second dialog
+  could get attributed to the first (unrelated) one, and a second
+  dialog's own state (e.g. a *ringing* second line) could be silently
+  invisible entirely. No wire-format change — `blf`'s event shape is
+  unchanged — this is purely a correctness fix to what state gets
+  chosen when a monitored extension has more than one concurrent
+  dialog; see `core/modules/ctrl_json/test/test_main.c`'s
+  `test_dialog_info_multi_dialog_scoping()` for the exact
+  before/after fixtures.
 
 ## Planned (still not in v1.8)
 
