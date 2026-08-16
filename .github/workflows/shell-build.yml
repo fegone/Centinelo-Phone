@@ -55,6 +55,19 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 
+# Explicit least privilege (RISK finding, release-ci audit 2026-08-16):
+# this workflow only checks out, compiles, and bundles - no publish step,
+# no writes to the repo. It previously had no `permissions:` block, so it
+# silently inherited whatever this repo's/org's Actions default is
+# (verified 2026-08-16 via `gh api
+# repos/fegone/Centinelo-Phone/actions/permissions/workflow` ->
+# `default_workflow_permissions: "read"`, so there was no live excess
+# scope) - but that default is a setting anyone with repo admin can flip
+# without touching this file. Declaring it here removes the dependency on
+# that external, unversioned setting.
+permissions:
+  contents: read
+
 jobs:
   macos:
     name: macOS (supported)
