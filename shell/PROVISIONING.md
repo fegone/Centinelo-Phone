@@ -152,6 +152,37 @@ the same admin-lock rule *except* for one carve-out:
   install can never be mid-call (the sidecar never even starts before an
   account exists), so this check runs unconditionally rather than only on
   the re-provision path.
+- **The clean-install carve-out above is also the one real gap a deep link
+  opens** (RISK 4R finding, 2026-08-16): a `centinelo://provision` link is
+  reachable from any email or webpage the OS hands to this app's scheme
+  handler, and its `config=` form needs no network fetch and nothing to
+  verify where it came from - so on a not-yet-configured machine, one
+  click on a crafted link followed by one click on "Connect" repointed the
+  phone at an attacker's PBX (`host`/`secret`/`tls_pin_sha256` all
+  attacker-controlled), no admin password involved because none exists
+  yet. Closed with a *typed confirmation*, not a cryptographic one: for a
+  pending config that both (a) isn't yet applying to an already-configured
+  install and (b) arrived via `handle_deep_link` rather than a manual
+  paste (`ProvisioningPending::set_from_deep_link` vs `set` -
+  `ProvisioningPreviewView.from_deep_link` carries the distinction to the
+  UI), `commands::provisioning_apply` requires the caller to also pass the
+  pending config's own `ext` back verbatim as `confirm_ext`. The
+  confirmation screen (`ui/js/app.js` `showProvisioningConfirm`) shows a
+  warning and an *empty* (never pre-filled) text field whenever
+  `from_deep_link` is true, so the operator has to already know (or be
+  told out-of-band, e.g. an install worksheet) which extension to expect -
+  a single click through a phishing link isn't enough on its own. **What
+  this does and doesn't stop**: closes "blind mass-phishing link" and
+  "malicious webpage" shapes of the attack, and needs no new key
+  infrastructure; does NOT stop a targeted attacker who already knows the
+  victim's real extension, and isn't a substitute for signing the
+  deep-link payload (the properly cryptographic fix - not implemented,
+  needs an offline key-ceremony the same shape as the updater's own
+  signing key, out of scope for this fix, flagged for Mario/Felix). A
+  manual paste never hits this check at all - copying a link already
+  implies the operator trusted the source enough to paste it themselves, a
+  materially different trust posture than an app-external deep-link
+  trigger.
 
 ## Security notes
 
@@ -262,15 +293,41 @@ picker/webcam loop can't be driven by the scripted e2e driver either).
 
 `CENTINELO_E2E_SCRIPT` steps (see `src-tauri/src/e2e.rs`):
 
-- `provisioning_resolve:<link>` - resolves (embedded config needs no
-  network; a `url=`/bare-https link does a real fetch). Logs the resolved
-  preview or the error.
-- `provisioning_apply` - applies whatever's currently pending.
+- `provisioning_resolve:<link>` - the *manual paste* command: resolves
+  (embedded config needs no network; a `url=`/bare-https link does a real
+  fetch), logs the resolved preview or the error, and tags the pending
+  config `from_deep_link=false`.
+- `deep_link:<link>` - same resolve, but via `handle_deep_link` (the
+  OS-scheme-handler path), tagging the pending config
+  `from_deep_link=true` (added 2026-08-16, RISK 4R finding - see "Admin
+  lock" above). Runs on its own spawned thread, so a script needs a
+  `wait:` after this step before `provisioning_apply`/
+  `provisioning_pending_preview`.
+- `provisioning_apply` / `provisioning_apply:<ext>` - applies whatever's
+  currently pending; `<ext>` is passed through as `confirm_ext`, only
+  actually required when the pending config is both unlocked (clean
+  install) and `from_deep_link=true` - see "Admin lock" above.
 - `provisioning_cancel` - discards whatever's currently pending.
 - `admin_set_password:<password>` - sets/changes the admin password and
   leaves the session unlocked (added 2026-07-16 4R re-review, to reach
   `provisioning_apply` on an already-configured account from a script,
   without a GUI to click through the unlock screen).
+
+Deep-link `confirm_ext` gate example (clean-install fixture, no PBX
+needed):
+
+```text
+deep_link:centinelo://provision?config=eyJob3N0IjogInBieC5leGFtcGxlLnRlc3QiLCAiZXh0IjogIjk5OTkiLCAic2VjcmV0IjogIngiLCAidmVyc2lvbiI6IDF9|wait:1|provisioning_apply
+```
+
+expected: `provisioning_apply -> err: Type the extension shown above to
+confirm you expected this link.` (no `confirm_ext`, deep-link-sourced,
+clean install). Appending the right extension applies successfully
+instead:
+
+```text
+deep_link:centinelo://provision?config=eyJob3N0IjogInBieC5leGFtcGxlLnRlc3QiLCAiZXh0IjogIjk5OTkiLCAic2VjcmV0IjogIngiLCAidmVyc2lvbiI6IDF9|wait:1|provisioning_apply:9999
+```
 
 Fully offline, deterministic example (no PBX/network needed - the embedded
 `config=` form):

@@ -27,10 +27,20 @@
 //! out-of-scope path exactly like it would from the real UI, not that it
 //! succeeds without a real transcript on disk),
 //! `provisioning_resolve:<link>` (auto-provisioning, spec §5 - see
-//! provisioning.rs; `<link>` is passed through unencoded, so a
+//! provisioning.rs - the *manual paste* command; always tags the pending
+//! config `from_deep_link=false`) / `deep_link:<link>` (same resolve, but
+//! via `provisioning::handle_deep_link` - the OS-scheme-handler path,
+//! tags the pending config `from_deep_link=true`; needs a `wait:` after it
+//! before the next step, see that step's own comment below) - `<link>` is
+//! passed through unencoded, so a
 //! `centinelo://provision?config=...` link's base64url payload is fine
 //! as-is, but avoid a link containing a literal `|` - this driver's own
-//! step separator), `provisioning_apply`, `provisioning_cancel`,
+//! step separator), `provisioning_apply` / `provisioning_apply:<ext>`
+//! (`<ext>` is passed as `confirm_ext` - only actually required by the
+//! command when the pending config is unlocked-clean-install *and*
+//! deep-link-sourced, see `commands::provisioning_apply`'s doc, but this
+//! driver always forwards whatever's given so a script can exercise both
+//! the pass and the fail case), `provisioning_cancel`,
 //! `admin_set_password:<password>` (sets/changes the admin password and
 //! leaves the session unlocked on success, same as the real
 //! `admin_set_password` command - lets a script reach an admin-gated step
@@ -250,12 +260,36 @@ pub fn maybe_run_e2e_script(app: &AppHandle) {
                     Ok(preview) => log::info!("e2e: provisioning_resolve -> ok, preview={preview:?}"),
                     Err(e) => log::info!("e2e: provisioning_resolve -> err: {e}"),
                 }
-            } else if step == "provisioning_apply" {
+            } else if let Some(link) = step.strip_prefix("deep_link:") {
+                // Drives `provisioning::handle_deep_link` directly - the
+                // OS-scheme-handler path `provisioning_resolve` above never
+                // exercises (that's the manual-paste command, which always
+                // tags a pending config `from_deep_link=false` -
+                // `ProvisioningPending::set` vs `set_from_deep_link`). Added
+                // 2026-08-16 so a script can reproduce
+                // `commands::provisioning_apply`'s clean-install
+                // `confirm_ext` gate (RISK 4R finding - see that command's
+                // doc) end to end without triggering a real OS deep link.
+                // `handle_deep_link` runs on its own spawned thread and
+                // returns immediately - a script needs its own `wait:`
+                // after this step before `provisioning_apply`/
+                // `provisioning_pending_preview` to give that thread time
+                // to finish resolving (matches this driver's existing
+                // fire-and-forget steps, e.g. `list_devices`).
+                match url::Url::parse(link) {
+                    Ok(url) => {
+                        crate::provisioning::handle_deep_link(app.clone(), url);
+                        log::info!("e2e: deep_link -> dispatched");
+                    }
+                    Err(e) => log::error!("e2e: deep_link -> bad url: {e}"),
+                }
+            } else if step == "provisioning_apply" || step.starts_with("provisioning_apply:") {
+                let confirm_ext = step.strip_prefix("provisioning_apply:").map(str::to_string);
                 let settings: tauri::State<std::sync::Arc<crate::settings::SettingsStore>> = app.state();
                 let admin: tauri::State<crate::settings::AdminSession> = app.state();
                 let sidecar: tauri::State<SidecarHandle> = app.state();
                 let provisioning: tauri::State<crate::provisioning::ProvisioningPending> = app.state();
-                match commands::provisioning_apply(settings, admin, sidecar, provisioning) {
+                match commands::provisioning_apply(settings, admin, sidecar, provisioning, confirm_ext) {
                     Ok(()) => log::info!("e2e: provisioning_apply -> ok"),
                     Err(e) => log::info!("e2e: provisioning_apply -> err: {e}"),
                 }

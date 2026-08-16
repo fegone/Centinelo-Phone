@@ -507,6 +507,16 @@ function showProvisioningConfirm(preview) {
   $("prov-confirm-ext").textContent = extLabel;
   const transportLabel = PROV_TRANSPORT_LABEL_KEY[preview.transport_priority] ? t(PROV_TRANSPORT_LABEL_KEY[preview.transport_priority]) : preview.transport_priority;
   $("prov-confirm-transport").textContent = preview.has_tls_pin ? t("provisioning.tlsPinIncluded", { transport: transportLabel }) : transportLabel;
+  // Deep-link hardening (RISK 4R finding, 2026-08-16 - see
+  // commands::provisioning_apply's doc): the real enforcement is server-
+  // side (that command rejects a mismatched/missing confirm_ext on a
+  // clean-install deep-link config regardless of what this screen shows),
+  // but showing the warning and requiring the extension to be typed here
+  // is what actually stops a single click through a phishing link from
+  // sailing past this screen unread. Always start the field empty, even
+  // if a previous confirmation left text behind.
+  $("prov-confirm-ext-check").value = "";
+  $("prov-confirm-deep-link-warning").hidden = !preview.from_deep_link;
   $("prov-confirm-error").hidden = true;
   $("provision-confirm-overlay").hidden = false;
 }
@@ -3174,7 +3184,12 @@ function wireStaticHandlers() {
     const btn = $("btn-prov-confirm");
     btn.disabled = true;
     try {
-      await invoke("provisioning_apply");
+      // confirm_ext is only actually enforced by provisioning_apply for a
+      // clean-install, deep-link-sourced pending config (see that
+      // command's doc) - sent unconditionally here since it's harmless
+      // (and simpler than duplicating that gating logic client-side) for
+      // every other case.
+      await invoke("provisioning_apply", { confirm_ext: $("prov-confirm-ext-check").value });
       $("provision-confirm-overlay").hidden = true;
       $("prov-input").value = "";
       showBanner(t("provisioning.connectedRegistering"), "info");

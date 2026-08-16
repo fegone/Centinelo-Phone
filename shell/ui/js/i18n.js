@@ -890,6 +890,30 @@ const ENTRIES = [
     "Conectado — registrando con tu sistema telefónico…",
   ],
   ["provisioning.linkError", "Provisioning link: {message}", "Link de provisionamento: {message}", "Enlace de aprovisionamiento: {message}"],
+  [
+    "provisioning.deepLinkWarning",
+    "This link came from outside the app. If you weren't told to expect it, don't continue.",
+    "Este link veio de fora do aplicativo. Se você não esperava por ele, não continue.",
+    "Este enlace llegó desde fuera de la aplicación. Si no esperabas recibirlo, no continúes.",
+  ],
+  [
+    "provisioning.deepLinkConfirmExtLabel",
+    "Type the extension shown above to confirm:",
+    "Digite o ramal mostrado acima para confirmar:",
+    "Escribe la extensión mostrada arriba para confirmar:",
+  ],
+  [
+    "provisioning.deepLinkConfirmExtPlaceholder",
+    "Extension",
+    "Ramal",
+    "Extensión",
+  ],
+  [
+    "provisioning.deepLinkConfirmExtMismatch",
+    "That doesn't match the extension shown above.",
+    "Isso não corresponde ao ramal mostrado acima.",
+    "Eso no coincide con la extensión mostrada arriba.",
+  ],
 
   // -- dial confirmation ------------------------------------------------
   ["dialConfirm.question", "Call this number?", "Ligar para este número?", "¿Llamar a este número?"],
