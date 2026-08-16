@@ -225,10 +225,25 @@ static void emit_error(const char *message)
 	struct odict *od = NULL;
 
 	str_ncpy(g_last_error, message ? message : "", sizeof(g_last_error));
-	++g_error_seq;
 
+	/* v1.7 fix: odict_alloc() (ENOMEM only, but real under memory
+	 * pressure) used to be checked *after* ++g_error_seq below, so a
+	 * failed alloc here still bumped the sequence with nothing actually
+	 * emitted - process_line()'s "did g_error_seq move during this
+	 * command's dispatch" check (see its own top-of-file comment) would
+	 * then see a moved counter and correctly report the command as
+	 * failed via `result`, but a consumer also watching for a matching
+	 * plain "error" event on stdout would wait forever for one that was
+	 * never sent - a silent gap in the numbering with no event to
+	 * explain it. Bumping only once the event is actually about to be
+	 * built (the `return` below is now hit before either side effect)
+	 * keeps the two in lockstep: g_error_seq moves if and only if an
+	 * "error" event was actually emitted (or would have been, had this
+	 * message not been the fallback empty string). */
 	if (odict_alloc(&od, 4))
 		return;
+
+	++g_error_seq;
 
 	(void)odict_entry_add(od, "event", ODICT_STRING, "error");
 	(void)odict_entry_add(od, "message", ODICT_STRING,
