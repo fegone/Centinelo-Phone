@@ -150,9 +150,10 @@ premium repo.
   full reasoning, and `centinelo-premium-abi`'s crate doc, "Why the split is
   a dylib").
 - **Dev/test key**: `premium.rs`'s embedded `LIB_PUBKEY_BYTES` is a
-  known, non-secret placeholder (`SigningKey::from_bytes(&[0x24; 32])`) so a
+  known, non-secret placeholder derived from a well-known dev/test seed so a
   dylib built and signed against that same well-known seed loads during
-  development without Felix's real offline key. Before an official release:
+  development without Felix's real offline key. The seed's literal value
+  lives in the private premium repo, not here. Before an official release:
   generate a real keypair with `premium-sign keygen` (private premium repo,
   offline, never in CI), replace `LIB_PUBKEY_BYTES` with the real public
   half, and re-sign the shipped dylib with the matching private half.
@@ -161,8 +162,8 @@ premium repo.
   mode), not a broken one.
 - **Building + signing a dylib for local testing**: from the private
   premium repo, `scripts/build-and-sign-premium.sh --key <path to a
-  centinelo_libsign.key file containing the 64-hex-char dev seed
-  `2424...24`>` produces `target/release/libcentinelo_premium.dylib(.sig)`
+  centinelo_libsign.key file containing the well-known dev seed - see that
+  repo for the value>` produces `target/release/libcentinelo_premium.dylib(.sig)`
   (macOS naming; see that crate's `expected_library_filename` for
   Windows/Linux). Copy both next to this app's own built executable
   (`shell/src-tauri/target/debug/` for a plain `cargo build`/`cargo run`,

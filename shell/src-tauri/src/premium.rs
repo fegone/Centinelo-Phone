@@ -46,14 +46,17 @@ use tauri::AppHandle;
 
 /// # DEV/TEST PLACEHOLDER — replace before shipping a real Pro build
 ///
-/// This is `SigningKey::from_bytes(&[0x24; 32]).verifying_key().to_bytes()`,
-/// the exact same fixed, publicly-documented dev/test seed `loader-poc`'s
-/// own test fixtures and demo binary use (see that crate's
-/// `tests/flow.rs` and `src/main.rs`), chosen so a locally-built
-/// `centinelo-premium` signed via `premium/scripts/build-and-sign-premium.sh`
-/// against that same test seed's private half will load correctly against
-/// *this* placeholder during development, without needing Felix's real
-/// key on hand.
+/// This is the verifying key derived from a fixed, well-known dev/test
+/// seed shared with `loader-poc`'s own test fixtures and demo binary
+/// (see that crate's `tests/flow.rs` and `src/main.rs`), chosen so a
+/// locally-built `centinelo-premium` signed via
+/// `premium/scripts/build-and-sign-premium.sh` against that same test
+/// seed's private half will load correctly against *this* placeholder
+/// during development, without needing Felix's real key on hand. The
+/// seed's literal value is intentionally not written here — it lives in
+/// the private `centinelo-premium` repo (and in `loader-poc`'s test
+/// fixtures) for anyone with access who needs to reproduce a matching
+/// signature.
 ///
 /// **Before an official release build**: run
 /// `premium-sign keygen --out-dir <offline location>` for real, replace
