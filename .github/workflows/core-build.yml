@@ -31,12 +31,25 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 
+# Explicit least privilege (RISK finding, release-ci audit 2026-08-16):
+# this workflow only checkouts, compiles, and uploads a build-log artifact
+# on failure - it never needs to write to the repo. It previously had no
+# `permissions:` block at all, so it silently inherited whatever this
+# repo's/org's Actions default is (verified 2026-08-16 via `gh api
+# repos/fegone/Centinelo-Phone/actions/permissions/workflow` ->
+# `default_workflow_permissions: "read"`, so there was no live excess
+# scope) - but that default is a setting anyone with repo admin can flip
+# without touching this file. Declaring it here removes the dependency on
+# that external, unversioned setting.
+permissions:
+  contents: read
+
 jobs:
   macos:
     name: macOS (supported)
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           submodules: recursive
 
@@ -185,7 +198,7 @@ jobs:
     # run 29459035249 (5be8dbf, OpenSSL discovery fix). See core/BUILD.md
     # "Windows CI" for the path-detection rationale.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           submodules: recursive
 
@@ -372,7 +385,7 @@ jobs:
 
       - name: Upload build logs (pass or fail)
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: windows-core-build-logs
           path: |

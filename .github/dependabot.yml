@@ -1,0 +1,13 @@
+version: 2
+updates:
+  # Every action in this repo's workflows is pinned to a full commit SHA
+  # (RISK finding, release-ci audit 2026-08-16 - see that commit's
+  # message for why). Dependabot understands SHA-pinned `uses:` lines and
+  # opens a PR bumping both the SHA and its trailing `# vX.Y.Z` comment
+  # when a new release lands, so pinning doesn't turn into permanent
+  # manual upkeep.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
