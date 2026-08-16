@@ -139,6 +139,91 @@ static void test_cmd_call_id_optional(void)
 }
 
 
+/* Regression test for the "call_id silently ignored when it's not a
+ * JSON string" gap (2026-08 audit finding #1): a call_id that's present
+ * but the wrong JSON type must be a hard decode error (CENT_CMD_NONE),
+ * NEVER silently treated the same as "call_id omitted" - see
+ * optional_call_id()'s own comment in cmd.c for the call-hijack scenario
+ * that "treat as absent" would otherwise open up (two calls live, a
+ * wrong-typed call_id on hangup/etc would silently act on "the current
+ * call" instead of failing loudly). Covers every non-string odict type
+ * json_decode_odict() can actually produce (number, bool, null, array,
+ * object) plus the same check for the independent "id" field, and
+ * confirms have_call_id/have_id stay false (nothing partially applied)
+ * and *errmsg is populated either way. */
+static void test_cmd_call_id_wrong_type(void)
+{
+	struct cent_cmd cmd;
+	const char *err;
+
+	err = NULL;
+	CHECK(CENT_CMD_NONE ==
+	      decode("{\"cmd\":\"hangup\",\"call_id\":42}", &cmd, &err),
+	      "hangup: call_id as JSON number -> CENT_CMD_NONE, not silently"
+	      " 'current call'");
+	CHECK(!cmd.have_call_id,
+	      "hangup: call_id as number -> have_call_id stays false");
+	CHECK(err != NULL && strstr(err, "call_id") != NULL,
+	      "hangup: call_id as number -> errmsg mentions call_id");
+
+	err = NULL;
+	CHECK(CENT_CMD_NONE ==
+	      decode("{\"cmd\":\"hangup\",\"call_id\":null}", &cmd, &err),
+	      "hangup: call_id as JSON null -> CENT_CMD_NONE");
+	CHECK(err != NULL && strstr(err, "call_id") != NULL,
+	      "hangup: call_id as null -> errmsg mentions call_id");
+
+	err = NULL;
+	CHECK(CENT_CMD_NONE ==
+	      decode("{\"cmd\":\"hangup\",\"call_id\":true}", &cmd, &err),
+	      "hangup: call_id as JSON bool -> CENT_CMD_NONE");
+	CHECK(err != NULL, "hangup: call_id as bool -> errmsg set");
+
+	err = NULL;
+	CHECK(CENT_CMD_NONE ==
+	      decode("{\"cmd\":\"hangup\",\"call_id\":[1,2]}", &cmd, &err),
+	      "hangup: call_id as JSON array -> CENT_CMD_NONE");
+	CHECK(err != NULL, "hangup: call_id as array -> errmsg set");
+
+	err = NULL;
+	CHECK(CENT_CMD_NONE ==
+	      decode("{\"cmd\":\"hangup\",\"call_id\":{\"x\":1}}",
+		     &cmd, &err),
+	      "hangup: call_id as JSON object -> CENT_CMD_NONE");
+	CHECK(err != NULL, "hangup: call_id as object -> errmsg set");
+
+	/* Same wrong-type rejection applies to hold/resume/mute/etc - not
+	 * just hangup - since every call-scoped command shares
+	 * optional_call_id(). Spot-check one more to confirm it's not a
+	 * hangup-only special case. */
+	err = NULL;
+	CHECK(CENT_CMD_NONE ==
+	      decode("{\"cmd\":\"hold\",\"call_id\":7}", &cmd, &err),
+	      "hold: call_id as JSON number -> CENT_CMD_NONE too");
+	CHECK(!cmd.have_call_id, "hold: call_id as number -> have_call_id"
+	      " stays false");
+
+	/* The independent "id" (request/response correlation) field
+	 * follows the identical rule - see optional_id()'s comment. */
+	err = NULL;
+	CHECK(CENT_CMD_NONE ==
+	      decode("{\"cmd\":\"answer\",\"id\":99}", &cmd, &err),
+	      "answer: id as JSON number -> CENT_CMD_NONE");
+	CHECK(!cmd.have_id, "answer: id as number -> have_id stays false");
+	CHECK(err != NULL && strstr(err, "id") != NULL,
+	      "answer: id as number -> errmsg mentions id");
+
+	/* A well-formed string call_id/id must still work exactly as
+	 * before - the fix only changes the wrong-type case. */
+	err = NULL;
+	CHECK(CENT_CMD_HANGUP ==
+	      decode("{\"cmd\":\"hangup\",\"call_id\":\"c1\"}", &cmd, &err),
+	      "hangup: string call_id still decodes normally");
+	CHECK(cmd.have_call_id && 0 == str_cmp(cmd.call_id, "c1"),
+	      "hangup: string call_id value unaffected by the fix");
+}
+
+
 static void test_cmd_dtmf(void)
 {
 	struct cent_cmd cmd;
@@ -1511,6 +1596,7 @@ int main(void)
 	test_cmd_dial();
 	test_cmd_simple_noargs();
 	test_cmd_call_id_optional();
+	test_cmd_call_id_wrong_type();
 	test_cmd_answer_call_id();
 	test_cmd_park();
 	test_cmd_set_answer_mode();

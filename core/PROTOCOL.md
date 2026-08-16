@@ -1,4 +1,4 @@
-# core/ — ctrl_json wire protocol (v1.6)
+# core/ — ctrl_json wire protocol (v1.7)
 
 `ctrl_json` (`core/modules/ctrl_json/`) is a baresip "application" module
 that turns the running engine into a sidecar controllable over stdio:
@@ -203,6 +203,42 @@ bug this version found and fixed in how a codec name gets handed to
 baresip's own `account_set_audio_codecs()`) and "Changes from v1.5"
 below for the full protocol changelog.
 
+**v1.7 status: one contract-hardening fix, no new commands/events —
+unit-tested (`cmd.c`, `test/test_main.c`, 318/318 checks, ASan-clean),
+verified by mutation (reverting the fix locally reproduces 8 test
+failures, confirming the new coverage actually exercises the changed
+code path).** Closes a gap a 2026-08 core-engine audit found in how
+`call_id` (and, for the same reason, the independent `id` correlation
+field) was decoded: **every call-scoped command already documented that
+an omitted `call_id` falls back to "the current call" and that an
+*unresolvable* `call_id` is an `error`** (see "Commands" above) — but a
+`call_id` that was present in the JSON with the *wrong type* (a number,
+`null`, a boolean, an array, an object — e.g. `{"cmd":"hangup",
+"call_id":42}`, a plausible bug in a shell that serializes a value
+incorrectly) fell through neither documented path: `odict_string()`
+returns `NULL` for a non-string entry exactly like it does for a
+genuinely absent one, so `cmd.c` silently treated "wrong type" as
+"omitted" and the command went ahead against "the current call" instead
+of failing. With more than one call live (an attended-transfer
+consultation leg, a second queued incoming call) that's a real,
+user-visible **wrong-call action taken with no error reported anywhere**
+— e.g. a receptionist console meaning to hang up one specific call could
+silently hang up the *other* one instead. **v1.7 is fully backward
+compatible with v1.6 for every well-formed message**: a `call_id`/`id`
+that's absent or a real (possibly empty) JSON string decodes exactly as
+before — only the previously-silent wrong-type case changes, from
+"treated as absent" to an `error` event (`CENT_CMD_NONE` internally,
+same "malformed input" event this file's "Commands" section already
+documents for *required* fields — see that paragraph, also updated by
+this version to state the same rule now applies to every optional
+`call_id`/`id` too). **This is a behavior change for any consumer that
+was accidentally relying on the old silent-fallback behavior** — see
+"Changes from v1.6" below; core-engine has no evidence any real caller
+does this (the shell's own JSON encoding always produces a genuine
+string or omits the field), but it's called out explicitly per this
+workspace's own rule that a protocol-visible behavior change is flagged
+loudly, not assumed harmless.
+
 ## Framing
 
 One JSON object per line (`\n`-terminated; a trailing `\r` is tolerated).
@@ -277,7 +313,14 @@ below. When omitted, the command targets "the current call" — see
 play (attended transfer). When given, it's resolved via `uag_call_find()`
 (searches every UA's call list — this engine registers exactly one UA,
 see `run-spike.sh`) — an unresolvable id (or "no current call" when
-omitted) always produces an `error` event, never a crash.
+omitted) always produces an `error` event, never a crash. **v1.7:** a
+`call_id` that's *present but not a JSON string* (a number, `null`, a
+boolean, an array, an object) is **never** treated the same as omitted —
+it's a decode error, same `error` event as a malformed required field
+(see below) — precisely so a caller bug never silently falls back to
+"the current call" and acts on the wrong one when more than one call is
+live. See this file's own top-of-file v1.7 status paragraph for the full
+rationale and the pre-v1.7 behavior this closes.
 
 **New in v1.1:** `id` (an opaque, caller-chosen string) is accepted as an
 optional field on **every** command below, call-scoped or not — see
@@ -315,12 +358,18 @@ either, both, or neither.
 
 Unknown `cmd` values, a required field missing/wrong-typed (e.g. `dial`
 without `uri`, `mute` without a real boolean `on`, `set_device` with a
-`kind` that isn't `"input"`/`"output"`), or a baresip call that returns
-an error, all produce an `error` event rather than crashing or hanging;
-the connection stays up. The JSON-decoding + field-validation half of
-this (everything except actually calling into baresip) is pure,
-unit-tested code — see `core/modules/ctrl_json/cmd.c` and
-`test/test_main.c`.
+`kind` that isn't `"input"`/`"output"`), **or an *optional* field that's
+present with the wrong JSON type (v1.7 — e.g. `call_id`/`id` given as a
+number, `null`, a boolean, an array, or an object instead of a string;
+see "Commands" `call_id` paragraph above)**, or a baresip call that
+returns an error, all produce an `error` event rather than crashing or
+hanging; the connection stays up. An optional field that's simply
+*absent* is never an error — only "present but wrong type" is; that
+distinction is exactly what v1.7 fixed for `call_id`/`id` (previously,
+"wrong type" and "absent" were indistinguishable and silently treated
+the same). The JSON-decoding + field-validation half of this (everything
+except actually calling into baresip) is pure, unit-tested code — see
+`core/modules/ctrl_json/cmd.c` and `test/test_main.c`.
 
 **v1.1 adds per-command request/response correlation** (an optional
 `id`, echoed back on a `result` event — see "Events") — the "Planned"
@@ -702,7 +751,43 @@ decision):
   engine needed — 300/300 `ctrl_json_test` checks pass under ASan,
   including this version's new coverage.
 
-## Planned (still not in v1.6)
+## Changes from v1.6
+
+v1.7 is a contract-hardening fix, not a new feature — no new commands,
+events, or fields. See this file's own top-of-file v1.7 status paragraph
+for the full rationale; summary:
+
+- **`call_id` and `id` now reject the wrong JSON type instead of
+  silently treating it as "absent"** — `cmd.c`'s `optional_call_id()`/
+  `optional_id()` used to call `odict_string()`, which returns `NULL`
+  both when a key is genuinely missing *and* when it's present with a
+  non-string type, so the two cases were indistinguishable and both
+  fell back to "the current call"/"no correlation id". They now go
+  through a shared `optional_str_field()` helper that looks the key up
+  first (`odict_lookup()`) and only calls it "absent" when the key
+  truly isn't there; present-but-wrong-type is a decode error
+  (`CENT_CMD_NONE`, the same `error` event a malformed *required* field
+  already produced pre-v1.7 — see "Commands"/general malformed-input
+  paragraph, both updated by this version).
+- **Behavior change for a caller relying on the old silent fallback**:
+  pre-v1.7, `{"cmd":"hangup","call_id":42}` (a number, not a string)
+  quietly hung up "the current call" instead of failing; v1.7 makes this
+  an `error` event instead. No real caller is known to depend on the old
+  behavior (the shell's JSON encoder always emits a genuine string or
+  omits the field), but this is called out explicitly since it's a
+  behavior change for a message shape v1.6 didn't reject.
+- Unit tests: `test/test_main.c` gained `test_cmd_call_id_wrong_type()`
+  (300 → 318 checks) covering every non-string odict type
+  `json_decode_odict()` can actually produce (number/bool/null/array/
+  object) on both `call_id` and `id`, across more than one call-scoped
+  command (not just one, to confirm the fix isn't command-specific), plus
+  a check that a well-formed string `call_id` still decodes exactly as
+  before. Verified by mutation: reverting `optional_call_id()` to its
+  pre-v1.7 `odict_string()`-only form locally reproduces exactly the 8
+  new-test failures this change is meant to catch, confirming the tests
+  actually exercise the fixed code path rather than passing vacuously.
+
+## Planned (still not in v1.7)
 
 - **G.722 is not in this build, on any platform, and not planned for
   the near term** — see `core/BUILD.md` "Codecs (G.722 — not in this
