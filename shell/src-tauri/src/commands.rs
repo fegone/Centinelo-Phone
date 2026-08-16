@@ -897,14 +897,35 @@ pub fn admin_set_password(
     Ok(())
 }
 
+/// Rate-limited: after `settings::ADMIN_LOCKOUT_THRESHOLD` consecutive
+/// failures this refuses every attempt - correct password or not - until
+/// the lockout window persisted in `settings.json` elapses. See
+/// `SettingsStore::admin_lockout_remaining_ms`'s doc for why that counter
+/// lives on disk rather than next to `AdminSession` in memory.
 #[tauri::command(rename_all = "snake_case")]
 pub fn admin_unlock(settings: State<Arc<SettingsStore>>, admin: State<AdminSession>, password: String) -> bool {
-    match settings.admin_password_hash() {
-        Some(hash) if settings::verify_password(&password, &hash) => {
-            admin.set_unlocked(true);
-            true
+    // No password configured yet (first run): nothing to brute-force, and
+    // nothing for the lockout to protect - always reject without touching
+    // the counter.
+    let Some(hash) = settings.admin_password_hash() else {
+        return false;
+    };
+    if let Some(remaining_ms) = settings.admin_lockout_remaining_ms() {
+        log::warn!("admin_unlock: rejected - locked out for {remaining_ms} more ms after repeated failures");
+        return false;
+    }
+    if settings::verify_password(&password, &hash) {
+        if let Err(e) = settings.reset_admin_lockout() {
+            log::warn!("admin_unlock: couldn't persist the lockout reset: {e}");
         }
-        _ => false,
+        admin.set_unlocked(true);
+        true
+    } else {
+        match settings.record_admin_unlock_failure() {
+            Ok(count) => log::warn!("admin_unlock: rejected (bad password, attempt {count})"),
+            Err(e) => log::warn!("admin_unlock: rejected; also couldn't persist the failure count: {e}"),
+        }
+        false
     }
 }
 
