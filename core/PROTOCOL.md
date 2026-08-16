@@ -203,7 +203,7 @@ bug this version found and fixed in how a codec name gets handed to
 baresip's own `account_set_audio_codecs()`) and "Changes from v1.5"
 below for the full protocol changelog.
 
-**v1.7 status: one contract-hardening fix, no new commands/events —
+**v1.7 status: two contract-hardening fixes, no new commands/events —
 unit-tested (`cmd.c`, `test/test_main.c`, 318/318 checks, ASan-clean),
 verified by mutation (reverting the fix locally reproduces 8 test
 failures, confirming the new coverage actually exercises the changed
@@ -238,6 +238,48 @@ does this (the shell's own JSON encoding always produces a genuine
 string or omits the field), but it's called out explicitly per this
 workspace's own rule that a protocol-visible behavior change is flagged
 loudly, not assumed harmless.
+
+**Second fix, same version: three engine-initiated hold-recovery paths
+were silently missing their `call_state` `"resumed"` event — e2e
+re-verified against the real test PBX** (2026-08, ext 1100 dual-contact
+self-bridge trick, `*43` echo as the source call, `*60` as the
+consultation, `abort_transfer` exercised end-to-end) **and confirmed by
+mutation on that same live PBX** (reverting the fix and re-running the
+identical scenario reproduces the missing-event bug: `abort_transfer`
+resumes the call PBX-side — RTP genuinely flows again — but the engine
+emits nothing, so a real shell would be stuck showing "on hold"
+indefinitely). Also found in the same 2026-08 audit: `emit_call_state()`'s
+own top-of-file comment in `ctrl_json.c` (matching this file's "Events"
+`call_state` row, pre-v1.7) already documented that a *locally*-initiated
+resume needs its own synthetic
+`"resumed"` event, because baresip raises no bevent for one — `cmd_resume()`
+(the direct `resume` command) always did this correctly, but three other
+places that also call `uag_hold_resume()` on the engine's own initiative,
+not in response to a `resume` command, did not: `abort_transfer` (see its
+own "Commands" row), `attended_transfer`'s cleanup when the consultation
+dial itself fails after the source was already put on hold (see
+`attended_transfer`'s own "Commands" row), and the cleanup when the
+consultation call closes on its own — peer hangup, failed dial internally
+surfacing async — before `complete_transfer`/`abort_transfer` ever runs
+(`BEVENT_CALL_CLOSED` handling, no dedicated "Commands" row — this is
+purely event-handler cleanup). All three now go through one shared
+helper, `resume_and_notify()` (`ctrl_json.c`), instead of a bare
+`uag_hold_resume()`. **Real, user-visible impact this closes**: a
+receptionist console mid-attended-transfer whose consultation leg dies
+(far end doesn't answer, network hiccup) would have the source call come
+back off hold on the engine/PBX side while the UI kept showing it on
+hold — silently wrong state with no way to tell from the wire that
+anything had changed. **Fully backward compatible with v1.6**: an
+*additional* event now fires on three paths that previously fired none at
+that moment — no existing event's shape changed, and no consumer was
+plausibly relying on the *absence* of `"resumed"` here (see "Changes from
+v1.6" below for the full writeup). Not unit-testable the way `cmd.c`'s
+own decode logic is — `resume_and_notify()` and its three call sites are
+`ctrl_json.c` code, baresip-dependent throughout (real `struct call`/
+`uag_hold_resume()`), same category as `audiotap.c` (see
+`core/E2E-F1.md` "F4 audio tap"). The real-PBX e2e run plus its
+mutation counterpart above is this fix's only verification, not a gap
+left uncovered by choice.
 
 ## Framing
 
@@ -341,9 +383,9 @@ either, both, or neither.
 | `{"cmd":"dtmf","digits":"123#","call_id":"..."}` | Send RFC2833 DTMF. `digits` is any sequence of `0-9 * # A-D`; invalid characters produce an `error`. |
 | `{"cmd":"mute","on":true,"call_id":"..."}` | Mute (`on:true`) or un-mute (`on:false`) the call's outgoing audio. `on` is a required, real JSON boolean (not the string `"true"`). Emits `call_state` `"muted"`/`"unmuted"` on success. |
 | `{"cmd":"blind_transfer","uri":"sip:target@host","call_id":"..."}` | REFER the call to `uri` (`call_transfer()`). Does **not** implicitly hold the call first (unlike the interactive `menu` module's own transfer key) — hold is a separate, composable command; send `hold` first if that's the desired UX. Outcome is asynchronous — see "Events". |
-| `{"cmd":"attended_transfer","uri":"sip:target@host","call_id":"..."}` | Start an attended transfer: holds the named/current call (the "source"), then dials `uri` as a new "consultation" call on the same UA. Fails with an `error` if another attended transfer is already pending (F1 supports one at a time, matching `modules/menu/dynamic_menu.c`'s own single-slot design) or if the source's peer doesn't support the `Replaces` extension. Emits `call_state` `"hold"` for the source, then `attended_transfer_started` (see "Events"), then the consultation call's normal `call_state` lifecycle (`ringing`/`established`/...). |
+| `{"cmd":"attended_transfer","uri":"sip:target@host","call_id":"..."}` | Start an attended transfer: holds the named/current call (the "source"), then dials `uri` as a new "consultation" call on the same UA. Fails with an `error` if another attended transfer is already pending (F1 supports one at a time, matching `modules/menu/dynamic_menu.c`'s own single-slot design) or if the source's peer doesn't support the `Replaces` extension. Emits `call_state` `"hold"` for the source, then `attended_transfer_started` (see "Events"), then the consultation call's normal `call_state` lifecycle (`ringing`/`established`/...). If the consultation dial itself fails after the source was already put on hold, the source is resumed as a best-effort cleanup (so it's never left stranded on hold for a consultation call that never started) — **v1.7:** that cleanup resume now also emits `call_state` `"resumed"` for the source, same as every other resume path (see this file's own top-of-file v1.7 status paragraph). |
 | `{"cmd":"complete_transfer"}` | Complete a pending attended transfer: REFERs the source call's peer to the consultation call's peer with a `Replaces` header (`call_replace_transfer()`), so the two outside parties end up connected directly and both of this engine's legs drop. `call_id` is accepted (for a future multi-pending-transfer world) but not currently used to disambiguate — there is at most one pending transfer. |
-| `{"cmd":"abort_transfer"}` | Cancel a pending attended transfer without completing it: resumes the held source call (`uag_hold_resume()`) and hangs up the consultation call is left to the caller (send `hangup` with the consultation's `call_id`, from `attended_transfer_started`, if that's also wanted) — `abort_transfer` itself only un-pends the transfer and un-holds the source. Not in the original F1 command list; added because without it a pending attended transfer had no clean cancel path short of hanging up the source outright. |
+| `{"cmd":"abort_transfer"}` | Cancel a pending attended transfer without completing it: resumes the held source call (`uag_hold_resume()`) and hangs up the consultation call is left to the caller (send `hangup` with the consultation's `call_id`, from `attended_transfer_started`, if that's also wanted) — `abort_transfer` itself only un-pends the transfer and un-holds the source. Not in the original F1 command list; added because without it a pending attended transfer had no clean cancel path short of hanging up the source outright. **v1.7:** emits `call_state` `"resumed"` for the source call on success, same as the direct `resume` command — see this file's own top-of-file v1.7 status paragraph for why this wasn't always true. |
 | `{"cmd":"quality_stats","call_id":"..."}` | Emit a `stats` event (see "Events") for the call's current RTCP-derived counters, **enriched in v1.1** with codec/transport (see "Events" `stats` row). |
 | `{"cmd":"blf_subscribe","ext":"510"}` | SIP SUBSCRIBE `Event: dialog` (RFC 4235) to `sip:<ext>@<same PBX host the account registered against>`, `Accept: application/dialog-info+xml`, refreshed automatically by `re`'s sipevent layer for as long as the subscription lives (no polling here). Emits `blf` events (see "Events") as NOTIFYs arrive, starting with the initial one. Errors if already subscribed to that `ext`. |
 | `{"cmd":"blf_unsubscribe","ext":"510"}` | Cleanly unsubscribes (`Expires: 0`) and stops tracking `ext`. Errors if not currently subscribed. |
@@ -384,7 +426,7 @@ exactly what `ok:true`/`ok:false` do and don't promise about a command's
 |---|---|
 | `{"event":"ready"}` | Once, right after `ctrl_json` finishes initializing — the earliest point commands can safely be sent. Unchanged from v0. |
 | `{"event":"reg_state","account":"...","state":"registering\|registered\|failed\|unregistered","transport":"udp\|tcp\|tls\|ws\|wss","reason":"..."}` | On every registration transition — now including transitions caused by the runtime `register`/`unregister` commands, not just process-start registration. `reason` present only on `failed`. Unchanged shape from v0. |
-| `{"event":"call_state","state":"...","peer":"...","id":"...","call_id":"...","}` | **`call_id` is new in v1** (added alongside the original `id` field, same value — kept both so a v0 consumer reading `id` doesn't break; a future v2 may drop `id`). `state` values beyond v0's `incoming\|ringing\|established\|closed`: **`hold`/`resumed`** (fired both for this engine's own local hold/resume commands — synthetically, right at the command's own success path, since baresip has no bevent for *locally*-initiated hold/resume, only peer-initiated — and relayed from `BEVENT_CALL_HOLD`/`BEVENT_CALL_RESUME` for a *peer*-initiated hold/resume) and **`muted`/`unmuted`** (from `mute`). None of these correspond to baresip's own `CALL_STATE_*` lifecycle machine changing — hold/mute are attributes of an otherwise-established call, not lifecycle transitions — they're folded into `call_state` anyway rather than inventing a new event per attribute, since from a consumer's perspective they're all "something about this call just changed, here's its id". |
+| `{"event":"call_state","state":"...","peer":"...","id":"...","call_id":"...","}` | **`call_id` is new in v1** (added alongside the original `id` field, same value — kept both so a v0 consumer reading `id` doesn't break; a future v2 may drop `id`). `state` values beyond v0's `incoming\|ringing\|established\|closed`: **`hold`/`resumed`** (fired both for this engine's own local hold/resume commands — synthetically, right at the command's own success path, since baresip has no bevent for *locally*-initiated hold/resume, only peer-initiated — and relayed from `BEVENT_CALL_HOLD`/`BEVENT_CALL_RESUME` for a *peer*-initiated hold/resume) and **`muted`/`unmuted`** (from `mute`). None of these correspond to baresip's own `CALL_STATE_*` lifecycle machine changing — hold/mute are attributes of an otherwise-established call, not lifecycle transitions — they're folded into `call_state` anyway rather than inventing a new event per attribute, since from a consumer's perspective they're all "something about this call just changed, here's its id". **v1.7:** the "synthetic, at the command's own success path" half of that rule now genuinely covers *every* engine-initiated resume, not just the direct `resume` command — `abort_transfer`, `attended_transfer`'s own dial-failure cleanup, and the consultation-call-closes-before-`complete_transfer`/`abort_transfer` cleanup (`BEVENT_CALL_CLOSED` handling) all emit `"resumed"` for the source call now too; see this file's own top-of-file v1.7 status paragraph for the gap this closes. |
 | `{"event":"error","message":"..."}` | Malformed/unparseable input line, unknown `cmd`, a required field missing/wrong-typed, a baresip command that returned an error, `BEVENT_AUDIO_ERROR` (also emits the dedicated `audio_error` event below, **new in v1.4** — this plain `error` still fires too, unchanged, for back-compat), or `BEVENT_CALL_TRANSFER_FAILED` (an async transfer failure reported by the far end after `blind_transfer`/`complete_transfer` already returned success synchronously — reuses this existing event/shape rather than inventing a transfer-specific one; **as of v1.4** also fires for a `park`/`blind_transfer` subscription-*establishment* failure, e.g. the wss-specific `EDESTADDRREQ` finding under `park` below — previously silently swallowed, see "Changes from v1.3" and `core/patches/0005-*`). |
 | `{"event":"audio_error","call_id":"...","message":"..."}` | **New in v1.4**, from `BEVENT_AUDIO_ERROR`, alongside the plain `error` event above (both fire, same underlying bevent). `call_id` is the failing call's real id (same convention as `call_state`/`tap_state`/`park`) — the plain `error` event has no `call_id` at all, so this is the only way to know *which* call's audio failed when more than one is in play. `message` is the identical text the plain `error` event's own `message` carries (baresip's own `"%d,%s", err, str` format from `call.c`'s `audio_error_handler()` — not re-parsed/restructured here). e2e-verified via fault injection (see this file's own top-of-file v1.4 status paragraph) — **only reachable for `ausrc`/microphone-side failures today**, see that same paragraph for the separate, unfixed `auplay`/speaker-side gap. |
 | `{"event":"stats","call_id":"...","rtt_us":N,"tx_packets":N,"tx_lost":N,"tx_jitter_us":N,"rx_packets":N,"rx_lost":N,"rx_jitter_us":N,"codec":"...","transport":"udp\|tcp\|tls\|ws\|wss"}` | New in v1, from `quality_stats`. Sourced from `stream_rtcp_stats()` (`src/stream.c`) — **this reflects the most recently *received* RTCP Sender/Receiver Report, not a live per-packet counter.** Querying more often than the RTCP interval (empirically ~10-20s against the test PBX, see `core/E2E-F1.md`) returns identical numbers between reports; that's correct RTCP behavior, not a bug or a stale/broken reading. Query again after waiting a few RTCP intervals if you need fresher numbers. `rtt_us` is frequently `0` against a real PBX even while every other field is healthy/non-zero — RTCP round-trip-time needs a full SR/RR/DLSR round trip to populate, which this repo's test PBX has never been observed to complete (see `core/E2E-F1.md` scenario (d)); don't read a `0` there as "stats are broken". **`codec`/`transport` are new in v1.1**: `codec` is the call's negotiated TX/encoder codec name (`audio_codec()`, `src/audio.c`) — omitted entirely (not an empty string) if not yet negotiated; `transport` is the *call's own* actual SIP transport (`call_transp()`, not the account's static config) using the same vocabulary as `reg_state`'s `transport`. |
@@ -786,6 +828,32 @@ for the full rationale; summary:
   pre-v1.7 `odict_string()`-only form locally reproduces exactly the 8
   new-test failures this change is meant to catch, confirming the tests
   actually exercise the fixed code path rather than passing vacuously.
+- **Three engine-initiated resumes now emit `call_state` `"resumed"`**
+  (see this file's own top-of-file v1.7 status paragraph "Second fix,
+  same version" for the full writeup, and the `abort_transfer`/
+  `attended_transfer` "Commands" rows and the `call_state` "Events" row,
+  all updated by this version): `abort_transfer`, `attended_transfer`'s
+  own dial-failure cleanup, and the `BEVENT_CALL_CLOSED`
+  consultation-closes-early cleanup all used to call `uag_hold_resume()`
+  directly and silently — only the direct `resume` command itself
+  emitted the synthetic `"resumed"` `call_state` this file's own
+  "Events" row already documented as accompanying *every* local resume.
+  `ctrl_json.c` gains one shared helper, `resume_and_notify()`, used by
+  all three; `cmd_resume()` itself is unchanged (it already did this
+  correctly and has its own explicit error handling that doesn't fit
+  the other three's "best-effort, stay silent on failure" shape).
+  e2e-verified against the real test PBX (ext 1100 dual-contact
+  self-bridge, `*43` source / `*60` consultation, `abort_transfer`
+  exercised end-to-end: `call_state` `"hold"` → `attended_transfer_started`
+  → consultation `established` → `abort_transfer` → `call_state`
+  `"resumed"` for the source, followed by two `quality_stats` samples
+  16s apart showing real packet growth on the source call, 751→1600 tx /
+  726→1575 rx, confirming genuine post-resume RTP flow, not just the
+  event itself) and by mutation on that same live PBX (reverting
+  `cmd_abort_transfer()`'s call site back to a bare `uag_hold_resume()`
+  and re-running the identical scenario reproduces the bug: the PBX-side
+  call genuinely comes off hold, but no `"resumed"` event is emitted -
+  the exact silent-desync this fix closes).
 
 ## Planned (still not in v1.7)
 

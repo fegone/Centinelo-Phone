@@ -1288,6 +1288,49 @@ static void xfer_reset(void)
 }
 
 
+/*
+ * Shared by every attended-transfer *cleanup* path that resumes the
+ * source call on the engine's own initiative rather than in direct
+ * response to a "resume" command (the dial-failure branch of
+ * cmd_attended_transfer(), cmd_abort_transfer(), and the
+ * BEVENT_CALL_CLOSED xfer_target-closed-early branch in
+ * event_handler() - see each call site's own comment for why that
+ * particular resume happens).
+ *
+ * uag_hold_resume() raises no bevent of its own for a *locally*
+ * initiated resume (same fact cmd_resume()'s own comment already
+ * documents for the direct "resume" command - BEVENT_CALL_RESUME is
+ * baresip's *peer*-initiated-only signal, see src/call.c
+ * detect_hold_resume()) - so a caller here that dropped the return
+ * value with a bare (void)uag_hold_resume(call), as all three sites
+ * used to, left the shell believing the call was still on hold
+ * indefinitely: nothing ever told it otherwise, even though the call
+ * was genuinely back off hold on the engine side from that moment on.
+ * Found in a 2026-08 core-engine audit - "call_state":"resumed" was
+ * documented (PROTOCOL.md "Events" call_state row) as accompanying
+ * every resume, direct or not, but these three engine-initiated paths
+ * never actually emitted it.
+ *
+ * Best-effort by design, matching what all three call sites already
+ * were before this fix: on failure (call already gone, no other call
+ * to hold instead, ...) this stays silent, same as the bare
+ * (void)uag_hold_resume() it replaces - none of these three are a
+ * user-facing command in their own right (the failure that actually
+ * matters, e.g. attended_transfer's dial failing, already got its own
+ * emit_errorf() before this ever runs), so surfacing a second,
+ * unrelated error here for an implementation detail of the cleanup
+ * itself would be noise, not signal.
+ */
+static void resume_and_notify(struct call *call)
+{
+	if (!call)
+		return;
+
+	if (!uag_hold_resume(call))
+		emit_call_state(call, "resumed");
+}
+
+
 static void cmd_attended_transfer(const struct cent_cmd *cmd)
 {
 	struct ua *ua = primary_ua();
@@ -1331,10 +1374,15 @@ static void cmd_attended_transfer(const struct cent_cmd *cmd)
 	if (err) {
 		emit_errorf("attended_transfer: dial to '%s' failed (%m)",
 			    cmd->uri, err);
-		(void)uag_hold_resume(source);   /* best-effort: don't strand
-						   * the source call on hold
-						   * for a consultation call
-						   * that never started */
+		resume_and_notify(source);   /* best-effort: don't strand
+					       * the source call on hold for
+					       * a consultation call that
+					       * never started - and, unlike
+					       * a bare uag_hold_resume(),
+					       * actually tell the shell it's
+					       * off hold again (see
+					       * resume_and_notify()'s own
+					       * comment). */
 		return;
 	}
 
@@ -1383,7 +1431,13 @@ static void cmd_abort_transfer(void)
 		return;
 	}
 
-	(void)uag_hold_resume(xfer_source);
+	/* resume_and_notify(), not a bare uag_hold_resume(): abort_transfer
+	 * is the one command whose whole documented job (PROTOCOL.md
+	 * "abort_transfer") is "resumes the held source call" - a shell
+	 * that just called this and got back a bare {"ok":true} result
+	 * (see process_line()'s "id" correlation) had no other way to
+	 * learn the source left hold, short of polling. */
+	resume_and_notify(xfer_source);
 	xfer_reset();
 }
 
@@ -2112,8 +2166,17 @@ static void event_handler(enum bevent_ev ev, struct bevent *event, void *arg)
 		 * modules/menu/menu.c's own cleanup on the same bevent for
 		 * its xfer_call/xfer_targ pair. */
 		if (call == xfer_source || call == xfer_target) {
+			/* resume_and_notify(), not a bare uag_hold_resume():
+			 * the shell was told "hold" for xfer_source when the
+			 * attended transfer started (see
+			 * cmd_attended_transfer()) - if the consultation leg
+			 * (xfer_target) now closes on its own before
+			 * complete_transfer/abort_transfer ran, the source
+			 * genuinely comes off hold right here, and the shell
+			 * needs its own "resumed" call_state to find out,
+			 * same as every other resume path in this file. */
 			if (call == xfer_target && xfer_source)
-				(void)uag_hold_resume(xfer_source);
+				resume_and_notify(xfer_source);
 			xfer_reset();
 		}
 		emit_call_state(call, "closed");
