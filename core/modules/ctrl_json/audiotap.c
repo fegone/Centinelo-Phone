@@ -32,16 +32,46 @@
  * The two are joined, per-frame, by a single fresh lookup
  * (find_reg(au) - a linear search of audiotap_regl by the struct audio*
  * pointer baresip hands both sides) rather than a cached pointer from
- * one into the other. This is deliberate, not just simplicity: baresip's
- * event loop is single-threaded (re_main() - see PROTOCOL.md "Framing"
- * and ctrl_json.c's own top comment), so there's no actual *race*
- * between a tap_stop freeing a struct audiotap_reg and an in-flight
- * encode()/decode() call using it - but a fresh lookup means there's
- * also no *class* of dangling-pointer bug to reason about here at all,
- * which is worth the linear search's cost (trivially cheap - this
- * engine registers one UA and this build's e2e testing never exceeds a
- * handful of concurrent calls, see PROTOCOL.md's attended-transfer
- * scenario for the realistic ceiling).
+ * one into the other - a fresh lookup means there's no *class* of
+ * dangling-pointer bug from a *stale* pointer to reason about, which is
+ * worth the linear search's cost (trivially cheap - this engine
+ * registers one UA and this build's e2e testing never exceeds a handful
+ * of concurrent calls, see PROTOCOL.md's attended-transfer scenario for
+ * the realistic ceiling).
+ *
+ * IMPORTANT (fixed 2026-08 - was documented wrong here before): this
+ * lookup, and audiotap_regl itself, are NOT single-threaded. An earlier
+ * revision of this comment claimed baresip's event loop is single-
+ * threaded so there's no real race - that's false for the actual
+ * baresip build vendored under core/deps/baresip (v4.9.0). Three
+ * distinct OS threads touch this module:
+ *
+ *   - "Audio TX" (src/audio.c start_source()/tx_thread()): calls
+ *     encode() below, under baresip's own tx->mtx.
+ *   - "RTP RX" (src/rtprecv.c rtprecv_thread(), one per stream): calls
+ *     decode() below via aurecv_receive(), under baresip's own ar->mtx.
+ *   - the engine's own main thread (ctrl_json.c's stdio command loop):
+ *     calls audiotap_start()/audiotap_stop()/audiotap_call_closed()/
+ *     audiotap_close().
+ *
+ * Those baresip-owned mutexes protect baresip's own filter-chain lists
+ * (tx->filtl / ar->filtl), not audiotap_regl - this module's own list is
+ * a plain, unsynchronized struct list. Without a lock of our own, the
+ * main thread's list_unlink()+free() (via mem_deref() in
+ * audiotap_stop()/audiotap_call_closed(), reached through
+ * reg_destructor()) can run concurrently with an Audio TX or RTP RX
+ * thread that's mid find_reg() (walking the same list) or mid
+ * write_frame() (reading/writing the very struct audiotap_reg being
+ * freed) - a genuine data race and use-after-free, not just a narrow
+ * window. audiotap_mtx below closes it: every read or mutation of
+ * audiotap_regl, or of a registry entry reachable through it, happens
+ * under that lock. It's held across encode()/decode()'s full body (find
+ * + active check + write), matching exactly how baresip itself already
+ * holds tx->mtx/ar->mtx across the identical call into this filter -
+ * this is not new contention on the hot path, it's this module joining
+ * a hot-path locking discipline baresip already imposes on every aufilt
+ * module. See audiotap_mtx's own comment below for why this doesn't
+ * turn into a real-time hazard.
  *
  * Copyright (C) 2026 Centinelo Phone
  */
@@ -116,7 +146,36 @@ struct audiotap_reg {
 
 static struct list audiotap_regl;
 
+/* Guards audiotap_regl and every field of every struct audiotap_reg
+ * reachable through it (au, active, {rx,tx}_w, {rx,tx}_scratch*) - see
+ * this file's own top comment for the three real threads this
+ * serializes and why. Allocated once from audiotap_init(), and
+ * deliberately never mem_deref()'d back: audiotap_close() can't prove
+ * no Audio TX/RTP RX thread is still mid-call into encode()/decode()
+ * the instant it returns (aufilt_unregister() only stops *new*
+ * encode_update()/decode_update() calls from picking this filter - it
+ * doesn't retroactively detach it from a call whose audio pipeline is
+ * mid-teardown), so destroying the mutex itself right after would just
+ * relocate the same class of use-after-free onto the mutex. A single
+ * fixed-size allocation that outlives the process is reachable via this
+ * static pointer for the module's whole lifetime, so it's not a leak
+ * (see core/BUILD.md "Memory safety" - this codebase already
+ * distinguishes reachable long-lived allocations from actual leaks for
+ * exactly this kind of process-lifetime singleton).
+ *
+ * encode()/decode()/audiotap_start()/audiotap_stop()/
+ * audiotap_call_closed()/audiotap_close() all guard against a NULL
+ * mutex (mutex_alloc() failing in audiotap_init(), i.e. we're already
+ * out of memory) by no-op'ing rather than dereferencing NULL - a cold,
+ * unrecoverable-anyway path, but "never crash the call" (this file's
+ * own running theme) still applies to it.
+ */
+static mtx_t *audiotap_mtx;
 
+
+/* Caller must hold audiotap_mtx - see that variable's own comment. Not
+ * asserted here (baresip's mtx_t has no "is this thread holding it"
+ * query) - every call site below takes the lock immediately before. */
 static struct audiotap_reg *find_reg(const struct audio *au)
 {
 	struct le *le;
@@ -370,11 +429,20 @@ static int encode(struct aufilt_enc_st *stp, struct auframe *af)
 	if (!st || !af)
 		return EINVAL;
 
+	if (!audiotap_mtx)
+		return 0;   /* audiotap_init()'s mutex_alloc() failed - see
+			     * that variable's own comment; can't safely
+			     * touch audiotap_regl at all */
+
+	mtx_lock(audiotap_mtx);
+
 	r = find_reg(st->au);
-	if (!r || !r->active)
+	if (!r || !r->active) {
+		mtx_unlock(audiotap_mtx);
 		return 0;   /* no tap requested for this call right now -
 			     * passthrough, exactly like every frame before
 			     * the first tap_start / after a tap_stop */
+	}
 
 	was_ok = !r->tx_w.err;
 
@@ -385,6 +453,8 @@ static int encode(struct aufilt_enc_st *stp, struct auframe *af)
 			" %s (%m) - tap continues capturing rx only\n",
 			r->call_id, r->tx_w.err);
 	}
+
+	mtx_unlock(audiotap_mtx);
 
 	/* Always 0: a tap write failure (e.g. disk full) must never
 	 * disrupt the actual phone call - see this file's own top comment
@@ -404,9 +474,16 @@ static int decode(struct aufilt_dec_st *stp, struct auframe *af)
 	if (!st || !af)
 		return EINVAL;
 
+	if (!audiotap_mtx)
+		return 0;   /* see encode()'s identical guard */
+
+	mtx_lock(audiotap_mtx);
+
 	r = find_reg(st->au);
-	if (!r || !r->active)
+	if (!r || !r->active) {
+		mtx_unlock(audiotap_mtx);
 		return 0;
+	}
 
 	was_ok = !r->rx_w.err;
 
@@ -417,6 +494,8 @@ static int decode(struct aufilt_dec_st *stp, struct auframe *af)
 			" %s (%m) - tap continues capturing tx only\n",
 			r->call_id, r->rx_w.err);
 	}
+
+	mtx_unlock(audiotap_mtx);
 
 	return 0;
 }
@@ -433,6 +512,15 @@ static struct aufilt audiotap_filt = {
 
 void audiotap_init(void)
 {
+	if (!audiotap_mtx) {
+		int err = mutex_alloc(&audiotap_mtx);
+
+		if (err) {
+			warning("audiotap: mutex_alloc failed (%m) - tap"
+				" registry disabled for this process\n", err);
+		}
+	}
+
 	aufilt_register(baresip_aufiltl(), &audiotap_filt);
 }
 
@@ -445,8 +533,21 @@ void audiotap_close(void)
 	 * mem_deref()s each - see core/deps/re/src/list/list.c), which
 	 * force-finalizes (idempotently - see that destructor's own
 	 * comment) any tap that was still active - "never leave a corrupt
-	 * WAV" holds even for `quit` racing an unfinished tap_stop. */
-	list_flush(&audiotap_regl);
+	 * WAV" holds even for `quit` racing an unfinished tap_stop.
+	 *
+	 * Locked like every other audiotap_regl access, for the same
+	 * reason: aufilt_unregister() just above doesn't guarantee an
+	 * Audio TX/RTP RX thread isn't still mid-encode()/decode() for a
+	 * call whose teardown is racing this same `quit`. audiotap_mtx
+	 * itself is deliberately NOT freed here - see its own comment. */
+	if (audiotap_mtx) {
+		mtx_lock(audiotap_mtx);
+		list_flush(&audiotap_regl);
+		mtx_unlock(audiotap_mtx);
+	}
+	else {
+		list_flush(&audiotap_regl);
+	}
 }
 
 
@@ -468,7 +569,10 @@ struct path_collision_ctx {
  * "Taken" = an rx_path/tx_path of a currently-active audiotap_regl
  * entry, or a file that already exists on disk (covers a stale leftover
  * from an earlier, unrelated call whose sanitized call_id happened to
- * match, not just a same-process concurrent collision). */
+ * match, not just a same-process concurrent collision). Reads
+ * audiotap_regl - caller (audiotap_start(), via
+ * pathsafe_unique_component()) must hold audiotap_mtx, same as
+ * find_reg(). */
 static bool path_taken(const char *candidate_id, void *arg)
 {
 	const struct path_collision_ctx *ctx = arg;
@@ -549,9 +653,31 @@ int audiotap_start(struct call *call, const char *dir,
 		return EINVAL;
 	}
 
+	if (!audiotap_mtx) {
+		*errmsg = e_nomem;   /* audiotap_init()'s mutex_alloc() failed -
+				      * see that variable's own comment */
+		return ENOMEM;
+	}
+
+	/* Locked from here through list_append() below: every read
+	 * (find_reg(), path_taken() inside pathsafe_unique_component()) and
+	 * every mutation (mem_deref() of a stale entry, list_append()) of
+	 * audiotap_regl must be atomic with respect to the Audio TX/RTP RX
+	 * threads' own find_reg() calls in encode()/decode() - see
+	 * audiotap_mtx's top comment. This does briefly serialize tap_start
+	 * (a rare, human/API-triggered command, never per-frame) against
+	 * in-flight frames of *other* concurrent calls too, since the lock
+	 * is module-global rather than per-call - accepted per this file's
+	 * own top comment on the realistic concurrency ceiling (never more
+	 * than "a handful" of calls), and it's the same trade already made
+	 * by wav_writer_create()'s synchronous file I/O happening inline
+	 * here regardless of locking. */
+	mtx_lock(audiotap_mtx);
+
 	r = find_reg(au);
 	if (r && r->active) {
 		*errmsg = e_running;
+		mtx_unlock(audiotap_mtx);
 		return EEXIST;
 	}
 	if (r) {
@@ -565,6 +691,7 @@ int audiotap_start(struct call *call, const char *dir,
 	r = mem_zalloc(sizeof(*r), reg_destructor);
 	if (!r) {
 		*errmsg = e_nomem;
+		mtx_unlock(audiotap_mtx);
 		return ENOMEM;
 	}
 
@@ -587,6 +714,7 @@ int audiotap_start(struct call *call, const char *dir,
 						AUDIOTAP_PATH_COLLISION_RETRIES)) {
 			*errmsg = e_collision;
 			mem_deref(r);
+			mtx_unlock(audiotap_mtx);
 			return EEXIST;
 		}
 	}
@@ -612,6 +740,7 @@ int audiotap_start(struct call *call, const char *dir,
 		(void)remove(r->rx_path);
 		(void)remove(r->tx_path);
 		mem_deref(r);
+		mtx_unlock(audiotap_mtx);
 		return EIO;
 	}
 
@@ -620,6 +749,8 @@ int audiotap_start(struct call *call, const char *dir,
 
 	str_ncpy(res->rx_path, r->rx_path, sizeof(res->rx_path));
 	str_ncpy(res->tx_path, r->tx_path, sizeof(res->tx_path));
+
+	mtx_unlock(audiotap_mtx);
 
 	return 0;
 }
@@ -654,9 +785,23 @@ int audiotap_stop(struct call *call, struct audiotap_result *res,
 		return EINVAL;
 	}
 
+	if (!audiotap_mtx) {
+		*errmsg = e_not_running;   /* see audiotap_mtx's own comment -
+					    * nothing to safely stop */
+		return ENOENT;
+	}
+
+	/* Locked for the same reason as audiotap_start(): finalize_reg()
+	 * closes r->{rx,tx}_w and mem_deref(r) frees `r` - both must be
+	 * atomic with respect to an Audio TX/RTP RX thread that's mid
+	 * find_reg()/write_frame() on this exact entry (the bug this
+	 * whole mutex exists to close - see audiotap_mtx's top comment). */
+	mtx_lock(audiotap_mtx);
+
 	r = find_reg(au);
 	if (!r || !r->active) {
 		*errmsg = e_not_running;
+		mtx_unlock(audiotap_mtx);
 		return ENOENT;
 	}
 
@@ -664,6 +809,8 @@ int audiotap_stop(struct call *call, struct audiotap_result *res,
 	mem_deref(r);   /* -> reg_destructor(): idempotent re-close (no-op,
 			 * already closed by finalize_reg() above) + unlink +
 			 * scratch-buffer free */
+
+	mtx_unlock(audiotap_mtx);
 
 	return 0;
 }
@@ -681,13 +828,24 @@ bool audiotap_call_closed(struct call *call, struct audiotap_result *res)
 	if (!au)
 		return false;
 
+	if (!audiotap_mtx)
+		return false;   /* see audiotap_mtx's own comment */
+
+	/* Locked for the same reason as audiotap_stop() - see that
+	 * function's comment and audiotap_mtx's top comment. */
+	mtx_lock(audiotap_mtx);
+
 	r = find_reg(au);
-	if (!r || !r->active)
+	if (!r || !r->active) {
+		mtx_unlock(audiotap_mtx);
 		return false;
+	}
 
 	memset(res, 0, sizeof(*res));
 	finalize_reg(r, res);
 	mem_deref(r);
+
+	mtx_unlock(audiotap_mtx);
 
 	return true;
 }
